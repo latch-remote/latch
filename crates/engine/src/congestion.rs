@@ -973,7 +973,12 @@ mod tests {
         for _ in 0..40 {
             t += Duration::from_millis(50);
             window(&mut c, t, 10.0, 0.0);
+            assert_eq!(c.budget(), 50_000, "idle keeps the target");
         }
+        assert!(
+            c.application_limited(),
+            "must exercise an underfilled encoder"
+        );
         // Scheduling jitter on the pings: not a route change.
         for tick in 0..200 {
             t += Duration::from_millis(50);
