@@ -961,11 +961,20 @@ fn push_headers<'a>(version: &'a str, sha: &'a str) -> [(&'static str, &'a str);
 }
 
 fn send_host(ip: Ipv4Addr, version: &str, sha: &str, exe: &[u8]) -> Result<()> {
+    let mut headers = push_headers(version, sha).to_vec();
+    // The service on this machine takes requests from its own user only.
+    let token = ip
+        .is_loopback()
+        .then(latch_core::config::local_control_token)
+        .flatten();
+    if let Some(token) = token.as_deref() {
+        headers.push((latch_core::config::LOCAL_CONTROL_HEADER, token));
+    }
     let r = http::request_with(
         (ip, CONTROL_PORT),
         "POST",
         UPDATE_PATH,
-        &push_headers(version, sha),
+        &headers,
         exe,
         Duration::from_secs(120),
     )?;

@@ -46,7 +46,8 @@ built-in streaming engine that captures and streams the desktop.
      (`%ProgramFiles%\Latch\engine`, `%ProgramFiles%\BroLink\engine`), a
      `SunshineService` installed in one of them, and the old firewall
      rules;
-   - copies the checked `latch-host.exe` into `%ProgramFiles%\Latch\Input`
+   - only when **Control windows that run as administrator** is enabled,
+     copies the checked `latch-host.exe` into `%ProgramFiles%\Latch\Input`
      and registers the `LatchInput` task, which runs that copy with
      `--input-helper` as the user who ran setup, elevated (see
      [Windows that run as administrator](#windows-that-run-as-administrator));
@@ -116,28 +117,61 @@ installer, Task Manager, an administrator's terminal or a game launcher that
 runs as administrator (HoYoPlay, for one) has focus: the viewer's pointer
 freezes until that window is closed at the PC.
 
-Each stream therefore starts the `LatchInput` task that setup registers. It
-runs the copy of Latch in `%ProgramFiles%\Latch\Input`, a folder only
-administrators can change, elevated, as the user who ran setup, with no
-prompt. The stream sends its input to that helper through a named pipe
-(`\\.\pipe\LatchInput-<session>`) that only that user's processes in the
-same session can open, and only after checking that the pipe's server is
-that very copy; until the helper answers, and if it ever goes away, Latch
-injects input itself. The helper lets go of every key and button its stream
-held when the stream ends, and exits a minute after the last stream.
+The Sharing tab's **Control windows that run as administrator** switch is
+**off by default**. Turn it on, then run **Set up as administrator** to apply
+it. Turning it off also requires setup, which stops and removes `LatchInput`.
+Existing installs with that task keep it enabled on upgrade, once, so working
+setups do not silently lose input; the switch shows that choice.
 
-Updates replace only the copy in `%LOCALAPPDATA%`. The helper keeps
-serving newer versions until one changes how the two talk; then
-`service.log` says the helper did not answer, and running setup again
-brings it up to date. The Sharing tab asks for setup while the helper is
-missing, and `service.log` names any window that ignores the viewer's
-input because it runs as administrator.
+While enabled, **any program running as you on this PC can control your
+administrator windows too**. This is a deliberate relaxation of Windows'
+normal integrity boundary, not a UAC bypass for other users or the secure
+desktop. Leave it off unless you need it.
 
-Any program running as that user can start the task, so it lets that user's
-unelevated programs send keyboard and mouse input to their own elevated
-windows, which Windows would otherwise refuse. Windows' secure desktop (UAC
-prompts, the sign-in and lock screens) still cannot be reached: it needs a
-SYSTEM service, which Latch 5 does not install.
+Each stream starts the task asynchronously. It runs the protected copy in
+`%ProgramFiles%\Latch\Input`. Until it answers the host injects normally;
+stream startup never waits for elevation. The helper releases held keys and
+buttons when the pipe closes and exits within about ten idle seconds (five
+seconds of grace plus its five-second idle check), allowing quick reconnects.
+It is not a logon task or a continuously running service.
+
+Both ends check the other process's image path. The helper uses
+`GetNamedPipeClientProcessId` and compares the image to the installed
+`latch-host.exe` path recorded by setup in its administrator-protected folder;
+it also checks the Windows session. This narrows the same-user route but does
+not close it: programs running as you can manipulate your unelevated host.
+The secure desktop, sign-in and lock screens remain inaccessible.
+
+Updates replace the user's host copy. Run setup again if its install path
+changes or if `service.log` reports an incompatible helper.
+
+## Troubleshooting
+
+**The mouse does not move over some windows:** those windows may run as
+administrator. If you accept the same-user risk described above, turn on
+**Control windows that run as administrator** in Sharing, then click
+**Set up as administrator**. UAC prompts on the secure desktop cannot be
+controlled even with this enabled.
+
+**Local control:** the window sends a per-user `local-control-token` from
+Latch's data directory. On Unix it is created with mode 0600. On Windows the
+normal `%LOCALAPPDATA%` profile directory supplies the user ACL inherited by
+Latch's directory and token (administrators and SYSTEM retain access).
+Microsoft documents the [per-user profile isolation](https://learn.microsoft.com/en-us/dotnet/standard/io/isolated-storage)
+and [LocalAppData location](https://learn.microsoft.com/windows/win32/shell/knownfolderid). Do not
+redirect the data directory to a shared folder. Unauthenticated loopback
+health/status reads continue to work, without service logs; display, power
+and quit requests require the token.
+
+**Tagged organisation hosts:** set `allowed_logins = ["you@example.com"]` in
+`host.toml`. Tailscale's local API reports identities and sharing markers,
+not a reliable membership assertion. Latch refuses these hosts' remote
+control without an explicit list and rejects marked shared or tagged peers.
+Personal tailnets retain exact owner-login matching.
+
+**Clipboard:** Sharing's clipboard switch defaults on. Only the current
+stream's peer, or that peer for five seconds afterwards, can read or write
+clipboard text. Older viewers use the same endpoint.
 
 ## Uninstalling
 
@@ -369,8 +403,10 @@ address that `tailscale whois` attributes to the account this PC is signed
 in as; a machine shared in from another tailnet is refused too. Anything
 else gets a 403 before any action. Loopback, and this PC's own Tailscale
 address, can be a process of any Windows user signed in here, so they may
-not start a stream or use the clipboard. Local update submissions are accepted
-only after independent release authentication.
+not start a stream or use the clipboard, and anything beyond reading the
+status needs the per-user token (see Local control). With it, this PC's own
+window may submit an update, which is checked against GitHub's published
+digest like any other.
 
 The service also listens on UDP 9. A magic packet for this PC's MAC that
 arrives while it is awake is logged and reported in the status, which is
