@@ -35,22 +35,26 @@ is sitting at it. Platform details are in [MACOS.md](MACOS.md) and
 
 ## Updates
 
-Latch keeps itself current. Every few hours the Mac app asks GitHub for
+Automatic release fetching runs on macOS only. Windows receives pushes
+from a Mac or needs manual installation; Linux needs a tarball install or
+Docker rebuild. Every few hours the Mac app asks GitHub for
 the latest release. A newer app is downloaded, checked against the digest
 GitHub publishes and its own code signature, swapped into `/Applications`
 once no stream is running, and relaunched. A newer Latch Host is sent
 from the Mac to every PC whose host reports an older version, over the same
 Tailscale-authenticated control API that can put the PC to sleep; the host
-verifies the digest, replaces its executable and restarts. That path updates `latch-host.exe`, which contains the entire streaming engine. A PC that is asleep gets the host
+verifies the sender-supplied digest, replaces its executable and restarts.
+This checks corruption, not independent publisher authenticity. That path updates `latch-host.exe`, which contains the entire streaming engine. A PC that is asleep gets the host
 update the next time the Mac sees it. Nothing is downloaded on the PC, and
 no GitHub login is needed there.
 
 Public releases need no GitHub login. If the repository is private, the Mac
 uses the GitHub token git has stored for github.com,
 `LATCH_GITHUB_TOKEN`, or `github_token` in `client.toml`. Settings has the
-switch and a **Check now** button. Hosts installed before 3.1 do not have the
-update route: install that release on the PC once (through the stream works),
-after which updates are automatic.
+switch and a **Check now** button. Hosts installed before 3.1 need local
+or SSH installation of a current release. A Latch 5 viewer cannot stream
+the retired protocol to upgrade them. Ad-hoc Mac updates may require
+re-granting Screen Recording and Accessibility and restarting the app.
 
 ## Staying reachable
 

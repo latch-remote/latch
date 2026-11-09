@@ -369,9 +369,11 @@
                 Tailscale is the path and the identity&nbsp;check.
               </h2>
               <p class="intro">
-                A machine answers only peers signed in to the same Tailscale
-                account. There is no Latch account or password, and the control
-                port is open to your tailnet only.
+                Untagged hosts authorize peers by Tailscale user ID. Tagged hosts
+                match the tailnet name or login domain; that is broader than
+                a membership check. Sockets listen on all interfaces, with
+                application authorization and Windows source-scoped firewall
+                rules. There is no Latch account or password.
               </p>
             </div>
           </header>
@@ -596,8 +598,8 @@
                 <dd>
                   <p>
                     The best both machines have: AV1, then HEVC, then H.264.
-                    Any can be chosen; one either machine lacks falls back to
-                    H.264.
+                    Any can be chosen; negotiation and decoder failure recovery try
+                    the next supported codec, ultimately Baseline H.264.
                   </p>
                 </dd>
               </div>

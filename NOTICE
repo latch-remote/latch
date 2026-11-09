@@ -5,10 +5,11 @@ Licensed under the GNU General Public License, version 3 or later (LICENSE).
 Parts of crates/codec/src/h264/decode are adapted from pith-h264 0.1.1
 (https://github.com/pith-hash/pith-h264), MIT License, Copyright (c) 2026 pith-hash contributors.
 
-Used when present, never redistributed:
+External runtime:
 
   Tailscale, BSD-3-Clause client            https://tailscale.com
-  Apollo, GPL-3.0, ClassicOldSong           https://github.com/ClassicOldSong/Apollo
+    Installed separately for native apps; the Docker node copies the
+    client and daemon from the official Tailscale image.
 
 Fonts:
 

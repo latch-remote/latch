@@ -3,7 +3,8 @@
 Latch for the Mac is one native app: every machine on your Tailscale
 account, a Connect button each, a power menu, the stream itself, and a
 **Sharing** tab so a Windows PC or another Mac can open this desktop. Latch's stream protocol is compiled in, video is captured with ScreenCaptureKit
-and encoded/decoded with VideoToolbox (H.264 and HEVC), audio is coded losslessly
+and encoded with VideoToolbox (H.264 and HEVC), decoded with VideoToolbox
+(including AV1 where hardware supports it), audio is coded losslessly
 with `lpcm-rice`, and the picture is drawn in Latch's own window under a toolbar.
 
 ## Requirements
@@ -17,7 +18,10 @@ with `lpcm-rice`, and the picture is drawn in Latch's own window under a toolbar
 
 ## Install a prebuilt app
 
-Public releases download with `curl`. If the repository is private, install
+The current installer needs `curl` and either Python 3 or the GitHub CLI
+to read the release digest; these are not present on every fresh Mac.
+The manual path below avoids that parser dependency. Public releases
+download anonymously with `curl`. If the repository is private, install
 the [GitHub CLI](https://cli.github.com) and sign in
 (`brew install gh && gh auth login`) so the script can fall back to `gh`.
 
@@ -32,15 +36,29 @@ By hand: download `latch-macos-arm64.tar.gz` from the
 [latest release](https://github.com/MrBeldum/latch/releases/latest), then
 
 ```bash
+shasum -a 256 latch-macos-arm64.tar.gz
+# Compare with this asset's SHA-256 digest on the GitHub release before extracting.
 tar xzf latch-macos-arm64.tar.gz
-xattr -dr com.apple.quarantine Latch.app
-open Latch.app
+codesign --verify --deep --strict Latch.app
+mv Latch.app /Applications/
+xattr -dr com.apple.quarantine /Applications/Latch.app
+open /Applications/Latch.app
 ```
+
+The digest comes from GitHub alongside the artifact, not an independent
+publisher signature. Ad-hoc signature verification checks bundle consistency.
 
 The `xattr` step is required for a browser download. The app is ad-hoc
 signed rather than signed with an Apple Developer ID, and macOS 15 reports
 such apps as damaged instead of offering "Open anyway". Removing the
 quarantine flag is how you tell macOS you fetched it deliberately.
+
+Move the app to `/Applications` before turning on sharing: the login item
+records its path. If this folder is not writable, ask an administrator to
+install it there. After an update, ad-hoc signing can invalidate Screen
+Recording and Accessibility grants. Re-grant them in System Settings and
+quit and reopen Latch. Viewing needs neither permission. Allow incoming
+connections if the macOS application firewall asks when sharing starts.
 
 ## Build on a Mac
 
@@ -48,8 +66,9 @@ quarantine flag is how you tell macOS you fetched it deliberately.
 ./scripts/install-macos.sh
 ```
 
-builds for `aarch64-apple-darwin` (pure Rust, no CMake or C compilers needed),
+builds for `aarch64-apple-darwin` (pure Rust, no C/C++ library compilation),
 bundles `dist.noindex/Latch.app`, and installs it to `/Applications`. The `.noindex` folder keeps build copies out of app search.
+Install Xcode Command Line Tools for the platform SDK and linker.
 A locally built app never carries the quarantine flag.
 
 ### Signing
@@ -73,7 +92,9 @@ xcrun stapler staple dist.noindex/Latch.app
    first. A dot and one line say whether each is ready, asleep, or
    missing something on its side.
 3. Click **Connect** (**Wake and connect** for a machine that is asleep).
-   There is no pairing: being on the same Tailscale account is the check.
+   Untagged hosts authorize by Tailscale user ID, without pairing. Tagged
+   hosts match login to the tailnet name or domain rather than membership;
+   restrict reachability with Tailscale policy.
    If Latch is not sharing on that machine, open Latch there and set up
    sharing on its **Sharing** tab first.
 4. The desktop appears.
@@ -125,7 +146,7 @@ the Mac cursor's position is sent 1:1 instead and nothing is captured.
 | **Keys** | Ctrl+Alt+Delete, Windows key, Alt+Tab, Escape, Print Screen; and **Command acts as Ctrl** |
 | **Stats** | The stats overlay (above). **More → Stream performance** opens the full panel: frame rate and bitrate against what was asked for, round trip, packet loss, encode, assembly, queue and decode times, and the decoder. **Copy diagnostics** puts it all on the clipboard |
 | **Full screen** | Toggle; the setting decides how a session starts |
-| **PC** (or **Mac**, **Machine**) | Sleep…, Restart…, Shut down…, each asking first, when the machine's owner allows them; Sleep only on a Windows PC, the one kind a wake packet can bring back. **Update Latch Host…** for a PC whose host is older than 3.1 |
+| **PC** (or **Mac**, **Machine**) | Sleep…, Restart…, Shut down…, each asking first, when the machine's owner allows them; Sleep only on a Windows PC, the one kind a wake packet can bring back. |
 | **Stream settings** | The same controls as Settings: quality profile, resolution, frame rate, bitrate and codec. **Apply and reconnect** restarts the session with them in a second or two; Escape or the close button leaves them as they were |
 | **Disconnect** | End the session |
 | **2 gamepads** | Shown while gamepads are connected to this Mac; hover for which, and whether the host takes them (green), or why not (amber) |
@@ -196,7 +217,7 @@ peer relay if you run one (**Relay** in Settings), otherwise one of
 Tailscale's (DERP). A relay adds a detour, and the round trip it adds is a
 floor under how quickly the PC answers a click; it changes nothing about
 what Latch asks for. Balanced quality is this screen's size at its own
-refresh rate on every path, so a relayed stream is laggier, not blurrier;
+refresh rate on every path. A relay can increase delay and lower quality;
 the host's rate control lowers the bitrate only when the network does not
 carry it.
 Tailscale's own relays are shared, so a stream through one can also
@@ -227,16 +248,15 @@ it from this network (see below).
 
 | Setting | What it changes |
 |---------|-----------------|
-| Quality | Profiles that follow this display, as GeForce NOW's do. **Balanced** (the default) asks for this screen's own size at its own refresh rate (120 Hz on a ProMotion MacBook Pro, 144–360 on a fast monitor). **Competitive** is 1080p at the display's refresh rate, up to 360 fps. **Cinematic** is this screen's size up to 4K, up to 120 fps, at half again the bitrate. Each profile's bitrate is a ceiling: 40 Mbps at 1080p60, growing as pixels to the ¾ and frame rate to the ½ (50 Mbps at 1080p60, 87 at 1440p120, 113 at 4K60, 160 at 4K120), half again for Cinematic, never under 5.1's 50 Mbps (Cinematic 100); the host comes down from it whenever the network carries less. **Custom** uses the rows below; changing one of them switches to it, starting from what the profile asked for. The PC's encoder sets the only other limits: a larger picture than it takes is scaled down in proportion. Settings saved by 5.1 move Smooth, Balanced and Sharp to Competitive, Balanced and Cinematic once |
+| Quality | Profiles that follow this display, as GeForce NOW's do. **Balanced** (the default) asks for this screen's own size at its own refresh rate (120 Hz on a ProMotion MacBook Pro, 144–360 on a fast monitor). **Competitive** is 1080p at the display's refresh rate, up to 360 fps. **Cinematic** is this screen's size up to 4K, up to 120 fps, at half again the bitrate. Each profile's bitrate is a ceiling: a computed 40 Mbps at 1080p60 before the 50 Mbps floor, growing as pixels to the ¾ and frame rate to the ½ (50 Mbps at 1080p60, 87 at 1440p120, 113 at 4K60, 160 at 4K120), half again for Cinematic, never under 5.1's 50 Mbps (Cinematic 100); the host comes down from it whenever the network carries less. **Custom** uses the rows below; changing one of them switches to it, starting from what the profile asked for. The negotiated encoder, decoder and display capabilities also limit the request: a larger picture than it takes is scaled down in proportion. Settings saved by 5.1 move Smooth, Balanced and Sharp to Competitive, Balanced and Cinematic once |
 | Resolution | **Match screen** is this display's own pixel size (3024×1964 on a 14" MacBook Pro), so the picture fills it exactly. **540p**, **720p**, **900p**, **1080p**, **1440p**, **4K**, **5K** and **8K** are the standard 16:9 sizes, 960×540, 1280×720, 1600×900, 1920×1080, 2560×1440, 3840×2160, 5120×2880 and 7680×4320; on a display of another shape they leave a bar above and below. The sizes below 1080p are for a PC that encodes in software or a slow network: fewer pixels leave more bitrate for each and a higher frame rate. The list shows the pixel size of each. The PC switches its display to the size asked for; a PC with no monitor needs a virtual display that lists that size, which setup on the PC arranges for the Virtual Display Driver |
 | Frame rate | 30 to 500, and this display's own rate (marked); the PC's display is switched to match when it can |
 | Bitrate | 2 to 1000 Mbps in steps (fine at the low end); arrow keys step once, Shift-arrow ten times. The most the encoder spends; the host's rate control comes down from it when the path drops packets |
-| Codec | Auto (the best both ends have: AV1, then HEVC, then H.264), AV1, HEVC, H.264. A codec either end lacks falls back to H.264 |
+| Codec | Auto (the best both ends have: AV1, then HEVC, then H.264), AV1, HEVC, H.264. Negotiation and decoder failure recovery try the next supported codec, ultimately Baseline H.264 |
 | Send my microphone | Off by default. On, this Mac's microphone plays on the PC as a microphone: by itself on Linux; on Windows and macOS through a virtual cable installed there (VB-CABLE, BlackHole). macOS asks for the microphone the first time |
 | Open streams full screen | How a session starts |
 | Capture the mouse | The toolbar's Mouse choice, remembered |
 | Command acts as Ctrl | Off makes ⌘ the Windows key on Windows and Linux machines; a Mac always gets ⌘ as Command |
-| App to open | The app on the PC to launch; "Desktop" is the whole screen. The list fills in after the first connection |
 | Offer to sleep a machine after a session | Off by default. Asleep, Tailscale is off there; this Mac can only wake it from its own network |
 | Keep Latch up to date | Updates this app and the Windows PCs' Latch Host; **Check now** checks at once |
 | Relay | Whether a relay of your own is in use, and the grant it needs |
@@ -323,7 +343,9 @@ submits a moving synthetic picture from prefilled IOSurfaces on the
 stream's grid, as capture does, and times each frame from submission to
 the encoder's output. `LATCH_VT_BENCH=hevc:1920x1080@240:80000,...`
 picks the cases, `LATCH_VT_IN_FLIGHT=1` measures one frame at a time.
-Two runs on 2026-11-03, the Mac busy with other builds:
+Two runs on 2026-11-03 on an M3 Pro, busy with other builds (revisions and
+source content are recorded in the linked measurements). These are
+synthetic encoder samples, not real-desktop frame-rate promises:
 
 | Case | 5.1 p50 / p95 ms | 5.1 fps | Now p50 / p95 ms | Now fps |
 | --- | --- | --- | --- | --- |
@@ -335,10 +357,10 @@ Two runs on 2026-11-03, the Mac busy with other builds:
 | H.264 High 3024×1964@120 | 27–33 / 60–65 | 28–32 | 27–28 / 29–32 | 70–72 |
 | Baseline 1080p240, 80 Mbps | 8.3–9.3 / 10–43 | 73–115 | 9.7 / 10.6–10.7 | 191–197 |
 
-H.264 runs out of encoder at about 195 fps at 1080p and 72 at
-3024×1964; asked for more, its frames queue behind each other (hence
-~10 ms and ~27 ms). HEVC is the codec for fast or large streams. 4K60
-HEVC takes 14 ms a frame.
+In these samples H.264 ran out of encoder at about 195 fps at 1080p and
+72 at 3024×1964; asked for more, its frames queued behind each other
+(hence ~10 ms and ~27 ms). HEVC did better for fast or large streams;
+4K60 HEVC took 14 ms a frame.
 The table predates HEVC's quality path: up to 1080p120 an HEVC frame
 now takes about 7 ms (p95 8–9 ms), still inside a 120 Hz frame.
 
@@ -449,8 +471,8 @@ asynchronous capture pipeline. `LATCH_TEST_VIDEO_LOSS=1:8` or `3:8` on
 
 - **Local network**: macOS 15 may ask; allow it so the wake broadcast can
   go out.
-- **Incoming connections**: if the macOS firewall is on it may ask once,
-  the first time the Mac serves a Latch Host install through the stream.
+- **Incoming connections**: if the macOS firewall is on it may ask when
+  this Mac starts sharing. Allow Latch to receive connections.
 - Only connecting, nothing else: Latch captures no screen and reads the
   keyboard and mouse only in its own window.
 - **Microphone**: asked for only when **Send my microphone** is on, the
@@ -520,26 +542,17 @@ and moved over `/Applications/Latch.app` once no stream is running; the
 app then relaunches. The Mac also sends the new `latch-host.exe` to each
 PC whose Latch Host is older and already speaks `/v1/update` (3.1+).
 
-A PC still on 3.0 cannot take that, and nobody may be at the PC to install
-by hand. So the stream's **PC → Update Latch Host…** does it through
-the stream: this Mac serves the new `latch-host.exe` and a short
-PowerShell script on its own Tailscale address (TCP 47851, to that one PC
-only, for ten minutes), presses Win+R on the PC, types one line
-(`powershell -ep bypass -c "irm http://<mac>:47851/u.ps1|iex"`) and
-presses Enter. A PowerShell window on the PC fetches the executable, checks
-its SHA-256 against the one in the script, stops the old service, swaps
-the file where it stands (found from the running process, or
-`%LOCALAPPDATA%\Latch`), registers it to start at logon and starts it.
-The stream is not interrupted; the toolbar reports each step and the lobby
-shows the new version a few seconds later. The PC's desktop has to be
-unlocked and in front, since the Run box needs it. From then on updates
-arrive by themselves.
+Hosts on 3.0 must be upgraded locally or over SSH using the current
+Windows release and installer. A Latch 5 viewer cannot stream the retired
+GameStream protocol to perform an upgrade through the desktop.
+Windows and Linux do not pull updates themselves. Windows can receive a
+push from a Mac; otherwise reinstall the current Windows zip manually.
+For Linux, install the new tarball or rebuild the Docker node.
 
 Public releases need no GitHub login. If the repository is private, the
 app uses, in order: `github_token` in `client.toml`, `LATCH_GITHUB_TOKEN`
-in the environment, and the token git has stored for github.com (which is
-there after `install-macos-release.sh` or any `git` use with the osxkeychain
-helper). Settings has the switch and a **Check now** button; the line under
+in the environment, and the token git has stored for github.com (only if you previously stored one through a configured credential
+helper; the public installer uses anonymous downloads and stores none). Settings has the switch and a **Check now** button; the line under
 it says what happened last. A copy that is not running from an app bundle
 (a development build) reports the new version but does not replace itself.
 
@@ -561,8 +574,9 @@ Baseline order. A cached probe requires both VideoToolbox's hardware query
 and a decoded hardware picture, including AV1 on M3 or newer hardware; older hosts skip the new name and negotiate HEVC/H.264.
 AV1 sized OBUs are submitted with an `av1C` format description. All codecs
 retain the IOSurface → Metal path. HEVC Main10 callers can select P010
-output without losing ten-bit samples; normal sessions still request NV12
-and SDR. HDR transfer functions and display negotiation are future work.
+output without losing ten-bit samples. Normal sessions negotiate colour
+automatically, retaining P010 for ten-bit SDR or native HDR presentation,
+with tone mapping on the renderer fallback path.
 
 Decode calls run on a worker thread of the session and are waited for at
 most 1 s. Apple's H.264 decoder can block forever inside

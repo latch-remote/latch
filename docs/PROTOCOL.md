@@ -514,7 +514,7 @@ host's 240-sample packets therefore advance by 5000 us at 48 kHz. Rice
 encoding falls back to existing independent verbatim subframes when needed
 to enforce the 3 + 2*(1 + 2*n) byte bound; no new audio format is introduced.
 
-## Performance integration on the consumer branch
+## Current transport behavior
 
 Protocol 1 and every UDP layout remain unchanged. Cursor support is opt-in:
 `StreamRequest.cursor` and `Accept.cursor` default to false, so plain #32 and
