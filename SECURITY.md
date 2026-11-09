@@ -42,16 +42,33 @@ Knowing the model makes a report more useful.
   pairing. Anyone who can sign a device in to your Tailscale account can
   see and control your shared machines; that is by design.
 - **Nodes shared in from another tailnet, and tagged devices, are
-  refused.** A tagged host (a relay VPS) answers people of its own tailnet
-  only.
-- **A local process can read status but cannot** start a stream, push an
-  update, or read the clipboard.
-- **Updates** are checked against the digest GitHub publishes for the
-  release asset, and on a Mac against the app's own code signature. Mac and
-  Windows builds are not yet signed with a paid developer certificate
-  ([docs/ROADMAP.md](docs/ROADMAP.md)).
+  refused.** A tagged host (a relay VPS) has no account of its own: on a
+  personal tailnet it answers the tailnet's owner, and on an organisation's
+  tailnet only the logins listed in `allowed_logins` in its `host.toml`.
+- **Programs running as the same OS user are trusted; other users on the
+  machine are not.** The service takes control requests from its own
+  machine only with a private per-user token kept in Latch's data folder.
+  Without it a local process can read the status and nothing else: it
+  cannot start a stream, read the service log, change the display or put
+  the machine to sleep.
+- **The clipboard** is shared only with the machine that is streaming, or
+  was in the last five seconds, and can be switched off.
+- **Updates.** A Windows host checks every executable it is sent against
+  the SHA-256 GitHub publishes for that release, whoever sent it, and
+  refuses one that is not newer. A Mac checks its download the same way,
+  and the new app's code signature. Releases carry `SHA256SUMS` and build
+  provenance attestations (`gh attestation verify <file> -R
+  MrBeldum/latch`). Mac and Windows builds are not yet signed with a paid
+  developer certificate ([docs/ROADMAP.md](docs/ROADMAP.md#signing-and-notarization)),
+  so the trust anchor for an update is GitHub and this repository.
 - **Windows setup** elevates once and runs only a copy in
   `%ProgramFiles%\Latch\Setup` whose SHA-256 matches the running file.
+- **Controlling administrator windows on Windows is optional and off by
+  default.** Turned on, an elevated helper injects the viewer's input, and
+  it answers only the installed `latch-host.exe` in the same session. That
+  narrows, but does not remove, a route by which another program running
+  as the same user could send input to an elevated window; leave it off
+  if that matters on your PC.
 
 In scope: anything that lets someone outside that model see a screen,
 inject input, read the clipboard, run code, push an update, or learn
