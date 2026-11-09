@@ -1,2 +1,55 @@
 
 running 1 test
+NOISE cap=5000 rtt=20 request=10000 decoded=274 gap_p50/p95_ms=16.508/22.180 keys=1 stats=Stats { color: ColorDescription { primaries: 1, transfer: 1, matrix: 1, full_range: false, bit_depth: 8, hdr: None, chroma: Left }, fps: 55.234524, mbps: 0.7233513, received_mbps: 1.515004, rtt_ms: 23, rtt_var_ms: 4, decode_ms: 7.4145, host_ms: 8.507143, assembly_ms: 1.8612858, queue_ms: 2.1615715, width: 640, height: 360, decoder: "H.264 · hardware", encoder: "Latch software H.264 (test pattern)", codec: "H.264", loss_pct: 0.0, fec_recovered: 0, audio: "", audio_latency: Latency { queued_ms: 0.0, device_ms: 0.0, jitter_ms: 0.0, underruns: 0 }, mic: "", video_problem: None, applied_bitrate_kbps: 1688, wire_budget_kbps: 3875, application_limited: false, requested_bitrate_kbps: 10000, pacing_queue_ms: 0.147, send_errors: 0, send_retries: 0, socket_send_bytes: 8388608, socket_receive_bytes: 8388608, host_socket_send_bytes: 8388608, host_socket_receive_bytes: 8388608, frames_lost: 0, window_ms: 253, received_fps: 51.2892, raw_loss_pct: 0.0, frames_dropped: 0, frame_jitter_ms: 6.985787 }
+test noise_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 5.17s
+
+
+running 1 test
+NOISE cap=5000 rtt=150 request=10000 decoded=232 gap_p50/p95_ms=16.426/44.629 keys=4 stats=Stats { color: ColorDescription { primaries: 1, transfer: 1, matrix: 1, full_range: false, bit_depth: 8, hdr: None, chroma: Left }, fps: 39.293224, mbps: 2.1582353, received_mbps: 3.8475926, rtt_ms: 162, rtt_var_ms: 13, decode_ms: 10.342, host_ms: 27.070002, assembly_ms: 13.0879, queue_ms: 3.728, width: 640, height: 360, decoder: "H.264 · hardware", encoder: "Latch software H.264 (test pattern)", codec: "H.264", loss_pct: 5.1282053, fec_recovered: 0, audio: "", audio_latency: Latency { queued_ms: 0.0, device_ms: 0.0, jitter_ms: 0.0, underruns: 0 }, mic: "", video_problem: None, applied_bitrate_kbps: 2250, wire_budget_kbps: 4040, application_limited: false, requested_bitrate_kbps: 10000, pacing_queue_ms: 16.348, send_errors: 0, send_retries: 0, socket_send_bytes: 8388608, socket_receive_bytes: 8388608, host_socket_send_bytes: 8388608, host_socket_receive_bytes: 8388608, frames_lost: 3, window_ms: 254, received_fps: 39.293224, raw_loss_pct: 5.1282053, frames_dropped: 1, frame_jitter_ms: 4.5667 }
+test noise_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 5.30s
+
+
+running 1 test
+NOISE cap=20000 rtt=20 request=40000 decoded=294 gap_p50/p95_ms=16.438/26.629 keys=1 stats=Stats { color: ColorDescription { primaries: 1, transfer: 1, matrix: 1, full_range: false, bit_depth: 8, hdr: None, chroma: Left }, fps: 59.919857, mbps: 9.080974, received_mbps: 10.814336, rtt_ms: 24, rtt_var_ms: 6, decode_ms: 1.0006, host_ms: 0.9533334, assembly_ms: 8.099667, queue_ms: 0.024466667, width: 640, height: 360, decoder: "H.264 · hardware", encoder: "Latch software H.264 (test pattern)", codec: "H.264", loss_pct: 0.0, fec_recovered: 0, audio: "", audio_latency: Latency { queued_ms: 0.0, device_ms: 0.0, jitter_ms: 0.0, underruns: 0 }, mic: "", video_problem: None, applied_bitrate_kbps: 15189, wire_budget_kbps: 19499, application_limited: true, requested_bitrate_kbps: 40000, pacing_queue_ms: 0.278, send_errors: 0, send_retries: 0, socket_send_bytes: 8388608, socket_receive_bytes: 8388608, host_socket_send_bytes: 8388608, host_socket_receive_bytes: 8388608, frames_lost: 0, window_ms: 250, received_fps: 59.919857, raw_loss_pct: 0.0, frames_dropped: 0, frame_jitter_ms: 0.58346665 }
+test noise_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 5.16s
+
+
+running 1 test
+NOISE cap=20000 rtt=150 request=40000 decoded=301 gap_p50/p95_ms=16.418/20.175 keys=2 stats=Stats { color: ColorDescription { primaries: 1, transfer: 1, matrix: 1, full_range: false, bit_depth: 8, hdr: None, chroma: Left }, fps: 59.9936, mbps: 7.9351535, received_mbps: 10.40529, rtt_ms: 153, rtt_var_ms: 11, decode_ms: 0.9798, host_ms: 0.76, assembly_ms: 6.944267, queue_ms: 0.0328, width: 640, height: 360, decoder: "H.264 · hardware", encoder: "Latch software H.264 (test pattern)", codec: "H.264", loss_pct: 0.0, fec_recovered: 0, audio: "", audio_latency: Latency { queued_ms: 0.0, device_ms: 0.0, jitter_ms: 0.0, underruns: 0 }, mic: "", video_problem: None, applied_bitrate_kbps: 7313, wire_budget_kbps: 11378, application_limited: true, requested_bitrate_kbps: 40000, pacing_queue_ms: 0.17, send_errors: 0, send_retries: 0, socket_send_bytes: 8388608, socket_receive_bytes: 8388608, host_socket_send_bytes: 8388608, host_socket_receive_bytes: 8388608, frames_lost: 0, window_ms: 250, received_fps: 59.9936, raw_loss_pct: 0.0, frames_dropped: 0, frame_jitter_ms: 0.62124443 }
+test noise_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 5.28s
+
+
+running 1 test
+NOISE cap=50000 rtt=20 request=100000 decoded=294 gap_p50/p95_ms=16.445/19.508 keys=2 stats=Stats { color: ColorDescription { primaries: 1, transfer: 1, matrix: 1, full_range: false, bit_depth: 8, hdr: None, chroma: Left }, fps: 59.970547, mbps: 9.092462, received_mbps: 10.861865, rtt_ms: 21, rtt_var_ms: 1, decode_ms: 0.86946666, host_ms: 0.62666667, assembly_ms: 3.0435336, queue_ms: 0.016666666, width: 640, height: 360, decoder: "H.264 · hardware", encoder: "Latch software H.264 (test pattern)", codec: "H.264", loss_pct: 0.0, fec_recovered: 0, audio: "", audio_latency: Latency { queued_ms: 0.0, device_ms: 0.0, jitter_ms: 0.0, underruns: 0 }, mic: "", video_problem: None, applied_bitrate_kbps: 79321, wire_budget_kbps: 100000, application_limited: true, requested_bitrate_kbps: 100000, pacing_queue_ms: 3.293, send_errors: 0, send_retries: 0, socket_send_bytes: 8388608, socket_receive_bytes: 8388608, host_socket_send_bytes: 8388608, host_socket_receive_bytes: 8388608, frames_lost: 0, window_ms: 250, received_fps: 59.970547, raw_loss_pct: 0.0, frames_dropped: 0, frame_jitter_ms: 0.35995555 }
+test noise_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 5.14s
+
+
+running 1 test
+NOISE cap=50000 rtt=150 request=100000 decoded=298 gap_p50/p95_ms=16.490/20.696 keys=2 stats=Stats { color: ColorDescription { primaries: 1, transfer: 1, matrix: 1, full_range: false, bit_depth: 8, hdr: None, chroma: Left }, fps: 59.86631, mbps: 9.048689, received_mbps: 11.954105, rtt_ms: 152, rtt_var_ms: 10, decode_ms: 1.0400666, host_ms: 0.98, assembly_ms: 3.0793998, queue_ms: 0.034066666, width: 640, height: 360, decoder: "H.264 · hardware", encoder: "Latch software H.264 (test pattern)", codec: "H.264", loss_pct: 0.0, fec_recovered: 0, audio: "", audio_latency: Latency { queued_ms: 0.0, device_ms: 0.0, jitter_ms: 0.0, underruns: 0 }, mic: "", video_problem: None, applied_bitrate_kbps: 34879, wire_budget_kbps: 48226, application_limited: true, requested_bitrate_kbps: 100000, pacing_queue_ms: 0.293, send_errors: 0, send_retries: 0, socket_send_bytes: 8388608, socket_receive_bytes: 8388608, host_socket_send_bytes: 8388608, host_socket_receive_bytes: 8388608, frames_lost: 0, window_ms: 250, received_fps: 59.86631, raw_loss_pct: 0.0, frames_dropped: 0, frame_jitter_ms: 0.4816 }
+test noise_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 5.40s
+
+
+running 1 test
+NOISE cap=0 rtt=0 request=100000 decoded=251 gap_p50/p95_ms=17.079/39.748 keys=2 stats=Stats { color: ColorDescription { primaries: 1, transfer: 1, matrix: 1, full_range: false, bit_depth: 8, hdr: None, chroma: Left }, fps: 35.935562, mbps: 5.403399, received_mbps: 6.5546465, rtt_ms: 1, rtt_var_ms: 0, decode_ms: 0.93722224, host_ms: 20.911112, assembly_ms: 18.456778, queue_ms: 0.016333334, width: 640, height: 360, decoder: "H.264 · hardware", encoder: "Latch software H.264 (test pattern)", codec: "H.264", loss_pct: 0.0, fec_recovered: 0, audio: "", audio_latency: Latency { queued_ms: 0.0, device_ms: 0.0, jitter_ms: 0.0, underruns: 0 }, mic: "", video_problem: None, applied_bitrate_kbps: 77071, wire_budget_kbps: 100000, application_limited: true, requested_bitrate_kbps: 100000, pacing_queue_ms: 81.904, send_errors: 0, send_retries: 0, socket_send_bytes: 8388608, socket_receive_bytes: 8388608, host_socket_send_bytes: 8388608, host_socket_receive_bytes: 8388608, frames_lost: 0, window_ms: 250, received_fps: 35.935562, raw_loss_pct: 0.0, frames_dropped: 0, frame_jitter_ms: 8.696889 }
+test noise_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 5.13s
+
+
+running 1 test
+NOISE cap=0 rtt=0 request=1000000 decoded=299 gap_p50/p95_ms=16.471/19.168 keys=2 stats=Stats { color: ColorDescription { primaries: 1, transfer: 1, matrix: 1, full_range: false, bit_depth: 8, hdr: None, chroma: Left }, fps: 59.99432, mbps: 9.093539, received_mbps: 10.827775, rtt_ms: 2, rtt_var_ms: 0, decode_ms: 0.96706665, host_ms: 0.7733333, assembly_ms: 4.1322665, queue_ms: 0.030066667, width: 640, height: 360, decoder: "H.264 · hardware", encoder: "Latch software H.264 (test pattern)", codec: "H.264", loss_pct: 0.0, fec_recovered: 0, audio: "", audio_latency: Latency { queued_ms: 0.0, device_ms: 0.0, jitter_ms: 0.0, underruns: 0 }, mic: "", video_problem: None, applied_bitrate_kbps: 614878, wire_budget_kbps: 800000, application_limited: true, requested_bitrate_kbps: 800000, pacing_queue_ms: 4.854, send_errors: 0, send_retries: 0, socket_send_bytes: 8388608, socket_receive_bytes: 8388608, host_socket_send_bytes: 8388608, host_socket_receive_bytes: 8388608, frames_lost: 0, window_ms: 250, received_fps: 59.99432, raw_loss_pct: 0.0, frames_dropped: 0, frame_jitter_ms: 0.8936267 }
+test noise_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 5.14s

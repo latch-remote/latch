@@ -4,7 +4,6 @@
 
 - Batch paced video with fresh rate reads, backpressure capture under pacing, account idle probes, and report oversized encoded frames explicitly.
 
-
 The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
 `## X.Y.Z (date)`.

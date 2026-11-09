@@ -53,4 +53,3 @@ PB cap=0 rtt=0 request=1000000 good_mbps=71.851 queue_ms=5.517/174.438/306.310 f
 test server::tests::paced_socket_measurement ... ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 110 filtered out; finished in 5.00s
-

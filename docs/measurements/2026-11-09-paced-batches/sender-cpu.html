@@ -1,0 +1,11 @@
+<section id="paced-sender-cpu" data-viz-composition>
+<div data-viz-container></div>
+<script type="application/json" data-viz-chart>
+{"id":"paced-sender-cpu","title":"Sender CPU on constrained links","description":"CPU milliseconds per three-second synthetic source run. Single samples on a shared, heavily loaded Mac; differing delivered loads prevent a causal throughput claim.","height":320,"columns":["Path","Before","After"],"rows":[["5 Mbps · RTT 20 ms",21.644,16.152],["5 Mbps · RTT 150 ms",20.988,13.684],["20 Mbps · RTT 20 ms",70.703,55.827],["20 Mbps · RTT 150 ms",52.756,35.651],["50 Mbps · RTT 20 ms",135.1,102.244],["50 Mbps · RTT 150 ms",144.328,103.482]],"spec":{"type":"horizontalBar","y":"Path","x":["Before","After"],"xLabel":"Sender CPU (ms)","showLegend":true,"showValues":true,"valueFormat":{"style":"decimal","maximumFractionDigits":3}}}
+</script>
+</section>
+<script type="module">
+import { mountChart } from "https://persistent.oaistatic.com/plugins/visualize/charts/1.1.6/element.js";
+const root = document.getElementById("paced-sender-cpu");
+mountChart(root.querySelector("[data-viz-container]"),JSON.parse(root.querySelector("[data-viz-chart]").textContent));
+</script>

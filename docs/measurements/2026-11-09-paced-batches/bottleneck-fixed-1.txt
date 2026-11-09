@@ -1,0 +1,24 @@
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.09s
+     Running tests/bottleneck.rs (target/debug/deps/bottleneck-336683fb679ad9fc)
+
+running 18 tests
+test congestion::tests::a_lone_late_window_does_not_stall_recovery ... ok
+test congestion::tests::a_policer_rate_caps_the_climb_until_it_lapses ... ok
+test congestion::tests::a_sparse_stream_cut_by_loss_regrows_while_idle_up_to_its_trains ... ok
+test congestion::tests::an_underfilled_stream_does_not_ratchet_after_one_delay_spike ... ok
+test congestion::tests::a_sparse_stream_does_not_rate_test_random_loss_spikes ... ok
+test congestion::tests::an_underfilled_stream_recovers_once_the_queue_clears ... ok
+test congestion::tests::capacity_steps_random_loss_and_steady_path ... ok
+test congestion::tests::idle_trains_need_independent_congestion_to_lower_the_target ... ok
+test congestion::tests::loss_only_reductions_require_rate_correlation ... ok
+test congestion::tests::an_underfilled_encoder_still_backs_off_from_a_policer ... ok
+test congestion::tests::recovery_integrates_report_time_and_rejects_stale_credit ... ok
+test congestion::tests::route_rebase_requires_lossless_delay_unresponsive_to_load_reduction ... ok
+test noise_socket_measurement ... ignored
+test congestion::tests::underfilled_encoder_cuts_actual_rate_and_only_pressure_enables_pacing ... ok
+test congestion::tests::random_loss_under_a_policer_settles_below_it ... ok
+test congestion::tests::protected_frames_fit_the_wire_reservation ... ok
+test saturated_ten_megabit_fifo_converges_and_recovers_with_fake_clock ... ok
+test noise_stream_keeps_delivering_through_sustained_queue_delay ... ok
+
+test result: ok. 17 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 6.49s

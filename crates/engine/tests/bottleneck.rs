@@ -124,6 +124,12 @@ fn noise_stream_keeps_delivering_through_sustained_queue_delay() {
         baseline.application_limited,
         "must exercise an underfilled encoder"
     );
+    // The first stats window can still contain a scheduling spike (42 ms
+    // unloaded on a busy Mac). Comparing the injected queue to that noisy
+    // snapshot can make a stable 46 ms queued RTT fail baseline + 20 forever.
+    // Use the midpoint of our known 5/45 ms relay delays for both phases;
+    // still require delivery and a return below that same threshold.
+    let queue_threshold_ms = 25;
     queue_delay_ms.store(45, Ordering::Relaxed);
     let mut clean = 0;
     let mut clean_from = frames.seq();
@@ -141,7 +147,7 @@ fn noise_stream_keeps_delivering_through_sustained_queue_delay() {
         // whole settled run, not in every poll. 12 fps over a ~250 ms stats
         // window is 1–3 frames: one frame reads as 3.8 fps.
         if s.applied_bitrate_kbps > 0
-            && s.rtt_ms >= baseline.rtt_ms + 20
+            && s.rtt_ms >= queue_threshold_ms
             && s.fps >= 3.0
             && s.loss_pct < 3.0
         {
@@ -165,7 +171,7 @@ fn noise_stream_keeps_delivering_through_sustained_queue_delay() {
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(300));
         let s = session.stats();
-        if s.rtt_ms < baseline.rtt_ms + 20
+        if s.rtt_ms < queue_threshold_ms
             && frames.seq() > recovery_frame + 10
             && s.fps >= 3.0
             && s.loss_pct < 3.0
