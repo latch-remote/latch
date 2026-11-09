@@ -449,11 +449,19 @@ All host pipelines use the same start-to-start deadline scheduler. Work time
 is inside the interval; a deadline missed by a whole interval resets the grid to the
 actual capture time, without catch-up trains (`video::Pacer`). Idle repeats remain bounded at 100 ms.
 Encoding feeds a two-frame bounded channel to a dedicated video sender;
-backpressure preserves encoded references. Cancellation may discard queued
+backpressure preserves encoded references. When pacing is active, the producer
+waits for outstanding sends before capturing the next picture. This bounds
+encoded backlog without dropping P references or generating extra recovery IDRs;
+a large keyframe still takes its unavoidable wire serialization time. Clean
+paths retain the two-frame overlap. Cancellation may discard queued
 media. Audio, input acknowledgements and pings bypass the video queue.
 
 Under pressure video uses a wire-byte token bucket at 2.5 times the wire budget,
-with a burst of two datagrams or 1 ms at that rate, whichever is larger. While
+with the existing burst cap (two datagrams, or 1 ms of credit plus one
+datagram, whichever is larger). The sender spends elapsed credit in batches
+through the normal GSO/USO/batch fallback and reloads the current rate between
+batches. Waits accumulate up to 1 ms of credit and use an absolute deadline;
+there is no final spin. A rate cut clamps saved credit to the new burst cap. While
 pacing, waiting in that bucket is not sender pressure (it would only slow the
 bucket further); a clean path still sends every frame, keyframes included,
 at once. The encoder allowance reserves audio separately,
@@ -484,13 +492,13 @@ unknown. Lossless delivery filling that pace validates 25% increases once
 per feedback horizon. A fresh fast train removes this limit; later fast
 trains restore confirmed cuts. An older viewer gets no probes or limit.
 
-Probe datagrams bypass the pacer and **are outside the wire budget** and
-ordinary throughput statistics: up to ~330 kbps extra in the first idle
-second, then ≤164 kbps, in bursts of 7,680–20,480 B (including tunnel
-allowance); each trailing ping adds 96 modeled wire bytes. At 5 Mbps the
-largest burst occupies 32.8 ms of a 40 ms FIFO. Skipping low retained
-budgets reduces the burst cost but does not guarantee safety after a
-capacity drop or through a small token bucket. See the protocol for limits.
+Probe trains and their trailing echo run on the video sender's token bucket,
+consume modeled wire credit (payload plus 80 bytes per packet), and count in
+successful sender throughput. Idle probes use the current pace, or 2.5 times
+the current budget on an otherwise unpaced path. Fresh pressure or queued video
+cancels a train between batches, so motion takes priority. Controller pressure
+also prevents scheduling trains. Pacing may limit measured dispersion: a slow
+sender is not evidence of independently corroborated network capacity.
 An
 underfilled stream that a standing delay cut while it still delivered
 everything (someone else's queue, or pings starved on a loaded machine) gets
@@ -643,3 +651,38 @@ frame by frame, which alternated surfaces (a flicker).
 
 See [colour measurements](measurements/2026-11-03/hdr/README.md) for tests,
 measurements and platform limitations.
+
+The maximum encoded frame is `255 * 64 * MAX_SHARD_LEN` bytes on both sides
+(19,127,040 with the protocol-1 layout). Packetization returns an explicit error
+rather than silently consuming a frame number. The sender logs an oversized
+frame, invalidates its recovery history, requests a keyframe and skips dependent
+queued pictures until an intact keyframe. Protocol 1 layouts are unchanged;
+older hosts already cannot emit frames beyond this limit.
+
+### Viewer input scheduling and recovery
+
+Mouse, keyboard and text are forwarded from egui's accumulated input during
+the viewer's UI update, so an event waits for the frame in progress to
+finish; the window repaints at once on input and presents without vsync,
+which bounds that wait by one frame's work. The session sender flushes
+immediately when called, and reliability retries run independently of the
+UI. Gamepad state is sent directly from each platform's gamepad thread.
+Sending mouse and keyboard from the OS event itself is on the
+[roadmap](ROADMAP.md).
+
+After an unexpected transport drop, the viewer reconnects with fresh
+negotiation for up to five minutes: 2/5/10-second waits followed by jittered
+20–30-second waits. Discovery returning online or an event-loop gap over ten
+seconds advances a pending retry. Explicit refusals, takeover and host ends
+stop automatic retries. The overlay offers Reconnect now and Stop.
+
+Windows Media Foundation workers answer their caller within a deadline: one
+second for an access unit, five to open a decoder, twenty for the
+once-per-process probe of every codec. The GPU-copy fence keeps its
+two-second bound. A decode that times out abandons that worker, reports an
+error (which requests a keyframe), and opens a fresh decoder on the next
+keyframe. At most three worker timeouts per ten minutes are allowed
+process-wide; reopen failures feed the existing Baseline software fallback or
+modern-codec renegotiation. Driver resources stay owned by the abandoned
+worker until its call returns. This recovery has not run against a hung
+driver on Windows hardware.

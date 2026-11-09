@@ -185,7 +185,8 @@ fn main() -> io::Result<()> {
                         }
                     }
                 }
-            });
+            })
+            .unwrap();
             frames += 1;
             bytes += size as u64;
             if mbps > 0.0 {

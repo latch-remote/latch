@@ -6,6 +6,14 @@ GitHub release notes, so each version gets a heading of the form
 
 ## Unreleased
 
+- A stream that loses its connection keeps trying for five minutes
+  instead of three attempts: after 2, 5 and 10 seconds, then every 20 to 30,
+  and at once when the machine shows as online again or this one wakes.
+  **Reconnect now** and **Stop** stay on screen. A refusal, another viewer
+  taking over, or the host ending the stream stops the retries.
+- Windows viewer: a hardware decoder that stops answering no longer freezes
+  the stream. Every wait on Media Foundation has a deadline; a stalled
+  decoder is abandoned and reopened at the next keyframe.
 - Windows hosts check every pushed update against the SHA-256 GitHub
   publishes for that release's `latch-host.exe`, not against the hash the
   sender supplies. A release without that file, or a PC that cannot reach
@@ -45,6 +53,12 @@ GitHub release notes, so each version gets a heading of the form
 - The stats overlay shows the decoder's 95th-percentile time against the
   frame budget, and labels what it counts (pictures handed to the window,
   and a modelled delay) for what they are.
+- Under network pressure the host paces video in batches instead of one
+  packet per timer sleep, re-reading the rate as it goes; holds back
+  capture while the paced sender is behind, instead of queueing frames
+  that go stale; counts bandwidth probes against the wire budget and stops
+  them under pressure; and reports an encoded frame too large for the
+  protocol (19 MB) instead of dropping it silently.
 
 ## 5.2.0 (2026-11-04)
 

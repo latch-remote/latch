@@ -290,14 +290,16 @@ fn simulate_with(
             }
             expected.insert(number, reconstruction);
             expected.remove(&number.wrapping_sub(256));
-            packetizer.packetize(
-                &OutFrame {
-                    data: &data,
-                    keyframe: idr,
-                    host_delay: 0,
-                },
-                |datagram| forward.send(now, datagram),
-            );
+            packetizer
+                .packetize(
+                    &OutFrame {
+                        data: &data,
+                        keyframe: idr,
+                        host_delay: 0,
+                    },
+                    |datagram| forward.send(now, datagram),
+                )
+                .unwrap();
             if idr {
                 keyframe_answers.sent(now);
             }

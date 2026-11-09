@@ -175,6 +175,10 @@ impl Controller {
         })
     }
 
+    pub(crate) fn probe_pressure(&self) -> bool {
+        self.pressure_windows != 0
+    }
+
     /// Datagrams in a probe train to send now, if one is due. Idle keeps
     /// the budget, but sends too little to show whether the path still
     /// carries it: after a 500 ms grace two trains 200 ms apart, then one a
@@ -184,7 +188,8 @@ impl Controller {
         let idle = self
             .idle_since
             .is_some_and(|since| now.duration_since(since) >= IDLE_GRACE);
-        if !idle
+        if self.probe_pressure()
+            || !idle
             || now < self.next_train
             || self.budget.max(self.held.unwrap_or(0)) < PROBE_MIN_KBPS
         {
@@ -1482,7 +1487,8 @@ mod tests {
                             host_delay: 0,
                         },
                         |_| {},
-                    );
+                    )
+                    .unwrap();
                     p.mark_recovery(0);
                 }
                 let mut wire = 0;
@@ -1491,7 +1497,7 @@ mod tests {
                     keyframe: kind == 1,
                     host_delay: 0,
                 };
-                p.packetize(&frame, |dg| wire += dg.len() + 80);
+                p.packetize(&frame, |dg| wire += dg.len() + 80).unwrap();
                 let wire_kbps = (wire * 8 * fps as usize / 1000) as u32;
                 let minimum = if protected {
                     5 * 109 * 8 * fps / 1000
