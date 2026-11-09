@@ -1,0 +1,63 @@
+name: Bug report
+description: Something in Latch does not work, or works badly.
+labels: ["bug", "needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. A stream involves two machines and a network, so the details below are what make a report fixable.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: Include the steps that lead to it if you know them.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Latch version
+      description: Settings tab, or `latch-host --version`. Give both machines' versions if they differ.
+      placeholder: "5.3.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: host_os
+    attributes:
+      label: Sharing machine (the desktop being streamed)
+      options: ["Windows", "macOS", "Linux (native)", "Linux (Docker node)", "Not about a stream"]
+    validations:
+      required: true
+  - type: dropdown
+    id: viewer_os
+    attributes:
+      label: Viewing machine
+      options: ["macOS", "Windows", "Linux", "Not about a stream"]
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: GPUs and displays
+      description: GPU of each machine; the viewer's display size and refresh rate; whether the host has a monitor, a dummy plug or a virtual display.
+      placeholder: "Host: RX 7800 XT, virtual display. Viewer: MacBook Pro M3 Pro, built-in 3024×1964 at 120 Hz."
+  - type: input
+    id: path
+    attributes:
+      label: Network path
+      description: What the stream toolbar shows (direct, your relay, or Tailscale's relay) and the round trip. `tailscale ping <machine>` says the same.
+      placeholder: "direct, 12 ms"
+  - type: textarea
+    id: stats
+    attributes:
+      label: Stats overlay and stream settings
+      description: For a picture, sound, latency or frame-rate problem, turn on Stats (host key, then S) and paste or screenshot it, with the quality profile you chose.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        `panel.log` and `service.log` from Latch's data folder on the machine where it went wrong:
+        macOS `~/Library/Application Support/io.github.MrBeldum.Latch/`, Windows `%LOCALAPPDATA%\Latch\`, Linux `~/.local/share/latch/`.
+        They can contain machine names and Tailscale addresses; trim what you would rather not share.
+      render: text
