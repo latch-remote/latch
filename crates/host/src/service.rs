@@ -1318,13 +1318,8 @@ pub fn ensure_service_running() -> bool {
 /// older window started) and start it again from the file now on disk.
 /// The supervisor would not restart it by itself, since /v1/quit exits 0.
 pub fn restart_service() {
-    let _ = http::request(
-        ("127.0.0.1", CONTROL_PORT),
-        "POST",
-        "/v1/quit",
-        None,
-        Duration::from_secs(2),
-    );
+    // The service takes /v1/quit only with this user's token.
+    let _ = crate::local_control::request("POST", "/v1/quit", Duration::from_secs(2));
     // Until it has let go of the port: a copy started while it still holds
     // it would exit at once, and launchd would leave it at that.
     let deadline = Instant::now() + Duration::from_secs(5);
