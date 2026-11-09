@@ -26,8 +26,13 @@ throughput equivalence or two-worker before/after speed claim is made yet.
 
 ## Throughput sweep: pending
 
-Concurrent builds and test suites kept one-minute load above the threshold of
-3. Timing samples from that period are excluded. The worker table therefore
+Concurrent builds and test suites prevented a sustained quiet window. A brief
+interval completed the [1080p encode-only rows](partial-timings.md); the full
+size/worker/content matrix remains incomplete. Every accepted row checked
+one-minute load below 3 both before and after each trial. Loaded samples are
+excluded. Initial pipeline rows were also discarded after correcting an
+encoder-setup timing mismatch in the explicit-worker benchmark constructor;
+its setup now occurs in the same first-frame call as the original constructor. The worker table therefore
 **remains capped at four** for all picture tiers; two-CPU machines retain two.
 Conversion, software encoding and the existing capacity probe use one selection
 function of available parallelism and output dimensions. Rust's available
@@ -47,11 +52,14 @@ python3 docs/measurements/2026-11-09-linux-output-size/sweep.py --baseline-ref 6
 ```
 
 The default wait limit is 40 minutes. Exit 2 means pending; rerunning resumes
-valid rows. Sizes: 1920×1080, 2560×1440, 3840×2160. Workers: 2, 4, 6, 8, 10.
+valid rows for the same binaries (use a new `--results` directory after code changes). Sizes: 1920×1080, 2560×1440, 3840×2160. Workers: 2, 4, 6, 8, 10.
 Encode content: moving texture and scrolling text, 30 frames, 60 fps target,
 20 Mbps. Pipeline content: noise and moving-bar desktop, one second, 500 fps
 request (to avoid a 60 fps pacing ceiling), 20 Mbps. Encoder fps in the table is
 1000 / steady encode milliseconds; pipeline fps includes capture and pacing.
+The pipeline's `noise` changes a bounded patch rather than the whole desktop;
+`motion` in the encode bench is the full-frame stress case. Pipeline rows near
+500 fps are pacing-limited and do not establish a conversion/encoder ceiling.
 
 The command also builds a baseline source snapshot in the results directory.
 Its only instrumentation replaces the two fixed worker expressions with a

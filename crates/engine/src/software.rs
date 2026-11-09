@@ -364,11 +364,9 @@ impl<C: CpuCapture> SoftwarePipeline<C> {
     /// pipelines use the machine policy in `new` and `LatchEncoder::open`.
     pub fn with_workers(capture: C, config: &VideoConfig, workers: usize) -> anyhow::Result<Self> {
         ensure!((1..=64).contains(&workers), "workers must be in 1..=64");
-        let mut pipeline = Self::with_encoder(
-            capture,
-            config,
-            Box::new(move |w, h, c| Ok(Box::new(LatchEncoder::with_workers(w, h, c, workers)?))),
-        )?;
+        let mut pipeline = Self::new(capture, config)?;
+        pipeline.open =
+            Box::new(move |w, h, c| Ok(Box::new(LatchEncoder::with_workers(w, h, c, workers)?)));
         pipeline.threads = workers;
         Ok(pipeline)
     }
