@@ -99,6 +99,9 @@ impl Codec {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamRequest {
+    /// Rank colour before codec order; send only to hosts advertising support.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prefer_color: bool,
     #[serde(default)]
     pub color: crate::color::ColorCapabilities,
     pub protocol: u32,

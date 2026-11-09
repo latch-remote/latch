@@ -1096,6 +1096,8 @@ fn run(c: &Connect, generation: u64) -> Result<()> {
             port: test.map_or(CONTROL_PORT, |a| a.port()),
         },
         Settings {
+            prefer_color: host.streamer.prefer_color
+                && settings.codec == crate::config::Codec::Auto,
             color: crate::video::color_capabilities(),
             width: w,
             height: h,
