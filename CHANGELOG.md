@@ -2,7 +2,19 @@
 
 The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
-`## X.Y.Z (date)`.
+`## Unreleased
+
+- Authenticate Windows pushed updates independently against the matching GitHub
+  release's bare `latch-host.exe` digest, preserving legacy Mac headers and rollback.
+  Offline verification and older releases without this asset fail closed; install
+  such a release manually on the PC once.
+- Windows pulls verified updates every six hours and from Settings when idle.
+  Linux announces the version and release URL for manual installation.
+- Publish the bare Windows executable and a complete `SHA256SUMS`; attest release
+  archives, pin workflow actions, scope job permissions, and run release tests
+  with CI's FFmpeg and conformance prerequisites.
+
+## X.Y.Z (date)`.
 
 ## 5.2.0 (2026-11-04)
 

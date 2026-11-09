@@ -82,16 +82,8 @@ pub fn spawn(
     ctx: egui::Context,
 ) {
     if !cfg!(target_os = "macos") {
-        // Everything below assumes a Mac: it replaces an app bundle and
-        // unpacks the Windows zip with /usr/bin/unzip. A Windows PC gets
-        // its new host pushed from the Mac, and a Linux node is rebuilt, so
-        // there is nothing here for either to fetch or send.
-        let _ = (discovery, live, progress, ctx);
-        state.lock().message = if cfg!(windows) {
-            "New versions arrive from the Mac on your Tailscale account.".into()
-        } else {
-            "Latch updates itself on a Mac; install new releases here by hand.".into()
-        };
+        spawn_desktop(state, live, progress, ctx);
+        let _ = discovery;
         return;
     }
     clean_old_stages();
@@ -378,6 +370,133 @@ fn prune_updates(root: &std::path::Path, keep: &str) {
             tracing::warn!("could not prune update cache {}: {e}", path.display());
         }
     }
+}
+
+fn desktop_offer(rel: &Release, windows: bool) -> Option<String> {
+    rel.is_newer_than(&update::current()).then(|| {
+        if windows {
+            format!(
+                "Latch {} is available; installs when no stream is running.",
+                rel.version
+            )
+        } else {
+            format!(
+                "Latch {} is available. Update manually: https://github.com/{}/releases/tag/{}",
+                rel.version,
+                update::REPO,
+                rel.tag
+            )
+        }
+    })
+}
+
+/// Windows pulls the bare release asset; Linux only advertises manual updates.
+fn spawn_desktop(
+    state: Arc<Mutex<State>>,
+    live: Arc<Mutex<Option<Live>>>,
+    progress: Arc<Mutex<Progress>>,
+    ctx: egui::Context,
+) {
+    std::thread::spawn(move || {
+        let mut next = Instant::now() + FIRST_CHECK;
+        let mut pending: Option<(Release, Option<String>)> = None;
+        loop {
+            std::thread::sleep(TICK);
+            let cfg = ClientConfig::load();
+            if !cfg.auto_update {
+                continue;
+            }
+            if state.lock().check_now || Instant::now() >= next {
+                state.lock().check_now = false;
+                let token = update::token(cfg.github_token.as_deref());
+                match update::latest(token.as_deref()) {
+                    Ok(rel) => {
+                        next = Instant::now() + CHECK_EVERY;
+                        let newer = rel.is_newer_than(&update::current());
+                        let mut st = state.lock();
+                        st.checked = Some(Instant::now());
+                        st.latest = Some(rel.version.clone());
+                        st.release = Some(rel.clone());
+                        st.message = desktop_offer(&rel, cfg!(windows))
+                            .unwrap_or_else(|| format!("Up to date (v{}).", update::current()));
+                        st.notice = newer.then(|| (Tone::Info, st.message.clone()));
+                        pending = (newer && cfg!(windows)).then_some((rel, token));
+                    }
+                    Err(e) => {
+                        next = Instant::now() + RETRY_AFTER;
+                        pending = None;
+                        let mut st = state.lock();
+                        st.checked = Some(Instant::now());
+                        st.message = format!("Could not check for updates: {e:#}");
+                    }
+                }
+                ctx.request_repaint();
+            }
+            if let Some((rel, token)) = pending.as_ref() {
+                let idle = {
+                    let live = live.lock();
+                    let mut p = progress.lock();
+                    if live.is_none() && !p.active() {
+                        p.updating = true;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !idle {
+                    continue;
+                }
+                let result = (|| -> Result<()> {
+                    let path = fetch_asset(rel, HOST_EXE, token.as_deref())?;
+                    let bytes = std::fs::read(path)?;
+                    update::verify_host(rel, &rel.version, &bytes)?;
+                    // The service independently authenticates the same bytes and serializes
+                    // installation with incoming streams and peer pushes.
+                    send_host(
+                        Ipv4Addr::LOCALHOST,
+                        &rel.version.to_string(),
+                        &update::sha256_hex(&bytes),
+                        &bytes,
+                    )?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => {
+                        state.lock().message = format!(
+                            "Installing Latch {}. Reopen Latch after the service restarts.",
+                            rel.version
+                        );
+                        #[cfg(windows)]
+                        if runs_at_least(
+                            SocketAddr::from((Ipv4Addr::LOCALHOST, CONTROL_PORT)),
+                            &rel.version,
+                            Duration::from_secs(90),
+                        ) {
+                            match std::process::Command::new(
+                                std::env::current_exe().unwrap_or_default(),
+                            )
+                            .spawn()
+                            {
+                                Ok(_) => std::process::exit(0),
+                                Err(e) => {
+                                    state.lock().message =
+                                        format!("Update installed; reopen Latch: {e}")
+                                }
+                            }
+                        }
+                        pending = None;
+                    }
+                    Err(e) => {
+                        state.lock().message = format!("Could not update this PC: {e:#}");
+                        next = Instant::now() + RETRY_AFTER;
+                        pending = None;
+                    }
+                }
+                progress.lock().updating = false;
+                ctx.request_repaint();
+            }
+        }
+    });
 }
 
 /// Recheck cached assets before using them: an interrupted download or a
@@ -881,6 +1000,24 @@ pub fn ago(at: Option<Instant>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_updates_offer_windows_install_and_linux_manual_release_url() {
+        let v = format!("{}.0.0", update::current().major + 1);
+        let json = format!(r#"{{"tag_name":"v{v}","assets":[]}}"#);
+        let rel = update::parse_release(json.as_bytes()).unwrap();
+        assert!(desktop_offer(&rel, true).unwrap().contains("no stream"));
+        let linux = desktop_offer(&rel, false).unwrap();
+        assert!(linux.contains(&format!(
+            "https://github.com/{}/releases/tag/v{v}",
+            update::REPO
+        )));
+        assert!(linux.contains("manually"));
+        let json = format!(r#"{{"tag_name":"v{}"}}"#, update::current());
+        let rel = update::parse_release(json.as_bytes()).unwrap();
+        assert!(desktop_offer(&rel, true).is_none());
+        assert!(desktop_offer(&rel, false).is_none());
+    }
 
     #[test]
     fn a_host_that_keeps_deferring_is_asked_less_often() {

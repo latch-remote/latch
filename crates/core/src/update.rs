@@ -5,9 +5,7 @@
 //! git has stored for github.com, which is the login the install script
 //! uses too. Without one the requests still go out.
 //!
-//! Only the Mac talks to GitHub. It replaces its own bundle and sends each
-//! PC the new `latch-host.exe` over the control API; see
-//! [`crate::api::UPDATE_PATH`].
+//! Each receiving Windows host authenticates updates directly with GitHub.
 
 use anyhow::{anyhow, bail, Context, Result};
 use semver::Version;
@@ -155,8 +153,47 @@ pub fn latest(token: Option<&str>) -> Result<Release> {
     }
 }
 
+/// Resolve a peer's version independently, using the same TLS client as pull updates.
+pub fn for_version(version: &Version, token: Option<&str>) -> Result<Release> {
+    let url = format!("https://api.github.com/repos/{REPO}/releases/tags/v{version}");
+    let mut body = Vec::new();
+    let status = fetch(&url, token, "application/vnd.github+json", &mut body)?;
+    if status != 200 {
+        bail!("could not authenticate release v{version}: GitHub HTTP {status}");
+    }
+    parse_release(&body)
+}
+
+/// Authenticate uploaded bytes against GitHub, never against the sender's hash alone.
+pub fn verify_host(release: &Release, claimed: &Version, bytes: &[u8]) -> Result<()> {
+    if release.tag != format!("v{claimed}")
+        || release.version != *claimed
+        || !release.is_newer_than(&current())
+    {
+        bail!("release tag must match the claimed version and be newer than this host");
+    }
+    let asset = release.asset(HOST_EXE).ok_or_else(|| {
+        anyhow!(
+            "release {} has no published {HOST_EXE}; update the PC once by hand",
+            release.tag
+        )
+    })?;
+    require_digest(asset)?;
+    if asset.size != bytes.len() as u64
+        || !asset
+            .sha256
+            .as_ref()
+            .is_some_and(|h| h.eq_ignore_ascii_case(&sha256_hex(bytes)))
+    {
+        bail!("the executable does not match GitHub's published {HOST_EXE} SHA-256");
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct ReleaseJson {
+    #[serde(default)]
+    draft: bool,
     tag_name: String,
     #[serde(default)]
     prerelease: bool,
@@ -176,6 +213,9 @@ struct AssetJson {
 
 pub fn parse_release(json: &[u8]) -> Result<Release> {
     let r: ReleaseJson = serde_json::from_slice(json).context("parse the release")?;
+    if r.draft {
+        bail!("draft releases are not published updates");
+    }
     let version = Version::parse(r.tag_name.trim_start_matches('v'))
         .with_context(|| format!("tag {:?} is not a version", r.tag_name))?;
     Ok(Release {
@@ -413,6 +453,35 @@ mod tests {
         {"name": "latch-windows-x64.zip", "url": "https://api.github.com/repos/x/y/releases/assets/2", "size": 28514670}
       ]
     }"#;
+
+    #[test]
+    fn host_authentication_requires_published_digest_and_matching_new_tag() {
+        let v = Version::new(current().major + 1, 0, 0);
+        let bytes = b"published executable";
+        let json = serde_json::json!({"tag_name": format!("v{v}"), "assets": [{
+            "name": HOST_EXE, "url": "https://api.github.com/unused", "size": bytes.len(),
+            "digest": format!("sha256:{}", sha256_hex(bytes))
+        }]});
+        let rel = parse_release(&serde_json::to_vec(&json).unwrap()).unwrap();
+        verify_host(&rel, &v, bytes).unwrap();
+        assert!(verify_host(&rel, &v, b"malicious executable").is_err());
+        assert!(verify_host(&rel, &current(), bytes).is_err());
+        let mut bad = rel.clone();
+        bad.assets[0].sha256 = None;
+        assert!(verify_host(&bad, &v, bytes).is_err());
+        bad.assets.clear();
+        assert!(verify_host(&bad, &v, bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("by hand"));
+        bad = rel.clone();
+        bad.tag = "v999.0.0".into();
+        assert!(verify_host(&bad, &v, bytes).is_err());
+        bad = rel;
+        bad.version = current();
+        bad.tag = format!("v{}", current());
+        assert!(verify_host(&bad, &current(), bytes).is_err());
+    }
 
     #[test]
     fn release_json_is_parsed_and_compared() {
