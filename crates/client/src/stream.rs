@@ -108,6 +108,7 @@ pub enum Action {
 /// An unexpected connection drop reconnection state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconnectState {
+    pub started: Instant,
     pub attempt: u32,
     pub deadline: Instant,
     pub in_flight: bool,
@@ -117,7 +118,8 @@ pub fn delay_for_attempt(attempt: u32) -> Duration {
     match attempt {
         1 => Duration::from_secs(2),
         2 => Duration::from_secs(5),
-        _ => Duration::from_secs(10),
+        3 => Duration::from_secs(10),
+        _ => Duration::from_secs(30),
     }
 }
 
@@ -128,6 +130,7 @@ impl ReconnectState {
 
     pub fn with_attempt(attempt: u32, now: Instant) -> Self {
         Self {
+            started: now,
             attempt,
             deadline: now + delay_for_attempt(attempt),
             in_flight: false,
@@ -152,10 +155,20 @@ impl ReconnectState {
     }
 
     pub fn next_attempt(&self, now: Instant) -> Option<Self> {
-        if self.attempt >= 3 {
+        if now.saturating_duration_since(self.started) >= Duration::from_secs(5 * 60) {
             None
         } else {
-            Some(Self::with_attempt(self.attempt + 1, now))
+            let mut next = Self::with_attempt(self.attempt.saturating_add(1), now);
+            next.started = self.started;
+            if next.attempt > 3 {
+                // Spread retrying viewers over 20–30 seconds after quick retries.
+                next.deadline =
+                    now + Duration::from_millis(rand::random::<u64>() % 10_001 + 20_000);
+            }
+            next.deadline = next
+                .deadline
+                .min(self.started + Duration::from_secs(5 * 60));
+            Some(next)
         }
     }
 }
@@ -205,6 +218,7 @@ struct Toast {
 
 pub struct View {
     /// The mouse is captured: hidden, held in place, raw movement sent.
+    recovery_observation: Option<(std::time::SystemTime, bool)>,
     captured: bool,
     grabbed: bool,
     /// The host key dropped the toolbar over the picture.
@@ -318,6 +332,7 @@ struct Link<'a, S: Sink + ?Sized> {
 impl Default for View {
     fn default() -> Self {
         Self {
+            recovery_observation: None,
             captured: false,
             grabbed: false,
             bar_shown: false,
@@ -507,6 +522,21 @@ impl View {
 
     pub fn handle_interruption(&mut self) {
         self.handle_interruption_at(Instant::now());
+    }
+
+    /// Discovery becoming online, or resuming after a long event-loop gap,
+    /// makes a pending retry due immediately. No network watcher is needed.
+    pub fn observe_recovery(&mut self, online: bool, wall: std::time::SystemTime, now: Instant) {
+        let restored = self.recovery_observation.is_some_and(|(last, was_online)| {
+            (!was_online && online)
+                || wall.duration_since(last).unwrap_or_default() > Duration::from_secs(10)
+        });
+        self.recovery_observation = Some((wall, online));
+        if let Some(Interruption::Reconnecting(state)) = &mut self.interrupted {
+            if restored && !state.in_flight {
+                state.deadline = now;
+            }
+        }
     }
 
     pub fn cancel_reconnect(&mut self) {
@@ -712,7 +742,7 @@ impl View {
                                     ui::muted(
                                         ui,
                                         format!(
-                                            "Reconnecting in {remaining_secs} s · attempt {} of 3",
+                                            "Reconnecting in {remaining_secs} s · attempt {}",
                                             state.attempt
                                         ),
                                     );
@@ -754,7 +784,7 @@ impl View {
                                         }
                                         actions.push(Action::Reconnect);
                                     }
-                                    if ui::ghost_button(ui, "Back to machines").clicked() {
+                                    if ui::ghost_button(ui, "Stop").clicked() {
                                         self.cancel_reconnect();
                                         actions.push(Action::Disconnect);
                                     }
@@ -771,6 +801,7 @@ impl View {
                                     if ui::primary_button(ui, "Try again").clicked() {
                                         self.interrupted =
                                             Some(Interruption::Reconnecting(ReconnectState {
+                                                started: Instant::now(),
                                                 attempt: 1,
                                                 deadline: Instant::now(),
                                                 in_flight: true,
@@ -3734,6 +3765,56 @@ pub(crate) mod tests {
         }
     }
 
+    fn recovery_fixture(
+        size: Vec2,
+        ppp: f32,
+        in_flight: bool,
+        gpu: bool,
+    ) -> egui_kittest::Harness<'static, Fixture> {
+        let mut state = ReconnectState::with_attempt(12, Instant::now());
+        state.in_flight = in_flight;
+        let view = View {
+            interrupted: Some(Interruption::Reconnecting(state)),
+            ..View::default()
+        };
+        harness_with(size, ppp, gpu, fixture(view, Extra::default()))
+    }
+
+    #[test]
+    fn reconnect_controls_fit_at_all_window_sizes() {
+        use crate::app::snapshots::MATRIX;
+        for &(size, ppp) in &MATRIX {
+            for in_flight in [false, true] {
+                let mut h = recovery_fixture(size, ppp, in_flight, false);
+                h.run_steps(1);
+                for label in ["Reconnect now", "Stop"] {
+                    assert_inside(
+                        label,
+                        node_rect(&h.get_by_label(label)),
+                        Rect::from_min_size(Pos2::ZERO, size),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "renders with a GPU; run on demand to review the UI"]
+    fn snapshots_reconnect() {
+        use crate::app::snapshots::{file_name, save, MATRIX};
+        for &(size, ppp) in &MATRIX {
+            for in_flight in [false, true] {
+                let mut h = recovery_fixture(size, ppp, in_flight, true);
+                let name = if in_flight {
+                    "reconnect-working"
+                } else {
+                    "reconnect-waiting"
+                };
+                save(h.render().unwrap(), &file_name("stream", name, size, ppp));
+            }
+        }
+    }
+
     #[test]
     #[ignore = "renders with a GPU; run on demand to review the UI"]
     fn snapshots_stream_overlay() {
@@ -4819,10 +4900,10 @@ pub(crate) mod tests {
             "Connection lost overlay must appear when disconnected during stream"
         );
         assert!(h.query_by_label("Reconnect now").is_some());
-        assert!(h.query_by_label("Back to machines").is_some());
+        assert!(h.query_by_label("Stop").is_some());
 
         // Clicking Back to machines sends Disconnect
-        h.get_by_label("Back to machines").simulate_click();
+        h.get_by_label("Stop").simulate_click();
         h.run_steps(2);
         assert!(h.state().actions.contains(&Action::Disconnect));
     }
@@ -4831,6 +4912,7 @@ pub(crate) mod tests {
     fn review_countdown_dispatches_once_and_back_cancels_in_flight() {
         let (mut h, _) = recording(View::default(), false);
         h.state_mut().view.interrupted = Some(Interruption::Reconnecting(ReconnectState {
+            started: Instant::now(),
             attempt: 1,
             deadline: Instant::now() - Duration::from_secs(1),
             in_flight: false,
@@ -4858,7 +4940,7 @@ pub(crate) mod tests {
             h.state().view.interrupted.is_some(),
             "focus loss must retain retry overlay"
         );
-        h.get_by_label("Back to machines").simulate_click();
+        h.get_by_label("Stop").simulate_click();
         h.run_steps(2);
         assert!(h.state().actions.contains(&Action::Disconnect));
         assert!(h.state().view.interrupted.is_none());
@@ -4905,10 +4987,40 @@ pub(crate) mod tests {
         assert_eq!(s3.remaining_secs(t2 + Duration::from_secs(10)), 0);
         assert!(s3.is_due(t2 + Duration::from_secs(10)));
 
-        // 4. Attempt 3 fails: exhausted retries transitions to Failed
+        // Retries continue beyond the initial three, but stop after five minutes.
         let t3 = t2 + Duration::from_secs(10);
         view.handle_interruption_at(t3);
+        let Some(Interruption::Reconnecting(ref s4)) = view.interrupted else {
+            panic!("expected fourth retry");
+        };
+        assert_eq!(s4.attempt, 4);
+        assert!((Duration::from_secs(20)..=Duration::from_secs(30)).contains(&s4.remaining(t3)));
+        view.handle_interruption_at(t0 + Duration::from_secs(300));
         assert_eq!(view.interrupted, Some(Interruption::Failed));
+    }
+
+    #[test]
+    fn recovery_signals_bypass_backoff_but_never_duplicate_an_attempt() {
+        let now = Instant::now();
+        let wall = std::time::SystemTime::now();
+        let mut view = View::default();
+        view.observe_recovery(false, wall, now);
+        view.handle_interruption_at(now);
+        view.observe_recovery(true, wall + Duration::from_secs(1), now);
+        let Some(Interruption::Reconnecting(state)) = &mut view.interrupted else {
+            panic!()
+        };
+        assert!(state.is_due(now));
+        state.deadline = now + Duration::from_secs(30);
+        state.in_flight = true;
+        view.observe_recovery(true, wall + Duration::from_secs(60), now);
+        let Some(Interruption::Reconnecting(state)) = &view.interrupted else {
+            panic!()
+        };
+        assert!(!state.is_due(now));
+        view.cancel_reconnect();
+        view.observe_recovery(true, wall + Duration::from_secs(120), now);
+        assert!(view.interrupted.is_none());
     }
 
     #[test]
@@ -4960,7 +5072,7 @@ pub(crate) mod tests {
         // Shows countdown
         assert!(h.query_by_label("Connection lost").is_some());
         assert!(h.query_by_label_contains("Reconnecting in").is_some());
-        assert!(h.query_by_label_contains("attempt 1 of 3").is_some());
+        assert!(h.query_by_label_contains("attempt 1").is_some());
         assert!(h.query_by_label("Reconnect now").is_some());
 
         // Primary click triggers Action::Reconnect

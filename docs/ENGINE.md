@@ -597,3 +597,28 @@ frame by frame, which alternated surfaces (a flicker).
 
 See [colour measurements](measurements/2026-11-03/hdr/README.md) for tests,
 measurements and platform limitations.
+
+
+### Viewer input scheduling and recovery
+
+Mouse, keyboard and text are currently forwarded from egui's accumulated
+input during the viewer UI update. The session sender flushes immediately
+when called; reliability retries run independently. Gamepad callbacks send
+directly from their platform threads. Mouse/keyboard transmission is still
+frame-dependent; no OS-to-socket latency result is available yet. See
+[the responsiveness record](measurements/2026-11-09-input-latency/README.md).
+
+After an unexpected transport drop, the viewer reconnects with fresh
+negotiation for up to five minutes: 2/5/10-second waits followed by jittered
+20–30-second waits. Discovery returning online or an event-loop gap over ten
+seconds advances a pending retry. Explicit refusals, takeover and host ends
+stop automatic retries. The overlay offers Reconnect now and Stop.
+
+Windows Media Foundation workers have one-second caller deadlines for
+startup, decode and hardware probes. The GPU-copy fence retains its existing
+two-second bound. A timed-out decode abandons that worker, reports an error
+(which requests a keyframe), and opens a fresh decoder on the next keyframe.
+At most three worker timeouts per ten minutes are allowed process-wide;
+reopen failures feed the existing Baseline software fallback or modern-codec
+renegotiation. Driver resources stay owned by the abandoned worker until its
+call returns. This recovery is unverified on Windows hardware.

@@ -1,5 +1,6 @@
 //! Standalone H.264, HEVC and AV1 decoding. COM and MF stay on a dedicated MTA so callers
 //! can create and move the decoder from a UI thread with any apartment.
+use super::worker_deadline;
 use anyhow::{bail, ensure, Context, Result};
 use latch_proto::control::Codec;
 use parking_lot::Mutex;
@@ -109,7 +110,8 @@ struct Request {
     reply: mpsc::SyncSender<Result<(Option<DecodedNv12>, &'static str)>>,
 }
 pub struct MfDecoder {
-    requests: mpsc::Sender<Request>,
+    requests: Option<mpsc::Sender<Request>>,
+    stream: (Codec, u32, u32, u8),
     name: &'static str,
 }
 impl MfDecoder {
@@ -128,6 +130,7 @@ impl MfDecoder {
     /// `depth` 10 keeps a Main10 stream's P010 samples (see
     /// [`DecodedNv12::bit_depth`]); 8 reduces any P010 output to NV12.
     pub fn with_stream(codec: Codec, width: u32, height: u32, depth: u8) -> Result<Self> {
+        worker_deadline::check()?;
         let (requests, receive) = mpsc::channel::<Request>();
         let (ready, startup) = mpsc::sync_channel(1);
         thread::Builder::new()
@@ -168,10 +171,9 @@ impl MfDecoder {
             })
             .context("spawn Media Foundation decoder worker")?;
         Ok(Self {
-            requests,
-            name: startup
-                .recv()
-                .context("decoder worker stopped during startup")??,
+            requests: Some(requests),
+            stream: (codec, width, height, depth),
+            name: worker_deadline::receive(&startup, worker_deadline::DEADLINE)??,
         })
     }
     pub fn decode(&mut self, annexb: &[u8]) -> Result<Option<DecodedNv12>> {
@@ -180,13 +182,30 @@ impl MfDecoder {
             "video access unit exceeds 64 MiB"
         );
         let (reply, receive) = mpsc::sync_channel(1);
+        if self.requests.is_none() {
+            let (codec, width, height, depth) = self.stream;
+            *self = Self::with_stream(codec, width, height, depth)
+                .context(worker_deadline::ReopenFailed)?;
+        }
         self.requests
+            .as_ref()
+            .expect("reopened worker")
             .send(Request {
                 bytes: annexb.to_vec(),
                 reply,
             })
             .context("decoder worker stopped")?;
-        let (frame, name) = receive.recv().context("decoder worker stopped")??;
+        let response = match worker_deadline::receive(&receive, worker_deadline::DEADLINE) {
+            Ok(response) => response,
+            Err(error) => {
+                // Dropping the channel prevents further submissions. The stuck
+                // worker owns all COM/GPU resources until the driver returns.
+                self.requests = None;
+                tracing::warn!("{error:#}; reopening decoder on the next keyframe");
+                return Err(error);
+            }
+        };
+        let (frame, name) = response?;
         self.name = name;
         Ok(frame)
     }
@@ -197,48 +216,54 @@ impl MfDecoder {
 /// Probe actual pictures, not just an installed MFT or a D3D profile GUID.
 /// This also catches missing Store codec extensions and unusable driver paths.
 pub fn supported() -> Vec<Codec> {
-    std::thread::spawn(|| {
-        let Ok(_runtime) = Runtime::new() else {
-            return Vec::new();
-        };
-        [
-            (
-                Codec::Av1,
-                include_bytes!("../../tests/fixtures/decode-probe.av1").as_slice(),
-            ),
-            (
-                Codec::Hevc,
-                include_bytes!("../../tests/fixtures/decode-probe.hevc").as_slice(),
-            ),
-            (
-                Codec::H264High,
-                include_bytes!("../../tests/fixtures/decode-probe.h264").as_slice(),
-            ),
-        ]
-        .into_iter()
-        .filter_map(|(codec, bytes)| {
-            let result: Result<()> = (|| {
-                let mut state = State::new(codec, true, None, 256, 256, 8)?;
-                for _ in 0..10 {
-                    if state.decode(bytes)?.is_some() {
-                        ensure!(state.dxva_used, "decoder returned CPU samples");
-                        return Ok(());
+    if worker_deadline::check().is_err() {
+        return Vec::new();
+    }
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = (|| {
+            let Ok(_runtime) = Runtime::new() else {
+                return Vec::new();
+            };
+            [
+                (
+                    Codec::Av1,
+                    include_bytes!("../../tests/fixtures/decode-probe.av1").as_slice(),
+                ),
+                (
+                    Codec::Hevc,
+                    include_bytes!("../../tests/fixtures/decode-probe.hevc").as_slice(),
+                ),
+                (
+                    Codec::H264High,
+                    include_bytes!("../../tests/fixtures/decode-probe.h264").as_slice(),
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(codec, bytes)| {
+                let result: Result<()> = (|| {
+                    let mut state = State::new(codec, true, None, 256, 256, 8)?;
+                    for _ in 0..10 {
+                        if state.decode(bytes)?.is_some() {
+                            ensure!(state.dxva_used, "decoder returned CPU samples");
+                            return Ok(());
+                        }
+                    }
+                    bail!("no hardware picture within ten access units");
+                })();
+                match result {
+                    Ok(()) => Some(codec),
+                    Err(error) => {
+                        tracing::info!(?codec, "hardware decode unavailable: {error:#}");
+                        None
                     }
                 }
-                bail!("no hardware picture within ten access units");
-            })();
-            match result {
-                Ok(()) => Some(codec),
-                Err(error) => {
-                    tracing::info!(?codec, "hardware decode unavailable: {error:#}");
-                    None
-                }
-            }
-        })
-        .collect()
-    })
-    .join()
-    .unwrap_or_default()
+            })
+            .collect()
+        })();
+        let _ = tx.send(result);
+    });
+    worker_deadline::receive(&rx, worker_deadline::DEADLINE).unwrap_or_default()
 }
 
 unsafe fn create_transform(subtype: windows::core::GUID) -> Result<IMFTransform> {

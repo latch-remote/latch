@@ -2,8 +2,16 @@
 
 The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
-`## Unreleased
+`## X.Y.Z (date)`.
 
+## Unreleased
+
+- Viewer: keep reconnecting for five minutes after a lost connection, with
+  jittered backoff, Reconnect now and Stop controls. Retry sooner when the
+  host returns online or the app resumes after a long pause.
+- Windows viewer: bound Media Foundation startup, decode and hardware-probe
+  waits. Reopen a stalled decoder after requesting a keyframe, with a limit
+  on abandoned driver workers and the existing software fallback.
 - Authenticate Windows pushed updates independently against the matching GitHub
   release's bare `latch-host.exe` digest, preserving legacy Mac headers and rollback.
   Offline verification and older releases without this asset fail closed; install
@@ -13,8 +21,6 @@ GitHub release notes, so each version gets a heading of the form
 - Publish the bare Windows executable and a complete `SHA256SUMS`; attest release
   archives, pin workflow actions, scope job permissions, and run release tests
   with CI's FFmpeg and conformance prerequisites.
-
-## X.Y.Z (date)`.
 
 ## 5.2.0 (2026-11-04)
 
