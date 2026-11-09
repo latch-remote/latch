@@ -34,7 +34,9 @@ function of available parallelism and output dimensions. Rust's available
 parallelism accounts for Linux quotas; macOS additionally prefers performance
 cores. Future caps above four reserve a CPU and require at least 128 pixels per
 slice. The capacity probe still measures the output it will actually encode.
-There is no new runtime governor or unmeasured capacity uplift.
+The probe retains its moving-bar/pixel-rate approximation; native capture and
+full-motion scaling costs are not certified by that sample. There is no new
+runtime governor or unmeasured capacity uplift.
 
 One command builds the benches, waits for load below 3, checks load before and
 after each trial, runs every size × worker count × content three times, saves

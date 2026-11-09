@@ -207,7 +207,18 @@ impl Server {
 
     /// Opens what a session needs, after ending the one running. A refusal
     /// is for the HTTP reply; nothing is left open after one.
-    pub fn prepare(&self, mut req: StreamRequest, peer: SocketAddr) -> Result<Prepared, Refusal> {
+    pub fn prepare(&self, req: StreamRequest, peer: SocketAddr) -> Result<Prepared, Refusal> {
+        self.prepare_using(req, peer, video::encodable(), video::limits, video::open)
+    }
+
+    fn prepare_using(
+        &self,
+        mut req: StreamRequest,
+        peer: SocketAddr,
+        encodable: Vec<Codec>,
+        limits_for: impl Fn(Codec) -> video::Limits,
+        mut open: impl FnMut(&VideoConfig) -> anyhow::Result<Box<dyn VideoPipeline>>,
+    ) -> Result<Prepared, Refusal> {
         if req.protocol != latch_proto::PROTOCOL {
             return Err(Refusal::new(
                 426,
@@ -218,15 +229,15 @@ impl Server {
                 ),
             ));
         }
-        let encodable = video::encodable();
+        let original = req.clone();
         // Best first, of those this host encodes at the size it would send.
-        let candidates: Vec<Codec> = req
+        let mut candidates: Vec<Codec> = req
             .codecs
             .iter()
             .copied()
             .filter(|c| encodable.contains(c))
             .filter(|&c| {
-                let (w, h, _) = video::limits(c).fit(
+                let (w, h, _) = limits_for(c).fit(
                     even(req.width.clamp(64, control::MAX_SIDE)),
                     even(req.height.clamp(64, control::MAX_SIDE)),
                     1,
@@ -234,6 +245,12 @@ impl Server {
                 video::takes(c, w, h)
             })
             .collect();
+        latch_proto::color::ColorDescription::rank_codecs(
+            &mut candidates,
+            req.color,
+            req.prefer_color,
+            cfg!(any(target_os = "macos", windows)),
+        );
         let Some(&codec) = candidates.first() else {
             return Err(Refusal::new(
                 406,
@@ -245,7 +262,7 @@ impl Server {
         };
         // What the encoder for that codec takes here, before the desktop is
         // sized for it: a larger request is scaled down in proportion.
-        let limits = video::limits(codec);
+        let limits = limits_for(codec);
         let (mut width, mut height, mut fps) = limits.fit(
             even(req.width.clamp(64, control::MAX_SIDE)),
             even(req.height.clamp(64, control::MAX_SIDE)),
@@ -327,9 +344,9 @@ impl Server {
             bitrate_kbps: prepared.req.bitrate_kbps,
             codec,
         };
-        let mut opened = video::open(&config);
+        let mut opened = open(&config);
         // A codec whose only encoder will not open here gives way to the
-        // next the viewer takes, refitting its output limits.
+        // next the viewer takes, refitted from the original request.
         for &next in &candidates[1..] {
             match &opened {
                 Err(e) if video::Unencodable::is(e) => {
@@ -340,10 +357,13 @@ impl Server {
                         next == video::Codec::Hevc,
                         cfg!(any(target_os = "macos", windows)),
                     );
-                    let limits = video::limits(next);
-                    (config.width, config.height, config.fps) =
-                        limits.fit(config.width, config.height, config.fps);
-                    config.bitrate_kbps = config.bitrate_kbps.min(limits.max_kbps);
+                    let limits = limits_for(next);
+                    (config.width, config.height, config.fps) = limits.fit(
+                        even(original.width.clamp(64, control::MAX_SIDE)),
+                        even(original.height.clamp(64, control::MAX_SIDE)),
+                        original.fps.clamp(1, control::MAX_FPS),
+                    );
+                    config.bitrate_kbps = original.bitrate_kbps.clamp(500, limits.max_kbps);
                     if let Some(ceiling) =
                         crate::software::ceiling().filter(|_| !video::hardware_encodes(next))
                     {
@@ -354,8 +374,17 @@ impl Server {
                     prepared.req.height = config.height;
                     prepared.req.fps = config.fps;
                     prepared.req.bitrate_kbps = config.bitrate_kbps;
+                    if let Some(undo) = prepared.undo.take() {
+                        undo();
+                    }
+                    prepared.undo = match &self.options.prepare {
+                        Some(prepare) => prepare(&prepared.req).map_err(|e| {
+                            Refusal::new(500, format!("could not prepare the desktop: {e:#}"))
+                        })?,
+                        None => None,
+                    };
                     prepared.codec = next;
-                    opened = video::open(&config);
+                    opened = open(&config);
                 }
                 _ => break,
             }

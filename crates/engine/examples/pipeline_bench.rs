@@ -60,7 +60,12 @@ fn main() -> anyhow::Result<()> {
     let height: u32 = arg("--height", "1080").parse()?;
     let source_width: u32 = arg("--source-width", &width.to_string()).parse()?;
     let source_height: u32 = arg("--source-height", &height.to_string()).parse()?;
-    let workers: usize = arg("--threads", "4").parse()?;
+    let default_workers = latch_engine::software::worker_count(
+        std::thread::available_parallelism().map_or(1, usize::from),
+        width,
+        height,
+    );
+    let workers: usize = arg("--threads", &default_workers.to_string()).parse()?;
     let fps: u32 = arg("--fps", "60").parse()?;
     let kbps: u32 = arg("--kbps", "20000").parse()?;
     let seconds: f64 = arg("--seconds", "10").parse()?;
@@ -99,9 +104,13 @@ fn main() -> anyhow::Result<()> {
             )?))
         }
         #[cfg(target_os = "linux")]
-        None if software || !hardware_available(&config) => Run::X11(Box::new(
-            SoftwarePipeline::new(latch_engine::linux::X11Capture::new()?, &config)?,
-        )),
+        None if software || !hardware_available(&config) => {
+            Run::X11(Box::new(SoftwarePipeline::with_workers(
+                latch_engine::linux::X11Capture::new()?,
+                &config,
+                workers,
+            )?))
+        }
         _ => {
             if motion.is_some() {
                 std::env::set_var(

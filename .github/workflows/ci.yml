@@ -17,15 +17,17 @@ env:
 
 jobs:
   test-windows:
+    permissions:
+      contents: read
     runs-on: windows-latest
     # A hung test fails the job instead of holding a runner for hours.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -139,23 +141,25 @@ jobs:
           exit 0
       - name: release build
         run: cargo build --locked --workspace --release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: latch-host-windows
           path: target/release/latch-host.exe
           if-no-files-found: error
 
   test-macos:
+    permissions:
+      contents: read
     runs-on: macos-15
     # A hung test fails the job instead of holding a runner for hours.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-apple-darwin
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # FFmpeg decodes the VideoToolbox encoder's output in the tests: an
       # independent decoder, never part of Latch.
       - name: ffmpeg for the encoder tests
@@ -171,6 +175,8 @@ jobs:
 
   # Test both common VPS architectures.
   test-linux:
+    permissions:
+      contents: read
     name: test-linux (${{ matrix.arch }})
     strategy:
       fail-fast: false
@@ -184,11 +190,11 @@ jobs:
     # A hung test fails the job instead of holding a runner for hours.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: native deps
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - name: clippy
@@ -197,53 +203,63 @@ jobs:
         run: cargo test --locked --workspace --all-targets
       - name: release host
         run: cargo build --locked --release -p latch-host
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: latch-host-linux-${{ matrix.arch }}
           path: target/release/latch-host
           if-no-files-found: error
 
   deploy-selftest:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: node kit selftest
         run: bash deploy/node/selftest.sh
   native-display-selftest:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: sudo apt-get update && sudo apt-get install -y xauth
       - run: bash deploy/native/selftest.sh
   relay-selftest:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: relay installer selftest
         run: bash deploy/relay/selftest.sh
 
   # Nothing Latch builds may compile C, C++ or assembler (docs/ENGINE.md).
   native-audit:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: no C, C++ or assembler in the build graph
         run: bash scripts/audit-native.sh
 
   # The H.264 decoder against the ITU-T H.264.1 conformance bitstreams:
   # every picture must equal the reference decoder's output byte for byte.
   codec-conformance:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: fetch the conformance bitstreams
         run: sh scripts/fetch-h264-conformance.sh
       - name: decode them

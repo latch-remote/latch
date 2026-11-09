@@ -7,7 +7,6 @@ use crate::config::HostConfig;
 use crate::setup;
 use eframe::egui;
 use latch_core::api::Status;
-use latch_core::http;
 use latch_core::CONTROL_PORT;
 use latch_ui::{self as ui, space, Kv, Tone};
 use parking_lot::Mutex;
@@ -213,6 +212,7 @@ impl HostApp {
                 .map_err(|e| e.to_string())
                 .and_then(|exe| {
                     setup::run(&setup::Plan {
+                        elevated_input: HostConfig::load().elevated_input,
                         exe: &exe,
                         adapter: &adapter,
                         adapter_description: &desc,
@@ -294,13 +294,7 @@ impl HostApp {
         if self.live {
             // Off the UI thread: the service may take a moment to answer.
             std::thread::spawn(|| {
-                let _ = http::request(
-                    ("127.0.0.1", CONTROL_PORT),
-                    "POST",
-                    "/v1/quit",
-                    None,
-                    Duration::from_secs(2),
-                );
+                let _ = crate::local_control::request("POST", "/v1/quit", Duration::from_secs(2));
             });
         }
         let mut s = self.shared.lock();
@@ -830,6 +824,23 @@ impl HostApp {
                     self.dirty = true;
                 }
             }
+            ui::row_separator(ui);
+            if ui::toggle_row(
+                ui,
+                &mut self.cfg.clipboard_sharing,
+                "Share clipboard text with the connected viewer",
+                Some("Only while connected or for five seconds after disconnecting."),
+            ) {
+                self.dirty = true;
+            }
+            if self.os == Os::Windows {
+                ui::row_separator(ui);
+                if ui::toggle_row(ui, &mut self.cfg.elevated_input,
+                    "Control windows that run as administrator",
+                    Some("While on, any program running as you on this PC can do the same. Apply changes with Set up as administrator.")) {
+                    self.dirty = true;
+                }
+            }
             if self.os == Os::Windows {
                 ui::row_separator(ui);
                 if ui::toggle_row(
@@ -1112,11 +1123,9 @@ fn spawn_poller(shared: Arc<Mutex<Shared>>, ctx: egui::Context) {
             // Repaint only when something the page shows has changed: an
             // idle window draws nothing.
             let mut changed = false;
-            let r: Result<Status, _> = http::get_json(
-                ("127.0.0.1", CONTROL_PORT),
-                "/v1/status",
-                Duration::from_millis(800),
-            );
+            let r: Result<Status, _> =
+                crate::local_control::request("GET", "/v1/status", Duration::from_millis(800))
+                    .and_then(|r| r.parse());
             match r {
                 Ok(st) => {
                     failures = 0;

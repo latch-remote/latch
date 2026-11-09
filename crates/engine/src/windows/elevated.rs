@@ -51,9 +51,9 @@ use windows::{
         },
         System::{
             Pipes::{
-                ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientSessionId,
-                GetNamedPipeServerProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-                PIPE_TYPE_BYTE, PIPE_WAIT,
+                ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
+                GetNamedPipeClientSessionId, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
+                PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
             },
             SystemInformation::GetSystemDirectoryW,
             Threading::{
@@ -76,7 +76,7 @@ const HELLO: &[u8; 8] = b"LATCHIN1";
 /// A request: the display rectangle, then one event, at most a text event.
 const MAX_REQUEST: usize = 16 + 2 + latch_proto::input::MAX_TEXT;
 /// The helper exits once no stream has used it for this long.
-const IDLE: Duration = Duration::from_secs(60);
+const IDLE: Duration = Duration::from_secs(5);
 /// How long a stream waits for the helper it started.
 const START_WAIT: Duration = Duration::from_secs(10);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -266,6 +266,10 @@ fn decode(bytes: &[u8]) -> Result<(Event, DisplayRect)> {
 fn serve() -> Result<()> {
     let token = own_token()?;
     let session = session(&token)?;
+    // Only setup writes this record in the administrators-only helper folder.
+    let expected =
+        std::fs::read_to_string(std::env::current_exe()?.with_file_name("host-path.txt"))?;
+    let expected = PathBuf::from(expected.trim().trim_start_matches('\u{feff}'));
     let name = HSTRING::from(pipe_name(session));
     let sddl = HSTRING::from(pipe_sddl(&user_sid(&token)?));
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
@@ -339,6 +343,13 @@ fn serve() -> Result<()> {
         // SAFETY: Reads the connected client's session into a local.
         if unsafe { GetNamedPipeClientSessionId(pipe, &mut client_session) }.is_err()
             || client_session != session
+        {
+            continue;
+        }
+        let mut pid = 0;
+        // SAFETY: The pipe is connected and the output points to a local.
+        if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) }.is_err()
+            || !process_image(pid).is_ok_and(|image| same_file_name(&image, &expected))
         {
             continue;
         }
@@ -573,6 +584,26 @@ mod tests {
         assert!(!sddl.contains(";WD)") && !sddl.contains(";AU)"));
         assert!(sddl.ends_with("S:(ML;;NW;;;ME)"));
         assert_eq!(pipe_name(1), r"\\.\pipe\LatchInput-1");
+    }
+
+    #[test]
+    fn pipe_client_must_match_the_recorded_install_path() {
+        use std::path::Path;
+        let installed = Path::new(r"C:\Users\User\AppData\Local\Latch\latch-host.exe");
+        assert!(same_file_name(
+            installed,
+            Path::new(r"c:\users\user\appdata\local\latch\LATCH-HOST.EXE")
+        ));
+        assert!(!same_file_name(
+            installed,
+            Path::new(r"C:\Temp\latch-host.exe")
+        ));
+        assert!(!same_file_name(
+            installed,
+            Path::new(r"C:\Users\User\AppData\Local\Latch\other.exe")
+        ));
+        let actual = process_image(std::process::id()).unwrap();
+        assert!(same_file_name(&actual, &std::env::current_exe().unwrap()));
     }
 
     #[test]

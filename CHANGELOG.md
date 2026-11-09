@@ -1,12 +1,49 @@
 # Changelog
 
+The release workflow publishes the section that matches the tag as the
+GitHub release notes, so each version gets a heading of the form
+`## X.Y.Z (date)`.
+
 ## Unreleased
 
 - Honour negotiated Linux/software output dimensions with damage-aware area scaling, aspect fitting, and matching cursor and input geometry.
 
-The release workflow publishes the section that matches the tag as the
-GitHub release notes, so each version gets a heading of the form
-`## X.Y.Z (date)`.
+- Windows hosts check every pushed update against the SHA-256 GitHub
+  publishes for that release's `latch-host.exe`, not against the hash the
+  sender supplies. A release without that file, or a PC that cannot reach
+  GitHub, refuses the update; install such a release on the PC by hand once.
+- Windows updates itself: with the window open it checks every six hours
+  (and from Settings) and installs a verified release when no stream is
+  running. Linux shows the new version and where to get it.
+- Releases carry the bare Windows executable and a `SHA256SUMS` for every
+  file, with build provenance attestations. Workflow actions are pinned to
+  commits, jobs have only the permissions they use, and a release runs the
+  same tests as CI.
+- Controlling administrator windows on a Windows host is now a choice:
+  new installs leave the helper off, and the Sharing tab explains what
+  turning it on allows. A PC that already had it keeps it. The helper
+  answers only the installed Latch.
+- The service on a machine takes control requests from that machine only
+  with a private per-user token, so another account signed in there can
+  read its status and nothing else.
+- A tagged host on an organisation's tailnet answers only the logins
+  listed in `allowed_logins` in `host.toml`; an email domain is not proof
+  of membership. Tagged and shared-in peers are refused.
+- The clipboard is shared only with the machine that is streaming, or was
+  in the last five seconds, and has a switch on the Sharing tab.
+
+## Unreleased
+
+- Auto preserves mutually supported HEVC ten-bit/HDR instead of preferring
+  eight-bit AV1, when both peers opt in. Explicit codec choices keep their order.
+- Encoder fallback refits the original request and prepares the final desktop size.
+- Decoder failures cool down per host and codec; Apply and reconnect retries
+  immediately. The encoded queue follows frame intervals and sustained decode
+  overload reports local capacity. Automatic session FPS reduction remains pending.
+- Stats distinguish UI-observed pictures and modelled delay, show decode p95
+  and frame budget, and name immediate presentation. Correct the small-window
+  keyboard snapshot fixture. Native decode benchmarks validate native surfaces
+  and separately time CPU materialisation.
 
 ## 5.2.0 (2026-11-04)
 

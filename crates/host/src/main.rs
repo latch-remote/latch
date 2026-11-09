@@ -149,6 +149,7 @@ fn main() -> Result<()> {
 fn run_setup() -> Result<()> {
     let exe = std::env::current_exe()?;
     latch_host::setup::run(&latch_host::setup::Plan {
+        elevated_input: latch_host::config::HostConfig::load().elevated_input,
         exe: &exe,
         adapter: "",
         adapter_description: "",

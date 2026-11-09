@@ -728,3 +728,55 @@ fn reopen_refuses_an_old_picture_held_in_the_send_queue() {
     let mut fresh = Decoder::new();
     assert_eq!(pixels, fresh.decode(&idr.data).unwrap().unwrap());
 }
+
+#[test]
+fn fallback_refits_geometry_and_prepares_the_final_mode() {
+    let prepared_sizes = Arc::new(Mutex::new(Vec::new()));
+    let seen = prepared_sizes.clone();
+    let server = Server::bind(
+        0,
+        Options {
+            prepare: Some(Box::new(move |r| {
+                seen.lock().push((r.width, r.height, r.fps));
+                Ok(None)
+            })),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let req: StreamRequest = serde_json::from_value(serde_json::json!({
+        "protocol": 1, "width": 16384, "height": 8704, "fps": 240,
+        "bitrate_kbps": 100000, "codecs": ["h264-high", "h264-baseline"],
+        "udp_port": 9, "audio": false
+    }))
+    .unwrap();
+    let limits_for = |codec| video::Limits {
+        max_side: if codec == Codec::H264Baseline {
+            1920
+        } else {
+            8192
+        },
+        ..video::Limits::level(codec)
+    };
+    let limits = limits_for(Codec::H264Baseline);
+    let mut expected = limits.fit(req.width, req.height, req.fps);
+    if let Some(c) = crate::software::ceiling() {
+        expected = c.fit(expected.0, expected.1, expected.2);
+    }
+    let mut calls = Vec::new();
+    let result = server.prepare_using(
+        req,
+        "127.0.0.1:9".parse().unwrap(),
+        vec![Codec::H264High, Codec::H264Baseline],
+        limits_for,
+        |cfg| {
+            calls.push(cfg.clone());
+            Err(video::Unencodable("injected open failure".into()).into())
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(calls.len(), 2);
+    let last = calls.last().unwrap();
+    assert_eq!((last.width, last.height, last.fps), expected);
+    assert_eq!(prepared_sizes.lock().last(), Some(&expected));
+}

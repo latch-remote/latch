@@ -92,6 +92,7 @@ fn connect_with(
             port,
         },
         Settings {
+            prefer_color: false,
             color: Default::default(),
             width: W,
             height: H,

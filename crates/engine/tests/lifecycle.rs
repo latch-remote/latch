@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 fn request(name: &str) -> StreamRequest {
     StreamRequest {
+        prefer_color: false,
         color: Default::default(),
         protocol: latch_proto::PROTOCOL,
         width: 64,
@@ -181,6 +182,7 @@ fn post_accept_end_close_and_missing_media_are_reported_as_failures() {
                 port,
             },
             Settings {
+                prefer_color: false,
                 color: Default::default(),
                 width: 64,
                 height: 64,

@@ -570,13 +570,7 @@ pub fn uninstall() -> Result<Vec<String>> {
 /// Ask a service nobody supervises (started by a window) to stop.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn quit_service() {
-    let _ = latch_core::http::request(
-        ("127.0.0.1", latch_core::CONTROL_PORT),
-        "POST",
-        "/v1/quit",
-        None,
-        std::time::Duration::from_secs(2),
-    );
+    let _ = crate::local_control::request("POST", "/v1/quit", std::time::Duration::from_secs(2));
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -754,13 +748,7 @@ pub fn adopt_legacy_bundle(background: bool) -> Result<()> {
             .stderr(Stdio::null())
             .status();
         // A service nobody supervised, started by an earlier window.
-        let _ = latch_core::http::request(
-            ("127.0.0.1", latch_core::CONTROL_PORT),
-            "POST",
-            "/v1/quit",
-            None,
-            Duration::from_secs(2),
-        );
+        let _ = crate::local_control::request("POST", "/v1/quit", Duration::from_secs(2));
         std::thread::sleep(Duration::from_millis(600));
         if had_agent {
             if let Ok(plist) = launch_agent_path() {
