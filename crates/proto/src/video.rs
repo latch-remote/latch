@@ -12,7 +12,27 @@ pub const REORDER_GRACE: Duration = Duration::from_millis(3);
 /// incomplete is lost.
 pub const FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 /// Largest frame the reassembler accepts.
-pub const MAX_FRAME_LEN: usize = 32 << 20;
+pub const MAX_FRAME_LEN: usize = u8::MAX as usize * crate::MAX_BLOCK_DATA * crate::MAX_SHARD_LEN;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketizeError {
+    FrameTooLarge,
+    Fec,
+}
+
+impl std::fmt::Display for PacketizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::FrameTooLarge => "frame exceeds the packetizer layout",
+                Self::Fec => "frame parity encoding failed",
+            }
+        )
+    }
+}
+impl std::error::Error for PacketizeError {}
 /// Incomplete frames kept at once; the oldest is lost beyond this.
 pub const MAX_PENDING_FRAMES: usize = 32;
 
@@ -146,9 +166,13 @@ impl Packetizer {
     /// that loses nothing is complete as soon as its data has arrived, and
     /// its data never waits for parity to be computed; a burst that takes
     /// out data is less likely to take out the parity sent after it.
-    /// Returns the frame's number. An empty frame is sent as one
+    /// Returns the frame's number, or an explicit layout/parity error. An empty frame is sent as one
     /// zero-length data shard.
-    pub fn packetize(&mut self, frame: &OutFrame<'_>, mut emit: impl FnMut(&[u8])) -> u32 {
+    pub fn packetize(
+        &mut self,
+        frame: &OutFrame<'_>,
+        mut emit: impl FnMut(&[u8]),
+    ) -> Result<u32, PacketizeError> {
         self.packetize_batches(frame, |batch| {
             for datagram in batch {
                 emit(datagram);
@@ -162,7 +186,12 @@ impl Packetizer {
         &mut self,
         frame: &OutFrame<'_>,
         mut emit: impl FnMut(&[Vec<u8>]),
-    ) -> u32 {
+    ) -> Result<u32, PacketizeError> {
+        if frame.data.len() > MAX_FRAME_LEN
+            || frame.data.len().div_ceil(self.shard_len) > u8::MAX as usize * crate::MAX_BLOCK_DATA
+        {
+            return Err(PacketizeError::FrameTooLarge);
+        }
         let number = self.next_frame;
         self.next_frame = self.next_frame.wrapping_add(1);
         let recovery = self
@@ -175,7 +204,7 @@ impl Packetizer {
         let total = frame.data.len().div_ceil(len).max(1);
         let blocks = total.div_ceil(crate::MAX_BLOCK_DATA);
         if blocks > u8::MAX as usize || frame.data.len() > u32::MAX as usize {
-            return number;
+            return Err(PacketizeError::FrameTooLarge);
         }
         let mut used = 0;
         // The last shard, zero-padded to the shard length.
@@ -247,10 +276,10 @@ impl Packetizer {
             parity_flat.resize(parity * len, 0);
             let mut out: Vec<&mut [u8]> = parity_flat.chunks_exact_mut(len).collect();
             let Ok(coder) = crate::fec::ReedSolomon::cached(data, parity) else {
-                return number;
+                return Err(PacketizeError::Fec);
             };
             if coder.encode(&refs, &mut out).is_err() {
-                return number;
+                return Err(PacketizeError::Fec);
             }
             for (index, bytes) in parity_flat.chunks_exact(len).enumerate() {
                 let shard = VideoShard {
@@ -269,7 +298,7 @@ impl Packetizer {
         if used > 0 {
             emit(&self.buffers[..used]);
         }
-        number
+        Ok(number)
     }
 }
 
@@ -952,6 +981,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn frame_layout_boundary_is_explicit_and_does_not_consume_a_number() {
+        let mut packetizer = Packetizer::new(1);
+        let data = vec![0; MAX_FRAME_LEN + 1];
+        assert_eq!(
+            packetizer.packetize(
+                &OutFrame {
+                    data: &data,
+                    keyframe: false,
+                    host_delay: 0
+                },
+                |_| panic!("oversize emitted data")
+            ),
+            Err(PacketizeError::FrameTooLarge)
+        );
+        assert_eq!(packetizer.next_frame(), 0);
+        let mut packets = 0;
+        let mut receiver = Reassembler::new(1);
+        let now = Instant::now();
+        assert_eq!(
+            packetizer.packetize(
+                &OutFrame {
+                    data: &data[..MAX_FRAME_LEN],
+                    keyframe: false,
+                    host_delay: 0
+                },
+                |dg| {
+                    let crate::wire::Datagram::Video { shard, .. } =
+                        crate::wire::parse(dg).unwrap()
+                    else {
+                        panic!()
+                    };
+                    assert_eq!(shard.blocks, 255);
+                    if packets == 0 {
+                        receiver.push(&shard, now);
+                    }
+                    packets += 1;
+                }
+            ),
+            Ok(0)
+        );
+        assert!(packets >= 255 * crate::MAX_BLOCK_DATA);
+        assert!(receiver.pending.contains_key(&0));
+    }
+
+    #[test]
     fn keyframes_and_recovery_survive_four_packet_bursts_even_when_tiny() {
         for size in [1, 7 * crate::MAX_SHARD_LEN, 150 * crate::MAX_SHARD_LEN] {
             for recovery in [false, true] {
@@ -985,7 +1059,8 @@ mod tests {
                             rx.push(&shard, now);
                         }
                     },
-                );
+                )
+                .unwrap();
                 let Some(Reassembled::Frame(frame)) = rx.poll(now) else {
                     panic!("lost protected frame size={size}")
                 };
@@ -1014,24 +1089,26 @@ mod tests {
             }
             let number = packetizer.next_frame();
             let data = [byte; 10];
-            packetizer.packetize(
-                &OutFrame {
-                    data: &data,
-                    keyframe,
-                    host_delay: 0,
-                },
-                |datagram| {
-                    let Ok(crate::wire::Datagram::Video { shard, .. }) =
-                        crate::wire::parse(datagram)
-                    else {
-                        panic!("not a video datagram");
-                    };
-                    assert_eq!(shard.recovery != 0, base.is_some() && !keyframe);
-                    if !lost.contains(&number) {
-                        reassembler.push(&shard, now);
-                    }
-                },
-            );
+            packetizer
+                .packetize(
+                    &OutFrame {
+                        data: &data,
+                        keyframe,
+                        host_delay: 0,
+                    },
+                    |datagram| {
+                        let Ok(crate::wire::Datagram::Video { shard, .. }) =
+                            crate::wire::parse(datagram)
+                        else {
+                            panic!("not a video datagram");
+                        };
+                        assert_eq!(shard.recovery != 0, base.is_some() && !keyframe);
+                        if !lost.contains(&number) {
+                            reassembler.push(&shard, now);
+                        }
+                    },
+                )
+                .unwrap();
             while let Some(r) = reassembler.poll(now) {
                 out.push(r);
             }
@@ -1266,24 +1343,27 @@ mod tests {
         let mut kinds = Vec::new();
         let mut reassembler = Reassembler::new(9);
         let now = Instant::now();
-        packetizer.packetize(
-            &OutFrame {
-                data: &data,
-                keyframe: true,
-                host_delay: 0,
-            },
-            |datagram| {
-                let Ok(crate::wire::Datagram::Video { shard, .. }) = crate::wire::parse(datagram)
-                else {
-                    panic!("not a video datagram");
-                };
-                kinds.push(shard.shard >= shard.data);
-                // Only the data reaches the viewer: it is enough.
-                if shard.shard < shard.data {
-                    reassembler.push(&shard, now);
-                }
-            },
-        );
+        packetizer
+            .packetize(
+                &OutFrame {
+                    data: &data,
+                    keyframe: true,
+                    host_delay: 0,
+                },
+                |datagram| {
+                    let Ok(crate::wire::Datagram::Video { shard, .. }) =
+                        crate::wire::parse(datagram)
+                    else {
+                        panic!("not a video datagram");
+                    };
+                    kinds.push(shard.shard >= shard.data);
+                    // Only the data reaches the viewer: it is enough.
+                    if shard.shard < shard.data {
+                        reassembler.push(&shard, now);
+                    }
+                },
+            )
+            .unwrap();
         assert!(kinds.iter().filter(|&&parity| !parity).count() > 64);
         let first_parity = kinds.iter().position(|&parity| parity).unwrap();
         assert!(kinds[first_parity..].iter().all(|&parity| parity));

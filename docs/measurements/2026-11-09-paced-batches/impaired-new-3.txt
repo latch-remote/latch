@@ -1,0 +1,14 @@
+
+running 1 test
+ 59.8 fps  0.60 Mbps loss  0.0% fec  12 decode  0.6 ms budget 6000 kbps rtt=26ms local_queue=0.04ms app_limited=true
+ 59.7 fps  0.70 Mbps loss  0.0% fec  14 decode  0.7 ms budget 6000 kbps rtt=26ms local_queue=0.05ms app_limited=true
+ 58.4 fps  0.49 Mbps loss  0.0% fec  11 decode  0.9 ms budget 6000 kbps rtt=26ms local_queue=0.08ms app_limited=true
+ 62.3 fps  0.65 Mbps loss  0.0% fec  16 decode  1.3 ms budget 6000 kbps rtt=26ms local_queue=2.91ms app_limited=true
+ 57.5 fps  0.50 Mbps loss  0.0% fec  10 decode  5.9 ms budget 4800 kbps rtt=25ms local_queue=1.70ms app_limited=true
+ 35.4 fps  0.54 Mbps loss  0.0% fec  17 decode  0.8 ms budget 6000 kbps rtt=25ms local_queue=0.06ms app_limited=true
+ 59.8 fps  0.45 Mbps loss  0.0% fec  13 decode  0.7 ms budget 6000 kbps rtt=25ms local_queue=0.06ms app_limited=true
+ 59.4 fps  0.66 Mbps loss  0.0% fec  16 decode  0.7 ms budget 6000 kbps rtt=24ms local_queue=0.06ms app_limited=true
+average 56.5 fps through the bad network; FEC rebuilt 109 shards
+test a_bad_network_slows_the_picture_but_loses_no_key ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.64s

@@ -325,39 +325,45 @@ fn video_timeout_advances_past_head_with_no_shards() {
     let mut link = Link::new(Impairment::NONE, 1);
     let mut sender = Packetizer::new(1);
     let mut receiver = Reassembler::new(1);
-    sender.packetize(
-        &OutFrame {
-            data: &[1],
-            keyframe: true,
-            host_delay: 0,
-        },
-        |dg| link.send(now, dg),
-    );
+    sender
+        .packetize(
+            &OutFrame {
+                data: &[1],
+                keyframe: true,
+                host_delay: 0,
+            },
+            |dg| link.send(now, dg),
+        )
+        .unwrap();
     receive_video(&mut link, &mut receiver, now);
     assert!(matches!(receiver.poll(now), Some(Reassembled::Frame(_))));
-    sender.packetize(
-        &OutFrame {
-            data: &[2],
-            keyframe: false,
-            host_delay: 0,
-        },
-        |_| {},
-    );
+    sender
+        .packetize(
+            &OutFrame {
+                data: &[2],
+                keyframe: false,
+                host_delay: 0,
+            },
+            |_| {},
+        )
+        .unwrap();
     let arrival = now + Duration::from_millis(10);
     let mut sent = false;
-    sender.packetize(
-        &OutFrame {
-            data: &[3; 3000],
-            keyframe: false,
-            host_delay: 0,
-        },
-        |dg| {
-            if !sent {
-                link.send(arrival, dg);
-                sent = true;
-            }
-        },
-    );
+    sender
+        .packetize(
+            &OutFrame {
+                data: &[3; 3000],
+                keyframe: false,
+                host_delay: 0,
+            },
+            |dg| {
+                if !sent {
+                    link.send(arrival, dg);
+                    sent = true;
+                }
+            },
+        )
+        .unwrap();
     receive_video(&mut link, &mut receiver, arrival);
     let deadline = arrival + FRAME_TIMEOUT;
     assert_eq!(receiver.next_deadline(), Some(deadline));
@@ -384,14 +390,16 @@ fn video_initial_keyframe_requests_start_only_after_loss() {
         let mut requests = KeyframeRequests::new();
         assert!(!requests.due(receiver.waiting_for_keyframe(), now, None));
         let mut shards = Vec::new();
-        sender.packetize(
-            &OutFrame {
-                data: &[1; 3000],
-                keyframe: true,
-                host_delay: 0,
-            },
-            |dg| shards.push(dg.to_vec()),
-        );
+        sender
+            .packetize(
+                &OutFrame {
+                    data: &[1; 3000],
+                    keyframe: true,
+                    host_delay: 0,
+                },
+                |dg| shards.push(dg.to_vec()),
+            )
+            .unwrap();
         link.send(now, &shards[0]);
         receive_video(&mut link, &mut receiver, now);
         assert!(receiver.poll(now).is_none());
@@ -493,14 +501,16 @@ fn another_frames_timeout_leaves_an_assembling_frame_alone() {
     let mut receiver = Reassembler::new(1);
     let mut frame = |data: &[u8], keyframe| {
         let mut shards = Vec::new();
-        sender.packetize(
-            &OutFrame {
-                data,
-                keyframe,
-                host_delay: 0,
-            },
-            |dg| shards.push(dg.to_vec()),
-        );
+        sender
+            .packetize(
+                &OutFrame {
+                    data,
+                    keyframe,
+                    host_delay: 0,
+                },
+                |dg| shards.push(dg.to_vec()),
+            )
+            .unwrap();
         shards
     };
     for dg in frame(&[1; 2400], true) {

@@ -168,7 +168,7 @@ pub fn run(s: &Scenario) -> Outcome {
                     pending.push_back((dg.to_vec(), number));
                     count += 1;
                 },
-            );
+            ).unwrap();
             last_dg_of.insert(number, count);
             enqueued.insert(number, (ms, size, fixed.is_some()));
             frames_pending += 1;

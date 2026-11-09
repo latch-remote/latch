@@ -170,7 +170,8 @@ fn transport_scenarios() {
                         }
                         pending.push_back((dg.to_vec(), false));
                     },
-                );
+                )
+                .unwrap();
                 pending.back_mut().unwrap().1 = true;
                 pending_frames += 1;
                 next_frame = ms * fps / 1000 + 1;
