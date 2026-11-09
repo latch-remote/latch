@@ -240,14 +240,16 @@ impl Controller {
         let falling = delay + 0.5 < self.previous_delay;
         self.gradient = self.gradient * 0.5 + (delay - self.previous_delay) * 0.5;
         self.previous_delay = delay;
-        // Idle streams never learned their radio jitter.
+        // Idle streams never learned their radio jitter, and pacing does
+        // not teach it: the estimate stays frozen while pacing, and the
+        // first false queue is what turned pacing on. Keep the floor
+        // until the sender actually fills its budget. Dropping it at the
+        // first cut makes a few milliseconds of jitter — under the idle
+        // threshold — look like a standing queue, and the next cut then
+        // adopts one sparse window's send rate.
         let jitter = self
             .jitter
-            .max(if self.application_limited() && !self.pacing {
-                3.0
-            } else {
-                0.0
-            });
+            .max(if self.application_limited() { 3.0 } else { 0.0 });
         let threshold = 6.0f32.max(self.min_rtt[1].min(self.min_rtt[0]) * 0.1);
         queued |= delay > threshold.max(jitter * 3.0);
         queued |= delay > 3.0f32.max(jitter * 1.5) && self.gradient > jitter.max(1.0);
@@ -998,6 +1000,54 @@ mod tests {
         // Back to the budget it had before the delay, a second after the
         // pacer settles and the delay is gone.
         assert!(recovered.is_some_and(|ms| ms <= 4000), "{recovered:?}");
+    }
+
+    #[test]
+    fn an_underfilled_stream_does_not_ratchet_after_one_delay_spike() {
+        // Impaired-session shape from macOS CI: a sweep sends a few hundred
+        // kilobits, one 50 ms window carries a whole frame (~2.2 Mbps), and
+        // two-way jitter stays inside 8 ms. Two windows of runner scheduling
+        // (still under 20 ms) may cost one 20% cut. They must not drop the
+        // idle jitter floor and ratchet through that frame's rate to the
+        // floor: the failed run was 6000, 4800, 1761, 1000, with no
+        // unrecovered loss.
+        let start = Instant::now();
+        let mut c = Controller::new(6_000, start);
+        let mut t = start;
+        let mut minimum = c.budget();
+        for tick in 0..400u32 {
+            t += Duration::from_millis(50);
+            let sent = if tick % 7 == 0 { 2_202 } else { 260 };
+            c.observe_sent(sent);
+            // 0, 2, 4, 6, 8 ms, the impairment's jitter in both directions.
+            // Two windows at +15 ms stand in for a scheduling spike.
+            let extra = if (120..122).contains(&tick) {
+                15.0
+            } else {
+                (tick % 5) as f32 * 2.0
+            };
+            let raw = if tick % 11 == 0 { 6.0 } else { 0.0 };
+            c.update(
+                t,
+                &Report {
+                    rtt_ms: 20.0 + extra,
+                    window_ms: 50,
+                    loss_pct: raw,
+                    unrecovered_loss_pct: Some(0.0),
+                    received_kbps: sent,
+                    ..Default::default()
+                },
+                20.0 + extra,
+                0.0,
+            );
+            minimum = minimum.min(c.budget());
+        }
+        assert!(
+            c.application_limited(),
+            "must exercise an underfilled encoder"
+        );
+        assert!(minimum >= 4_800, "delay spike ratcheted budget: {minimum}");
+        assert_eq!(c.budget(), 6_000, "did not restore the idle budget");
     }
 
     #[test]
