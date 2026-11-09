@@ -442,17 +442,18 @@ is rejected. Equal timestamps allow up to 1 ms of receive batching noise;
 an entirely batched train supplies only a high timing bound.
 The fastest usable rate goes in `probe_kbps`; zero means unknown.
 
-These datagrams bypass the video pacer and **are outside the wire budget**
-and ordinary throughput counters (`received_kbps` counts no probes).
-Including the 80-byte per-datagram tunnel allowance, each train bursts
-7,680–20,480 B, up to ~330 kbps extra in the first idle second (two trains),
-then ≤164 kbps. A 16-packet burst takes 32.8 ms at 5 Mbps in a 40 ms FIFO;
-skipping low retained budgets reduces this risk, but cannot prevent a
-burst overflowing a path that fell below the retained rate or a small
-policer bucket. After every train an ordinary 16-byte Ping (96 modeled
-wire bytes) independently times its queue. Its echo is kept separate from
-the ordinary minimum RTT; it must show delay above the measured ping
-jitter before a train alone can lower the target. Padding and these extra
+These datagrams share the video sender's pacer and successful-send accounting.
+The sender budgets payload plus the 80-byte per-datagram tunnel allowance in
+its token bucket, and cancels a train between batches when video is queued or
+fresh controller feedback reports pressure. An otherwise unpaced sender uses
+2.5 times its current wire budget for probes. Viewer `received_kbps` continues
+to count media only, preserving protocol-1 feedback semantics. Each train costs
+7,680–20,480 modeled wire bytes; pacing bounds bursts but cannot prove safety
+after an unknown capacity drop or through a small policer bucket. After a
+completed train an ordinary 16-byte Ping (96 modeled wire bytes) independently
+times its queue. Its echo is kept separate from the ordinary minimum RTT; it
+must show delay above measured ping jitter before a train alone can lower the
+target. Pacing itself may limit usable dispersion. Padding and these extra
 pings add no new wire fields; old viewers receive neither train nor echo.
 
 ## Versioning

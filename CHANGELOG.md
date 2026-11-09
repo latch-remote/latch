@@ -8,6 +8,14 @@ GitHub release notes, so each version gets a heading of the form
 
 - Honour negotiated Linux/software output dimensions with damage-aware area scaling, aspect fitting, and matching cursor and input geometry.
 
+- A stream that loses its connection keeps trying for five minutes
+  instead of three attempts: after 2, 5 and 10 seconds, then every 20 to 30,
+  and at once when the machine shows as online again or this one wakes.
+  **Reconnect now** and **Stop** stay on screen. A refusal, another viewer
+  taking over, or the host ending the stream stops the retries.
+- Windows viewer: a hardware decoder that stops answering no longer freezes
+  the stream. Every wait on Media Foundation has a deadline; a stalled
+  decoder is abandoned and reopened at the next keyframe.
 - Windows hosts check every pushed update against the SHA-256 GitHub
   publishes for that release's `latch-host.exe`, not against the hash the
   sender supplies. A release without that file, or a PC that cannot reach
@@ -32,8 +40,6 @@ GitHub release notes, so each version gets a heading of the form
 - The clipboard is shared only with the machine that is streaming, or was
   in the last five seconds, and has a switch on the Sharing tab.
 
-## Unreleased
-
 - Auto preserves mutually supported HEVC ten-bit/HDR instead of preferring
   eight-bit AV1, when both peers opt in. Explicit codec choices keep their order.
 - Encoder fallback refits the original request and prepares the final desktop size.
@@ -44,6 +50,7 @@ GitHub release notes, so each version gets a heading of the form
   and frame budget, and name immediate presentation. Correct the small-window
   keyboard snapshot fixture. Native decode benchmarks validate native surfaces
   and separately time CPU materialisation.
+- Batch paced video with fresh rate reads, backpressure capture under pacing, account idle probes, and report oversized encoded frames explicitly.
 
 ## 5.2.0 (2026-11-04)
 

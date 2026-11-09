@@ -11,7 +11,13 @@ remote machine, or port 47850 was used. Baseline: `69539f01d947326b050633406b0ba
 |---|---|---|---|
 | Xvfb 3840×2160 | 1920×1080 | 3840×2160 | 1920×1080 |
 | Xvfb 3840×2160 | 3840×2160 | native geometry | 3840×2160 |
+| Xvfb 3840×2160 | 1920×1200 | not rerun | 1920×1200, exact 60-row black bars top/bottom |
 | Synthetic 1280×720 | 640×360 | not rerun | 640×360, decoded in loopback test |
+
+For the different-aspect request, a white desktop decoded as white content in
+rows 60–1139 with black rows 0–59 and 1140–1199 (decoded PGM luma checked).
+Keep an X client connected before `xsetroot -solid white`, or start Xvfb with
+`-noreset`, so the fixture background survives client disconnects.
 
 The smaller request now encodes one quarter as many pixels. This is a geometry
 result, not a measured fourfold speedup. Capture remains at native size. The

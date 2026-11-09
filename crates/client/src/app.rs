@@ -629,6 +629,14 @@ impl ClientApp {
                     live.codec = s.codec;
                 }
             }
+            let online = self
+                .discovery
+                .lock()
+                .pcs
+                .iter()
+                .any(|pc| pc.node_id == live.node_id && pc.online);
+            self.view
+                .observe_recovery(online, std::time::SystemTime::now(), Instant::now());
             let mut prog = self.progress.lock();
             while live.generation == prog.generation {
                 let Ok(ev) = live.events.try_recv() else {
@@ -682,6 +690,10 @@ impl ClientApp {
                             if cancelled { " after a stop" } else { "" }
                         );
                         self.stream_failed = !cancelled;
+                        // An HTTP refusal is an answer, not a broken path.
+                        if !cancelled && stage == "starting" {
+                            self.view.interrupted = Some(crate::stream::Interruption::Failed);
+                        }
                         if !cancelled && live.frames.seq() > 0 && self.view.interrupted.is_none() {
                             self.view.handle_interruption();
                         }
@@ -698,6 +710,10 @@ impl ClientApp {
                                 Some(crate::stream::Interruption::TakenOver(message.clone()));
                         } else if self.power_sent.load(Ordering::Relaxed) {
                             self.view.interrupted = Some(crate::stream::Interruption::HostSleeping);
+                        } else if !cancelled && matches!(code, 0 | 5) {
+                            // An explicit end or host-side Stop must never be
+                            // answered by automatic takeover.
+                            self.view.interrupted = Some(crate::stream::Interruption::Failed);
                         } else if error && live.frames.seq() > 0 && self.view.interrupted.is_none()
                         {
                             self.view.handle_interruption();
@@ -4473,6 +4489,7 @@ mod live_snapshot {
         for attempt in 1..=3 {
             h.state_mut().view.interrupted = Some(crate::stream::Interruption::Reconnecting(
                 crate::stream::ReconnectState {
+                    started: Instant::now(),
                     attempt,
                     deadline: Instant::now(),
                     in_flight: true,
@@ -4501,13 +4518,9 @@ mod live_snapshot {
             let after = h.state().view.interrupted.clone();
             h.state_mut().poll_live(&ctx);
             assert_eq!(h.state().view.interrupted, after, "one failure counts once");
-            if attempt < 3 {
-                assert!(
-                    matches!(after, Some(crate::stream::Interruption::Reconnecting(s)) if s.attempt == attempt + 1 && !s.in_flight)
-                );
-            } else {
-                assert_eq!(after, Some(crate::stream::Interruption::Failed));
-            }
+            assert!(
+                matches!(after, Some(crate::stream::Interruption::Reconnecting(s)) if s.attempt == attempt + 1 && !s.in_flight)
+            );
             assert!(h.state().fullscreen);
             assert_eq!(h.state().fullscreen_after, Some(false));
         }
@@ -4519,12 +4532,48 @@ mod live_snapshot {
     }
 
     #[test]
+    fn reconnect_stops_when_the_stream_upgrade_is_refused() {
+        let mut h = snapshots::build(
+            snapshots::Setup::new(Discovery::default()),
+            egui::vec2(800.0, 600.0),
+            1.0,
+            false,
+        );
+        let ctx = h.ctx.clone();
+        let mut live = crate::stream::tests::dummy_live(&ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        live.events = rx;
+        *h.state().live.lock() = Some(live);
+        h.state().progress.lock().step = Step::Connecting;
+        let mut state = crate::stream::ReconnectState::new(Instant::now());
+        state.in_flight = true;
+        h.state_mut().view.interrupted = Some(crate::stream::Interruption::Reconnecting(state));
+        tx.send(Event::Failed {
+            stage: "starting".into(),
+            message: "HTTP 403: refused".into(),
+        })
+        .unwrap();
+        h.state_mut().poll_live(&ctx);
+        assert_eq!(
+            h.state().view.interrupted,
+            Some(crate::stream::Interruption::Failed)
+        );
+        h.state_mut().poll_live(&ctx);
+        assert_eq!(
+            h.state().view.interrupted,
+            Some(crate::stream::Interruption::Failed)
+        );
+    }
+
+    #[test]
     fn review_session_end_events_retry_only_unexpected_loss() {
         for (cancel, sleeping, code, retry) in [
             (false, false, 2, true),
             (true, false, 2, false),
             (false, true, 2, false),
             (false, false, 1, false),
+            (false, false, 0, false),
+            (false, false, 5, false),
         ] {
             let mut h = snapshots::build(
                 snapshots::Setup::new(Discovery::default()),

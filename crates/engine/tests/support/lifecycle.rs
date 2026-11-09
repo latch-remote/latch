@@ -729,6 +729,274 @@ fn reopen_refuses_an_old_picture_held_in_the_send_queue() {
     assert_eq!(pixels, fresh.decode(&idr.data).unwrap().unwrap());
 }
 
+thread_local! {
+    pub(super) static SEND_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(super) static SEND_SAMPLES: std::cell::RefCell<Vec<(f64, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Codec-free real sockets: isolates sender scheduling from encoder/decoder speed.
+/// Re-run in release, one case per process (PB_CAP kbps, PB_RTT ms, PB_SECONDS).
+#[test]
+#[ignore]
+fn paced_socket_measurement() {
+    use latch_proto::{
+        sim::{Impairment, Link},
+        video::{Reassembled, Reassembler},
+    };
+    let cap: u32 = std::env::var("PB_CAP")
+        .unwrap_or("20000".into())
+        .parse()
+        .unwrap();
+    let rtt: u64 = std::env::var("PB_RTT")
+        .unwrap_or("20".into())
+        .parse()
+        .unwrap();
+    let seconds: u64 = std::env::var("PB_SECONDS")
+        .unwrap_or("3".into())
+        .parse()
+        .unwrap();
+    let requested = if cap == 0 {
+        std::env::var("PB_REQUEST")
+            .unwrap_or("100000".into())
+            .parse()
+            .unwrap()
+    } else {
+        cap * 2
+    };
+    let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+    receiver.set_nonblocking(true).unwrap();
+    let viewer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    viewer.set_nonblocking(true).unwrap();
+    let viewer_addr = viewer.local_addr().unwrap();
+    let session = session(receiver.local_addr().unwrap());
+    session.transport.budget.store(requested, Ordering::Relaxed);
+    // Start clean, just like the production controller.
+    session.pace_kbps.store(
+        if std::env::var_os("PB_START_PACED").is_some() {
+            cap * 5 / 2
+        } else {
+            0
+        },
+        Ordering::Relaxed,
+    );
+    let server = Server::bind(0, Options::default()).unwrap();
+    let (tx, rx) = mpsc::sync_channel(2);
+    let start = Instant::now();
+    let stop_at = start + Duration::from_secs(seconds);
+    let timeline = Arc::new(Mutex::new(Vec::new()));
+    let mut produced = 0;
+    let mut delays = Vec::new();
+    let mut good = 0usize;
+    let mut lost = 0;
+    let mut delivered = 0;
+    std::thread::scope(|scope| {
+        let samples = scope.spawn(|| {
+            let cpu = thread_cpu();
+            paced_video(&server, &session, rx);
+            (
+                SEND_SAMPLES.with(|s| s.take()),
+                thread_cpu() - cpu,
+                SEND_CALLS.with(|s| s.get()),
+            )
+        });
+        let timeline_ref = &timeline;
+        let producer_session = &session;
+        let producer = scope.spawn(move || {
+            let mut last_key = None;
+            let mut index = 0;
+            while Instant::now() < stop_at {
+                while std::env::var_os("PB_DROP").is_none()
+                    && producer_session.pace_kbps.load(Ordering::Relaxed) != 0
+                    && producer_session.transport.pending.load(Ordering::Acquire) != 0
+                {
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                let at = Instant::now();
+                let target = crate::congestion::video_budget(
+                    producer_session.transport.budget.load(Ordering::Relaxed),
+                    10,
+                    0,
+                    60,
+                    false,
+                    false,
+                );
+                let size = target as usize * 1000 / 8 / 60;
+                let key = index == 0
+                    || (recovery_due(last_key, at, Some(Duration::from_millis(rtt)))
+                        && producer_session.keyframe.swap(false, Ordering::Relaxed));
+                if key {
+                    last_key = Some(at);
+                }
+                timeline_ref.lock().push(at);
+                let mut frame = EncodedVideo {
+                    data: vec![17; size * if index == 0 { 8 } else { 1 }],
+                    keyframe: key,
+                    captured: at,
+                    picture: index,
+                    generation: 0,
+                    recovery: None,
+                };
+                frame.data[..8].copy_from_slice(&index.to_le_bytes());
+                producer_session
+                    .transport
+                    .pending
+                    .fetch_add(1, Ordering::Release);
+                if tx.send((frame, at)).is_err() {
+                    break;
+                }
+                index += 1;
+                std::thread::sleep(
+                    (start + Duration::from_secs_f64(index as f64 / 60.0))
+                        .saturating_duration_since(Instant::now()),
+                );
+            }
+            index
+        });
+        let mut link = Link::new(
+            Impairment {
+                delay: Duration::from_millis(rtt / 2),
+                ..Impairment::NONE
+            },
+            17,
+        );
+        link.set_bandwidth(cap, Duration::from_millis(50));
+        let mut assembly = Reassembler::new(7);
+        let mut controller = crate::congestion::Controller::new(requested, start);
+        let mut mark = start;
+        let mut before = (0, 0, 0);
+        let mut sent_before = 0;
+        let mut received = 0usize;
+        let mut buf = [0; 2048];
+        while Instant::now() < stop_at + Duration::from_secs(2) {
+            while let Ok((n, _)) = receiver.recv_from(&mut buf) {
+                link.send(Instant::now(), &buf[..n]);
+            }
+            let now = Instant::now();
+            for d in link.receive(now) {
+                received += d.len();
+                viewer.send_to(&d, viewer_addr).unwrap();
+            }
+            while let Ok((n, _)) = viewer.recv_from(&mut buf) {
+                if let Ok(wire::Datagram::Video { shard, .. }) = wire::parse(&buf[..n]) {
+                    assembly.push(&shard, now);
+                }
+            }
+            while let Some(out) = assembly.poll(now) {
+                match out {
+                    Reassembled::Frame(f) => {
+                        good += f.data.len();
+                        delivered += 1;
+                        if let Some(at) = timeline
+                            .lock()
+                            .get(u64::from_le_bytes(f.data[..8].try_into().unwrap()) as usize)
+                        {
+                            delays.push(at.elapsed().as_secs_f64() * 1000.0);
+                        }
+                    }
+                    Reassembled::Lost { .. } => {
+                        lost += 1;
+                        session.keyframe.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+            if now.duration_since(mark) >= Duration::from_millis(50) {
+                let elapsed = now.duration_since(mark).as_secs_f64();
+                let counts = link.counts();
+                let sent = session.bytes.load(Ordering::Relaxed);
+                controller
+                    .observe_sent(((sent - sent_before) as f64 * 8.0 / 1000.0 / elapsed) as u32);
+                let loss =
+                    (counts.1 - before.1) as f32 * 100.0 / (counts.0 - before.0).max(1) as f32;
+                let report = control::Report {
+                    rtt_ms: rtt as f32 + link.queue_delay(now).as_secs_f32() * 1000.0,
+                    loss_pct: loss,
+                    unrecovered_loss_pct: Some(loss),
+                    received_kbps: (received as f64 * 8.0 / 1000.0 / elapsed) as u32,
+                    window_ms: (elapsed * 1000.0) as u32,
+                    ..Default::default()
+                };
+                controller.update(
+                    now,
+                    &report,
+                    report.rtt_ms,
+                    session.transport.queue_us.swap(0, Ordering::Relaxed) as f32 / 1000.0,
+                );
+                session
+                    .transport
+                    .budget
+                    .store(controller.budget(), Ordering::Relaxed);
+                session
+                    .pace_kbps
+                    .store(controller.pace_kbps(), Ordering::Relaxed);
+                mark = now;
+                before = counts;
+                sent_before = sent;
+                received = 0;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        produced = producer.join().unwrap();
+        let (mut samples, cpu, calls) = samples.join().unwrap();
+        samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+        delays.sort_by(f64::total_cmp);
+        let q = |p: f64| {
+            samples
+                .get(((samples.len().saturating_sub(1)) as f64 * p) as usize)
+                .map_or(0.0, |s| s.0)
+        };
+        let d = |p: f64| {
+            delays
+                .get(((delays.len().saturating_sub(1)) as f64 * p) as usize)
+                .copied()
+                .unwrap_or(0.0)
+        };
+        eprintln!("PB cap={cap} rtt={rtt} request={requested} good_mbps={:.3} queue_ms={:.3}/{:.3}/{:.3} frame_ms={:.3}/{:.3} produced={produced} delivered={delivered} lost={lost} keys={} syscalls_per_s={:.1} skipped={} sender_cpu_ms={:.3}", good as f64 * 8.0 / seconds as f64 / 1e6, q(0.5), q(0.95), q(1.0), d(0.5), d(0.95), samples.iter().filter(|s| s.1).count(), calls as f64 / seconds as f64, assembly.stats().frames_skipped, cpu * 1000.0);
+    });
+}
+
+#[cfg(unix)]
+fn thread_cpu() -> f64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes exactly one initialized timespec.
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+        0
+    );
+    time.tv_sec as f64 + time.tv_nsec as f64 / 1e9
+}
+#[cfg(not(unix))]
+fn thread_cpu() -> f64 {
+    0.0
+}
+
+#[test]
+fn idle_probes_share_sender_accounting_and_stop_under_pressure() {
+    for pressure in [false, true] {
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let session = session(udp.local_addr().unwrap());
+        let server = Server::bind(0, Options::default()).unwrap();
+        session
+            .transport
+            .probe_pressure
+            .store(pressure, Ordering::Release);
+        *session.transport.probe.lock() = Some((1, 6));
+        let (tx, rx) = mpsc::sync_channel(2);
+        drop(tx);
+        paced_video(&server, &session, rx);
+        assert_eq!(
+            session.bytes.load(Ordering::Relaxed),
+            if pressure {
+                0
+            } else {
+                6 * latch_proto::MAX_DATAGRAM as u64 + 16
+            }
+        );
+    }
+}
+
 #[test]
 fn fallback_refits_geometry_and_prepares_the_final_mode() {
     let prepared_sizes = Arc::new(Mutex::new(Vec::new()));
