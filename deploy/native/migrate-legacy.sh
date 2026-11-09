@@ -7,7 +7,7 @@
 #   bash migrate-legacy.sh
 #
 # It stops the old stack, swaps the user units, the display cookie name and
-# the wait script, and starts the new one. The data folder (settings,
+# removes old wait hooks, and starts the new one. The data folder (settings,
 # preferences) are moved by latch-host itself the
 # first time it runs, so nothing is copied here. Safe to run twice.
 set -euo pipefail
@@ -68,13 +68,5 @@ systemctl --user enable latch.service
 # restart, not start: on an upgrade the old latch-host is still running.
 systemctl --user restart latch.service
 
-for _ in $(seq 1 30); do
-	if status="$(curl -fsS --max-time 2 http://127.0.0.1:47850/v1/status 2>/dev/null)"; then
-		echo "$status" | python3 -c 'import json,sys; s=json.load(sys.stdin); print("app=%s version=%s name=%s streamer=%s running=%s" % (s["app"], s["version"], s["name"], s["streamer"]["kind"], s["streamer"]["running"]))'
-		echo "done. The previous host binary can be removed once this looks right."
-		exit 0
-	fi
-	sleep 2
-done
-echo "latch.service did not answer on 47850; see: journalctl --user -u latch -n 50" >&2
-exit 1
+echo "Check the user units, then connect from another machine's Latch window:"
+systemctl --user --no-pager status latch.service latch-desktop.service latch-display.service
