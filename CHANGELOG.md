@@ -6,13 +6,14 @@ GitHub release notes, so each version gets a heading of the form
 
 ## Unreleased
 
-- Viewer: keep reconnecting for five minutes after a lost connection, with
-  jittered backoff, Reconnect now and Stop controls. Retry sooner when the
-  host returns online or the app resumes after a long pause.
-- Windows viewer: bound Media Foundation startup, decode and hardware-probe
-  waits. Reopen a stalled decoder after requesting a keyframe, with a limit
-  on abandoned driver workers and the existing software fallback.
-
+- A stream that loses its connection keeps trying for five minutes
+  instead of three attempts: after 2, 5 and 10 seconds, then every 20 to 30,
+  and at once when the machine shows as online again or this one wakes.
+  **Reconnect now** and **Stop** stay on screen. A refusal, another viewer
+  taking over, or the host ending the stream stops the retries.
+- Windows viewer: a hardware decoder that stops answering no longer freezes
+  the stream. Every wait on Media Foundation has a deadline; a stalled
+  decoder is abandoned and reopened at the next keyframe.
 - Windows hosts check every pushed update against the SHA-256 GitHub
   publishes for that release's `latch-host.exe`, not against the hash the
   sender supplies. A release without that file, or a PC that cannot reach

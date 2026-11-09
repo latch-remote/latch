@@ -173,7 +173,7 @@ impl MfDecoder {
         Ok(Self {
             requests: Some(requests),
             stream: (codec, width, height, depth),
-            name: worker_deadline::receive(&startup, worker_deadline::DEADLINE)??,
+            name: worker_deadline::receive(&startup, worker_deadline::STARTUP)??,
         })
     }
     pub fn decode(&mut self, annexb: &[u8]) -> Result<Option<DecodedNv12>> {
@@ -195,7 +195,7 @@ impl MfDecoder {
                 reply,
             })
             .context("decoder worker stopped")?;
-        let response = match worker_deadline::receive(&receive, worker_deadline::DEADLINE) {
+        let response = match worker_deadline::receive(&receive, worker_deadline::DECODE) {
             Ok(response) => response,
             Err(error) => {
                 // Dropping the channel prevents further submissions. The stuck
@@ -263,7 +263,7 @@ pub fn supported() -> Vec<Codec> {
         })();
         let _ = tx.send(result);
     });
-    worker_deadline::receive(&rx, worker_deadline::DEADLINE).unwrap_or_default()
+    worker_deadline::receive(&rx, worker_deadline::PROBE).unwrap_or_default()
 }
 
 unsafe fn create_transform(subtype: windows::core::GUID) -> Result<IMFTransform> {

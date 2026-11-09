@@ -3,8 +3,19 @@ use anyhow::{bail, Result};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
+/// One access unit. A healthy decoder answers in milliseconds, and the
+/// VideoToolbox path gives up after the same second.
 #[cfg(windows)]
-pub(super) const DEADLINE: Duration = Duration::from_secs(1);
+pub(super) const DECODE: Duration = Duration::from_secs(1);
+/// Opening a decoder: Media Foundation, a Direct3D device and the driver's
+/// session, which a cold system can take seconds over.
+#[cfg(windows)]
+pub(super) const STARTUP: Duration = Duration::from_secs(5);
+/// Probing every codec once per process: three decoders opened and a
+/// picture decoded on each. Giving up early would report a working GPU as
+/// having no hardware decoder for as long as Latch runs.
+#[cfg(windows)]
+pub(super) const PROBE: Duration = Duration::from_secs(20);
 const WINDOW: Duration = Duration::from_secs(600);
 const MAX_STALLS: usize = 3;
 static STALLS: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
