@@ -84,10 +84,12 @@ Local results:
 - Formatting, workspace clippy and `cargo test --workspace`: passed.
 - Windows cross-target check (stream + client) and stream clippy: passed.
 - Deadline tests: 2 passed. Reconnect-filtered tests: 14 passed, 1 ignored.
-- Full ignored client snapshots: 8 passed, 1 failed. The failure is the
-  audit's existing `snapshots_stream_menus_at_the_smallest_size`:
-  `Tab never reached "Copy diagnostics"`. That test is owned by concurrent
-  viewer work and was not changed here.
+- Initial full ignored client snapshots: 8 passed, 1 failed at the audit's
+  existing `snapshots_stream_menus_at_the_smallest_size` (Copy diagnostics).
+  After merging the concurrent viewer work from main, all 9 snapshots passed.
+  That test's correction came from the concurrent branch, not this change.
+- Formatting, workspace clippy/tests and both Windows cross-target checks
+  were repeated after merging that base and passed.
 - `cargo test -p latch-client snapshots_reconnect -- --ignored`: passed;
   waiting and in-flight PNGs were inspected at minimum and typical sizes.
 - Dependencies unchanged; the dependency audit was not required.

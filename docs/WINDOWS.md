@@ -1,5 +1,18 @@
 # Windows
 
+### Viewer negotiation and decoder recovery
+
+Protocol 1 Auto peers that advertise/offer joint colour ranking prefer HEVC
+Main10/HDR when supported over SDR8 AV1. Explicit AV1 retains priority. Opening
+failures (including unavailable OS codec extensions) are suppressed per host
+and codec for five minutes; runtime decode failures cool down for 15 seconds.
+A new connection after expiry retries; Apply and reconnect bypasses cooldowns.
+This does not change the Media Foundation frame format or native transfer path.
+The immediate-present stats label describes policy, not completed presentation;
+scanout and panel latency are unmeasured. Decoder overload reports local capacity
+but does not yet retime the host session automatically.
+
+
 `latch-host.exe` is Latch on Windows: a background service other
 machines talk to over Tailscale, a window that lists every machine on
 your account (Connect opens their desktop) and shares this PC, and the
@@ -278,7 +291,8 @@ on hardware encoders. Four cached NV12 textures and their views are reused.
 - **Fallback.** H.264 High/Baseline keep the GPU MFT → Microsoft MFT →
   Latch software path. An AMF runtime failure reopens MF HEVC and starts
   with an IDR. A hardware-only codec that fails through MF ends the stream
-  and is withheld until restart; a stream never silently changes codec.
+  and the viewer reconnects without it, with a notice and host-scoped cooldown;
+  a stream never silently changes codec.
 
 ### Virtual display modes
 
@@ -541,7 +555,7 @@ loaded lazily so Windows without Media Foundation can still start.
 
 Decoders enable `CODECAPI_AVLowLatencyMode` before type negotiation. The
 streaming encoders must disable B-frame/reorder delay too. NV12 and Main10
-P010 decoder outputs are accepted; P010 is reduced to SDR eight-bit output.
+P010 decoder outputs are accepted and retain ten-bit samples for SDR/HDR presentation.
 Baseline retains the first-ten-access-unit fallback to `latch-codec`. Modern
 codecs have no pure-Rust software fallback.
 

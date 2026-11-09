@@ -42,8 +42,10 @@ const PING_EVERY: Duration = Duration::from_millis(500);
 /// Complete frames waiting for the decoder. Past this the decoder cannot
 /// keep up: the queue is dropped and the stream restarts at a keyframe,
 /// rather than the picture falling further and further behind.
-const DECODE_QUEUE: usize = 8;
-const DECODE_MAX_AGE: Duration = Duration::from_millis(50);
+const DECODE_QUEUE: usize = 3;
+fn decode_max_age(fps: u32) -> Duration {
+    Duration::from_secs_f64((3.0 / f64::from(fps.max(1))).clamp(0.012, 0.100))
+}
 const REPORT_EVERY: Duration = Duration::from_millis(50);
 const STATS_EVERY: Duration = Duration::from_millis(250);
 /// How long a stopping session waits for a decode in progress. A platform
@@ -102,6 +104,8 @@ pub struct Server {
 
 #[derive(Debug, Clone)]
 pub struct Settings {
+    /// Host advertised joint colour ranking and the user chose Auto.
+    pub prefer_color: bool,
     pub color: latch_proto::color::ColorCapabilities,
     pub width: u32,
     pub height: u32,
@@ -144,6 +148,10 @@ pub struct Stats {
     pub rtt_ms: u32,
     pub rtt_var_ms: u32,
     pub decode_ms: f32,
+    pub decode_p95_ms: f32,
+    pub frame_budget_ms: f32,
+    /// Sustained decoder throughput; zero until overload is detected.
+    pub decode_capacity_fps: u32,
     /// Capture to send on the host.
     pub host_ms: f32,
     /// First shard to whole frame.
@@ -369,6 +377,7 @@ impl VideoHealth {
 struct DecodeWindow {
     frames: u32,
     decode_us: u64,
+    samples_us: Vec<u64>,
     queue_us: u64,
     host_tenths: u64,
     assembly_us: u64,
@@ -445,7 +454,7 @@ struct Inner {
     attempt: AtomicU64,
     /// A codec this machine failed to decode, and why: the session asks
     /// the host again without it.
-    renegotiate: Mutex<Option<(Codec, String)>>,
+    renegotiate: Mutex<Option<(Codec, String, video::FailureKind)>>,
     finished: AtomicBool,
     audio_gain: Arc<AtomicU32>,
     done: Mutex<bool>,
@@ -460,6 +469,29 @@ struct Inner {
     /// Pads' newest states from before the host accepted, sent once it has.
     /// Locked after `link`, never before.
     pending_pads: Mutex<[Option<(PadKind, PadState)>; latch_proto::gamepad::MAX_PADS]>,
+}
+
+#[derive(Default)]
+struct DecodeLoad {
+    samples: VecDeque<Duration>,
+    reported: bool,
+}
+impl DecodeLoad {
+    fn sample(&mut self, service: Duration, budget: Duration) -> Option<u32> {
+        self.samples.push_back(service);
+        if self.samples.len() > 60 {
+            self.samples.pop_front();
+        }
+        if self.reported || self.samples.len() < 60 {
+            return None;
+        }
+        let mean = self.samples.iter().sum::<Duration>() / 60;
+        if mean > budget.mul_f32(1.1) {
+            self.reported = true;
+            return Some((1.0 / mean.as_secs_f64()).floor().max(1.0) as u32);
+        }
+        None
+    }
 }
 
 #[derive(Default)]
@@ -797,15 +829,17 @@ fn refusal(status: u16, body: &str) -> String {
 /// The stream, asked for again without a codec whose decoder failed here,
 /// down to H.264 Constrained Baseline, which `latch-codec` always decodes.
 fn run(inner: &Arc<Inner>, server: &Server, settings: &Settings) {
+    let mut excluded = Vec::new();
     loop {
-        attempt(inner, server, settings);
-        let Some((codec, why)) = inner.renegotiate.lock().take() else {
+        attempt(inner, server, settings, &excluded);
+        let Some((codec, why, kind)) = inner.renegotiate.lock().take() else {
             return;
         };
         if inner.stop.load(Ordering::Acquire) {
             return;
         }
-        video::decoder_failed(codec);
+        excluded.push(codec);
+        video::decoder_failed_for(SocketAddr::new(server.address, server.port), codec, kind);
         let codec = match codec {
             Codec::H264High => "H.264 High",
             other => other.name(),
@@ -822,7 +856,7 @@ fn run(inner: &Arc<Inner>, server: &Server, settings: &Settings) {
 }
 
 /// One request for the stream, and the stream until it ends.
-fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings) {
+fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &[Codec]) {
     if inner.stopping() {
         return;
     }
@@ -854,8 +888,15 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings) {
         Err(e) => return fail("connecting", format!("cannot configure media buffers: {e}")),
     }
     let udp_port = udp.local_addr().map(|a| a.port()).unwrap_or(0);
-    let codecs = offer(settings);
+    let codecs: Vec<_> = offer(settings)
+        .into_iter()
+        .filter(|&c| {
+            !excluded.contains(&c)
+                && video::decoder_available_for(SocketAddr::new(server.address, server.port), c)
+        })
+        .collect();
     let request = StreamRequest {
+        prefer_color: settings.prefer_color,
         color: settings.color,
         protocol: latch_proto::PROTOCOL,
         width: settings.width,
@@ -965,7 +1006,8 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings) {
         {
             Ok(d) => d,
             Err(e) if accept.codec != Codec::H264Baseline => {
-                *inner.renegotiate.lock() = Some((accept.codec, format!("{e:#}")));
+                *inner.renegotiate.lock() =
+                    Some((accept.codec, format!("{e:#}"), video::FailureKind::Open));
                 let _ = tcp.shutdown(Shutdown::Both);
                 return;
             }
@@ -979,6 +1021,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings) {
         stats.encoder = accept.encoder.clone();
         stats.codec = accept.codec.name();
         stats.color = accept.color;
+        stats.frame_budget_ms = 1000.0 / accept.fps.max(1) as f32;
         if accept.audio.is_none() && settings.audio {
             stats.audio = if accept.audio_problem.is_empty() {
                 "no sound from the host".into()
@@ -1534,7 +1577,8 @@ fn receive(
             window_base = stats;
             let secs = (now - window_start).as_secs_f32();
             window_start = now;
-            let decode = std::mem::take(&mut *inner.decode.lock());
+            let mut decode = std::mem::take(&mut *inner.decode.lock());
+            decode.samples_us.sort_unstable();
             let frames = decode.frames.max(1) as f32;
             {
                 let mut s = inner.stats.lock();
@@ -1546,6 +1590,11 @@ fn receive(
                 s.frames_dropped = skipped + inner.dropped.swap(0, Ordering::Relaxed);
                 (s.mbps, s.received_mbps) = throughput.take(secs);
                 s.decode_ms = decode.decode_us as f32 / frames / 1000.0;
+                if !decode.samples_us.is_empty() {
+                    s.decode_p95_ms =
+                        decode.samples_us[(decode.samples_us.len() * 95).div_ceil(100) - 1] as f32
+                            / 1000.0;
+                }
                 s.queue_ms = decode.queue_us as f32 / frames / 1000.0;
                 s.host_ms = decode.host_tenths as f32 / frames / 10.0;
                 s.assembly_ms = decode.assembly_us as f32 / frames / 1000.0;
@@ -1603,11 +1652,13 @@ fn hand_off_video(
                 losses.delivered(&inner.recovery, &frame, now);
                 throughput.frame(&frame);
                 arrivals.frame(now);
+                let max_age =
+                    decode_max_age((1000.0 / inner.stats.lock().frame_budget_ms.max(1.0)) as u32);
                 let mut q = inner.queue.lock();
                 if q.frames.len() >= DECODE_QUEUE
                     || q.frames
                         .front()
-                        .is_some_and(|(_, at)| now.saturating_duration_since(*at) >= DECODE_MAX_AGE)
+                        .is_some_and(|(_, at)| now.saturating_duration_since(*at) >= max_age)
                 {
                     tracing::warn!("the decoder fell behind; restarting at a keyframe");
                     inner
@@ -1826,6 +1877,9 @@ fn decode(
     // Since the last picture: access units decoded, and errors.
     let mut tries = 0u32;
     let mut errors = 0u32;
+    let budget_ms = inner.stats.lock().frame_budget_ms.max(1.0);
+    let max_age = decode_max_age((1000.0 / budget_ms) as u32);
+    let mut load = DecodeLoad::default();
     loop {
         let (frame, ready) = {
             let mut q = inner.queue.lock();
@@ -1835,7 +1889,7 @@ fn decode(
                 }
                 if q.frames
                     .front()
-                    .is_some_and(|(_, at)| at.elapsed() >= DECODE_MAX_AGE)
+                    .is_some_and(|(_, at)| at.elapsed() >= max_age)
                 {
                     inner
                         .dropped
@@ -1863,6 +1917,11 @@ fn decode(
             // The session may have finished without waiting for this.
             return;
         }
+        let service = start.elapsed();
+        if let Some(fps) = load.sample(service, Duration::from_secs_f32(budget_ms / 1000.0)) {
+            inner.stats.lock().decode_capacity_fps = fps;
+            inner.emit(Event::Notice(format!("This machine decodes about {fps} fps at this size. Lower the frame rate in Stream settings.")));
+        }
         match &decoded {
             Ok(Some(_)) => (tries, errors) = (0, 0),
             Ok(None) => tries += 1,
@@ -1880,7 +1939,7 @@ fn decode(
                 }
                 _ => format!("{} gave no picture for {tries} frames", decoder.name()),
             };
-            *inner.renegotiate.lock() = Some((codec, why));
+            *inner.renegotiate.lock() = Some((codec, why, video::FailureKind::Decode));
             inner.attempt_over.store(true, Ordering::Release);
             inner.queue_cv.notify_all();
             return;
@@ -1898,6 +1957,7 @@ fn decode(
                             picture.color.bit_depth,
                             color.bit_depth
                         ),
+                        video::FailureKind::Decode,
                     ));
                     inner.attempt_over.store(true, Ordering::Release);
                     inner.queue_cv.notify_all();
@@ -1925,6 +1985,7 @@ fn decode(
                 let mut w = inner.decode.lock();
                 w.frames += 1;
                 w.decode_us += (decoded - start).as_micros() as u64;
+                w.samples_us.push((decoded - start).as_micros() as u64);
                 w.queue_us += (start - ready).as_micros() as u64;
                 w.host_tenths += u64::from(frame.host_delay);
                 w.assembly_us += frame.assembly.as_micros() as u64;
@@ -1954,6 +2015,93 @@ fn receive_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_budget_tracks_frame_interval_with_bounds() {
+        for (fps, ms) in [(30, 100), (60, 50), (120, 25), (240, 12), (500, 12)] {
+            assert_eq!(decode_max_age(fps).as_millis(), ms);
+        }
+        assert_eq!(decode_max_age(0), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn slow_test_decoder_emits_capacity_notice_and_stats() {
+        struct Slow;
+        impl video::Decoder for Slow {
+            fn name(&self) -> &'static str {
+                "slow test decoder"
+            }
+            fn decode(
+                &mut self,
+                _: &[u8],
+                _: bool,
+                _: Option<video::Frame>,
+            ) -> anyhow::Result<Option<video::Frame>> {
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(Some(video::Frame::default()))
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let inner = Arc::new(Inner::new(
+            tx,
+            Arc::new(FrameSlot::default()),
+            Box::new(|| {}),
+        ));
+        inner.stats.lock().frame_budget_ms = 10.0;
+        let worker = {
+            let inner = inner.clone();
+            std::thread::spawn(move || {
+                decode(
+                    &inner,
+                    Box::new(Slow),
+                    Codec::H264Baseline,
+                    Default::default(),
+                )
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for frame in 0..60 {
+            inner.queue.lock().frames.push_back((
+                InFrame {
+                    frame,
+                    data: vec![],
+                    keyframe: true,
+                    recovery: false,
+                    host_delay: 0,
+                    assembly: Duration::ZERO,
+                },
+                Instant::now(),
+            ));
+            inner.queue_cv.notify_one();
+            while inner.frames.seq() <= u64::from(frame) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        inner.stop.store(true, Ordering::Release);
+        inner.queue_cv.notify_all();
+        worker.join().unwrap();
+        let capacity = inner.stats.lock().decode_capacity_fps;
+        assert!(capacity > 0 && capacity <= 50, "{capacity}");
+        assert!(rx
+            .try_iter()
+            .any(|e| matches!(e, Event::Notice(s) if s.contains("This machine decodes about"))));
+    }
+
+    #[test]
+    fn sustained_slow_decoder_is_detected_once_and_bursts_are_not() {
+        let budget = Duration::from_millis(10);
+        let mut load = DecodeLoad::default();
+        for _ in 0..59 {
+            assert_eq!(load.sample(Duration::from_millis(20), budget), None);
+        }
+        assert_eq!(load.sample(Duration::from_millis(20), budget), Some(50));
+        assert_eq!(load.sample(Duration::from_millis(20), budget), None);
+        let mut load = DecodeLoad::default();
+        for i in 0..120 {
+            let ms = if i == 30 { 30 } else { 5 };
+            assert_eq!(load.sample(Duration::from_millis(ms), budget), None);
+        }
+    }
 
     #[cfg(windows)]
     #[test]
@@ -2138,6 +2286,7 @@ mod tests {
     #[test]
     fn hevc_is_offered_only_when_the_settings_allow_it() {
         let mut s = Settings {
+            prefer_color: false,
             color: Default::default(),
             cursor: false,
             gamepads: false,
@@ -2170,6 +2319,7 @@ mod tests {
                 port,
             },
             Settings {
+                prefer_color: false,
                 color: Default::default(),
                 cursor: false,
                 gamepads: false,
@@ -2320,7 +2470,7 @@ mod tests {
         inner.stop.store(true, Ordering::Release);
         inner.queue_cv.notify_all();
         worker.join().unwrap();
-        let given_up = inner.renegotiate.lock().take();
+        let given_up = inner.renegotiate.lock().take().map(|(c, why, _)| (c, why));
         given_up
     }
 

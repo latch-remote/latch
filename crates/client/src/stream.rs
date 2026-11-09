@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 /// cannot overlap Disconnect or the machine's name.
 const OVERFLOW_BELOW: f32 = 1040.0;
 /// Below this width the toolbar drops the host-key hint.
-const HINT_BELOW: f32 = 1200.0;
+const HINT_BELOW: f32 = 1400.0;
 /// Below this width the toolbar drops the stream facts after the name.
 const FACTS_BELOW: f32 = 1560.0;
 const TOAST_FOR: Duration = Duration::from_secs(5);
@@ -890,6 +890,9 @@ impl View {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = space::SM;
                     apply = ui::primary_button(ui, "Apply and reconnect").clicked();
+                    if apply {
+                        latch_stream::video::retry_decoders();
+                    }
                     if ui::ghost_button(ui, "Cancel").clicked() {
                         close = true;
                     }
@@ -2428,12 +2431,20 @@ fn overlay_rows(live: &Live, s: &latch_stream::Stats, p: &Presented) -> Vec<Row>
     let total = s.host_ms + network + decode + shown;
     let slow = |fps: f32| asked > 0 && fps < asked as f32 * 0.9;
     vec![
-        row("Resolution", format!("{w} × {h}"), false),
+        row(
+            "Resolution",
+            if s.decode_capacity_fps > 0 {
+                format!("{w} × {h} · decodes ~{} fps", s.decode_capacity_fps)
+            } else {
+                format!("{w} × {h}")
+            },
+            s.decode_capacity_fps > 0,
+        ),
         row("Codec", format!("{codec} · {}", s.decoder), false),
         row(
             "Frame rate",
             format!(
-                "{:.0} in · {:.0} decoded · {:.0} shown / {asked}",
+                "{:.0} in · {:.0} decoded · {:.0} UI observed / {asked}",
                 s.received_fps, s.fps, p.fps
             ),
             slow(s.fps),
@@ -2461,14 +2472,29 @@ fn overlay_rows(live: &Live, s: &latch_stream::Stats, p: &Presented) -> Vec<Row>
         row(
             "Dropped",
             format!(
-                "{} lost · {} skipped · {} not shown",
+                "{} lost · {} skipped · {} UI skipped",
                 s.frames_lost, s.frames_dropped, p.not_shown
             ),
             s.frames_lost + s.frames_dropped > 0,
         ),
-        row("Decode", format!("{:.1} ms", s.decode_ms), false),
-        row("Present", format!("{:.1} ms", p.wait_ms), false),
-        row("Latency", format!("≈ {total:.0} ms"), false),
+        row(
+            "Decode",
+            format!(
+                "{:.1} avg · {:.1} p95 / {:.1} ms",
+                s.decode_ms, s.decode_p95_ms, s.frame_budget_ms
+            ),
+            s.decode_capacity_fps > 0,
+        ),
+        row(
+            "Decode → UI",
+            format!("{:.1} ms · immediate", p.wait_ms),
+            false,
+        ),
+        row(
+            "Modelled delay",
+            format!("≈ {total:.0} ms · no scanout"),
+            false,
+        ),
         row(
             "",
             format!(
@@ -2853,6 +2879,7 @@ pub(crate) mod tests {
         let session = latch_stream::Session::start(
             server,
             latch_stream::Settings {
+                prefer_color: false,
                 color: Default::default(),
                 width: requested.0,
                 height: requested.1,
@@ -3031,6 +3058,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn toolbar_rightmost_control_fits_every_snapshot_size() {
+        for w in [
+            640.0, 960.0, 1040.0, 1100.0, 1200.0, 1280.0, 1400.0, 1560.0, 1920.0,
+        ] {
+            let h = harness(Vec2::new(w, 420.0));
+            assert_inside(
+                "Disconnect",
+                node_rect(&h.get_by_label("Disconnect")),
+                Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h.state().view.bar_h)),
+            );
+            assert_no_overlap(&bar_control_rects(&h));
+        }
+    }
+
+    #[test]
     fn toolbar_at_640_does_not_overlap_and_keeps_disconnect() {
         let h = harness(Vec2::new(640.0, 420.0));
         assert!(
@@ -3168,7 +3210,7 @@ pub(crate) mod tests {
             h.run_steps(2);
             let overlay = |h: &egui_kittest::Harness<'_, Fixture>| {
                 h.output().shapes.iter().any(|s| {
-                    matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text.contains("shown / 60"))
+                    matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text.contains("UI observed / 60"))
                 })
             };
             assert!(!overlay(&h), "stats start hidden at {size}");
@@ -3201,7 +3243,7 @@ pub(crate) mod tests {
         h.run_steps(2);
         let stats_text = |h: &egui_kittest::Harness<'_, Fixture>| {
             h.output().shapes.iter().find_map(|s| match &s.shape {
-                egui::Shape::Text(t) if t.galley.job.text.contains("shown / 60") => {
+                egui::Shape::Text(t) if t.galley.job.text.contains("UI observed / 60") => {
                     Some(t.visual_bounding_rect())
                 }
                 _ => None,
@@ -3327,6 +3369,8 @@ pub(crate) mod tests {
             width: 2560,
             height: 1440,
             fps: 118.0,
+            decode_p95_ms: 2.1,
+            frame_budget_ms: 1000.0 / 120.0,
             received_fps: 119.0,
             mbps: 41.5,
             rtt_ms: 12,
@@ -3354,6 +3398,8 @@ pub(crate) mod tests {
             width: 2560,
             height: 1440,
             fps: 118.0,
+            decode_p95_ms: 2.1,
+            frame_budget_ms: 1000.0 / 120.0,
             received_fps: 119.0,
             mbps: 41.5,
             rtt_ms: 12,
@@ -3388,8 +3434,8 @@ pub(crate) mod tests {
             "Packet loss",
             "Dropped",
             "Decode",
-            "Present",
-            "Latency",
+            "Decode → UI",
+            "Modelled delay",
         ] {
             assert!(labels.contains(&want), "{want} in {labels:?}");
         }
@@ -3398,7 +3444,7 @@ pub(crate) mod tests {
         assert_eq!(value("Packet loss").value, "1.20% · 0.00% after FEC");
         assert!(!value("Packet loss").warn, "FEC rebuilt it all");
         // 4 host + 6 + 1 network + 0.5 + 1.5 decode + 2 + 4.2 display.
-        assert_eq!(value("Latency").value, "≈ 19 ms");
+        assert_eq!(value("Modelled delay").value, "≈ 19 ms · no scanout");
         let lossy = latch_stream::Stats {
             loss_pct: 0.5,
             frames_lost: 2,
@@ -3655,13 +3701,20 @@ pub(crate) mod tests {
                     fixture(view_with_bar(), windows_old_host()),
                 );
                 assert_menu_fits(&mut h, size, trigger, last);
+                if let Some(disconnect) = h.query_by_label("Disconnect") {
+                    assert_inside(
+                        "Disconnect",
+                        node_rect(&disconnect),
+                        Rect::from_min_size(Pos2::ZERO, size),
+                    );
+                }
                 save(h.render().unwrap(), &file_name("stream", name, size, ppp));
             }
             for (name, view, last) in [
                 (
                     "stats-end",
                     View {
-                        stats: true,
+                        details: true,
                         ..view_with_bar()
                     },
                     "Copy diagnostics",
@@ -3992,6 +4045,13 @@ pub(crate) mod tests {
                 if let Some(label) = open {
                     h.get_by_label(label).simulate_click();
                     h.run_steps(3);
+                }
+                if let Some(disconnect) = h.query_by_label("Disconnect") {
+                    assert_inside(
+                        "Disconnect",
+                        node_rect(&disconnect),
+                        Rect::from_min_size(Pos2::ZERO, size),
+                    );
                 }
                 save(h.render().unwrap(), &file_name("stream", name, size, ppp));
             }

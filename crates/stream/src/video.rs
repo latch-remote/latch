@@ -404,27 +404,60 @@ pub trait Decoder: Send {
     fn name(&self) -> &'static str;
 }
 
-/// Codecs whose decoder failed on a stream since this process started:
-/// they are not offered again until it restarts.
-static FAILED: Mutex<Vec<Codec>> = Mutex::new(Vec::new());
-
-/// Stop offering `codec`: its decoder failed on a stream. Baseline stays,
-/// since `latch-codec` decodes it whatever the platform's decoder does.
-pub fn decoder_failed(codec: Codec) {
-    let mut failed = FAILED.lock();
-    if codec != Codec::H264Baseline && !failed.contains(&codec) {
-        failed.push(codec);
+/// Startup failures (e.g. unavailable OS extensions) retry less often than
+/// transient decode failures. Each host has an independent circuit breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    Open,
+    Decode,
+}
+impl FailureKind {
+    fn cooldown(self) -> std::time::Duration {
+        std::time::Duration::from_secs(match self {
+            Self::Open => 300,
+            Self::Decode => 15,
+        })
     }
 }
+struct Failure {
+    host: std::net::SocketAddr,
+    codec: Codec,
+    kind: FailureKind,
+    at: std::time::Instant,
+}
+static FAILED: Mutex<Vec<Failure>> = Mutex::new(Vec::new());
 
-/// What this machine decodes, best first, gated by platform hardware probes
-/// and by decoders that failed on a stream. Baseline always remains
-/// available through `latch-codec`.
+pub fn decoder_failed_for(host: std::net::SocketAddr, codec: Codec, kind: FailureKind) {
+    if codec == Codec::H264Baseline {
+        return;
+    }
+    let mut failed = FAILED.lock();
+    failed.retain(|f| {
+        f.at.elapsed() < f.kind.cooldown()
+            && !(f.host == host && f.codec == codec && f.kind == kind)
+    });
+    failed.push(Failure {
+        host,
+        codec,
+        kind,
+        at: std::time::Instant::now(),
+    });
+}
+
+/// Stream settings can retry immediately, without restarting the app.
+pub fn retry_decoders() {
+    FAILED.lock().clear();
+}
+
+pub fn decoder_available_for(host: std::net::SocketAddr, codec: Codec) -> bool {
+    let mut failed = FAILED.lock();
+    failed.retain(|f| f.at.elapsed() < f.kind.cooldown());
+    !failed.iter().any(|f| f.host == host && f.codec == codec)
+}
+
+/// Hardware-probed codecs. Session failures are scoped to the remote host.
 pub fn decodable() -> Vec<Codec> {
-    let failed = FAILED.lock().clone();
-    let mut codecs = probed();
-    codecs.retain(|c| !failed.contains(c));
-    codecs
+    probed()
 }
 
 fn probed() -> Vec<Codec> {
@@ -941,5 +974,34 @@ mod tests {
             uv_ptr,
             "no new allocation for the UV plane"
         );
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    #[test]
+    fn failures_expire_and_are_host_codec_and_kind_scoped() {
+        let a = "127.0.0.1:49121".parse().unwrap();
+        let b = "127.0.0.1:49122".parse().unwrap();
+        decoder_failed_for(a, Codec::Hevc, FailureKind::Decode);
+        assert!(!decoder_available_for(a, Codec::Hevc));
+        assert!(decoder_available_for(b, Codec::Hevc));
+        assert!(decoder_available_for(a, Codec::Av1));
+        {
+            let mut failed = FAILED.lock();
+            let f = failed.iter_mut().find(|f| f.host == a).unwrap();
+            f.at -= std::time::Duration::from_secs(16);
+        }
+        assert!(decoder_available_for(a, Codec::Hevc));
+        decoder_failed_for(a, Codec::Hevc, FailureKind::Open);
+        {
+            let mut failed = FAILED.lock();
+            let f = failed.iter_mut().find(|f| f.host == a).unwrap();
+            f.at -= std::time::Duration::from_secs(16);
+        }
+        assert!(!decoder_available_for(a, Codec::Hevc));
+        retry_decoders();
+        assert!(decoder_available_for(a, Codec::Hevc));
     }
 }
