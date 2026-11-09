@@ -1,10 +1,11 @@
-# UI audit and redesign, 4.0.2 → unreleased
+# Historical UI audit: 4.0.2 redesign
 
 A harsh pass over every screen of the unified window, the Sharing page
 and the stream overlay, as rendered by the snapshot harness and as read
 in code. Severity is the effect on someone using Latch, not the effort
 to fix. Every item was found on 4.0.2 (`f96e1a3`); the last column is
-its state on this branch.
+its state at the time of that redesign. This is a historical record, not
+a description of the current protocol or a current release checklist.
 
 Renders: `cargo test -p latch-client -p latch-host snapshots -- --ignored`
 writes `target/ui-snapshots/`. Names below refer to that folder

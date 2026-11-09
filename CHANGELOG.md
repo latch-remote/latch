@@ -6,9 +6,10 @@ GitHub release notes, so each version gets a heading of the form
 
 ## 5.2.0 (2026-11-04)
 
-Latch no longer sets limits of its own. A stream can ask for up to 500 fps,
-1 Gbps and 16384 pixels a side, and the sharing machine fits the request to
-what its encoder and display take; the network sets the rest.
+Request ceilings are 16384 pixels a side, 500 fps and 1 Gbps
+(`crates/proto/src/control.rs`), above what current hardware delivers.
+A session is fitted to what both machines' encoders, decoders and displays
+report; network capacity and software budgets also affect achieved rates.
 
 - **Quality profiles that follow the display.** Balanced (the default: this
   display's size at its own refresh rate), Competitive (1080p at the
@@ -21,7 +22,8 @@ what its encoder and display take; the network sets the rest.
 - **Windows host**: hardware HEVC by default (on AMD through AMF directly),
   and setup adds 90–360 Hz modes to the virtual display.
 - **Mac host**: VideoToolbox keeps up with fast streams (synthetic 1080p
-  HEVC on an M3 Pro: 240 fps, was 110).
+  HEVC on an M3 Pro, 2026-11-03 sample: 240 fps, was 110;
+  not a real-desktop performance promise).
 - **Linux host**: only what changed on screen is read, converted and
   encoded. NVENC and VA-API hardware encoding is in place but has not yet
   run on a GPU.
@@ -192,7 +194,8 @@ negotiated within protocol 1.
 
 ### HDR and ten-bit colour
 
-- Negotiate default-off ten-bit SDR and HDR10 colour, display peak luminance,
+- Negotiate ten-bit SDR and HDR10 colour automatically from viewer
+  capabilities (absent wire fields default off for compatibility), display peak luminance,
   and mastering/content-light metadata within protocol 1. Legacy peers stay
   SDR8. Ten-bit and HDR apply to HEVC streams from Mac and Windows hosts;
   a viewer offers ten-bit when its GPU samples 16-bit textures and HDR when
@@ -492,8 +495,8 @@ instead of 37 (p95 39 ms instead of 47–52). Measurements:
   moonlight-common-c (C), OpenH264 (C++), and libopus (C) with a custom,
   in-process streaming engine compiled directly into `latch-host`
   (`latch-engine`, `latch-proto`, `latch-codec`, and `latch-stream`).
-  No C/C++ or assembler build dependencies (`cmake`, `nasm`, `clang`)
-  are required.
+  No C/C++ or assembler library build dependencies (`cmake`, `nasm`)
+  are required; Rust still needs a platform linker and SDK.
 - **Latch stream protocol 1.** Streaming runs over UDP with Reed-Solomon
   forward error correction and loss-triggered keyframe requests. Audio is
   coded losslessly at 48 kHz stereo with `lpcm-rice`. Video uses hardware
@@ -526,15 +529,6 @@ instead of 37 (p95 39 ms instead of 47–52). Measurements:
   machine reached the control API from 127.0.0.1 and was trusted as the
   local panel. Loopback connections are now checked with `tailscale whois`
   of their port, and the node kit runs Tailscale with kernel networking.
-- **Pairing.** The Mac hands the PIN over beside the first pairing request
-  instead of in front of it, so pairing goes on the moment the PC accepts
-  the PIN, a request that fails shows its error at once, and Cancel works
-  throughout. A refusal from Latch on the PC is shown with its reason
-  instead of "isn't answering" and ends the attempt; the PIN goes to this
-  Mac's own pending pairing, never another device's.
-- **Cancelling a connection** no longer quits an app or desktop it had
-  rejoined on the PC. Connection failures are logged with every cause and
-  the banner names the step that failed.
 - **Power.** Sleep is offered only for Windows PCs and refused by hosts
   nothing can wake (a Linux VM such as a VPS desktop, a Mac, a container),
   every power action asks first and follows the owner's setting, the
@@ -557,8 +551,8 @@ instead of 37 (p95 39 ms instead of 47–52). Measurements:
   in quotes or newlines no longer fails to cross. On Linux the clipboard
   works again after the X server restarts.
 - **Settings survive a bad value.** One setting a build cannot read (720p
-  read by an older build, say) no longer wipes client.toml with its pairing
-  certificates and wake addresses: only that value falls back. The service
+  read by an older build, say) no longer wipes client.toml with its saved
+  settings and wake addresses: only that value falls back. The service
   keeps its last good host.toml when a hand edit has a typo.
 - **Machine list.** A machine that is away can be forgotten from its menu,
   and one that left the tailnet over a month ago is forgotten by itself.
@@ -567,10 +561,6 @@ instead of 37 (p95 39 ms instead of 47–52). Measurements:
   and a LAN address (saved by older versions too) is never used as a PC's
   public wake address. A Mac with Share this Mac off no longer reads as "the
   background service is stopped".
-- **A desktop that follows its viewer** (a Linux VPS) ends a session nobody
-  has watched for two minutes, so its prep command's undo puts the desktop
-  back at its idle size instead of leaving it at the last viewer's 4K. The
-  Mac relaunches the Desktop for a new size only on such a desktop.
 - **Background service.** On a Mac it runs under launchd, is restarted
   there after an update (never two copies), and its login item is turned
   back on with sharing; the Sharing page says when the macOS firewall or a
@@ -582,13 +572,6 @@ instead of 37 (p95 39 ms instead of 47–52). Measurements:
   updates; pushes are logged with their sender and SHA-256. The wake
   listener and "keeping awake" claims are Windows-only (a shared Mac is now
   really kept awake while plugged in).
-- **Windows setup.** Setup run over SSH starts the engine in the signed-in
-  user's session instead of one with no desktop, running it again no longer
-  starts the SYSTEM engine beside yours, install-host.ps1 brings the host
-  back after replacing it, a BroLink engine move retries and keeps paired
-  devices, a stale engine archive falls back to the pinned download, Set up
-  during a stream explains the administrator prompt first, and the audio
-  fix-up backs off instead of running PowerShell every 30 seconds.
 - **Light appearance.** Latch no longer quits at launch on a Mac or PC set
   to Light. Screen readers hear dropdown names and values and can adjust
   the Bitrate slider, Escape that closes a menu stays in Latch, a menu can
@@ -601,30 +584,10 @@ instead of 37 (p95 39 ms instead of 47–52). Measurements:
   starts a fresh session.
 - **Resolutions below 1080p: 900p, 720p and 540p** (1600 × 900, 1280 × 720,
   960 × 540), for a machine that encodes in software or a slow network.
-  The frame-rate ceiling a small-CPU host reports (30 fps) now holds at
-  1080p and rises in proportion for fewer pixels, so 720p gets 60 fps
-  from a two-core VPS; larger sizes keep 30. A host with a fixed desktop
-  is still never asked for more than its own size, but a smaller size is
-  now honoured (scaled down) instead of replaced by the desktop's.
-  Windows PCs on the Virtual Display Driver need **Repair setup** once so
-  the driver lists the three new sizes.
-- **A new size starts the Desktop again.** Connecting while the PC's
-  Desktop still ran from an earlier stream resumed it, and a Linux desktop
-  that resizes itself to the viewer only does so at a launch: a 540p stream
-  showed the 3024 x 1964 desktop scaled down, with captured mouse movement
-  crossing it at a third of the speed. The Mac now ends and relaunches the
-  Desktop whenever it asks for a different size than it last launched it
-  at (or does not know), and resumes it at the same size. Games and other
-  apps are never ended for this.
+  A smaller stream can scale down a fixed-size desktop.
 - Captured mouse movement over a desktop of fixed size that the stream
   shrinks (a 1080p VPS desktop streamed at 720p) is scaled to the
   desktop's pixels, so it keeps the Mac's speed.
-- **Pairing with Sunshine from October 2026.** Those engines keep the PIN
-  request open until the Mac has finished the pairing handshake, and the
-  Mac only went on with it once Latch Host had answered, so pairing a new
-  Mac timed out. Latch Host now answers as soon as the engine has taken the
-  PIN, and answers the Mac's retries for that PIN without asking the
-  engine again.
 - `connect_real` (an ignored test in `crates/client/src/session.rs`)
   connects to a machine through the window's own path at a list of sizes,
   with optional pointer probes, typing and frame-rate sampling.
@@ -639,23 +602,6 @@ instead of 37 (p95 39 ms instead of 47–52). Measurements:
   Shift+Insert, and says so in `/v1/clipboard` (`selection`); against an
   older Linux host the Mac keeps Ctrl+V for paste, which would otherwise
   paste the terminal's last selection.
-- **A VPS desktop streams at its own size and a frame rate it can keep.**
-  Latch Host reports the X screen it captures and, when it encodes in
-  software on fewer than four cores, a 30 fps ceiling; the Mac asks for
-  exactly that. "Match screen" used to ask a 1920 × 1080 desktop for the
-  Mac's size, which Sunshine met by scaling the same pixels up (blurrier,
-  and more work for the encoder). On a two-core VPS, 60 fps desktop
-  sessions averaged 33 to 47 encoded frames a second; Sunshine took 136%
-  CPU for a still desktop at 60 fps and 78% for a busier one at 30.
-- On Linux the engine no longer holds a 60 fps floor
-  (`minimum_fps_target = 0`): X11 capture already delivers a frame every
-  interval, so the floor could only re-encode the last picture whenever a
-  frame was done early. Part of the CPU the 30 fps ceiling frees goes to
-  the `superfast` preset, whose keyframes keep text legible (QP 21 instead
-  of 38 at 20 Mbps, for 19% more encoding time a frame). Existing
-  hosts pick both up once (`stream-profile-v4`) while nothing streams,
-  checked through GameStream's `/serverinfo`, which reports the running
-  app; `/api/apps` does not.
 - The native VPS units give the engine and the X server ten times the CPU
   share of other user services (`CPUWeight=1000`).
 - **A Mac can be only a viewer.** On a Mac, **Share this Mac** on the
