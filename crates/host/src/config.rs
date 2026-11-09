@@ -9,6 +9,12 @@ pub const FILE: &str = "host.toml";
 pub struct HostConfig {
     /// Let a Mac on the tailnet sleep, restart, or shut this PC down.
     pub power_allowed: bool,
+    /// Explicit consent to the same-user elevated input route (Windows setup).
+    #[serde(default)]
+    pub elevated_input: bool,
+    pub clipboard_sharing: bool,
+    /// Required on tagged organisation hosts: local API has no membership assertion.
+    pub allowed_logins: Vec<String>,
     /// Keep the background service registered to start at logon. On by
     /// default: a PC nobody can walk up to must come back reachable after
     /// every restart. The service re-adds the registry entry if it is gone.
@@ -30,6 +36,9 @@ impl Default for HostConfig {
     fn default() -> Self {
         Self {
             power_allowed: true,
+            elevated_input: false,
+            clipboard_sharing: true,
+            allowed_logins: Vec::new(),
             start_with_windows: true,
             stay_awake: true,
             accept_updates: true,
@@ -44,6 +53,7 @@ impl HostConfig {
         Self {
             power_allowed: false,
             accept_updates: false,
+            clipboard_sharing: false,
             ..Self::default()
         }
     }
@@ -61,9 +71,28 @@ impl HostConfig {
 
     pub fn load() -> Self {
         match latch_core::config::data_dir() {
-            Ok(dir) => Self::load_path(&dir.join(FILE)),
+            Ok(dir) => {
+                let path = dir.join(FILE);
+                #[cfg(windows)]
+                Self::migrate_input(&path);
+                Self::load_path(&path)
+            }
             Err(_) => Self::safest(),
         }
+    }
+
+    #[cfg(windows)]
+    fn migrate_input(path: &std::path::Path) {
+        // Presence of the field is the one-time migration marker, including false.
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if !input_migration_needed(&text) {
+            return;
+        }
+        let enabled = crate::setup::powershell(
+            "if (Get-ScheduledTask -TaskName 'LatchInput' -ErrorAction SilentlyContinue) { 'present' }"
+        ).is_ok_and(|s| s.trim() == "present");
+        // A malformed existing file must not be replaced with permissive defaults.
+        let _ = latch_core::config::update(FILE, |c: &mut Self| c.elevated_input = enabled);
     }
 
     /// Read host.toml for a service that already runs on settings: an error
@@ -81,11 +110,20 @@ impl HostConfig {
     pub fn save(&self) -> anyhow::Result<()> {
         latch_core::config::update(FILE, |disk: &mut Self| {
             disk.power_allowed = self.power_allowed;
+            disk.elevated_input = self.elevated_input;
+            disk.clipboard_sharing = self.clipboard_sharing;
             disk.start_with_windows = self.start_with_windows;
             disk.stay_awake = self.stay_awake;
             disk.accept_updates = self.accept_updates;
         })
     }
+}
+
+#[cfg(any(windows, test))]
+fn input_migration_needed(text: &str) -> bool {
+    !text
+        .lines()
+        .any(|l| l.trim_start().starts_with("elevated_input"))
 }
 
 #[cfg(test)]
@@ -110,9 +148,20 @@ mod tests {
     }
 
     #[test]
+    fn input_upgrade_only_applies_before_an_explicit_choice() {
+        assert!(input_migration_needed("power_allowed = true"));
+        assert!(input_migration_needed(""));
+        assert!(!input_migration_needed("elevated_input = true"));
+        assert!(!input_migration_needed("elevated_input = false"));
+    }
+
+    #[test]
     fn defaults_allow_power_and_autostart() {
         let c = HostConfig::default();
         assert!(c.power_allowed);
+        assert!(!c.elevated_input);
+        assert!(c.clipboard_sharing);
+        assert!(c.allowed_logins.is_empty());
         assert!(c.start_with_windows);
         assert!(c.stay_awake);
         assert!(c.accept_updates, "pushed updates stay on unless turned off");

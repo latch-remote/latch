@@ -120,28 +120,30 @@ fn validate_frame_planes(f: &Frame) -> Result<()> {
     if w == 0 || h == 0 {
         bail!("zero frame dimensions");
     }
-    if f.y_stride < w || f.y_stride.checked_mul(h).is_none_or(|n| f.y.len() < n) {
-        bail!("invalid Y plane buffer or stride");
-    }
-    if f.uv_stride < cw || f.uv_stride.checked_mul(ch).is_none_or(|n| f.uv.len() < n) {
-        bail!("invalid UV plane buffer or stride");
-    }
-    Ok(())
+    f.with_planes(|y, ys, uv, uvs| {
+        if ys < w || ys.checked_mul(h).is_none_or(|n| y.len() < n) {
+            bail!("invalid Y plane buffer or stride");
+        }
+        if uvs < cw || uvs.checked_mul(ch).is_none_or(|n| uv.len() < n) {
+            bail!("invalid UV plane buffer or stride");
+        }
+        Ok(())
+    })
 }
 
 fn validate_pixel_oracle(f: &Frame) -> Result<()> {
     if f.width != 64 || f.height != 64 || f.is_black() {
         bail!("pixel oracle failed: unexpected dimensions or black frame");
     }
-    let (top, bot) = (16 * f.y_stride + 32, 48 * f.y_stride + 32);
-    if top >= f.y.len() || bot >= f.y.len() {
-        bail!("pixel oracle coordinates exceed Y buffer bounds");
-    }
-    let (white, black) = (f.y[top], f.y[bot]);
-    if white < 230 || black > 20 {
-        bail!("pixel oracle brightness failed: white={white} (>=230), black={black} (<=20)");
-    }
-    Ok(())
+    f.with_planes(|y, stride, _, _| {
+        let (top, bot) = (16 * stride + 32, 48 * stride + 32);
+        let white = *y.get(top).context("pixel oracle exceeds Y buffer")?;
+        let black = *y.get(bot).context("pixel oracle exceeds Y buffer")?;
+        if white < 230 || black > 20 {
+            bail!("pixel oracle brightness failed: white={white}, black={black}");
+        }
+        Ok(())
+    })
 }
 
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
@@ -158,6 +160,7 @@ fn run_bench(
     fixture: &[u8],
     is_builtin: bool,
     cfg: &Config,
+    materialize: bool,
 ) -> Result<serde_json::Value> {
     // Priming decode: initializes session before querying actual decoder hardware state
     let prime = decoder
@@ -182,7 +185,9 @@ fn run_bench(
         let mut f = decoder
             .decode(fixture, true, spare.take())?
             .context("warmup decode failed")?;
-        f.ensure_cpu_planes();
+        if materialize {
+            f.ensure_cpu_planes();
+        }
         validate_frame_planes(&f)?;
         check_backend(decoder)?;
         spare = Some(f);
@@ -196,7 +201,9 @@ fn run_bench(
         let mut f = decoder
             .decode(fixture, true, spare.take())?
             .context("decode failed")?;
-        f.ensure_cpu_planes();
+        if materialize {
+            f.ensure_cpu_planes();
+        }
         samples.push(t0.elapsed());
         validate_frame_planes(&f)?;
         check_backend(decoder)?;
@@ -215,10 +222,11 @@ fn run_bench(
     let last = spare.as_ref().unwrap();
 
     Ok(json!({
-        "version": 1,
+        "version": 2,
+        "output_mode": if materialize { "CPU-materialised" } else { "native" },
         "build": { "version": env!("CARGO_PKG_VERSION"), "os": std::env::consts::OS, "arch": std::env::consts::ARCH, "debug_assertions": cfg!(debug_assertions) },
         "benchmark": "synthetic_decoder_microbenchmark",
-        "note": "Repeated single IDR. Decode wall time includes CPU output copy into host memory; excludes capture, encoding, network, audio, and presentation. Loop elapsed time also includes frame validation. CPU output bytes are not GPU transfer measurements.",
+        "note": "Repeated single IDR. Decode wall time includes CPU materialisation only in CPU-materialised mode; validation accesses planes outside the timed sample; excludes capture, encoding, network, audio, and presentation. Loop elapsed time also includes frame validation. CPU output bytes are not GPU transfer measurements.",
         "decoder": dec_name,
         "hardware": is_hw,
         "source": { "hash": sha256_hex(fixture), "bytes": fixture.len(), "builtin": is_builtin },
@@ -253,7 +261,10 @@ fn main() -> Result<()> {
     let mut decoder =
         new_decoder(Codec::H264High).context("failed to instantiate H.264 decoder")?;
 
-    let output = run_bench(decoder.as_mut(), &fixture_bytes, is_builtin, &config)?;
+    let native = run_bench(decoder.as_mut(), &fixture_bytes, is_builtin, &config, false)?;
+    let mut decoder = new_decoder(Codec::H264High)?;
+    let cpu = run_bench(decoder.as_mut(), &fixture_bytes, is_builtin, &config, true)?;
+    let output = json!({ "native": native, "cpu_materialised": cpu });
     serde_json::to_writer_pretty(std::io::stdout(), &output)?;
     println!();
     Ok(())
@@ -408,7 +419,7 @@ mod tests {
             fallback_at: usize::MAX,
         };
         assert_eq!(hw.name(), "H.264 · software (uninitialized)");
-        let report = run_bench(&mut hw, b"idr", true, &cfg).unwrap();
+        let report = run_bench(&mut hw, b"idr", true, &cfg, true).unwrap();
         assert_eq!(report["hardware"], true);
         assert_eq!(
             report["decode_wall_ns_in_order"].as_array().unwrap().len(),
@@ -421,7 +432,7 @@ mod tests {
             is_hw: false,
             fallback_at: usize::MAX,
         };
-        assert!(run_bench(&mut sw, b"idr", true, &cfg).is_err());
+        assert!(run_bench(&mut sw, b"idr", true, &cfg, true).is_err());
 
         let cfg = Config { warmup: 1, ..cfg };
         // A fallback in warmup or measurement must not inherit the prime's label.
@@ -431,7 +442,7 @@ mod tests {
                 is_hw: true,
                 fallback_at,
             };
-            assert!(run_bench(&mut changed, b"idr", true, &cfg).is_err());
+            assert!(run_bench(&mut changed, b"idr", true, &cfg, true).is_err());
         }
     }
 }

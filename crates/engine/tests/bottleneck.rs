@@ -77,6 +77,7 @@ fn noise_stream_keeps_delivering_through_sustained_queue_delay() {
         // modest frame rate to deliberately underfill the requested bitrate;
         // keep exercising delivery on a slow CI runner.
         Settings {
+            prefer_color: false,
             color: Default::default(),
             cursor: false,
             gamepads: false,
@@ -291,6 +292,7 @@ fn noise_socket_measurement() {
             port,
         },
         Settings {
+            prefer_color: false,
             color: Default::default(),
             cursor: false,
             gamepads: false,

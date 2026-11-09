@@ -7,6 +7,7 @@ use latch_core::CONTROL_PORT;
 use std::path::{Path, PathBuf};
 
 pub struct Plan<'a> {
+    pub elevated_input: bool,
     pub exe: &'a Path,
     pub adapter: &'a str,
     pub adapter_description: &'a str,
@@ -264,7 +265,7 @@ exit 0
         tailnet = "100.64.0.0/10,fd7a:115c:a1e0::/48",
         exe = q(&p.exe.display().to_string()),
         virtual_display = crate::virtual_display::setup_ps(),
-        input_helper = input_helper_ps(),
+        input_helper = input_helper_ps(p.elevated_input, p.exe),
         record = record_power_ps(),
         gamepad_driver = gamepad_driver_ps(),
     )
@@ -333,7 +334,16 @@ const INPUT_TASK: &str = "LatchInput";
 /// this task, which runs a copy of this checked file elevated as the user
 /// who ran setup. The copy sits in `%ProgramFiles%\Latch\Input`, which
 /// only administrators can change, and is replaced on every setup.
-fn input_helper_ps() -> String {
+fn input_helper_ps(enabled: bool, installed: &Path) -> String {
+    if !enabled {
+        return format!(
+            r#"Step "Removing administrator input helper"
+Stop-ScheduledTask -TaskName '{INPUT_TASK}' -ErrorAction SilentlyContinue
+if (Get-ScheduledTask -TaskName '{INPUT_TASK}' -ErrorAction SilentlyContinue) {{
+    Unregister-ScheduledTask -TaskName '{INPUT_TASK}' -Confirm:$false -ErrorAction Stop
+}}"#
+        );
+    }
     format!(
         r#"Step "Letting a viewer control windows that run as administrator"
 try {{
@@ -349,11 +359,15 @@ try {{
     Start-Sleep -Milliseconds 500
     if (Test-Path -LiteralPath $inputExe) {{ Assert-Protected $inputExe }}
     Copy-Item -LiteralPath $inputSource -Destination $inputExe -Force -ErrorAction Stop
+    $hostRecord = Join-Path $inputDir 'host-path.txt'
+    if (Test-Path -LiteralPath $hostRecord) {{ Assert-Protected $hostRecord }}
+    Set-Content -LiteralPath $hostRecord -Value '{installed}' -Encoding UTF8 -ErrorAction Stop
     $action = New-ScheduledTaskAction -Execute $inputExe -Argument '{arg}' -WorkingDirectory $inputDir
     $principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -Priority 4
     Register-ScheduledTask -TaskName '{task}' -Action $action -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
 }} catch {{ Write-Output "  input helper: $_"; $setupFailed = $true }}"#,
+        installed = installed.display().to_string().replace('\'', "''"),
         task = INPUT_TASK,
         arg = "--input-helper",
     )
@@ -519,6 +533,7 @@ pub fn run_as_admin(program: Option<&Path>) -> Result<()> {
         );
         let wake = crate::wake::probe();
         let plan = Plan {
+            elevated_input: crate::config::HostConfig::load().elevated_input,
             exe: program,
             adapter: &wake.adapter,
             adapter_description: &wake.description,
@@ -930,6 +945,7 @@ mod tests {
     #[test]
     fn setup_opens_both_control_transports_and_keeps_wake_and_display_steps() {
         let s = script(&Plan {
+            elevated_input: true,
             exe: Path::new("C:\\Users\\O'Brien\\Latch\\latch-host.exe"),
             adapter: "Ethernet",
             adapter_description: "Realtek",
@@ -957,6 +973,7 @@ mod tests {
     #[test]
     fn setup_installs_the_pinned_gamepad_driver_and_uninstall_only_removes_its_own() {
         let s = script(&Plan {
+            elevated_input: true,
             exe: Path::new(r"C:\Latch\latch-host.exe"),
             adapter: "",
             adapter_description: "",
@@ -1001,6 +1018,7 @@ mod tests {
     #[test]
     fn setup_records_the_power_settings_before_changing_them() {
         let s = script(&Plan {
+            elevated_input: true,
             exe: Path::new("C:\\Latch\\latch-host.exe"),
             adapter: "",
             adapter_description: "",
@@ -1052,6 +1070,7 @@ mod tests {
         }
         // Setup records the very names uninstall reads back.
         let setup = script(&Plan {
+            elevated_input: true,
             exe: Path::new("C:\\Latch\\latch-host.exe"),
             adapter: "",
             adapter_description: "",
@@ -1092,11 +1111,12 @@ mod tests {
     #[test]
     fn setup_installs_the_elevated_input_helper_and_uninstall_removes_it() {
         let setup = script(&Plan {
-            exe: Path::new("C:\\Latch\\latch-host.exe"),
+            elevated_input: true,
+            exe: Path::new(r"C:\Latch\latch-host.exe"),
             adapter: "",
             adapter_description: "",
         });
-        let step = input_helper_ps();
+        let step = input_helper_ps(true, Path::new(r"C:\Latch\latch-host.exe"));
         assert!(setup.contains(&step));
         assert!(step.contains(r"'Latch\Setup\latch-host.exe'"));
         assert!(step.contains(r"'Latch\Input'"));
@@ -1120,6 +1140,11 @@ mod tests {
             "nothing elevated from the user's folder"
         );
 
+        let disabled = input_helper_ps(false, Path::new(r"C:\Latch\latch-host.exe"));
+        assert!(disabled.contains("Stop-ScheduledTask"));
+        assert!(disabled.contains("Unregister-ScheduledTask"));
+        assert!(!disabled.contains("-RunLevel Highest"));
+        assert!(step.contains("host-path.txt"));
         let m = uninstall_machine_ps();
         assert!(m.contains("Unregister-ScheduledTask -TaskName 'LatchInput'"));
         assert!(m.contains("$inputDir = Join-Path $latchDir 'Input'"));
@@ -1312,6 +1337,7 @@ mod tests {
     #[test]
     fn setup_lifts_windows_block_rules_for_this_executable_only() {
         let s = script(&Plan {
+            elevated_input: true,
             exe: Path::new("C:\\Users\\O'Brien\\latch-host.exe"),
             adapter: "",
             adapter_description: "",
@@ -1342,6 +1368,7 @@ mod tests {
         std::fs::write(
             out,
             script(&Plan {
+                elevated_input: true,
                 exe: Path::new(&exe),
                 adapter: &adapter,
                 adapter_description: &description,

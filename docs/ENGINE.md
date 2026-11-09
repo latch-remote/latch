@@ -1,5 +1,36 @@
 # The Latch 5 streaming engine
 
+### Viewer negotiation and decoder load
+
+Auto can rank colour before codec order when the host advertises
+`streamer.prefer_color` and the viewer opts in. HEVC currently carries ten-bit
+SDR and HDR10; other implemented codecs negotiate SDR8. Without opt-in the
+viewer's order is unchanged. Each encoder fallback refits width, height, FPS
+and bitrate from the original request, including software limits, and undoes
+and repeats desktop preparation for that geometry.
+
+The encoded decoder queue holds at most three pending frames; its age budget
+is three frame intervals clamped to 12–100 ms. Overflow still resets the
+reference chain and requests a keyframe. A rolling 60-service-time window
+reports overload when mean decode time exceeds the negotiated frame interval
+by 10%, once per attempt. Stats show decode p95 over each stats window and a
+local throughput estimate. This detection does **not** lower the host's FPS:
+users must lower FPS/size in Stream settings. Sustained overload can still
+cause repeated recovery. A negotiated session FPS control and safe capture/
+encoder retiming, with slow-decoder loopback evidence, remain required.
+
+Failures are scoped by remote address/port, codec, and failure kind: opening
+failures cool down for five minutes, runtime decode failures for 15 seconds.
+The next connection after expiry attempts the codec again; a running fallback
+session does not upgrade itself. A codec is tried only once per connection's
+fallback chain. Apply and reconnect clears cooldowns immediately. Baseline
+software decoding remains available. Hardware capability probes remain cached.
+
+Stats count UI-observed pictures, not scanout. Modelled delay adds
+host processing, half RTT, measured assembly/queue/decode/preparation and half
+refresh; GPU completion, compositor, panel response and scanout are unmeasured.
+
+
 Latch 4 shared a desktop through Sunshine (C++) and viewed it through
 moonlight-common-c (C), OpenH264 (C++) and libopus (C). Latch 5 does both
 in Rust, inside the one `latch-host` executable that already runs the
@@ -92,15 +123,16 @@ High, HEVC and AV1 have the session's instead (`session::HARDWARE_PROBATION`):
 a decoder that cannot be created, gives no picture for ten access units, or
 fails three times without one ends that attempt, and the session asks the
 host again without the codec (down to Baseline), with a notice saying why;
-the codec is not offered again until the viewer restarts.
+the codec cools down for this host (five minutes for opening failures,
+15 seconds for runtime decode failures); Apply and reconnect retries immediately.
 `LATCH_TEST_BREAK_DECODER=hevc,h264-high` (or `all`; `hevc=silent` for a
 decoder that gives nothing) breaks decoders on purpose to test this.
 Unknown codec names in an offer are skipped by protocol-1 hosts.
 
 Main10 input is supported by the platform decoders. Mac callers can choose
 P010 with `new_decoder_with_format`; its two 16-bit Metal planes retain ten
-bits. The normal session still requests NV12/SDR. Windows accepts NV12 or
-P010 MFT output, reducing P010 to eight bits for the current SDR renderer.
+bits. Sessions negotiate NV12/SDR8 or HEVC P010/ten-bit SDR/HDR. Windows accepts
+NV12 or P010 MFT output and preserves ten-bit samples for the renderer.
 With a D3D12 renderer on the same adapter, NV12 pictures use a bounded pool
 of shared D3D11 textures opened as wgpu plane views. A D3D11 fence completes
 the GPU copy before publication; the renderer retains each surface through
@@ -553,7 +585,7 @@ frames on the batch path are handed to decode after each datagram, before
 processing the rest of the batch or waiting for readiness: waiting at the
 end of a receive batch held each complete picture until the next datagram. Video
 shard storage is reused with a 4096-buffer pool cap. Decode queues are
-bounded by eight frames and 50 ms of age; exceeding either restarts at an
+bounded by three frames and three frame intervals (12–100 ms) of age; exceeding either restarts at an
 IDR rather than decoding an increasing backlog. A missing initial IDR
 triggers recovery on the first complete P-frame, or after 500 ms without
 a delivered keyframe. Requests retry at max(50 ms, RTT), and at once when
