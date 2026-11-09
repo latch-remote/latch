@@ -165,6 +165,9 @@ pub struct Status {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Streamer {
+    /// Joint codec/colour ranking, opt-in on protocol 1.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub prefer_color: bool,
     /// "Latch" when sharing is set up; empty when no engine is installed.
     pub kind: String,
     pub installed: bool,

@@ -162,6 +162,7 @@ fn main() -> anyhow::Result<()> {
             port,
         },
         Settings {
+            prefer_color: false,
             color: latch_proto::color::ColorCapabilities {
                 ten_bit: flag("--ten-bit"),
                 hdr: flag("--hdr"),

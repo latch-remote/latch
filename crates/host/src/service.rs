@@ -141,6 +141,7 @@ impl Service {
         };
         let (max_fps, codecs) = streamer::capacity(&encoder, status.viewer.is_some());
         Streamer {
+            prefer_color: true,
             kind: latch_core::STREAMER_KIND.into(),
             installed: true,
             running: server.is_some(),

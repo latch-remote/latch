@@ -4,6 +4,19 @@ The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
 `## X.Y.Z (date)`.
 
+## Unreleased
+
+- Auto preserves mutually supported HEVC ten-bit/HDR instead of preferring
+  eight-bit AV1, when both peers opt in. Explicit codec choices keep their order.
+- Encoder fallback refits the original request and prepares the final desktop size.
+- Decoder failures cool down per host and codec; Apply and reconnect retries
+  immediately. The encoded queue follows frame intervals and sustained decode
+  overload reports local capacity. Automatic session FPS reduction remains pending.
+- Stats distinguish UI-observed pictures and modelled delay, show decode p95
+  and frame budget, and name immediate presentation. Correct the small-window
+  keyboard snapshot fixture. Native decode benchmarks validate native surfaces
+  and separately time CPU materialisation.
+
 ## 5.2.0 (2026-11-04)
 
 Latch no longer sets limits of its own. A stream can ask for up to 500 fps,

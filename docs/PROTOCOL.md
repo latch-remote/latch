@@ -1,5 +1,20 @@
 # Latch stream protocol, version 1
 
+### Optional joint colour ranking (protocol 1)
+
+Host status may advertise `streamer.prefer_color: true` (absent means false).
+Only an Auto viewer seeing that offer sends `StreamRequest.prefer_color: true`.
+False is omitted. The host then stably ranks offered, supported codecs by
+negotiated HDR and bit depth before their existing codec order. Current
+implementations provide ten-bit/HDR through HEVC. Explicit codec selection and
+old viewers omit the flag; old hosts receive no new request field and keep
+legacy selection. No version bump or new control message is introduced.
+
+Decoder-overload detection is local only. No session FPS reduction is sent;
+old and new hosts continue the accepted rate until reconnection. Queue recovery
+still uses the existing keyframe messages.
+
+
 Latch 5 streams a desktop with its own protocol. It replaces the
 GameStream/Moonlight protocol that Sunshine and moonlight-common-c spoke
 until Latch 4. Every byte of it is implemented in Rust in `crates/proto`.
