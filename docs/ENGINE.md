@@ -644,3 +644,31 @@ rather than silently consuming a frame number. The sender logs an oversized
 frame, invalidates its recovery history, requests a keyframe and skips dependent
 queued pictures until an intact keyframe. Protocol 1 layouts are unchanged;
 older hosts already cannot emit frames beyond this limit.
+
+### Viewer input scheduling and recovery
+
+Mouse, keyboard and text are forwarded from egui's accumulated input during
+the viewer's UI update, so an event waits for the frame in progress to
+finish; the window repaints at once on input and presents without vsync,
+which bounds that wait by one frame's work. The session sender flushes
+immediately when called, and reliability retries run independently of the
+UI. Gamepad state is sent directly from each platform's gamepad thread.
+Sending mouse and keyboard from the OS event itself is on the
+[roadmap](ROADMAP.md).
+
+After an unexpected transport drop, the viewer reconnects with fresh
+negotiation for up to five minutes: 2/5/10-second waits followed by jittered
+20–30-second waits. Discovery returning online or an event-loop gap over ten
+seconds advances a pending retry. Explicit refusals, takeover and host ends
+stop automatic retries. The overlay offers Reconnect now and Stop.
+
+Windows Media Foundation workers answer their caller within a deadline: one
+second for an access unit, five to open a decoder, twenty for the
+once-per-process probe of every codec. The GPU-copy fence keeps its
+two-second bound. A decode that times out abandons that worker, reports an
+error (which requests a keyframe), and opens a fresh decoder on the next
+keyframe. At most three worker timeouts per ten minutes are allowed
+process-wide; reopen failures feed the existing Baseline software fallback or
+modern-codec renegotiation. Driver resources stay owned by the abandoned
+worker until its call returns. This recovery has not run against a hung
+driver on Windows hardware.

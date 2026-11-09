@@ -13,6 +13,8 @@ mod av1;
 mod software;
 #[cfg(target_os = "macos")]
 mod videotoolbox;
+#[cfg(any(windows, test))]
+mod worker_deadline;
 
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
@@ -634,6 +636,14 @@ impl Decoder for Fallback {
     ) -> Result<Option<Frame>> {
         if let Some(platform) = self.platform.as_mut() {
             let result = platform.decode(annexb, idr, spare.take());
+            #[cfg(windows)]
+            if result
+                .as_ref()
+                .is_err_and(|e| e.is::<worker_deadline::ReopenFailed>())
+            {
+                self.proven = false;
+                self.tries = PROBATION - 1;
+            }
             if self.proven {
                 return result;
             }
