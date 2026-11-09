@@ -4,7 +4,8 @@
 //! loopback (the host's own control panel), or a tailnet machine that
 //! `tailscale whois` says belongs to the account this one is signed in as.
 //! A tagged machine (the relay VPS) belongs to no account, so it answers
-//! the members of its own tailnet. Everyone else gets a 403 and nothing
+//! its personal tailnet owner or explicitly allowed organisation logins.
+//! Everyone else gets a 403 and nothing
 //! more: a machine shared in from someone else's tailnet can reach the
 //! port, but may not stream, sleep the PC, read its clipboard or push it an
 //! executable.
@@ -50,6 +51,8 @@ const TIDY_TICK: u64 = 120;
 
 pub struct Service {
     cfg: Mutex<HostConfig>,
+    local_secret: Option<String>,
+    clipboard_lease: Arc<Mutex<Option<ClipboardLease>>>,
     /// This machine's name, re-read now and then: asking macOS or Linux
     /// runs a program, which every status request used to do.
     name: Mutex<String>,
@@ -90,10 +93,33 @@ pub struct Service {
     power_pending: Arc<AtomicBool>,
 }
 
+/// A generation ties clipboard access to one admitted stream, including unwinding.
+#[derive(Clone, Copy)]
+struct ClipboardLease {
+    peer: IpAddr,
+    generation: Instant,
+    active: bool,
+}
+struct ClipboardStream {
+    lease: Arc<Mutex<Option<ClipboardLease>>>,
+    generation: Instant,
+}
+impl Drop for ClipboardStream {
+    fn drop(&mut self) {
+        let mut state = self.lease.lock();
+        if let Some(lease) = state.as_mut().filter(|l| l.generation == self.generation) {
+            lease.active = false;
+            lease.generation = Instant::now();
+        }
+    }
+}
+
 impl Service {
     pub fn new() -> Self {
         Self {
             cfg: Mutex::new(HostConfig::load()),
+            local_secret: crate::local_control::token().ok(),
+            clipboard_lease: Arc::new(Mutex::new(None)),
             name: Mutex::new(latch_core::config::machine_name()),
             tailscale: Mutex::new(Err("not checked yet".into())),
             wake: Mutex::new(WakeInfo::default()),
@@ -296,6 +322,9 @@ impl Service {
     fn refresh(self: &Arc<Self>, tick: u64) {
         let prev = self.cfg.lock().clone();
         let (cfg, line) = next_config(prev, HostConfig::try_load(), &mut self.cfg_problem.lock());
+        if self.cfg.lock().allowed_logins != cfg.allowed_logins {
+            self.auth.lock().clear();
+        }
         *self.cfg.lock() = cfg;
         if let Some(line) = line {
             self.log(line);
@@ -473,8 +502,17 @@ impl Service {
         let wake = self.wake.lock().clone();
         let streamer = self.streaming_status();
         let mut setup = Vec::new();
+        if self.local_secret.is_none() {
+            setup.push("Local control secret unavailable: check data-directory permissions, then restart Latch.".into());
+        }
         if let Err(e) = &*ts {
             setup.push(format!("Tailscale: {e}. Install it and sign in."));
+        }
+        if ts.as_ref().is_ok_and(|st| {
+            let owner = self.owner(st);
+            owner.tagged && !owner.tailnet.contains('@') && cfg.allowed_logins.is_empty()
+        }) {
+            setup.push("Tagged organisation host: set allowed_logins in host.toml. An email domain does not prove membership; remote control is refused until configured.".into());
         }
         #[cfg(target_os = "macos")]
         setup.extend(crate::unix_setup::permission_items());
@@ -499,7 +537,9 @@ impl Service {
             );
         }
         #[cfg(windows)]
-        if !latch_engine::windows::input_helper_exe().is_some_and(|exe| exe.is_file()) {
+        if cfg.elevated_input
+            && !latch_engine::windows::input_helper_exe().is_some_and(|exe| exe.is_file())
+        {
             setup.push(
                 "Windows that run as administrator ignore a viewer's mouse and keyboard.".into(),
             );
@@ -573,7 +613,7 @@ impl Service {
             };
         }
         let tun = *self.tun.lock();
-        let owner = self.tailscale.lock().as_ref().ok().map(Owner::of);
+        let owner = self.tailscale.lock().as_ref().ok().map(|st| self.owner(st));
         loopback_caller(tun, owner.as_ref(), || {
             let found = tailscale::whois_addr(peer);
             let line = match &found {
@@ -619,6 +659,12 @@ impl Service {
     /// a tailnet peer must pass [`Owner::admits`]. A `whois` answer is
     /// remembered for [`AUTH_TTL`], a refusal included; a failed `whois` is
     /// not remembered.
+    fn owner(&self, st: &tailscale::Status) -> Owner {
+        let mut owner = Owner::of(st);
+        owner.allowed_logins = self.cfg.lock().allowed_logins.clone();
+        owner
+    }
+
     fn authorized(&self, ip: IpAddr) -> bool {
         if ip.is_loopback() {
             return true;
@@ -635,9 +681,13 @@ impl Service {
         }
         // Copied out so the lock is not held across the `whois` call.
         let owner = match &*self.tailscale.lock() {
-            Ok(st) => Owner::of(st),
+            Ok(st) => self.owner(st),
             Err(_) => return false,
         };
+        if owner.tagged && !owner.tailnet.contains('@') && owner.allowed_logins.is_empty() {
+            self.log("Tagged organisation host: set allowed_logins in host.toml; local API does not establish tailnet membership. Refused.");
+            return false;
+        }
         let allowed = match tailscale::whois(ip) {
             Ok(w) => {
                 let allowed = owner.admits(&w);
@@ -718,14 +768,41 @@ impl Service {
             );
         }
         // The service log and /v1/quit are for this machine's own window.
-        let local = caller == Caller::Local;
+        let local_machine = caller == Caller::Local || self.own_address(peer.ip());
+        let local = local_machine
+            && self
+                .local_secret
+                .as_deref()
+                .is_some_and(|secret| req.header(crate::local_control::HEADER) == Some(secret));
+        if local_machine && !local && !(req.method == "GET" && req.path == "/v1/status") {
+            return Response::json(403, &Ack::err("local control requires this user's secret"));
+        }
+        if req.path == CLIPBOARD_PATH {
+            let ip = if peer.ip().is_loopback() {
+                media_peer(peer, tailscale::whois_addr(peer).ok().flatten()).ip()
+            } else {
+                peer.ip()
+            };
+            if ip.is_loopback()
+                || !self.cfg.lock().clipboard_sharing
+                || !self.clipboard_lease.lock().as_ref().is_some_and(|lease| {
+                    lease.peer == ip
+                        && (lease.active || lease.generation.elapsed() < Duration::from_secs(5))
+                })
+            {
+                return Response::json(
+                    403,
+                    &Ack::err(
+                        "clipboard sharing requires a current or recent stream from this peer",
+                    ),
+                );
+            }
+        }
         // Loopback, or this machine's own tailnet address, is any process
         // here, signed in as any OS user. An executable pushed from there
         // would run as the account that owns this service, and the
         // clipboard is that account's: both are for the other machines.
-        if (req.path == UPDATE_PATH || req.path == CLIPBOARD_PATH)
-            && (local || self.own_address(peer.ip()))
-        {
+        if (req.path == UPDATE_PATH || req.path == CLIPBOARD_PATH) && local_machine {
             return Response::json(
                 403,
                 &Ack::err("updates and the clipboard are for the other machines on this Tailscale account"),
@@ -738,7 +815,7 @@ impl Service {
             ("POST", p) if p == control::PATH => {
                 // Connecting to our own tailnet address does not establish
                 // which OS account is asking to control this desktop.
-                if local || self.own_address(peer.ip()) {
+                if local_machine {
                     Response::json(
                         403,
                         &Ack::err("streaming sessions must come from another authorized Tailscale machine"),
@@ -885,9 +962,31 @@ impl Service {
         } else {
             peer
         };
+        if peer.ip().is_loopback() {
+            return Response::json(
+                403,
+                &Ack::err("could not resolve the streaming peer's Tailscale address"),
+            );
+        }
         match server.prepare(request, peer) {
             Ok(prepared) => {
-                Response::switching(control::UPGRADE, move |tcp| server.run(prepared, tcp))
+                let lease = self.clipboard_lease.clone();
+                let id = Instant::now();
+                *lease.lock() = Some(ClipboardLease {
+                    peer: peer.ip(),
+                    generation: id,
+                    active: false,
+                });
+                Response::switching(control::UPGRADE, move |tcp| {
+                    if let Some(current) = lease.lock().as_mut().filter(|l| l.generation == id) {
+                        current.active = true;
+                    }
+                    let _stream = ClipboardStream {
+                        lease,
+                        generation: id,
+                    };
+                    server.run(prepared, tcp);
+                })
             }
             Err(refusal) => Response::json(refusal.status, &Ack::err(refusal.message)),
         }
@@ -1095,11 +1194,13 @@ struct Owner {
     /// `CurrentTailnet.Name`: the owner's login for a personal tailnet,
     /// the domain for an organisation's.
     tailnet: String,
+    allowed_logins: Vec<String>,
 }
 
 impl Owner {
     fn of(st: &tailscale::Status) -> Self {
         Self {
+            allowed_logins: Vec::new(),
             user: st.self_node.user_id,
             tagged: !st.self_node.tags.is_empty(),
             tailnet: st
@@ -1112,12 +1213,16 @@ impl Owner {
 
     /// The same account may ask. A tagged machine has no account of its
     /// own, so it takes the members of its tailnet: the owner of a
-    /// personal tailnet, the users of an organisation's domain. A machine
+    /// personal tailnet, explicitly allowed logins in an organisation. A machine
     /// shared in from another tailnet is neither, even though `whois`
     /// knows it and the tailnet's rules let it reach this port.
     fn admits(&self, peer: &tailscale::WhoIs) -> bool {
         let user = peer.user_profile.id;
-        if user == 0 {
+        if user == 0
+            || !peer.node.tags.is_empty()
+            || peer.node.sharer != 0
+            || peer.node.hostinfo.sharee_node
+        {
             return false;
         }
         if !self.tagged {
@@ -1130,10 +1235,13 @@ impl Owner {
             return false;
         }
         let login = peer.user_profile.login_name.as_str();
-        login.eq_ignore_ascii_case(&self.tailnet)
-            || login
-                .rsplit_once('@')
-                .is_some_and(|(_, domain)| domain.eq_ignore_ascii_case(&self.tailnet))
+        if self.tailnet.contains('@') {
+            login.eq_ignore_ascii_case(&self.tailnet)
+        } else {
+            self.allowed_logins
+                .iter()
+                .any(|allowed| login.eq_ignore_ascii_case(allowed))
+        }
     }
 }
 
@@ -1484,7 +1592,7 @@ mod tests {
             tailnet: "example.com".into(),
             ..vps.clone()
         };
-        assert!(org.admits(&whois(5, "ada@EXAMPLE.com")));
+        assert!(!org.admits(&whois(5, "ada@EXAMPLE.com")));
         assert!(!org.admits(&whois(6, "eve@example.com.evil")));
         // Without a tailnet name a tagged machine takes nobody.
         let unnamed = Owner {
@@ -1495,12 +1603,165 @@ mod tests {
         assert!(!unnamed.admits(&relay));
     }
 
+    #[test]
+    fn organisation_requires_explicit_logins_and_rejects_sharing_markers() {
+        let st = tailscale::parse_status(r#"{"Self":{"UserID":18,"Tags":["tag:relay"]},"CurrentTailnet":{"Name":"example.com"}}"#).unwrap();
+        let mut owner = Owner::of(&st);
+        let fixtures = [
+            (
+                r#"{"UserProfile":{"ID":21,"LoginName":"member@example.com"},"Node":{}}"#,
+                true,
+            ),
+            (
+                r#"{"UserProfile":{"ID":22,"LoginName":"shared@example.com"},"Node":{"Sharer":42}}"#,
+                false,
+            ),
+            (
+                r#"{"UserProfile":{"ID":23,"LoginName":"guest@other.test"},"Node":{}}"#,
+                false,
+            ),
+            (
+                r#"{"UserProfile":{"ID":18,"LoginName":"tagged-devices"},"Node":{"Tags":["tag:relay"]}}"#,
+                false,
+            ),
+            (
+                r#"{"UserProfile":{"ID":22,"LoginName":"shared@example.com"},"Node":{"Hostinfo":{"ShareeNode":true}}}"#,
+                false,
+            ),
+        ];
+        for (json, expected) in fixtures {
+            let peer = serde_json::from_str(json).unwrap();
+            assert!(!owner.admits(&peer));
+            owner.allowed_logins = vec![
+                "member@example.com".into(),
+                "shared@example.com".into(),
+                "tagged-devices".into(),
+            ];
+            assert_eq!(owner.admits(&peer), expected);
+            owner.allowed_logins.clear();
+        }
+    }
+
+    #[test]
+    fn local_secret_protects_writes_and_private_status() {
+        let svc = Service::new();
+        let local = "127.0.0.1:5".parse().unwrap();
+        for path in ["/v1/quit", "/v1/display", "/v1/power"] {
+            let req = Request {
+                method: "POST".into(),
+                path: path.into(),
+                headers: json_header(),
+                ..Default::default()
+            };
+            assert_eq!(svc.handle(local, &req).status, 403);
+            let mut wrong = req.clone();
+            wrong
+                .headers
+                .push((crate::local_control::HEADER.into(), "wrong".into()));
+            assert_eq!(svc.handle(local, &wrong).status, 403);
+        }
+        let mut req = Request {
+            method: "POST".into(),
+            path: "/v1/display".into(),
+            headers: json_header(),
+            body: b"invalid".to_vec(),
+        };
+        req.headers.push((
+            crate::local_control::HEADER.into(),
+            svc.local_secret.clone().unwrap(),
+        ));
+        assert_eq!(svc.handle(local, &req).status, 400);
+        svc.log("private log");
+        let mut req = Request {
+            method: "GET".into(),
+            path: "/v1/status".into(),
+            ..Default::default()
+        };
+        assert!(!svc.handle(local, &req).body.contains("private log"));
+        req.headers.push((
+            crate::local_control::HEADER.into(),
+            svc.local_secret.clone().unwrap(),
+        ));
+        assert!(svc.handle(local, &req).body.contains("private log"));
+    }
+
+    #[test]
+    fn clipboard_stream_drop_starts_grace_without_retiring_a_new_stream() {
+        let id = Instant::now();
+        let state = Arc::new(Mutex::new(Some(ClipboardLease {
+            peer: "100.64.0.5".parse().unwrap(),
+            generation: id,
+            active: true,
+        })));
+        drop(ClipboardStream {
+            lease: state.clone(),
+            generation: id,
+        });
+        assert!(!state.lock().unwrap().active);
+        let next = Instant::now();
+        state.lock().as_mut().unwrap().generation = next;
+        state.lock().as_mut().unwrap().active = true;
+        drop(ClipboardStream {
+            lease: state.clone(),
+            generation: id,
+        });
+        assert!(state.lock().unwrap().active);
+    }
+
+    #[test]
+    fn clipboard_requires_same_peer_recent_stream_and_switch() {
+        let svc = Service::new();
+        let peer: SocketAddr = "100.64.0.5:5".parse().unwrap();
+        let other: SocketAddr = "100.64.0.6:5".parse().unwrap();
+        let mut st = tailscale::Status::default();
+        st.self_node.tailscale_ips = vec!["100.64.0.99".into()];
+        *svc.tailscale.lock() = Ok(st);
+        for ip in [peer.ip(), other.ip()] {
+            svc.auth.lock().insert(ip, (Instant::now(), true));
+        }
+        // Invalid JSON proves admission without accessing the system clipboard.
+        let req = Request {
+            method: "POST".into(),
+            path: CLIPBOARD_PATH.into(),
+            headers: json_header(),
+            body: b"invalid".to_vec(),
+        };
+        assert_eq!(svc.handle(peer, &req).status, 403);
+        *svc.clipboard_lease.lock() = Some(ClipboardLease {
+            peer: peer.ip(),
+            generation: Instant::now(),
+            active: true,
+        });
+        assert_eq!(svc.handle(peer, &req).status, 400);
+        assert_eq!(svc.handle(other, &req).status, 403);
+        *svc.clipboard_lease.lock() = Some(ClipboardLease {
+            peer: peer.ip(),
+            generation: Instant::now(),
+            active: false,
+        });
+        assert_eq!(svc.handle(peer, &req).status, 400);
+        *svc.clipboard_lease.lock() = Some(ClipboardLease {
+            peer: peer.ip(),
+            generation: Instant::now() - Duration::from_secs(6),
+            active: false,
+        });
+        assert_eq!(svc.handle(peer, &req).status, 403);
+        *svc.clipboard_lease.lock() = Some(ClipboardLease {
+            peer: peer.ip(),
+            generation: Instant::now(),
+            active: true,
+        });
+        svc.cfg.lock().clipboard_sharing = false;
+        assert_eq!(svc.handle(peer, &req).status, 403);
+    }
+
     /// A Docker node's tailscaled in userspace mode relays every tailnet
     /// peer from 127.0.0.1: only `whois` of the port tells them apart from
     /// the node's own processes.
     #[test]
     fn a_peer_relayed_through_loopback_is_judged_like_any_other() {
         let owner = Owner {
+            allowed_logins: Vec::new(),
             user: 21,
             tagged: false,
             tailnet: "ada@example.com".into(),
@@ -1705,7 +1966,13 @@ mod tests {
         let post = |path: &str, body: &str| Request {
             method: "POST".into(),
             path: path.into(),
-            headers: json_header(),
+            headers: vec![
+                ("content-type".into(), "application/json".into()),
+                (
+                    crate::local_control::HEADER.into(),
+                    svc.local_secret.clone().unwrap(),
+                ),
+            ],
             body: body.into(),
         };
         assert_eq!(svc.handle(local, &post(control::PATH, "{}")).status, 403);
@@ -1808,7 +2075,7 @@ mod tests {
         }
         // Another machine on the account still gets through to the route.
         assert_ne!(svc.handle(other, &update).status, 403);
-        assert_eq!(svc.handle(other, &write).status, 400);
+        assert_eq!(svc.handle(other, &write).status, 403);
         assert_eq!(svc.handle(other, &stream).status, 400);
         // A cached admission must not bypass the local-address check when
         // the next Tailscale status probe fails.
@@ -1874,10 +2141,16 @@ mod tests {
             &Request {
                 method: "POST".into(),
                 path: "/v1/power".into(),
-                headers: vec![(
-                    "content-type".into(),
-                    "Application/JSON; charset=utf-8".into(),
-                )],
+                headers: vec![
+                    (
+                        crate::local_control::HEADER.into(),
+                        svc.local_secret.clone().unwrap(),
+                    ),
+                    (
+                        "content-type".into(),
+                        "Application/JSON; charset=utf-8".into(),
+                    ),
+                ],
                 body: br#"{"action":"nap"}"#.to_vec(),
             },
         );
@@ -1958,7 +2231,7 @@ mod tests {
                 body: b"not json".to_vec(),
             },
         );
-        assert_eq!(r.status, 400, "{}", r.body);
+        assert_eq!(r.status, 403, "{}", r.body);
         let r = svc.handle(
             peer,
             &Request {
@@ -1967,7 +2240,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(r.status == 200 || r.status == 500, "{}", r.body);
+        assert_eq!(r.status, 403, "{}", r.body);
     }
 
     #[test]

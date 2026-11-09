@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Default new Windows installs to no administrator input helper. Sharing offers explicit consent with a same-user risk explanation; existing tasks migrate on once. Setup records the installed host path for pipe client checks and removes disabled tasks.
+- Require a private per-user secret for local control, keeping read-only status available to health checks.
+- Require explicit `allowed_logins` on tagged organisation hosts rather than trusting email domains; reject sharing-marked and tagged peers.
+- Restrict clipboard sharing to the current/recent streaming peer and add a Sharing switch.
+
 The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
 `## X.Y.Z (date)`.
