@@ -36,7 +36,7 @@ screen they also moved between the app's space and the desktop.
 | `presentation failed` warnings | many a second | 0 |
 | Exercise steps / focus changes logged | n/a | 41 / 13 |
 
-These counts come from the app's own log, in [the log excerpt](sdr10-real-app.log).
+These counts come from the app's own log, (the log excerpt was not kept).
 This shell cannot take screenshots, so nothing here looks at the screen. The
 "before" column is the owner's report and log. A before build with the same test
 hook was ready but could not be run (see below).
@@ -96,7 +96,7 @@ each Space switch and came back.
 Before the display-ID change, a debug run of this branch logged a
 `video display changed` after every activation. The probe showed the same
 window with a new `NSScreen` pointer each time, though no switch followed
-for SDR. Logs: [review-fixes-real-app.log](review-fixes-real-app.log).
+for SDR. The log was not kept.
 
 **Still not run live:** an HDR (PQ) stream in the real window. The test
 `serve` only makes 8-bit H.264, and the PC that makes Main10 PQ is offline.

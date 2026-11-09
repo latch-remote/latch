@@ -39,10 +39,10 @@ and gamepads, and the clipboard. Every install can both view and share;
 there is no separate host and client to pick.
 
 - **Fast.** Hardware HEVC, AV1 and H.264, HDR10 and ten-bit colour, 5.1 and
-  7.1 sound. Latch sets no ceilings of its own: a stream asks for this
-  display's own size and refresh rate (anything up to 16384 pixels a side,
-  500 fps and 1 Gbps) and the two machines and the path between them decide
-  what you get. [Measured numbers](docs/PERFORMANCE.md).
+  7.1 sound. A stream asks for this display's own size and refresh rate,
+  and is fitted to what the two machines' encoders, decoders and displays
+  report; the request ceilings (16384 pixels a side, 500 fps, 1 Gbps) sit
+  above what current hardware does. [Measured numbers](docs/PERFORMANCE.md).
 - **Nothing to configure.** No accounts, no pairing PINs, no port
   forwarding. Tailscale is the identity check and the encryption; Latch
   answers only devices signed in to your own account.
