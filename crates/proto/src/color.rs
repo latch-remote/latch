@@ -62,6 +62,20 @@ impl Default for ColorDescription {
     }
 }
 impl ColorDescription {
+    pub fn rank_codecs(
+        codecs: &mut [crate::control::Codec],
+        caps: ColorCapabilities,
+        enabled: bool,
+        hdr_source: bool,
+    ) {
+        if enabled {
+            codecs.sort_by_key(|c| {
+                let color = Self::negotiate(caps, *c == crate::control::Codec::Hevc, hdr_source);
+                std::cmp::Reverse((color.is_hdr(), color.bit_depth))
+            });
+        }
+    }
+
     pub fn negotiate(caps: ColorCapabilities, hevc: bool, hdr_source: bool) -> Self {
         if !hevc {
             return Self::default();
@@ -243,6 +257,55 @@ pub fn hevc_hdr_sei(meta: HdrMetadata) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn joint_codec_colour_matrix_and_legacy_order() {
+        use crate::control::Codec::{Av1, H264Baseline, Hevc};
+        for av1 in [false, true] {
+            for hevc in [false, true] {
+                for (ten_bit, hdr) in [(false, false), (true, false), (true, true)] {
+                    for enabled in [false, true] {
+                        let mut codecs = Vec::new();
+                        if av1 {
+                            codecs.push(Av1);
+                        }
+                        if hevc {
+                            codecs.push(Hevc);
+                        }
+                        codecs.push(H264Baseline);
+                        let original = codecs.clone();
+                        ColorDescription::rank_codecs(
+                            &mut codecs,
+                            ColorCapabilities {
+                                ten_bit,
+                                hdr,
+                                peak_nits: 1000,
+                            },
+                            enabled,
+                            true,
+                        );
+                        if enabled && ten_bit && hevc {
+                            assert_eq!(codecs[0], Hevc);
+                        } else {
+                            assert_eq!(codecs, original);
+                        }
+                    }
+                }
+            }
+        }
+        // Explicit AV1 is never replaced by an unoffered codec.
+        let mut explicit = [Av1, H264Baseline];
+        ColorDescription::rank_codecs(
+            &mut explicit,
+            ColorCapabilities {
+                ten_bit: true,
+                hdr: true,
+                peak_nits: 1000,
+            },
+            true,
+            true,
+        );
+        assert_eq!(explicit[0], Av1);
+    }
     #[test]
     fn negotiation_is_default_off() {
         assert_eq!(

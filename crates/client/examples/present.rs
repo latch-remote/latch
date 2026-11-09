@@ -251,6 +251,7 @@ fn main() -> anyhow::Result<()> {
                     Some(Session::start(
                         server,
                         Settings {
+                            prefer_color: false,
                             width,
                             height,
                             fps,

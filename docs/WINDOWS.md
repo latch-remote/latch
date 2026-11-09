@@ -1,5 +1,18 @@
 # Windows
 
+### Viewer negotiation and decoder recovery
+
+Protocol 1 Auto peers that advertise/offer joint colour ranking prefer HEVC
+Main10/HDR when supported over SDR8 AV1. Explicit AV1 retains priority. Opening
+failures (including unavailable OS codec extensions) are suppressed per host
+and codec for five minutes; runtime decode failures cool down for 15 seconds.
+A new connection after expiry retries; Apply and reconnect bypasses cooldowns.
+This does not change the Media Foundation frame format or native transfer path.
+The immediate-present stats label describes policy, not completed presentation;
+scanout and panel latency are unmeasured. Decoder overload reports local capacity
+but does not yet retime the host session automatically.
+
+
 `latch-host.exe` is Latch on Windows: a background service other
 machines talk to over Tailscale, a window that lists every machine on
 your account (Connect opens their desktop) and shares this PC, and the
@@ -53,7 +66,8 @@ built-in streaming engine that captures and streams the desktop.
      (`%ProgramFiles%\Latch\engine`, `%ProgramFiles%\BroLink\engine`), a
      `SunshineService` installed in one of them, and the old firewall
      rules;
-   - copies the checked `latch-host.exe` into `%ProgramFiles%\Latch\Input`
+   - only when **Control windows that run as administrator** is enabled,
+     copies the checked `latch-host.exe` into `%ProgramFiles%\Latch\Input`
      and registers the `LatchInput` task, which runs that copy with
      `--input-helper` as the user who ran setup, elevated (see
      [Windows that run as administrator](#windows-that-run-as-administrator));
@@ -123,28 +137,61 @@ installer, Task Manager, an administrator's terminal or a game launcher that
 runs as administrator (HoYoPlay, for one) has focus: the viewer's pointer
 freezes until that window is closed at the PC.
 
-Each stream therefore starts the `LatchInput` task that setup registers. It
-runs the copy of Latch in `%ProgramFiles%\Latch\Input`, a folder only
-administrators can change, elevated, as the user who ran setup, with no
-prompt. The stream sends its input to that helper through a named pipe
-(`\\.\pipe\LatchInput-<session>`) that only that user's processes in the
-same session can open, and only after checking that the pipe's server is
-that very copy; until the helper answers, and if it ever goes away, Latch
-injects input itself. The helper lets go of every key and button its stream
-held when the stream ends, and exits a minute after the last stream.
+The Sharing tab's **Control windows that run as administrator** switch is
+**off by default**. Turn it on, then run **Set up as administrator** to apply
+it. Turning it off also requires setup, which stops and removes `LatchInput`.
+Existing installs with that task keep it enabled on upgrade, once, so working
+setups do not silently lose input; the switch shows that choice.
 
-Updates replace only the copy in `%LOCALAPPDATA%`. The helper keeps
-serving newer versions until one changes how the two talk; then
-`service.log` says the helper did not answer, and running setup again
-brings it up to date. The Sharing tab asks for setup while the helper is
-missing, and `service.log` names any window that ignores the viewer's
-input because it runs as administrator.
+While enabled, **any program running as you on this PC can control your
+administrator windows too**. This is a deliberate relaxation of Windows'
+normal integrity boundary, not a UAC bypass for other users or the secure
+desktop. Leave it off unless you need it.
 
-Any program running as that user can start the task, so it lets that user's
-unelevated programs send keyboard and mouse input to their own elevated
-windows, which Windows would otherwise refuse. Windows' secure desktop (UAC
-prompts, the sign-in and lock screens) still cannot be reached: it needs a
-SYSTEM service, which Latch 5 does not install.
+Each stream starts the task asynchronously. It runs the protected copy in
+`%ProgramFiles%\Latch\Input`. Until it answers the host injects normally;
+stream startup never waits for elevation. The helper releases held keys and
+buttons when the pipe closes and exits within about ten idle seconds (five
+seconds of grace plus its five-second idle check), allowing quick reconnects.
+It is not a logon task or a continuously running service.
+
+Both ends check the other process's image path. The helper uses
+`GetNamedPipeClientProcessId` and compares the image to the installed
+`latch-host.exe` path recorded by setup in its administrator-protected folder;
+it also checks the Windows session. This narrows the same-user route but does
+not close it: programs running as you can manipulate your unelevated host.
+The secure desktop, sign-in and lock screens remain inaccessible.
+
+Updates replace the user's host copy. Run setup again if its install path
+changes or if `service.log` reports an incompatible helper.
+
+## Troubleshooting
+
+**The mouse does not move over some windows:** those windows may run as
+administrator. If you accept the same-user risk described above, turn on
+**Control windows that run as administrator** in Sharing, then click
+**Set up as administrator**. UAC prompts on the secure desktop cannot be
+controlled even with this enabled.
+
+**Local control:** the window sends a per-user `local-control-token` from
+Latch's data directory. On Unix it is created with mode 0600. On Windows the
+normal `%LOCALAPPDATA%` profile directory supplies the user ACL inherited by
+Latch's directory and token (administrators and SYSTEM retain access).
+Microsoft documents the [per-user profile isolation](https://learn.microsoft.com/en-us/dotnet/standard/io/isolated-storage)
+and [LocalAppData location](https://learn.microsoft.com/windows/win32/shell/knownfolderid). Do not
+redirect the data directory to a shared folder. Unauthenticated loopback
+health/status reads continue to work, without service logs; display, power
+and quit requests require the token.
+
+**Tagged organisation hosts:** set `allowed_logins = ["you@example.com"]` in
+`host.toml`. Tailscale's local API reports identities and sharing markers,
+not a reliable membership assertion. Latch refuses these hosts' remote
+control without an explicit list and rejects marked shared or tagged peers.
+Personal tailnets retain exact owner-login matching.
+
+**Clipboard:** Sharing's clipboard switch defaults on. Only the current
+stream's peer, or that peer for five seconds afterwards, can read or write
+clipboard text. Older viewers use the same endpoint.
 
 ## Uninstalling
 
@@ -299,7 +346,8 @@ on hardware encoders. Four cached NV12 textures and their views are reused.
 - **Fallback.** H.264 High/Baseline keep the GPU MFT → Microsoft MFT →
   Latch software path. An AMF runtime failure reopens MF HEVC and starts
   with an IDR. A hardware-only codec that fails through MF ends the stream
-  and is withheld until restart; a stream never silently changes codec.
+  and the viewer reconnects without it, with a notice and host-scoped cooldown;
+  a stream never silently changes codec.
 
 ### Virtual display modes
 
@@ -379,13 +427,16 @@ requests, all JSON:
 
 A request is answered only if it comes from loopback or from a Tailscale
 address that `tailscale whois` attributes to the account this PC is signed
-in as. Tagged hosts instead match login to the tailnet name or domain;
-that is broader than a membership check and can admit a shared-in user
-with a matching domain. Other remote callers get a 403 before any action. Loopback, and this PC's own Tailscale
+in as. A tagged host has no account of its own: on a personal tailnet it
+answers the tailnet's owner, and on an organisation's tailnet only the
+logins listed in `allowed_logins` in `host.toml`. Machines shared in from
+another tailnet, and tagged peers, are refused. Other remote callers get a
+403 before any action. Loopback, and this PC's own Tailscale
 address, can be a process of any Windows user signed in here, so they may
-not start a stream, push an update or use the clipboard. Local processes
-can still request quit, display changes and permitted power actions;
-loopback is not authentication of a particular Windows user.
+not start a stream or use the clipboard, and anything beyond reading the
+status needs the per-user token (see Local control). With it, this PC's own
+window may submit an update, which is checked against GitHub's published
+digest like any other.
 
 The service also listens on UDP 9. A magic packet for this PC's MAC that
 arrives while it is awake is logged and reported in the status, which is
@@ -499,23 +550,43 @@ and restart Latch. Without one, the viewer's stats line says
 
 ## Updates
 
-Latch Host does not download anything. The Mac fetches each release and
-POSTs the new `latch-host.exe` to `/v1/update` on the control port with
-its version and SHA-256, from a machine on the PC's own Tailscale account,
-the same check that guards remote power actions. The service verifies the
-sender-supplied digest and a superficial Windows x64 executable structure,
-trusts the sender's version header, writes
-`latch-host.exe.new` beside itself, renames the running file to
-`latch-host.exe.old`, moves the new one in and starts it with
-`--replaces <pid>`; the new service waits for the old one to release the
-port, then removes the `.old` file. Both events appear in the host log and
-updates wait until no viewer is streaming. There is no independent
-publisher-signature check on a pushed executable.
+Windows checks GitHub every six hours and on **Check now** in Settings.
+When no viewing or sharing stream is active, it downloads the published
+`latch-host.exe`, verifies GitHub's SHA-256, and uses the same restart,
+probation and rollback path as a pushed update. Automatic updates must be
+enabled in Settings; `accept_updates` in `host.toml` also gates installation.
 
-For Windows-only installations, download the new release zip and repeat
-the PowerShell installer invocation above. Hosts older than 3.1 need local
-or SSH installation too: a Latch 5 viewer cannot connect to their retired
-GameStream protocol to upgrade through a stream.
+For every pushed update, the receiving PC independently looks up the claimed
+`v<version>` release in `MrBeldum/latch` using HTTPS. The version must be newer
+and the executable must exactly match the bare `latch-host.exe` asset's digest
+and size. The sender's hash alone is insufficient. Old Mac header names still
+work. Offline PCs, missing digests and releases without that bare asset are
+refused with a readable error on the pushing Mac. For a release predating the
+asset, update the PC once by hand using its Windows zip; no archive fallback is
+downloaded. Private repositories require `LATCH_GITHUB_TOKEN` or `github_token`
+in the PC's client configuration as well as on the Mac.
+
+Linux checks and announces newer versions in Settings and the status line,
+including the release URL, but never replaces its executable. Download the
+matching Linux tarball, verify it against the release's `SHA256SUMS`, and
+follow `deploy/native/README.md` to replace the binary and restart the service;
+container installations must rebuild/redeploy their image.
+
+GitHub digests and build attestations establish the GitHub/TLS release boundary;
+they do not provide an independent publisher signature if GitHub is compromised.
+
+After authentication, the service stages `latch-host.exe.new` beside itself,
+renames the running file to `latch-host.exe.old`, moves the new file in and
+starts it with `--replaces <pid>`. The new service waits for the old one to
+release the port. The probation watcher restores the previous executable if
+the replacement fails to become healthy. Installation is deferred during streams.
+Local submissions from the Windows pull updater use this same authenticated
+route; `accept_updates = false` refuses them as well as peer pushes.
+
+Hosts older than 3.1 need a local or SSH installation: download the
+release zip and run the PowerShell installer as above. A Latch 5 viewer
+cannot connect to their retired GameStream protocol to upgrade them
+through a stream.
 
 ## Staying reachable
 

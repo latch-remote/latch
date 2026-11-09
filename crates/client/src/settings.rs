@@ -25,7 +25,7 @@ pub fn mbps_label(kbps: u32) -> String {
 fn hint(q: Quality) -> &'static str {
     match q {
         Quality::Competitive => "1080p at this display's refresh rate, up to 360 fps: the most frames and the least delay.",
-        Quality::Auto => "This display's own size at its own refresh rate. Only the PC's encoder and the network set limits; a relay or a long round trip never lowers the frame rate or the bitrate.",
+        Quality::Auto => "This display's own size at its own refresh rate, fitted to what both machines report. The network can limit the delivered quality and frame rate.",
         Quality::Cinematic => "This display's size up to 4K, up to 120 fps, at half again Balanced's bitrate: the sharpest picture.",
         Quality::Custom => "Your own resolution, frame rate and bitrate, up to what the PC's encoder takes.",
     }

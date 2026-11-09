@@ -1,5 +1,18 @@
 # macOS client (Apple Silicon)
 
+### Viewer decode measurements
+
+`cargo run --release -p latch-stream --example stream_decode_bench` validates
+native VideoToolbox pictures with `Frame::with_planes`. Its native mode times
+decode without forced CPU materialisation; CPU-materialised mode includes
+`ensure_cpu_planes`. Validation and the pixel oracle are outside sample timing
+(and access native planes); loop elapsed time includes validation. Repeated
+64×64 H.264 IDRs measure neither desktop throughput nor GPU presentation.
+Stats label UI observation and modelled delay; present mode is immediate,
+with physical scanout unmeasured. Sustained local decode overload reports a
+capacity estimate; lower FPS/size and reconnect to act on it.
+
+
 Latch for the Mac is one native app: every machine on your Tailscale
 account, a Connect button each, a power menu, the stream itself, and a
 **Sharing** tab so a Windows PC or another Mac can open this desktop. Latch's stream protocol is compiled in, video is captured with ScreenCaptureKit
@@ -122,11 +135,12 @@ answered.
 **Stats** (or the host key with **S**, or **F6** as in GeForce NOW:
 Control-Option-S) lays a stats overlay over the picture's top-right
 corner without taking the mouse or showing the toolbar: resolution, codec
-and decoder; frames a second received, decoded and drawn against what was
+and decoder; frames a second received, decoded and UI-observed against what was
 asked for; bitrate now against the host's current target and the ceiling;
 round trip; frame jitter; packet loss as it happened and after FEC; frames
-lost, skipped before decoding and decoded but never drawn; decode time;
-how long a decoded picture waits to be drawn; and an estimated latency
+lost, skipped before decoding and decoded but never observed; average and p95
+decode time against the frame budget; decode-to-UI observation delay and immediate
+present mode; and modelled delay (excluding physical scanout)
 with its breakdown (host capture to send, half the round trip plus frame
 assembly, decoder queue plus decode, waiting to be drawn plus half a
 refresh of this display). Values worth a look turn amber.
@@ -248,7 +262,7 @@ it from this network (see below).
 
 | Setting | What it changes |
 |---------|-----------------|
-| Quality | Profiles that follow this display, as GeForce NOW's do. **Balanced** (the default) asks for this screen's own size at its own refresh rate (120 Hz on a ProMotion MacBook Pro, 144–360 on a fast monitor). **Competitive** is 1080p at the display's refresh rate, up to 360 fps. **Cinematic** is this screen's size up to 4K, up to 120 fps, at half again the bitrate. Each profile's bitrate is a ceiling: a computed 40 Mbps at 1080p60 before the 50 Mbps floor, growing as pixels to the ¾ and frame rate to the ½ (50 Mbps at 1080p60, 87 at 1440p120, 113 at 4K60, 160 at 4K120), half again for Cinematic, never under 5.1's 50 Mbps (Cinematic 100); the host comes down from it whenever the network carries less. **Custom** uses the rows below; changing one of them switches to it, starting from what the profile asked for. The negotiated encoder, decoder and display capabilities also limit the request: a larger picture than it takes is scaled down in proportion. Settings saved by 5.1 move Smooth, Balanced and Sharp to Competitive, Balanced and Cinematic once |
+| Quality | Profiles that follow this display, as GeForce NOW's do. **Balanced** (the default) asks for this screen's own size at its own refresh rate (120 Hz on a ProMotion MacBook Pro, 144–360 on a fast monitor). **Competitive** is 1080p at the display's refresh rate, up to 360 fps. **Cinematic** is this screen's size up to 4K, up to 120 fps, at half again the bitrate. Each profile's bitrate is a ceiling: a computed 40 Mbps at 1080p60 before the 50 Mbps floor, growing as pixels to the ¾ and frame rate to the ½ (50 Mbps at 1080p60, 87 at 1440p120, 113 at 4K60, 160 at 4K120), half again for Cinematic, never under 5.1's 50 Mbps (Cinematic 100); the host comes down from it whenever the network carries less. **Custom** uses the rows below; changing one of them switches to it, starting from what the profile asked for. The request is fitted to what both machines report; larger pictures are scaled down in proportion. Settings saved by 5.1 move Smooth, Balanced and Sharp to Competitive, Balanced and Cinematic once |
 | Resolution | **Match screen** is this display's own pixel size (3024×1964 on a 14" MacBook Pro), so the picture fills it exactly. **540p**, **720p**, **900p**, **1080p**, **1440p**, **4K**, **5K** and **8K** are the standard 16:9 sizes, 960×540, 1280×720, 1600×900, 1920×1080, 2560×1440, 3840×2160, 5120×2880 and 7680×4320; on a display of another shape they leave a bar above and below. The sizes below 1080p are for a PC that encodes in software or a slow network: fewer pixels leave more bitrate for each and a higher frame rate. The list shows the pixel size of each. The PC switches its display to the size asked for; a PC with no monitor needs a virtual display that lists that size, which setup on the PC arranges for the Virtual Display Driver |
 | Frame rate | 30 to 500, and this display's own rate (marked); the PC's display is switched to match when it can |
 | Bitrate | 2 to 1000 Mbps in steps (fine at the low end); arrow keys step once, Shift-arrow ten times. The most the encoder spends; the host's rate control comes down from it when the path drops packets |

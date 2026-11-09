@@ -94,7 +94,8 @@ High, HEVC and AV1 have the session's instead (`session::HARDWARE_PROBATION`):
 a decoder that cannot be created, gives no picture for ten access units, or
 fails three times without one ends that attempt, and the session asks the
 host again without the codec (down to Baseline), with a notice saying why;
-the codec is not offered again until the viewer restarts.
+the codec cools down for this host (five minutes for opening failures,
+15 seconds for runtime decode failures); Apply and reconnect retries immediately.
 `LATCH_TEST_BREAK_DECODER=hevc,h264-high` (or `all`; `hevc=silent` for a
 decoder that gives nothing) breaks decoders on purpose to test this.
 Unknown codec names in an offer are skipped by protocol-1 hosts.
@@ -306,6 +307,37 @@ back each pad's triggers, unless `LATCH_TEST_GAMEPADS=system` sends them to
 the platform's own. None of this compiles C: ViGEmBus's IOCTL layouts are
 declared in Rust from its MIT-licensed headers, and evdev/uinput are ioctls
 through `libc`.
+
+### Viewer negotiation and decoder load
+
+Auto can rank colour before codec order when the host advertises
+`streamer.prefer_color` and the viewer opts in. HEVC currently carries ten-bit
+SDR and HDR10; other implemented codecs negotiate SDR8. Without opt-in the
+viewer's order is unchanged. Each encoder fallback refits width, height, FPS
+and bitrate from the original request, including software limits, and undoes
+and repeats desktop preparation for that geometry.
+
+The queue of encoded frames waiting for the decoder is bounded by age: three
+frame intervals, clamped to 12–100 ms. Up to eight frames may wait, so the
+burst a network stall releases is decoded rather than discarded. Past either
+bound the reference chain is reset and a keyframe requested. A rolling 60-service-time window
+reports overload when mean decode time exceeds the negotiated frame interval
+by 10%, once per attempt. Stats show decode p95 over each stats window and a
+local throughput estimate. This detection does **not** lower the host's frame rate:
+the viewer says what this machine manages and the person lowers the frame
+rate or size in Stream settings. Sustained overload can still cause repeated
+recovery; adapting the session by itself is on the [roadmap](ROADMAP.md).
+
+Failures are scoped by remote address/port, codec, and failure kind: opening
+failures cool down for five minutes, runtime decode failures for 15 seconds.
+The next connection after expiry attempts the codec again; a running fallback
+session does not upgrade itself. A codec is tried only once per connection's
+fallback chain. Apply and reconnect clears cooldowns immediately. Baseline
+software decoding remains available. Hardware capability probes remain cached.
+
+Stats count UI-observed pictures, not scanout. Modelled delay adds
+host processing, half RTT, measured assembly/queue/decode/preparation and half
+refresh; GPU completion, compositor, panel response and scanout are unmeasured.
 
 ## Decisions
 
@@ -559,7 +591,7 @@ frames on the batch path are handed to decode after each datagram, before
 processing the rest of the batch or waiting for readiness: waiting at the
 end of a receive batch held each complete picture until the next datagram. Video
 shard storage is reused with a 4096-buffer pool cap. Decode queues are
-bounded by eight frames and 50 ms of age; exceeding either restarts at an
+bounded by eight frames and three frame intervals (12–100 ms) of age; exceeding either restarts at an
 IDR rather than decoding an increasing backlog. A missing initial IDR
 triggers recovery on the first complete P-frame, or after 500 ms without
 a delivered keyframe. Requests retry at max(50 ms, RTT), and at once when

@@ -4,6 +4,48 @@ The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
 `## X.Y.Z (date)`.
 
+## Unreleased
+
+- Windows hosts check every pushed update against the SHA-256 GitHub
+  publishes for that release's `latch-host.exe`, not against the hash the
+  sender supplies. A release without that file, or a PC that cannot reach
+  GitHub, refuses the update; install such a release on the PC by hand once.
+- Windows updates itself: with the window open it checks every six hours
+  (and from Settings) and installs a verified release when no stream is
+  running. Linux shows the new version and where to get it.
+- Releases carry the bare Windows executable and a `SHA256SUMS` for every
+  file, with build provenance attestations. Workflow actions are pinned to
+  commits, jobs have only the permissions they use, and a release runs the
+  same tests as CI.
+- Controlling administrator windows on a Windows host is now a choice:
+  new installs leave the helper off, and the Sharing tab explains what
+  turning it on allows. A PC that already had it keeps it. The helper
+  answers only the installed Latch.
+- The service on a machine takes control requests from that machine only
+  with a private per-user token, so another account signed in there can
+  read its status and nothing else.
+- A tagged host on an organisation's tailnet answers only the logins
+  listed in `allowed_logins` in `host.toml`; an email domain is not proof
+  of membership. Tagged and shared-in peers are refused.
+- The clipboard is shared only with the machine that is streaming, or was
+  in the last five seconds, and has a switch on the Sharing tab.
+- **Auto** keeps ten-bit colour and HDR: when both machines can do HEVC
+  Main10 it is chosen ahead of eight-bit AV1. A codec picked by hand is
+  left alone.
+- When the first encoder will not open and the host falls back to another
+  codec, the size, frame rate and bitrate are fitted again for that codec
+  instead of carried over.
+- A decoder that fails is avoided for that host and codec for a while (five
+  minutes if it would not open, fifteen seconds if it failed mid-stream)
+  instead of for every host until Latch restarts; **Apply and reconnect**
+  tries it again at once.
+- The viewer drops a decode backlog by its age (three frame intervals)
+  instead of a fixed 50 ms, and says so when this machine decodes fewer
+  frames a second than the stream sends.
+- The stats overlay shows the decoder's 95th-percentile time against the
+  frame budget, and labels what it counts (pictures handed to the window,
+  and a modelled delay) for what they are.
+
 ## 5.2.0 (2026-11-04)
 
 Request ceilings are 16384 pixels a side, 500 fps and 1 Gbps
