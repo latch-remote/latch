@@ -133,8 +133,8 @@ fn a_bad_network_slows_the_picture_but_loses_no_key() {
         std::thread::sleep(Duration::from_secs(1));
         let s = session.stats();
         eprintln!(
-            "{:5.1} fps {:5.2} Mbps loss {:4.1}% fec {:3} decode {:4.1} ms budget {} kbps",
-            s.fps, s.mbps, s.loss_pct, s.fec_recovered, s.decode_ms, s.wire_budget_kbps
+            "{:5.1} fps {:5.2} Mbps loss {:4.1}% fec {:3} decode {:4.1} ms budget {} kbps rtt={}ms local_queue={:.2}ms app_limited={}",
+            s.fps, s.mbps, s.loss_pct, s.fec_recovered, s.decode_ms, s.wire_budget_kbps, s.rtt_ms, s.pacing_queue_ms, s.application_limited
         );
         seconds.push(s);
     }

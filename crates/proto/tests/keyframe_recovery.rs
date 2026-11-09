@@ -88,14 +88,16 @@ fn longest_freeze(rules: Rules, seed: u64, secs: u64) -> (Duration, u32) {
                 900 + (random % 900) as usize
             };
             let data = vec![(random >> 32) as u8; len];
-            packetizer.packetize(
-                &OutFrame {
-                    data: &data,
-                    keyframe: encoding_key,
-                    host_delay: 0,
-                },
-                |datagram| down.send(now, datagram),
-            );
+            packetizer
+                .packetize(
+                    &OutFrame {
+                        data: &data,
+                        keyframe: encoding_key,
+                        host_delay: 0,
+                    },
+                    |datagram| down.send(now, datagram),
+                )
+                .unwrap();
             if encoding_key {
                 keyframes += 1;
                 answers.sent(now);

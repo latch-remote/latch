@@ -42,6 +42,7 @@ GitHub release notes, so each version gets a heading of the form
   and frame budget, and name immediate presentation. Correct the small-window
   keyboard snapshot fixture. Native decode benchmarks validate native surfaces
   and separately time CPU materialisation.
+- Batch paced video with fresh rate reads, backpressure capture under pacing, account idle probes, and report oversized encoded frames explicitly.
 
 ## 5.2.0 (2026-11-04)
 

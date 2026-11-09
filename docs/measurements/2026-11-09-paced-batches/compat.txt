@@ -1,0 +1,5 @@
+compat-new-v51 port 50258 exit 0
+compat-v51-new port 61996 exit 0
+compat-new-v52 port 58031 exit 0
+compat-v52-new port 53186 exit 0
+compat-new-new port 53762 exit 0

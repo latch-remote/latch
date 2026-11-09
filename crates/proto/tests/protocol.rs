@@ -67,16 +67,18 @@ fn test_1_random_video_frames_lossy_link() {
 
         sent_frames.insert(frame_idx as u32, (data.clone(), is_keyframe));
 
-        packetizer.packetize(
-            &OutFrame {
-                data: &data,
-                keyframe: is_keyframe,
-                host_delay: 10,
-            },
-            |buf| {
-                link.send(now, buf);
-            },
-        );
+        packetizer
+            .packetize(
+                &OutFrame {
+                    data: &data,
+                    keyframe: is_keyframe,
+                    host_delay: 10,
+                },
+                |buf| {
+                    link.send(now, buf);
+                },
+            )
+            .unwrap();
 
         // Advance simulated time in 1 ms steps up to the next frame (16 ms, ~60 fps)
         for _ in 0..16 {
@@ -226,16 +228,18 @@ fn test_2_burst_loss_and_no_impairment() {
         let data: Vec<u8> = (0..size).map(|i| (i ^ frame_idx as usize) as u8).collect();
         sent_frames.insert(frame_idx as u32, (data.clone(), is_keyframe));
 
-        packetizer.packetize(
-            &OutFrame {
-                data: &data,
-                keyframe: is_keyframe,
-                host_delay: 0,
-            },
-            |buf| {
-                link.send(now, buf);
-            },
-        );
+        packetizer
+            .packetize(
+                &OutFrame {
+                    data: &data,
+                    keyframe: is_keyframe,
+                    host_delay: 0,
+                },
+                |buf| {
+                    link.send(now, buf);
+                },
+            )
+            .unwrap();
 
         for _ in 0..16 {
             now += Duration::from_millis(1);
@@ -327,16 +331,18 @@ fn test_2_burst_loss_and_no_impairment() {
         let data = vec![i as u8; size];
         perfect_sent.insert(i as u32, data.clone());
 
-        perfect_packetizer.packetize(
-            &OutFrame {
-                data: &data,
-                keyframe: is_keyframe,
-                host_delay: 5,
-            },
-            |buf| {
-                perfect_link.send(now, buf);
-            },
-        );
+        perfect_packetizer
+            .packetize(
+                &OutFrame {
+                    data: &data,
+                    keyframe: is_keyframe,
+                    host_delay: 5,
+                },
+                |buf| {
+                    perfect_link.send(now, buf);
+                },
+            )
+            .unwrap();
     }
 
     for dg in perfect_link.receive(now) {
@@ -874,14 +880,16 @@ fn test_7_performance_video_and_fec() {
 
     let start = Instant::now();
     let mut shards = Vec::with_capacity(1100);
-    packetizer.packetize(
-        &OutFrame {
-            data: &data,
-            keyframe: true,
-            host_delay: 0,
-        },
-        |buf| shards.push(buf.to_vec()),
-    );
+    packetizer
+        .packetize(
+            &OutFrame {
+                data: &data,
+                keyframe: true,
+                host_delay: 0,
+            },
+            |buf| shards.push(buf.to_vec()),
+        )
+        .unwrap();
     let encode_time = start.elapsed();
 
     // Reassembler rebuilding with 5% loss (drop 1 out of 20 shards)
@@ -936,20 +944,22 @@ fn lost_startup_idr_requests_recovery_and_accepts_next_idr() {
     let mut rx = Reassembler::new(42);
     let mut requests = latch_proto::video::KeyframeRequests::new();
     for index in 0..4 {
-        packetizer.packetize(
-            &OutFrame {
-                data: &[7; 100],
-                keyframe: index == 0 || index == 3,
-                host_delay: 0,
-            },
-            |bytes| {
-                if index != 0 {
-                    if let Datagram::Video { shard, .. } = wire::parse(bytes).unwrap() {
-                        rx.push(&shard, now);
+        packetizer
+            .packetize(
+                &OutFrame {
+                    data: &[7; 100],
+                    keyframe: index == 0 || index == 3,
+                    host_delay: 0,
+                },
+                |bytes| {
+                    if index != 0 {
+                        if let Datagram::Video { shard, .. } = wire::parse(bytes).unwrap() {
+                            rx.push(&shard, now);
+                        }
                     }
-                }
-            },
-        );
+                },
+            )
+            .unwrap();
         let result = rx.poll(now);
         if index == 1 {
             assert!(result.is_none());
@@ -1048,7 +1058,8 @@ fn startup_grace_bounds_silence_and_allows_a_healthy_idr_to_finish() {
                 assert!(!rx.needs_keyframe(accepted, accepted + Duration::from_millis(80)));
             }
         },
-    );
+    )
+    .unwrap();
     assert!(matches!(
         rx.poll(accepted + Duration::from_millis(90)),
         Some(Reassembled::Frame(_))

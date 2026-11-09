@@ -130,7 +130,8 @@ fn transport_scenarios() {
                             link.send(now, dg);
                         }
                     },
-                );
+                )
+                .unwrap();
                 next_frame += 1;
             }
             let queue = link.queue_delay(now).as_secs_f32() * 1000.0;
