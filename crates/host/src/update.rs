@@ -1,9 +1,9 @@
 //! Taking a new `latch-host.exe` from a Mac on the tailnet and swapping it
 //! in.
 //!
-//! The Mac does the fetching (it has the GitHub login; the PC has none) and
+//! The Mac can fetch and push an update, or Windows can pull one. The sender
 //! POSTs the executable to `/v1/update` with its version and SHA-256. The
-//! service checks the digest, that the bytes are a Windows executable and a
+//! service authenticates the bytes against GitHub, checks the PE headers and a
 //! newer version, and stages the file beside itself. Then it renames:
 //! Windows lets a running executable be renamed but not overwritten. The new
 //! exe is started with `--replaces <pid>`, which makes it wait for the old
@@ -90,6 +90,16 @@ pub fn refuse_self_update(engine_running: bool, someone_watching: bool) -> bool 
 /// Check the upload and stage it beside `exe`. Returns the version it
 /// carries.
 pub fn stage(req: &Request, exe: &Path) -> Result<Version, Rejected> {
+    let cfg = latch_client::config::ClientConfig::load();
+    let token = update::token(cfg.github_token.as_deref());
+    stage_with(req, exe, |v| update::for_version(v, token.as_deref()))
+}
+
+fn stage_with(
+    req: &Request,
+    exe: &Path,
+    lookup: impl FnOnce(&Version) -> Result<update::Release>,
+) -> Result<Version, Rejected> {
     let version = req
         .header(UPDATE_VERSION_HEADER)
         .or_else(|| req.header(legacy::UPDATE_VERSION_HEADER))
@@ -120,6 +130,10 @@ pub fn stage(req: &Request, exe: &Path) -> Result<Version, Rejected> {
             "the upload does not match the SHA-256 it came with".into(),
         ));
     }
+    let release = lookup(&version)
+        .map_err(|e| Rejected::Bad(format!("could not authenticate the update: {e:#}")))?;
+    update::verify_host(&release, &version, &req.body)
+        .map_err(|e| Rejected::Bad(format!("could not authenticate the update: {e:#}")))?;
     let path = staged(exe);
     std::fs::write(&path, &req.body)
         .map_err(|e| Rejected::Bad(format!("could not write {}: {e}", path.display())))?;
@@ -450,6 +464,30 @@ mod tests {
         b
     }
 
+    fn test_stage(req: &Request, exe: &Path) -> Result<Version, Rejected> {
+        stage_with(req, exe, |v| {
+            let json = serde_json::json!({"tag_name": format!("v{v}"), "assets": [{
+                "name": update::HOST_EXE, "url": "https://api.github.com/unused",
+                "size": req.body.len(), "digest": format!("sha256:{}", update::sha256_hex(&req.body))
+            }]});
+            update::parse_release(&serde_json::to_vec(&json)?)
+        })
+    }
+
+    #[test]
+    fn unauthenticated_upload_never_reaches_staging() {
+        let dir = std::env::temp_dir().join(format!("latch-auth-upd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("latch-host.exe");
+        let body = fake_exe();
+        let v = format!("{}.0.0", update::current().major + 1);
+        let request = req(Some(&v), Some(&update::sha256_hex(&body)), body);
+        let result = stage_with(&request, &exe, |_| anyhow::bail!("offline"));
+        assert!(result.unwrap_err().message().contains("offline"));
+        assert!(!staged(&exe).exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn corrupt_and_incompatible_executables_are_refused() {
         assert!(is_host_executable(&fake_exe()));
@@ -526,7 +564,7 @@ mod tests {
             ],
             body: body.clone(),
         };
-        let v = stage(&request, &exe).unwrap();
+        let v = test_stage(&request, &exe).unwrap();
         assert_eq!(v.to_string(), newer);
         assert_eq!(std::fs::read(staged(&exe)).unwrap(), body);
         let _ = std::fs::remove_dir_all(&dir);
@@ -541,25 +579,25 @@ mod tests {
         let sha = update::sha256_hex(&body);
         let newer = format!("{}.0.0", update::current().major + 1);
 
-        let r = stage(&req(None, Some(&sha), body.clone()), &exe).unwrap_err();
+        let r = test_stage(&req(None, Some(&sha), body.clone()), &exe).unwrap_err();
         assert_eq!(r.status(), 400);
-        let r = stage(&req(Some("soon"), Some(&sha), body.clone()), &exe).unwrap_err();
+        let r = test_stage(&req(Some("soon"), Some(&sha), body.clone()), &exe).unwrap_err();
         assert_eq!(r.status(), 400);
-        let r = stage(&req(Some("0.0.1"), Some(&sha), body.clone()), &exe).unwrap_err();
+        let r = test_stage(&req(Some("0.0.1"), Some(&sha), body.clone()), &exe).unwrap_err();
         assert_eq!(r.status(), 409, "{}", r.message());
         let current = update::current().to_string();
-        let r = stage(&req(Some(&current), Some(&sha), body.clone()), &exe).unwrap_err();
+        let r = test_stage(&req(Some(&current), Some(&sha), body.clone()), &exe).unwrap_err();
         assert_eq!(
             r,
             Rejected::NotNewer(format!("this PC already runs Latch Host {current}"))
         );
-        let r = stage(&req(Some(&newer), None, body.clone()), &exe).unwrap_err();
+        let r = test_stage(&req(Some(&newer), None, body.clone()), &exe).unwrap_err();
         assert_eq!(r.status(), 400);
-        let r = stage(&req(Some(&newer), Some("00"), body.clone()), &exe).unwrap_err();
+        let r = test_stage(&req(Some(&newer), Some("00"), body.clone()), &exe).unwrap_err();
         assert!(r.message().contains("SHA-256"), "{}", r.message());
         let mut not_pe = body.clone();
         not_pe[0] = b'X';
-        let r = stage(
+        let r = test_stage(
             &req(Some(&newer), Some(&update::sha256_hex(&not_pe)), not_pe),
             &exe,
         )
@@ -570,7 +608,7 @@ mod tests {
             r.message()
         );
         let small = b"MZ tiny".to_vec();
-        let r = stage(
+        let r = test_stage(
             &req(Some(&newer), Some(&update::sha256_hex(&small)), small),
             &exe,
         )
@@ -581,7 +619,7 @@ mod tests {
             "nothing may be written for a refused upload"
         );
 
-        let v = stage(
+        let v = test_stage(
             &req(Some(&newer), Some(&sha.to_uppercase()), body.clone()),
             &exe,
         )
