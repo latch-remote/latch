@@ -44,8 +44,7 @@ pub fn hardware_encodes(codec: crate::video::Codec) -> bool {
     hardware::backend(codec).is_some()
 }
 
-/// Whether `codec` can stream `width` × `height`, and the desktop as it is
-/// now (which the session sends when it does not resize to the viewer).
+/// Whether `codec` can stream the negotiated `width` × `height`.
 /// H.264 always can: the software encoder takes what hardware does not.
 pub fn takes(codec: crate::video::Codec, width: u32, height: u32) -> bool {
     use crate::video::Codec;
@@ -53,11 +52,10 @@ pub fn takes(codec: crate::video::Codec, width: u32, height: u32) -> bool {
         return true;
     }
     hardware::fits(codec, width, height)
-        && capture_size().map_or(true, |[w, h]| hardware::fits(codec, w, h))
 }
 
 /// X11 capture into the hardware encoder for `config.codec` when there is
-/// one that takes the desktop's size, else into `latch-codec`. H.264 goes
+/// one that takes the negotiated output size, else into `latch-codec`. H.264 goes
 /// to `latch-codec` (Baseline, which every H.264 viewer decodes) when the
 /// hardware encoder does not open, then or after a resize. HEVC or AV1,
 /// which the viewer has been told, have no such fallback: the error is
@@ -75,7 +73,7 @@ pub fn open_video(config: &VideoConfig) -> anyhow::Result<Box<dyn VideoPipeline>
         );
         return Ok(Box::new(SoftwarePipeline::new(X11Capture::new()?, config)?));
     };
-    // Opens the hardware encoder for each size the desktop takes; for
+    // Opens the hardware encoder for the negotiated output size; for
     // H.264, the software one where that fails.
     let open =
         move |width, height, config: &VideoConfig| -> anyhow::Result<Box<dyn PictureEncoder>> {

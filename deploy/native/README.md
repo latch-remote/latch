@@ -72,8 +72,14 @@ restart policy) reaches a running node without restarting anything.
 
 ## A desktop that takes the viewer's size
 
-Xvfb cannot change size, so the relay desktop is streamed at 1920x1080 (a
-smaller size the Mac asks for is that desktop scaled down). An X server that
+Xvfb cannot change size. Latch captures the relay desktop at its native
+1920x1080 and scales into the negotiated stream size in its CPU colour
+conversion pass, including when feeding NVENC or VA-API. Different aspect
+ratios use centred black bars, with pointer input mapped into the desktop
+content. A smaller request reduces the encoded picture without changing
+Xvfb's desktop size. Software conversion and encoding retain the conservative
+four-worker cap (two on a two-CPU quota) pending the documented worker sweep.
+An X server that
 can resize (Xorg with the dummy driver) can instead switch to each stream's
 size: give Sunshine a `global_prep_cmd` that runs `xrandr` with
 `SUNSHINE_CLIENT_WIDTH` and `SUNSHINE_CLIENT_HEIGHT`, and set

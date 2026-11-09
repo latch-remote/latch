@@ -6,6 +6,8 @@ GitHub release notes, so each version gets a heading of the form
 
 ## Unreleased
 
+- Honour negotiated Linux/software output dimensions with damage-aware area scaling, aspect fitting, and matching cursor and input geometry.
+
 - A stream that loses its connection keeps trying for five minutes
   instead of three attempts: after 2, 5 and 10 seconds, then every 20 to 30,
   and at once when the machine shows as online again or this one wakes.

@@ -47,8 +47,14 @@ pub fn motion() -> Option<Motion> {
 
 pub fn open_video(config: &VideoConfig, motion: Motion) -> anyhow::Result<Box<dyn VideoPipeline>> {
     let pattern = Arc::new(Mutex::new(Pattern::new(
-        config.width,
-        config.height,
+        std::env::var("LATCH_TEST_SOURCE_WIDTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(config.width),
+        std::env::var("LATCH_TEST_SOURCE_HEIGHT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(config.height),
         config.fps,
         motion,
     )));
@@ -138,7 +144,25 @@ struct PatternInput;
 impl InputSink for PatternInput {
     fn apply(&mut self, event: &Event, _display: DisplayRect) -> anyhow::Result<()> {
         if let Some(p) = CURRENT.lock().as_ref() {
-            p.lock().input(event);
+            let mut pattern = p.lock();
+            if let Event::MousePosition {
+                x,
+                y,
+                width,
+                height,
+            } = *event
+            {
+                let display = pattern.display();
+                let (x, y) = display.map(x, y, width, height);
+                pattern.input(&Event::MousePosition {
+                    x: x as u16,
+                    y: y as u16,
+                    width: display.width as u16,
+                    height: display.height as u16,
+                });
+            } else {
+                pattern.input(event);
+            }
         }
         Ok(())
     }
