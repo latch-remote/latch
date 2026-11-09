@@ -2094,7 +2094,9 @@ mod tests {
             keyframe: true,
             host_delay: 0,
         };
-        video.packetize(&frame, |dg| datagrams.push(dg.to_vec()));
+        video
+            .packetize(&frame, |dg| datagrams.push(dg.to_vec()))
+            .unwrap();
         let mut audio = AudioPacketizer::new(1);
         for seq in 0..8 {
             audio.packetize(seq * 5000, &[1; 500], |dg| datagrams.push(dg.to_vec()));

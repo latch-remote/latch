@@ -1,0 +1,56 @@
+
+running 1 test
+PB cap=5000 rtt=20 request=10000 good_mbps=2.056 queue_ms=0.088/1.919/8.425 frame_ms=18.623/19.450 produced=180 delivered=174 lost=3 keys=2 syscalls_per_s=336.7 skipped=3 sender_cpu_ms=16.736
+test server::tests::paced_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 110 filtered out; finished in 5.00s
+
+
+running 1 test
+PB cap=5000 rtt=150 request=10000 good_mbps=0.997 queue_ms=0.078/0.200/8.455 frame_ms=79.515/80.295 produced=180 delivered=169 lost=6 keys=3 syscalls_per_s=238.3 skipped=5 sender_cpu_ms=14.620
+test server::tests::paced_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 110 filtered out; finished in 5.00s
+
+
+running 1 test
+PB cap=20000 rtt=20 request=40000 good_mbps=7.507 queue_ms=0.172/5.028/9.933 frame_ms=16.805/20.686 produced=180 delivered=173 lost=3 keys=2 syscalls_per_s=1168.7 skipped=4 sender_cpu_ms=40.675
+test server::tests::paced_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 110 filtered out; finished in 5.00s
+
+
+running 1 test
+PB cap=20000 rtt=150 request=40000 good_mbps=6.163 queue_ms=0.234/4.794/7.044 frame_ms=81.618/82.027 produced=180 delivered=169 lost=6 keys=3 syscalls_per_s=1080.7 skipped=5 sender_cpu_ms=53.065
+test server::tests::paced_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 110 filtered out; finished in 5.00s
+
+
+running 1 test
+PB cap=50000 rtt=20 request=100000 good_mbps=21.936 queue_ms=0.653/5.736/18.104 frame_ms=18.931/19.996 produced=180 delivered=173 lost=3 keys=2 syscalls_per_s=3246.3 skipped=4 sender_cpu_ms=90.485
+test server::tests::paced_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 110 filtered out; finished in 5.00s
+
+
+running 1 test
+PB cap=50000 rtt=150 request=100000 good_mbps=16.776 queue_ms=0.250/4.907/8.188 frame_ms=82.091/82.341 produced=180 delivered=169 lost=6 keys=3 syscalls_per_s=2794.3 skipped=5 sender_cpu_ms=59.603
+test server::tests::paced_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 110 filtered out; finished in 5.00s
+
+
+running 1 test
+PB cap=0 rtt=0 request=100000 good_mbps=82.406 queue_ms=1.122/2.797/13.454 frame_ms=1.890/4.397 produced=180 delivered=180 lost=0 keys=1 syscalls_per_s=9798.0 skipped=0 sender_cpu_ms=230.587
+test server::tests::paced_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 110 filtered out; finished in 5.00s
+
+
+running 1 test
+PB cap=0 rtt=0 request=1000000 good_mbps=251.208 queue_ms=13.469/88.463/142.376 frame_ms=9.909/77.696 produced=180 delivered=92 lost=58 keys=22 syscalls_per_s=70556.3 skipped=30 sender_cpu_ms=1598.174
+test server::tests::paced_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 110 filtered out; finished in 5.00s
+

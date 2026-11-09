@@ -245,3 +245,86 @@ fn saturated_ten_megabit_fifo_converges_and_recovers_with_fake_clock() {
         "must recover to requested rate"
     );
 }
+
+/// The actual software noise-pattern codec and viewer, separate from the
+/// codec-free sender isolation test. Stats are window means, not frame percentiles.
+#[test]
+#[ignore]
+fn noise_socket_measurement() {
+    std::env::set_var("LATCH_TEST_PATTERN", "noise");
+    let cap: u32 = std::env::var("PB_CAP")
+        .unwrap_or("20000".into())
+        .parse()
+        .unwrap();
+    let rtt: u64 = std::env::var("PB_RTT")
+        .unwrap_or("20".into())
+        .parse()
+        .unwrap();
+    let requested = if cap == 0 {
+        std::env::var("PB_REQUEST")
+            .unwrap_or("100000".into())
+            .parse()
+            .unwrap()
+    } else {
+        cap * 2
+    };
+    let port = relay::relay_with_bandwidth(
+        host(),
+        Impairment {
+            delay: Duration::from_millis(rtt / 2),
+            ..Impairment::NONE
+        },
+        Arc::default(),
+        cap,
+    );
+    let frames = Arc::new(FrameSlot::default());
+    let (tx, rx) = mpsc::channel();
+    let session = Session::start(
+        latch_stream::Server {
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+        },
+        Settings {
+            color: Default::default(),
+            cursor: false,
+            gamepads: false,
+            mic: false,
+            width: 640,
+            height: 360,
+            fps: 60,
+            bitrate_kbps: requested,
+            hevc: false,
+            av1: false,
+            audio: false,
+            name: "paced measurement".into(),
+        },
+        frames.clone(),
+        tx,
+        || {},
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Event::Connected) => break,
+            Ok(Event::Failed { stage, message }) => panic!("{stage}: {message}"),
+            _ => assert!(Instant::now() < deadline),
+        }
+    }
+    let start = Instant::now();
+    let mut mark = start;
+    let mut sequence = frames.seq();
+    let mut gaps = Vec::new();
+    while start.elapsed() < Duration::from_secs(5) {
+        if frames.seq() != sequence {
+            gaps.push(mark.elapsed().as_secs_f64() * 1000.0);
+            mark = Instant::now();
+            sequence = frames.seq();
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    gaps.sort_by(f64::total_cmp);
+    let stats = session.stats();
+    let keys = session.recovery_log().keyframes;
+    session.stop();
+    eprintln!("NOISE cap={cap} rtt={rtt} request={requested} decoded={} gap_p50/p95_ms={:.3}/{:.3} keys={keys} stats={stats:?}", frames.seq(), gaps[gaps.len()/2], gaps[gaps.len()*95/100]);
+}

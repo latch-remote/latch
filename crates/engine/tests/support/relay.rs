@@ -13,6 +13,17 @@ pub fn relay(
     impairment: Impairment,
     queue_delay_ms: Arc<std::sync::atomic::AtomicU32>,
 ) -> u16 {
+    relay_with_bandwidth(host_port, impairment, queue_delay_ms, 0)
+}
+
+/// Real-session measurement with a downstream 50 ms FIFO wire bottleneck.
+#[allow(dead_code)]
+pub fn relay_with_bandwidth(
+    host_port: u16,
+    impairment: Impairment,
+    queue_delay_ms: Arc<std::sync::atomic::AtomicU32>,
+    kbps: u32,
+) -> u16 {
     let (listener, udp) = loop {
         // UDP picks the port, as in `host`.
         let u = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -51,7 +62,9 @@ pub fn relay(
     let host_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host_port);
     let viewer: Arc<Mutex<Option<SocketAddr>>> = Arc::default();
     let up = Arc::new(Mutex::new(Link::new(impairment, 7)));
-    let down = Arc::new(Mutex::new(Link::new(impairment, 11)));
+    let mut downstream = Link::new(impairment, 11);
+    downstream.set_bandwidth(kbps, Duration::from_millis(50));
+    let down = Arc::new(Mutex::new(downstream));
     {
         let (from_viewer, link, viewer) = (udp.try_clone().unwrap(), up.clone(), viewer.clone());
         std::thread::spawn(move || {

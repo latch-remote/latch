@@ -715,6 +715,10 @@ impl Server {
                     let changed = controller.update(now, &r, host_rtt, queue_ms);
                     session
                         .transport
+                        .probe_pressure
+                        .store(controller.probe_pressure(), Ordering::Release);
+                    session
+                        .transport
                         .budget
                         .store(controller.budget(), Ordering::Relaxed);
                     if changed {
@@ -782,30 +786,11 @@ impl Server {
                 }
                 _ => {}
             }
-            // While idle, a train of padding back to back: the viewer times
-            // its spread, which shows whether the path still carries the
-            // budget before motion resumes into it.
-            if let (Some(addr), true) = (addr, session.probe_trains) {
+            // The video sender owns all paced traffic, including idle probes.
+            if addr.is_some() && session.probe_trains {
                 if let Some(count) = controller.probe_train(now) {
-                    let mut buf = Vec::with_capacity(latch_proto::MAX_DATAGRAM);
                     train = train.wrapping_add(1);
-                    for index in 0..count {
-                        wire::write_probe(
-                            &mut buf,
-                            session.id,
-                            train,
-                            index,
-                            count,
-                            latch_proto::MAX_DATAGRAM,
-                        );
-                        let _ = self.udp.send_to(&buf, addr);
-                    }
-                    // This echo sits behind the burst in the FIFO. Its RTT
-                    // must corroborate dispersion before a target cut.
-                    let time = self.now_us();
-                    session.train_ping.store(time, Ordering::Relaxed);
-                    wire::write_ping(&mut buf, session.id, time);
-                    let _ = self.udp.send_to(&buf, addr);
+                    *session.transport.probe.lock() = Some((train, count));
                 }
             }
             let silent = self
@@ -1092,6 +1077,9 @@ impl RecoveryState {
 }
 
 struct TransportState {
+    probe: Mutex<Option<(u16, u8)>>,
+    probe_pressure: AtomicBool,
+    pending: AtomicU32,
     budget: AtomicU32,
     applied: AtomicU32,
     queue_us: AtomicU64,
@@ -1101,6 +1089,9 @@ struct TransportState {
 impl TransportState {
     fn new(kbps: u32) -> Self {
         Self {
+            probe: Mutex::new(None),
+            probe_pressure: AtomicBool::new(false),
+            pending: AtomicU32::new(0),
             budget: AtomicU32::new(kbps),
             applied: AtomicU32::new(0),
             queue_us: AtomicU64::new(0),
@@ -1405,6 +1396,16 @@ fn encode_video(
     let audio = session.audio_enabled;
     let mut applied = 0;
     while !session.stopping() {
+        // Once pacing is needed, finish outstanding references before taking
+        // another picture. Never encode a stale picture just to drop its GOP.
+        while session.pace_kbps.load(Ordering::Relaxed) != 0
+            && session.transport.pending.load(Ordering::Acquire) != 0
+        {
+            if session.stopping() {
+                return;
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
         let protected =
             session.keyframe.load(Ordering::Relaxed) || session.recovery.asked.lock().is_some();
         let target = crate::congestion::video_budget(
@@ -1490,6 +1491,7 @@ fn encode_video(
                 continue;
             }
         };
+        let encoded_at = Instant::now();
         if frame.keyframe {
             if let Some(meta) = pipeline.info().color.hdr {
                 let mut data = latch_proto::color::hevc_hdr_sei(meta);
@@ -1538,7 +1540,8 @@ fn encode_video(
             continue;
         }
         // Blocking is deliberate: dropping an encoded reference corrupts the GOP.
-        if tx.send((frame, Instant::now())).is_err() {
+        session.transport.pending.fetch_add(1, Ordering::Release);
+        if tx.send((frame, encoded_at)).is_err() {
             return;
         }
     }
@@ -1553,15 +1556,87 @@ fn paced_video(
     let mut packetizer = Packetizer::new(session.id);
     let mut sender = latch_proto::transport::SendBatch::default();
     let mut pacer = crate::pacing::Pacer::new(Instant::now());
+    let mut lost_reference = false;
+    #[cfg(test)]
+    let drop_stale = std::env::var_os("PB_DROP").is_some();
     while !session.stopping() {
+        let probe = session.transport.probe.lock().take();
+        let probe_addr = *session.addr.lock();
+        if let (Some((train, count)), Some(addr)) = (probe, probe_addr) {
+            let mut packets = Vec::with_capacity(usize::from(count));
+            for index in 0..count {
+                let mut buf = Vec::with_capacity(latch_proto::MAX_DATAGRAM);
+                wire::write_probe(
+                    &mut buf,
+                    session.id,
+                    train,
+                    index,
+                    count,
+                    latch_proto::MAX_DATAGRAM,
+                );
+                packets.push(buf);
+            }
+            if send_paced_batch(
+                server,
+                session,
+                &mut sender,
+                &mut pacer,
+                &packets,
+                addr,
+                None,
+            ) {
+                let time = server.now_us();
+                session.train_ping.store(time, Ordering::Relaxed);
+                let mut ping = Vec::new();
+                wire::write_ping(&mut ping, session.id, time);
+                send_paced_batch(
+                    server,
+                    session,
+                    &mut sender,
+                    &mut pacer,
+                    &[ping],
+                    addr,
+                    None,
+                );
+            }
+        }
         let (frame, queued) = match rx.recv_timeout(Duration::from_millis(20)) {
             Ok(frame) => frame,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(_) => return,
         };
+        // Also releases producer backpressure on every early return.
+        struct Finished<'a>(&'a AtomicU32);
+        impl Drop for Finished<'_> {
+            fn drop(&mut self) {
+                if self.0.load(Ordering::Relaxed) > 0 {
+                    self.0.fetch_sub(1, Ordering::Release);
+                }
+            }
+        }
+        let _finished = Finished(&session.transport.pending);
         let Some(addr) = *session.addr.lock() else {
             continue;
         };
+        #[cfg(test)]
+        if drop_stale && queued.elapsed() > Duration::from_secs_f64(1.0 / 60.0) {
+            recovery_lost(session);
+            lost_reference = true;
+            continue;
+        }
+        if frame.data.len() > latch_proto::video::MAX_FRAME_LEN {
+            server.log(format!(
+                "video frame ({} bytes) exceeds maximum {}; requesting a keyframe",
+                frame.data.len(),
+                latch_proto::video::MAX_FRAME_LEN
+            ));
+            recovery_lost(session);
+            lost_reference = true;
+            continue;
+        }
+        if lost_reference && !frame.keyframe {
+            continue;
+        }
         packetizer.set_fec_percent(session.fec.load(Ordering::Relaxed));
         packetizer.set_fec_burst(session.fec_burst.load(Ordering::Relaxed));
         let recovery = &session.recovery;
@@ -1584,7 +1659,6 @@ fn paced_video(
             keyframe: frame.keyframe,
             host_delay: delay,
         };
-        let pace = session.pace_kbps.load(Ordering::Relaxed);
         let number = packetizer.next_frame();
         if recovery.enabled {
             let mut sent = recovery.sent.lock();
@@ -1607,40 +1681,96 @@ fn paced_video(
                 },
             );
         }
-        packetizer.packetize_batches(&out, |batch| {
-            if pace == 0 {
-                if !session.stopping() {
-                    session
-                        .transport
-                        .queue_us
-                        .fetch_max(queued.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    send_batch(&mut sender, &server.udp, session, batch, addr);
-                }
-                return;
-            }
-            for datagram in batch {
-                loop {
-                    if session.stopping() {
-                        return;
-                    }
-                    session
-                        .transport
-                        .queue_us
-                        .fetch_max(queued.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    let wait = pacer.delay(Instant::now(), datagram.len(), pace);
-                    if wait.is_zero() {
-                        break;
-                    }
-                    std::thread::sleep(wait.min(Duration::from_millis(5)));
-                }
-                send(&server.udp, session, datagram, addr);
-            }
+        let result = packetizer.packetize_batches(&out, |batch| {
+            send_paced_batch(
+                server,
+                session,
+                &mut sender,
+                &mut pacer,
+                batch,
+                addr,
+                Some(queued),
+            );
+        });
+        if let Err(error) = result {
+            server.log(format!(
+                "video frame {} ({} bytes) not sent: {error}; requesting a keyframe",
+                number,
+                frame.data.len()
+            ));
+            recovery_lost(session);
+            lost_reference = true;
+            continue;
+        }
+        lost_reference = false;
+        #[cfg(test)]
+        tests::SEND_SAMPLES.with(|s| {
+            s.borrow_mut()
+                .push((queued.elapsed().as_secs_f64() * 1000.0, frame.keyframe))
         });
         if frame.keyframe {
             session.keyframe_requests.lock().sent(Instant::now());
         }
         session.frames.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+fn recovery_lost(session: &Session) {
+    session.recovery.sent.lock().clear();
+    session.recovery.asked.lock().take();
+    session.keyframe.store(true, Ordering::Release);
+}
+
+/// None denotes an idle probe; motion and fresh pressure cancel it between batches.
+fn send_paced_batch(
+    server: &Server,
+    session: &Session,
+    sender: &mut latch_proto::transport::SendBatch,
+    pacer: &mut crate::pacing::Pacer,
+    batch: &[Vec<u8>],
+    addr: SocketAddr,
+    queued: Option<Instant>,
+) -> bool {
+    let mut sent = 0;
+    while sent < batch.len() && !session.stopping() {
+        let mut rate = session.pace_kbps.load(Ordering::Relaxed);
+        if queued.is_none() {
+            if session.transport.pending.load(Ordering::Acquire) != 0
+                || session.transport.probe_pressure.load(Ordering::Acquire)
+            {
+                return false;
+            }
+            if rate == 0 {
+                rate = session
+                    .transport
+                    .budget
+                    .load(Ordering::Relaxed)
+                    .saturating_mul(5)
+                    / 2;
+            }
+        }
+        let (count, wait) = pacer.batch(Instant::now(), &batch[sent..], rate);
+        if count == 0 {
+            let deadline = Instant::now() + wait;
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            continue;
+        }
+        if let Some(queued) = queued {
+            session
+                .transport
+                .queue_us
+                .fetch_max(queued.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        send_batch(
+            sender,
+            &server.udp,
+            session,
+            &batch[sent..sent + count],
+            addr,
+        );
+        sent += count;
+    }
+    sent == batch.len()
 }
 
 fn send_audio(
@@ -1741,6 +1871,8 @@ fn send_batch(
     let mut sent = 0;
     let mut failures = 0;
     while sent < batch.len() && !session.stopping() {
+        #[cfg(all(test, target_os = "macos"))]
+        tests::SEND_CALLS.with(|s| s.set(s.get() + (batch.len() - sent) as u64));
         match sender.send(udp, &batch[sent..], to) {
             Ok(n) if n > 0 => {
                 let bytes: usize = batch[sent..sent + n].iter().map(Vec::len).sum();
@@ -1769,6 +1901,8 @@ fn send_batch(
 /// says ENOBUFS when a keyframe outruns the interface).
 fn send(udp: &UdpSocket, session: &Session, datagram: &[u8], to: SocketAddr) {
     for attempt in 0..3 {
+        #[cfg(all(test, target_os = "macos"))]
+        tests::SEND_CALLS.with(|s| s.set(s.get() + 1));
         match udp.send_to(datagram, to) {
             Ok(n) => {
                 session.bytes.fetch_add(n as u64, Ordering::Relaxed);

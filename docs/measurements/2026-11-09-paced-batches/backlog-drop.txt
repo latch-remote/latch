@@ -1,0 +1,7 @@
+
+running 1 test
+PB cap=5000 rtt=150 request=10000 good_mbps=1.009 queue_ms=0.085/2.485/51.450 frame_ms=79.528/83.629 produced=180 delivered=171 lost=1 keys=3 syscalls_per_s=212.0 skipped=0 sender_cpu_ms=17.589
+test server::tests::paced_socket_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 113 filtered out; finished in 5.00s
+

@@ -1,0 +1,4 @@
+serving on 127.0.0.1:50258 (TCP and UDP)
+host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+view example is watching: 640×360 at 60 fps, 20000 kb/s, Latch software H.264 (test pattern)
+view example stopped watching after 3 s: the viewer disconnected
