@@ -15,26 +15,72 @@ fitted to the encoders, decoders and displays both machines report.
 
 ## Next
 
-These are open work areas, not promised dates or tested capabilities:
+Open work, grouped by what it would change. None of it is promised for a
+date, and none of it is a tested capability until it leaves this list.
 
-- Verify Linux NVENC and VA-API encode on physical GPUs, including driver
-  failure and fallback behavior.
+### Picture
+
+- **Full-chroma (4:4:4) streams.** Every path is 4:2:0 today, which softens
+  coloured text and thin lines. Needs a negotiated pixel format and
+  encoder, decoder and presenter support on each platform.
+- **Display-paced presentation.** The viewer shows each frame as soon as it
+  is decoded. A vsync-locked mode, a smoothing mode, and feeding the
+  viewer's display phase back to the host's capture clock are not built.
+- **Changing size and frame rate during a session.** Only bitrate adapts
+  while a stream runs; resolution and frame rate are fixed at connect. A
+  governor that trades them under encoder or network pressure is open.
+- **A shared audio and video clock.** Sound and picture are each played as
+  early as possible instead of against one timeline.
+- **Choosing the display.** A host with several monitors shares one that
+  Latch picks (the whole X11 root on Linux). Selection belongs in the
+  protocol and the stream menu, along with per-machine stream settings.
 - Verify HDR end to end on physical HDR panels. Synthetic roundtrips and
   native presenter tests do not establish panel output or photon latency.
-- Add Linux viewer hardware decode and synchronized GPU buffer import.
-- Add Apple hardware AV1 encode when hardware and platform APIs offer it;
-  AV1 viewing already exists on supported Mac hardware.
-- Emulate gamepads on Mac hosts; forwarding to Windows/Linux already works.
-- Sign Windows builds and sign/notarize Mac builds; integrate publisher
-  verification into updates and reduce repeated permission prompts.
-- Add an update path for Windows-only users and Linux update notifications.
-- Review elevated input consent, tagged-host authorization, local control
-  authentication and independently authenticated pushed updates.
-- Add Wayland capture and input with compositor permission handling.
-- Add phone, TV and browser viewers; current viewers are desktop apps.
-- Add explicit multi-monitor selection, per-machine stream settings and
-  tray/menu-bar presence.
-- Extend sustained-session and clean-install validation across platforms.
+
+### Hosts and viewers
+
+- **Linux viewer hardware decode** (VA-API, then Vulkan Video) with
+  synchronized GPU buffer import. Linux viewers decode H.264 in software.
+- **Linux host GPU path without the CPU round trip.** NVENC and VA-API
+  encode from pictures prepared on the CPU; capture, colour conversion and
+  encode should stay on the GPU. Both backends also still need a first run
+  on physical GPUs, including driver failure and fallback.
+- **Windows ten-bit and HDR viewing without a CPU readback.**
+- **A separate cursor plane on Mac hosts.** Windows and Linux hosts send
+  the pointer outside the video; a Mac host draws it into the picture.
+- Apple hardware AV1 encode when the hardware and platform APIs offer it;
+  AV1 viewing already works on supported Macs.
+- Gamepad emulation on Mac hosts, and motion and touchpad data from pads
+  on Mac viewers. Forwarding to Windows and Linux hosts already works.
+- Wayland capture and input, with compositor permission handling.
+- Phone, TV and browser viewers. Current viewers are desktop apps.
+
+### Network
+
+- **Cheaper loss recovery everywhere.** Long-term-reference recovery is
+  qualified on AMD (AMF) and opt-in elsewhere; other encoders repair a
+  lost frame with a full keyframe. Per-device qualification, NVENC
+  reference invalidation and intra refresh are open.
+- **Per-packet delivery feedback.** The receiver reports in 50 ms
+  aggregates over the control connection. Sequence-numbered feedback over
+  UDP would let the controller tell network queueing from scheduling.
+- **ECN and L4S.** No ECN marks are read or sent. This needs marks to
+  survive the Tailscale tunnel and a compliant controller, not a socket
+  flag.
+- Tuning for mixed loss on long round trips, where simulations still show
+  damaged frames.
+
+### Around the stream
+
+- Clipboard contents other than text, and file transfer.
+- Microphone capture off the audio callback thread.
+- Sign Windows builds and sign and notarize Mac builds
+  ([below](#signing-and-notarization)); hold updates to the publisher's
+  signature and stop macOS forgetting permissions after an update.
+- Self-installing updates on Linux. Linux hosts show a notice today.
+- Tray and menu-bar presence.
+- Sustained-session and clean-install validation on more machines. The
+  hardware Latch has run on is listed in [PERFORMANCE.md](PERFORMANCE.md).
 
 ## Not planned
 
