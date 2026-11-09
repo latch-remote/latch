@@ -1968,18 +1968,17 @@ impl ClientApp {
 
     fn updates_section(&mut self, ui: &mut egui::Ui) {
         ui::section(ui, "Updates", |ui| {
-            if !cfg!(target_os = "macos") {
-                // Only a Mac runs the updater (see update::spawn); here it
-                // has left a line saying where new versions come from.
-                let message = self.updates.lock().message.clone();
-                ui::setting_row(ui, "New versions", Some(&message), |_| {});
-                return;
-            }
             if ui::toggle_row(
                 ui,
                 &mut self.cfg.auto_update,
                 "Keep Latch up to date",
-                Some("Checks GitHub every few hours, installs new versions of this app, and sends updates to your Windows PCs over Tailscale."),
+                Some(if cfg!(target_os = "macos") {
+                    "Checks GitHub every few hours, installs new versions of this app, and sends updates to your Windows PCs over Tailscale."
+                } else if cfg!(windows) {
+                    "Checks GitHub every few hours and installs verified releases when no stream is running."
+                } else {
+                    "Checks GitHub every few hours and announces releases for manual installation."
+                }),
             ) {
                 self.dirty = true;
             }

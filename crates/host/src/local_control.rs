@@ -1,8 +1,8 @@
 //! The window authenticates as the OS user owning this service.
 use anyhow::{Context, Result};
 use std::{fs::OpenOptions, io::Write, time::Duration};
-pub const HEADER: &str = "x-latch-local-control";
-pub const FILE: &str = "local-control-token";
+pub const HEADER: &str = latch_core::config::LOCAL_CONTROL_HEADER;
+pub const FILE: &str = latch_core::config::LOCAL_CONTROL_FILE;
 
 pub fn token() -> Result<String> {
     token_at(&latch_core::config::data_dir()?.join(FILE))

@@ -798,14 +798,14 @@ impl Service {
                 );
             }
         }
-        // Loopback, or this machine's own tailnet address, is any process
-        // here, signed in as any OS user. An executable pushed from there
-        // would run as the account that owns this service, and the
-        // clipboard is that account's: both are for the other machines.
-        if (req.path == UPDATE_PATH || req.path == CLIPBOARD_PATH) && local_machine {
+        // The clipboard is for the other machines. An update may also come
+        // from this user's own window (it carries the token above): every
+        // executable is checked against GitHub's published digest before
+        // it is staged.
+        if req.path == CLIPBOARD_PATH && local_machine {
             return Response::json(
                 403,
-                &Ack::err("updates and the clipboard are for the other machines on this Tailscale account"),
+                &Ack::err("the clipboard is for the other machines on this Tailscale account"),
             );
         }
         match (req.method.as_str(), req.path.as_str()) {
@@ -2019,8 +2019,8 @@ mod tests {
     #[test]
     fn local_accounts_cannot_access_remote_only_routes() {
         // Loopback, and this machine's own tailnet address, can be any OS
-        // user signed in here. Updates, clipboard data and desktop control
-        // belong to the account that owns this service.
+        // user signed in here. Clipboard data and desktop control belong
+        // to the account that owns this service. Updates require a published digest.
         let svc = Service::new();
         let mut st = tailscale::Status::default();
         st.self_node.tailscale_ips = vec!["100.64.0.5".into(), "fd7a:115c:a1e0::5".into()];
@@ -2063,11 +2063,21 @@ mod tests {
             own,
             own_v6,
         ] {
-            for req in [&update, &read, &write, &stream] {
+            for req in [&read, &write, &stream] {
                 let r = svc.handle(from, req);
                 assert_eq!(r.status, 403, "{} {} from {from}", req.method, req.path);
             }
         }
+        // This user's own window may submit an update, with the token;
+        // malformed bytes never reach staging. Any other local process may not.
+        let loopback: SocketAddr = "127.0.0.1:5".parse().unwrap();
+        assert_eq!(svc.handle(loopback, &update).status, 403);
+        let mut own_window = update.clone();
+        own_window.headers.push((
+            crate::local_control::HEADER.into(),
+            svc.local_secret.clone().unwrap(),
+        ));
+        assert_eq!(svc.handle(loopback, &own_window).status, 400);
         // Another machine on the account still gets through to the route.
         assert_ne!(svc.handle(other, &update).status, 403);
         assert_eq!(svc.handle(other, &write).status, 403);
@@ -2075,7 +2085,7 @@ mod tests {
         // A cached admission must not bypass the local-address check when
         // the next Tailscale status probe fails.
         *svc.tailscale.lock() = Err("status unavailable".into());
-        for req in [&update, &read, &write, &stream] {
+        for req in [&read, &write, &stream] {
             assert_eq!(svc.handle(own, req).status, 403);
         }
         *svc.tailscale.lock() = Ok(tailscale::Status::default());
@@ -2083,7 +2093,7 @@ mod tests {
         let mut malformed = tailscale::Status::default();
         malformed.self_node.tailscale_ips = vec!["not-an-address".into()];
         *svc.tailscale.lock() = Ok(malformed);
-        for req in [&update, &write, &stream] {
+        for req in [&write, &stream] {
             assert_eq!(svc.handle(own, req).status, 403);
         }
     }

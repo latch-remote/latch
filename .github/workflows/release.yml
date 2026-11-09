@@ -14,16 +14,20 @@ env:
 
 jobs:
   macos:
+    permissions:
+      contents: read
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: ffmpeg for the encoder tests
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install ffmpeg
       # Never ship a binary whose tests were not run.
       - name: test
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --all-targets
       - name: build app
         run: cargo build --locked --release -p latch-host --target aarch64-apple-darwin
       # bundle-macos.sh ad-hoc signs and verifies the bundle itself.
@@ -53,7 +57,7 @@ jobs:
           cp docs/MACOS.md dist.noindex/legacy/README-MACOS.md
           cp LICENSE NOTICE dist.noindex/legacy/
           cd dist.noindex/legacy && tar czf ../brolink-macos-arm64.tar.gz BroLink.app README-MACOS.md LICENSE NOTICE
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: latch-macos-arm64
           path: |
@@ -62,13 +66,15 @@ jobs:
           if-no-files-found: error
 
   windows:
+    permissions:
+      contents: read
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: test
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --all-targets
       - name: build
         run: cargo build --locked --release -p latch-host
       - name: package
@@ -76,6 +82,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target\release\latch-host.exe dist\
+          Copy-Item target\release\latch-host.exe latch-host.exe
           Copy-Item docs\WINDOWS.md dist\README-WINDOWS.md
           Copy-Item scripts\install-host.ps1, LICENSE, NOTICE dist\
           Compress-Archive -Path dist\* -DestinationPath latch-windows-x64.zip
@@ -90,12 +97,13 @@ jobs:
           Copy-Item docs\WINDOWS.md legacy\README-WINDOWS.md
           Copy-Item scripts\install-host.ps1, LICENSE, NOTICE legacy\
           Compress-Archive -Path legacy\* -DestinationPath brolink-windows-x64.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: latch-windows-x64
           path: |
             latch-windows-x64.zip
             brolink-windows-x64.zip
+            latch-host.exe
           if-no-files-found: error
 
   # The Linux host, for VPS desktops: both production ones are arm64, x64 is
@@ -103,6 +111,8 @@ jobs:
   # 2.39 or later. The Mac does not push updates to Linux hosts; they install
   # from here (deploy/native/README.md) and check the published SHA-256.
   linux:
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
@@ -112,13 +122,13 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: native deps
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - name: test
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --all-targets
       - name: build
         run: cargo build --locked --release -p latch-host
       - name: package
@@ -130,7 +140,7 @@ jobs:
           tar -C dist -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
           cat "$name.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: latch-host-linux-${{ matrix.arch }}
           path: |
@@ -138,17 +148,33 @@ jobs:
             latch-host-linux-${{ matrix.arch }}.tar.gz.sha256
           if-no-files-found: error
 
+  codec-conformance:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: fetch the conformance bitstreams
+        run: sh scripts/fetch-h264-conformance.sh
+      - name: decode them
+        run: cargo test --locked --release -p latch-codec --test conformance -- --nocapture
+
   publish:
     # Tags only: a manual run just leaves artifacts on the run page.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [macos, windows, linux]
+    needs: [macos, windows, linux, codec-conformance]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       # Checkout first: it empties the workspace, so artifacts downloaded
       # before it would be deleted.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           sparse-checkout: |
             CHANGELOG.md
@@ -161,9 +187,21 @@ jobs:
         run: |
           have="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           [ "$have" = "${GITHUB_REF_NAME#v}" ] || { echo "::error::tag ${GITHUB_REF_NAME} but Cargo.toml says ${have}"; exit 1; }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
+      - name: checksums for every release asset
+        run: |
+          mkdir release-assets
+          find artifacts -type f -exec cp {} release-assets/ \;
+          cd release-assets
+          sha256sum * > SHA256SUMS
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: |
+            release-assets/*.tar.gz
+            release-assets/*.zip
+            release-assets/latch-host.exe
       - name: release notes
         # The CHANGELOG.md section whose heading is this version, up to
         # the next heading. A tag without one gets GitHub's generated notes.
@@ -191,4 +229,4 @@ jobs:
             --title "Latch ${GITHUB_REF_NAME}" \
             $NOTES \
             $PRE \
-            artifacts/*/*
+            release-assets/*

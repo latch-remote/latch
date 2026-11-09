@@ -389,7 +389,10 @@ address that `tailscale whois` attributes to the account this PC is signed
 in as; a machine shared in from another tailnet is refused too. Anything
 else gets a 403 before any action. Loopback, and this PC's own Tailscale
 address, can be a process of any Windows user signed in here, so they may
-not start a stream, push an update or use the clipboard.
+not start a stream or use the clipboard, and anything beyond reading the
+status needs the per-user token (see Local control). With it, this PC's own
+window may submit an update, which is checked against GitHub's published
+digest like any other.
 
 The service also listens on UDP 9. A magic packet for this PC's MAC that
 arrives while it is awake is logged and reported in the status, which is
@@ -503,16 +506,39 @@ and restart Latch. Without one, the viewer's stats line says
 
 ## Updates
 
-Latch Host does not download anything. The Mac fetches each release and
-POSTs the new `latch-host.exe` to `/v1/update` on the control port with
-its version and SHA-256, from a machine on the PC's own Tailscale account,
-the same check that guards remote power actions. The service verifies the
-digest, that the bytes are a Windows executable and a newer version, writes
-`latch-host.exe.new` beside itself, renames the running file to
-`latch-host.exe.old`, moves the new one in and starts it with
-`--replaces <pid>`; the new service waits for the old one to release the
-port, then removes the `.old` file. Both events appear in the host log and
-the streaming session, if any, is not interrupted.
+Windows checks GitHub every six hours and on **Check now** in Settings.
+When no viewing or sharing stream is active, it downloads the published
+`latch-host.exe`, verifies GitHub's SHA-256, and uses the same restart,
+probation and rollback path as a pushed update. Automatic updates must be
+enabled in Settings; `accept_updates` in `host.toml` also gates installation.
+
+For every pushed update, the receiving PC independently looks up the claimed
+`v<version>` release in `MrBeldum/latch` using HTTPS. The version must be newer
+and the executable must exactly match the bare `latch-host.exe` asset's digest
+and size. The sender's hash alone is insufficient. Old Mac header names still
+work. Offline PCs, missing digests and releases without that bare asset are
+refused with a readable error on the pushing Mac. For a release predating the
+asset, update the PC once by hand using its Windows zip; no archive fallback is
+downloaded. Private repositories require `LATCH_GITHUB_TOKEN` or `github_token`
+in the PC's client configuration as well as on the Mac.
+
+Linux checks and announces newer versions in Settings and the status line,
+including the release URL, but never replaces its executable. Download the
+matching Linux tarball, verify it against the release's `SHA256SUMS`, and
+follow `deploy/native/README.md` to replace the binary and restart the service;
+container installations must rebuild/redeploy their image.
+
+GitHub digests and build attestations establish the GitHub/TLS release boundary;
+they do not provide an independent publisher signature if GitHub is compromised.
+
+
+After authentication, the service stages `latch-host.exe.new` beside itself,
+renames the running file to `latch-host.exe.old`, moves the new file in and
+starts it with `--replaces <pid>`. The new service waits for the old one to
+release the port. The probation watcher restores the previous executable if
+the replacement fails to become healthy. Installation is deferred during streams.
+Local submissions from the Windows pull updater use this same authenticated
+route; `accept_updates = false` refuses them as well as peer pushes.
 
 Hosts older than 3.1 have no update route, and the Mac does not POST the
 executable at them (that used to show as a broken pipe). Instead the Mac
