@@ -1,8 +1,8 @@
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
-$root='C:\Users\Daniel\dev\latch-fix-vdd'
+$root='C:\Users\dev\dev\latch-fix-vdd'
 $setup='C:\Program Files\Latch\Setup\latch-host.exe'
-$installed='C:\Users\Daniel\AppData\Local\Latch\latch-host.exe'
+$installed='C:\Users\dev\AppData\Local\Latch\latch-host.exe'
 $reg='HKLM:\SOFTWARE\MikeTheTech\VirtualDisplayDriver'
 # Save the helper as setup refreshes it; the deployed host itself stays running.
 Copy-Item 'C:\Program Files\Latch\Input\latch-host.exe' "$root\input-main-backup.exe" -Force

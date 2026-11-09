@@ -6,14 +6,14 @@ out=/tmp/gfn-h-bench/out; mkdir -p $out
 SSH=(ssh -o ConnectTimeout=20 -o ControlMaster=auto -o ControlPath=/tmp/gfn-h-ssh-%C -o ControlPersist=60m -o ServerAliveInterval=10 linux)
 $SSH "pkill -x serve; sleep 0.5" 2>/dev/null
 if [[ $pat == desktop ]]; then envs="DISPLAY=:1 XAUTHORITY=/run/user/1004/latch.Xauthority"; keys=0
-elif [[ $pat == x9 ]]; then envs="DISPLAY=:9 XAUTHORITY=/home/daniel/gfn-h/xauth9"; keys=0
+elif [[ $pat == x9 ]]; then envs="DISPLAY=:9 XAUTHORITY=/home/dev/gfn-h/xauth9"; keys=0
 else envs="LATCH_TEST_PATTERN=$pat"; keys=${KEYS:-30}; fi
 [[ $pat == x9 ]] && $SSH "bash ~/gfn-h/x9.sh play 640 360 400 300" >/dev/null
-$SSH "cd ~/gfn-h/$build && (env $envs RUST_LOG=info nohup ./serve --bind 100.70.121.94 --port 47887 > ~/gfn-h/out-$label.log 2>&1 &)"
+$SSH "cd ~/gfn-h/$build && (env $envs RUST_LOG=info nohup ./serve --bind 100.64.0.31 --port 47887 > ~/gfn-h/out-$label.log 2>&1 &)"
 sleep 1.5
 # CPU of the serve process (all threads) over the run: utime+stime ticks at start and end.
 $SSH 'p=$(pgrep -x serve); t=$(awk "{print \$14+\$15}" /proc/$p/stat); echo $p $t $(date +%s.%N) > ~/gfn-h/cpu0' 
-/tmp/gfn-h-bench/view 100.70.121.94 --port 47887 --width $w --height $h --fps $fps --kbps $kbps --seconds $secs --keys $keys > $out/$label.json 2> $out/$label.err
+/tmp/gfn-h-bench/view 100.64.0.31 --port 47887 --width $w --height $h --fps $fps --kbps $kbps --seconds $secs --keys $keys > $out/$label.json 2> $out/$label.err
 cpu=$($SSH 'read p t0 s0 < ~/gfn-h/cpu0; t1=$(awk "{print \$14+\$15}" /proc/$p/stat 2>/dev/null); s1=$(date +%s.%N); hz=$(getconf CLK_TCK); awk -v a=$t0 -v b=$t1 -v x=$s0 -v y=$s1 -v hz=$hz "BEGIN{printf \"%.0f\", (b-a)/hz/(y-x)*100}"; echo " load $(cut -d" " -f1 /proc/loadavg)"')
 $SSH "pkill -x serve"
 [[ $pat == x9 ]] && $SSH "bash ~/gfn-h/x9.sh noplay" >/dev/null

@@ -4,7 +4,7 @@ Workstream C, MacBook Pro M3 Pro and Windows 11 / RX 6600. The baseline is
 9fe0ae9 with only the native measurement example/timestamps added. Original
 tables below precede the shared-texture continuation; see the continuation
 section for the final path. Tests use
-port **47882** and isolated Windows checkout `C:\Users\Daniel\dev\latch-gfn-c`;
+port **47882** and isolated Windows checkout `C:\Users\dev\dev\latch-gfn-c`;
 the installed host is not replaced. Other workstreams also used these machines;
 these are observed runs, not a controlled claim of performance improvement.
 
@@ -223,7 +223,7 @@ query; Mac offers now also require a cached, successfully decoded hardware
 picture. The local Mac checks passed again after that correction.
 
 The final Windows viewer also attempted the deployed Linux host at
-`100.70.121.94:47850`, 1080p120 for ten seconds, without input. Session setup
+`100.64.0.31:47850`, 1080p120 for ten seconds, without input. Session setup
 failed with socket error **10057** before any picture arrived; the log is
 `windows/c3-linux-live.log`. Transport changes are outside this workstream,
 so this does not count as a successful live remote-stream validation. The
@@ -233,7 +233,7 @@ successful Windows decode/presentation evidence.
 Cleanup confirmed no `LatchGfnViewer*C` task registrations and no test
 `present`/`serve` processes left in the isolated checkout. The deployed host
 remained PID 6084 in interactive session 1, at
-`C:\Users\Daniel\AppData\Local\Latch\latch-host.exe`, listening on 47850.
+`C:\Users\dev\AppData\Local\Latch\latch-host.exe`, listening on 47850.
 No display modes or drivers were changed; other workstreams' tasks and
 `LatchInput` were left alone. The Mac test server on 47882 was stopped.
 

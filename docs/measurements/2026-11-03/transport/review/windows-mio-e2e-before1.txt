@@ -1,5 +1,5 @@
 ﻿view.exe : Stage("Asking for the streamΓÇª")
-At C:\Users\Daniel\dev\latch-gfn-b2\e2e.ps1:7 char:3
+At C:\Users\dev\dev\latch-gfn-b2\e2e.ps1:7 char:3
 +   & "$Exe\view.exe" 127.0.0.1 --port 47881 --width 1280 --height 720  ...
 +   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (Stage("Asking for the streamΓÇª"):String) [], Remote 

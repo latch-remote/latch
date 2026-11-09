@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-Set-Location C:\Users\Daniel\dev\latch-gfn-c
+Set-Location C:\Users\dev\dev\latch-gfn-c
 Add-Type -AssemblyName System.Drawing
 Add-Type @'
 using System;

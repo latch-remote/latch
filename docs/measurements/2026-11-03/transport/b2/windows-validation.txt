@@ -12,7 +12,7 @@
    Compiling serde_json v1.0.151
    Compiling serde_derive v1.0.229
    Compiling serde v1.0.229
-   Compiling latch-proto v5.1.0 (C:\Users\Daniel\dev\latch-gfn-b2\crates\proto)
+   Compiling latch-proto v5.1.0 (C:\Users\dev\dev\latch-gfn-b2\crates\proto)
     Finished `test` profile [optimized + debuginfo] target(s) in 22.15s
      Running unittests src\lib.rs (target\debug\deps\latch_proto-213b95d7572c3215.exe)
 
@@ -104,7 +104,7 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     Checking bitflags v2.13.1
     Checking smallvec v1.16.0
     Checking bytemuck v1.25.2
-    Checking latch-codec v5.1.0 (C:\Users\Daniel\dev\latch-gfn-b2\crates\codec)
+    Checking latch-codec v5.1.0 (C:\Users\dev\dev\latch-gfn-b2\crates\codec)
     Checking log v0.4.34
     Checking parking_lot_core v0.9.12
     Checking png v0.18.1
@@ -123,7 +123,7 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     Checking serde_spanned v0.6.9
     Checking toml_datetime v0.6.11
     Checking toml_edit v0.22.27
-    Checking latch-proto v5.1.0 (C:\Users\Daniel\dev\latch-gfn-b2\crates\proto)
+    Checking latch-proto v5.1.0 (C:\Users\dev\dev\latch-gfn-b2\crates\proto)
     Checking toml v0.8.23
     Checking windows-core v0.58.0
     Checking windows-core v0.62.2
@@ -133,15 +133,15 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     Checking windows-future v0.3.2
     Checking windows v0.62.2
     Checking tracing v0.1.44
-    Checking latch-core v5.1.0 (C:\Users\Daniel\dev\latch-gfn-b2\crates\core)
+    Checking latch-core v5.1.0 (C:\Users\dev\dev\latch-gfn-b2\crates\core)
     Checking cpal v0.18.2
-    Checking latch-stream v5.1.0 (C:\Users\Daniel\dev\latch-gfn-b2\crates\stream)
-    Checking latch-engine v5.1.0 (C:\Users\Daniel\dev\latch-gfn-b2\crates\engine)
+    Checking latch-stream v5.1.0 (C:\Users\dev\dev\latch-gfn-b2\crates\stream)
+    Checking latch-engine v5.1.0 (C:\Users\dev\dev\latch-gfn-b2\crates\engine)
     Finished `dev` profile [optimized + debuginfo] target(s) in 53.13s
 
 
-ExecutablePath : C:\Users\Daniel\AppData\Local\Latch\latch-host.exe
-CommandLine    : "C:\Users\Daniel\AppData\Local\Latch\latch-host.exe" --background
+ExecutablePath : C:\Users\dev\AppData\Local\Latch\latch-host.exe
+CommandLine    : "C:\Users\dev\AppData\Local\Latch\latch-host.exe" --background
 
 
 

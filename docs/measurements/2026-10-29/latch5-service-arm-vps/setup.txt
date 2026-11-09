@@ -1,0 +1,4 @@
+active
+active
+prep_do = "/usr/local/bin/arm-vps-display"
+prep_undo = "/usr/local/bin/arm-vps-display idle"

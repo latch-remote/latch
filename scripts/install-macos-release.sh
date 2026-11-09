@@ -25,17 +25,14 @@ if ! curl -fsSL -o "$TMP/latch-macos-arm64.tar.gz" "$URL"; then
 fi
 
 echo "checking SHA-256"
+# The release API lists each asset's name and, after it, the digest GitHub
+# computed for it. Read with tools every Mac has: no Python, no gh.
 DIGEST=""
 if JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" "$API" 2>/dev/null); then
-  DIGEST=$(printf '%s' "$JSON" | python3 -c '
-import json, sys
-rel = json.load(sys.stdin)
-for a in rel.get("assets") or []:
-    if a.get("name") == "latch-macos-arm64.tar.gz":
-        d = a.get("digest") or ""
-        print(d[7:] if d.lower().startswith("sha256:") else d)
-        break
-' 2>/dev/null || true)
+  DIGEST=$(printf '%s' "$JSON" | tr -d '\n\r' \
+    | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"latch-macos-arm64\.tar\.gz"\(.*\)/\1/p' \
+    | grep -o '"digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-fA-F]\{64\}"' | head -1 \
+    | sed 's/.*sha256:\([0-9a-fA-F]*\)".*/\1/' || true)
 fi
 if [[ -z "$DIGEST" ]] && command -v gh >/dev/null 2>&1; then
   DIGEST=$(gh api "repos/$REPO/releases/latest" --jq '
@@ -43,7 +40,10 @@ if [[ -z "$DIGEST" ]] && command -v gh >/dev/null 2>&1; then
   ' 2>/dev/null | sed 's/^[Ss][Hh][Aa]256://' || true)
 fi
 if [[ ! "$DIGEST" =~ ^[0-9a-fA-F]{64}$ ]]; then
-  echo "release published no SHA-256 for latch-macos-arm64.tar.gz; refusing to install" >&2
+  echo "could not read the published SHA-256 for latch-macos-arm64.tar.gz from" >&2
+  echo "  $API" >&2
+  echo "(GitHub may be rate-limiting this address; try again in a few minutes)." >&2
+  echo "Refusing to install an unchecked download." >&2
   exit 1
 fi
 GOT=$(shasum -a 256 "$TMP/latch-macos-arm64.tar.gz" | awk '{print $1}')
@@ -65,6 +65,12 @@ xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
 codesign --verify --deep --strict "$APP"
 
 DEST="/Applications/Latch.app"
+if [[ ! -w /Applications ]]; then
+  echo "this account cannot write to /Applications." >&2
+  echo "Run the installer from an administrator account. Latch's login item and" >&2
+  echo "updater expect the app in /Applications, so it is not installed elsewhere." >&2
+  exit 1
+fi
 STAGE="/Applications/.Latch-install-$$.app"
 rm -rf "$STAGE"
 cp -R "$APP" "$STAGE"

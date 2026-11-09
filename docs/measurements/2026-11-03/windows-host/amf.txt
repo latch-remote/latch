@@ -2,7 +2,7 @@
 running 1 test
 latch_engine-17af6b37c18aa0e1.exe : HEVC input: width=128..8192,
 height=128..4352
-At C:\Users\Daniel\dev\latch-gfn-a\a3-run.ps1:16 char:1
+At C:\Users\dev\dev\latch-gfn-a\a3-run.ps1:16 char:1
 + & $exe --ignored --nocapture hardware_amf --test-threads=1 *> "$d\a3- ...
 + ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (HEVC input: wid...eight=128..

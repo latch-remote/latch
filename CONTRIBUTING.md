@@ -34,9 +34,16 @@ cargo test --workspace
 ```
 
 `cargo test` and `cargo run` keep settings and logs in `target/latch-data`
-(`.cargo/config.toml` sets `LATCH_DATA_DIR`), so a development build never
-touches an installed Latch's files. Some engine integration tests stream
-through an emulated bad network and take a few minutes.
+(`.cargo/config.toml` sets `LATCH_DATA_DIR`), apart from an installed
+Latch's. That separates the files, not the machine: `cargo run -p
+latch-host` is still the real app. It starts a background service on port
+47850 if none is running, and its Sharing tab can register a login item or
+change system settings when you ask it to. To exercise streaming without
+any of that, use the loopback tools below. Some engine integration tests
+stream through an emulated bad network and take a few minutes; a few
+codec tests compare against FFmpeg and the ITU conformance streams
+(`scripts/fetch-h264-conformance.sh`) and skip quietly when those are not
+there.
 
 ## Where things live
 

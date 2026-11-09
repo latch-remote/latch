@@ -231,7 +231,7 @@ host was changed, and no remote reboot was attempted.
 
 Cleanup is deferred by the owner until the PC is reachable. Remove:
 
-- Build directory: `C:\Users\Daniel\dev\latch-rfi2` (including logs, dump
+- Build directory: `C:\Users\dev\dev\latch-rfi2` (including logs, dump
   files and any still-running cargo/rustc processes targeting that directory).
 - Scheduled task: `LatchTestRfiMF` (hidden hardware test launcher).
 - Firewall allow rule: `LatchTest rfi-vt-mf tests`.

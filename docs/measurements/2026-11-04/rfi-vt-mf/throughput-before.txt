@@ -85,7 +85,7 @@
    Compiling rand v0.8.8
    Compiling gethostname v1.1.0
    Compiling sharded-slab v0.1.7
-   Compiling latch-proto v5.1.0 (/Users/daniel/.t3/worktrees/latch/t3-14028ebb/crates/proto)
+   Compiling latch-proto v5.1.0 (/Users/dev/.t3/worktrees/latch/t3-14028ebb/crates/proto)
    Compiling matchers v0.2.0
    Compiling parking_lot v0.12.5
    Compiling toml v0.8.23
@@ -94,7 +94,7 @@
    Compiling mio v1.2.4
    Compiling thread_local v1.1.10
    Compiling x11rb-protocol v0.13.2
-   Compiling latch-codec v5.1.0 (/Users/daniel/.t3/worktrees/latch/t3-14028ebb/crates/codec)
+   Compiling latch-codec v5.1.0 (/Users/dev/.t3/worktrees/latch/t3-14028ebb/crates/codec)
    Compiling nu-ansi-term v0.50.3
    Compiling tracing-subscriber v0.3.23
    Compiling objc2-core-audio v0.3.2
@@ -107,9 +107,9 @@
    Compiling image v0.25.10
    Compiling cpal v0.18.2
    Compiling x11rb v0.13.2
-   Compiling latch-core v5.1.0 (/Users/daniel/.t3/worktrees/latch/t3-14028ebb/crates/core)
-   Compiling latch-stream v5.1.0 (/Users/daniel/.t3/worktrees/latch/t3-14028ebb/crates/stream)
-   Compiling latch-engine v5.1.0 (/Users/daniel/.t3/worktrees/latch/t3-14028ebb/crates/engine)
+   Compiling latch-core v5.1.0 (/Users/dev/.t3/worktrees/latch/t3-14028ebb/crates/core)
+   Compiling latch-stream v5.1.0 (/Users/dev/.t3/worktrees/latch/t3-14028ebb/crates/stream)
+   Compiling latch-engine v5.1.0 (/Users/dev/.t3/worktrees/latch/t3-14028ebb/crates/engine)
     Finished `release` profile [optimized] target(s) in 26.04s
      Running unittests src/lib.rs (target/release/deps/latch_engine-ba871161630e97b6)
 

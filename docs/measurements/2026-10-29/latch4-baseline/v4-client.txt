@@ -1,8 +1,8 @@
 
 running 1 test
-2026-10-29T06:47:53.952910Z  INFO path to stuzha: Direct · 13 ms · 720p · 60 fps · 10 Mbps
+2026-10-29T06:47:53.952910Z  INFO path to arm-vps: Direct · 13 ms · 720p · 60 fps · 10 Mbps
 720p: asked 1280x720 at 60 fps, desktop None, connected in 267.6015ms
-2026-10-29T06:47:56.627392Z  INFO audio: playing on Daniel’s AirPods at 48000 Hz, 2 channels
+2026-10-29T06:47:56.627392Z  INFO audio: playing on AirPods at 48000 Hz, 2 channels
   pointer to the centre, 640x360
   pointer to a quarter in, 320x180
   100 stream pixels right, in steps of 10

@@ -801,7 +801,7 @@ instead of 37 (p95 39 ms instead of 47–52). Measurements:
   arguments at spaces, so it received half a path and an unexpected
   extra argument and failed.
 - The service log keeps what matters. Every machine that polled the
-  service was logged again each minute ("hermes (…) asked" was 2,707 of
+  service was logged again each minute ("gaming-pc (…) asked" was 2,707 of
   the 2,810 lines in this Mac's `service.log`), and every change of the
   nearest Tailscale relay region logged a network line. Each peer is now
   logged when first seen, when its answer changes or after an hour away,
@@ -832,7 +832,7 @@ instead of 37 (p95 39 ms instead of 47–52). Measurements:
 
 - `panel.log` and `service.log` no longer grow without end. Both were
   opened in append mode and nothing ever pruned them, so a machine that
-  streams for weeks kept every line it had ever logged: Hermes reached a
+  streams for weeks kept every line it had ever logged: one PC reached a
   32 MB `panel.log`. Each file now rolls over at 4 MB, keeping one previous
   generation as `<name>.1`, so a log costs at most 8 MB however long the
   service or the window runs.

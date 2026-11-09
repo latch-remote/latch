@@ -1,15 +1,15 @@
-   Compiling latch-codec v5.1.0 (C:\Users\Daniel\dev\latch-gfn-c\crates\codec)
-   Compiling latch-proto v5.1.0 (C:\Users\Daniel\dev\latch-gfn-c\crates\proto)
-   Compiling latch-core v5.1.0 (C:\Users\Daniel\dev\latch-gfn-c\crates\core)
-   Compiling latch-host v5.1.0 (C:\Users\Daniel\dev\latch-gfn-c\crates\host)
-   Compiling latch-engine v5.1.0 (C:\Users\Daniel\dev\latch-gfn-c\crates\engine)
-   Compiling latch-stream v5.1.0 (C:\Users\Daniel\dev\latch-gfn-c\crates\stream)
-   Compiling latch-ui v5.1.0 (C:\Users\Daniel\dev\latch-gfn-c\crates\ui)
-   Compiling latch-client v5.1.0 (C:\Users\Daniel\dev\latch-gfn-c\crates\client)
+   Compiling latch-codec v5.1.0 (C:\Users\dev\dev\latch-gfn-c\crates\codec)
+   Compiling latch-proto v5.1.0 (C:\Users\dev\dev\latch-gfn-c\crates\proto)
+   Compiling latch-core v5.1.0 (C:\Users\dev\dev\latch-gfn-c\crates\core)
+   Compiling latch-host v5.1.0 (C:\Users\dev\dev\latch-gfn-c\crates\host)
+   Compiling latch-engine v5.1.0 (C:\Users\dev\dev\latch-gfn-c\crates\engine)
+   Compiling latch-stream v5.1.0 (C:\Users\dev\dev\latch-gfn-c\crates\stream)
+   Compiling latch-ui v5.1.0 (C:\Users\dev\dev\latch-gfn-c\crates\ui)
+   Compiling latch-client v5.1.0 (C:\Users\dev\dev\latch-gfn-c\crates\client)
 error: could not compile `latch-codec` (lib test)
 
 Caused by:
-  process didn't exit successfully: `C:\Users\Daniel\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe --crate-name latch_codec --edition=2021 crates\codec\src\lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C opt-level=1 -C embed-bitcode=no -C debuginfo=2 -C debug-assertions=on --test --check-cfg cfg(docsrs,test) --check-cfg "cfg(feature, values())" -C metadata=500973441e618442 -C extra-filename=-040f9e82c25fb93b --out-dir C:\Users\Daniel\dev\latch-gfn-c\target\debug\deps -L dependency=C:\Users\Daniel\dev\latch-gfn-c\target\debug\deps -C target-feature=+crt-static` (exit code: 0xc0000005, STATUS_ACCESS_VIOLATION)
+  process didn't exit successfully: `C:\Users\dev\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe --crate-name latch_codec --edition=2021 crates\codec\src\lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C opt-level=1 -C embed-bitcode=no -C debuginfo=2 -C debug-assertions=on --test --check-cfg cfg(docsrs,test) --check-cfg "cfg(feature, values())" -C metadata=500973441e618442 -C extra-filename=-040f9e82c25fb93b --out-dir C:\Users\dev\dev\latch-gfn-c\target\debug\deps -L dependency=C:\Users\dev\dev\latch-gfn-c\target\debug\deps -C target-feature=+crt-static` (exit code: 0xc0000005, STATUS_ACCESS_VIOLATION)
 warning: build failed, waiting for other jobs to finish...
 invalid type ref
 !3345 = !DILocalVariable(name: "ptr", scope: !3346, file: !3065, line: 286, type: !3334, align: 64)

@@ -1,4 +1,4 @@
-Set-Location C:\Users\Daniel\dev\latch-gfn-c
+Set-Location C:\Users\dev\dev\latch-gfn-c
 $ff = 'C:\ffmpeg\bin\ffmpeg.exe'
 foreach ($r in @(@('1080','1920x1080','30M'),@('4k','3840x2160','80M'))) {
   $n,$size,$rate = $r

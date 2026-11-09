@@ -1,4 +1,4 @@
-   Compiling latch-engine v5.1.0 (/Users/daniel/.t3/worktrees/latch/t3-7facfba8/crates/engine)
+   Compiling latch-engine v5.1.0 (/Users/dev/.t3/worktrees/latch/t3-7facfba8/crates/engine)
     Finished `test` profile [optimized + debuginfo] target(s) in 0.48s
      Running tests/recovery.rs (target/debug/deps/recovery-9bc13fd845afd7e7)
 

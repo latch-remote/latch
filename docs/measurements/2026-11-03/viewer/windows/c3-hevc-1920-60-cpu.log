@@ -1,7 +1,7 @@
 decodable [Av1, Hevc, H264High, H264Baseline]
 renderer Dx12 AMD Radeon RX 6600
 
-thread 'main' (33660) panicked at C:\Users\Daniel\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wgpu-24.0.5\src\backend\wgpu_core.rs:3432:18:
+thread 'main' (33660) panicked at C:\Users\dev\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wgpu-24.0.5\src\backend\wgpu_core.rs:3432:18:
 wgpu error: Validation Error
 
 Caused by:

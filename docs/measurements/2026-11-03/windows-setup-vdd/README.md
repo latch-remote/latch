@@ -68,7 +68,7 @@ LATCH_DUMP_VDD_SCRIPT=vdd.ps1 cargo test -p latch-host --lib \
 `reproduce-boundary.ps1` and `reproduce-limit.ps1` variants isolate the limit.
 They preserve the original XML and registry values, save candidate XML,
 restart, observe, and restore. `modes.ps1` calls user32 display enumeration;
-run it in Daniel's interactive session through a temporary scheduled task,
+run it in the interactive session through a temporary scheduled task,
 with a hidden wscript launcher. Session 0 cannot enumerate desktop modes.
 
 The mock regression script runs on Windows without touching installed
@@ -80,7 +80,7 @@ scripts/test-vdd-setup.ps1 -Script vdd.ps1
 
 ## Real setup and streaming
 
-Built on the PC in `C:\Users\Daniel\dev\latch-fix-vdd`, `-j 2`:
+Built on the PC in `C:\Users\dev\dev\latch-fix-vdd`, `-j 2`:
 
 ```powershell
 cargo build --locked --release -p latch-host -j 2
@@ -111,9 +111,9 @@ and 2560×1440 through `EnumDisplaySettingsW`. Other stream sizes retain
 **CURRENT 1920x1080@240**, rather than just the XML advertising it.
 
 ```sh
-target/release/examples/view 100.106.23.40 --port 47850 \
+target/release/examples/view 100.64.0.10 --port 47850 \
   --width 1920 --height 1080 --fps 240 --kbps 80000 --hevc --seconds 8
-target/release/examples/view 100.106.23.40 --port 47897 \
+target/release/examples/view 100.64.0.10 --port 47897 \
   --width 1920 --height 1080 --fps 240 --kbps 80000 --hevc --seconds 12
 ```
 

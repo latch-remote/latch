@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $env:CARGO_INCREMENTAL = '0'
 $env:Path = "$env:USERPROFILE\.cargo\bin;" + $env:Path
-Set-Location C:\Users\Daniel\dev\latch-gfn-c
+Set-Location C:\Users\dev\dev\latch-gfn-c
 $env:RUST_LOG = 'latch_stream=info,latch_client=info'
 function RunViewer($arguments, $label) {
   $p = Start-Process -FilePath "$PWD\target\release\examples\present.exe" -ArgumentList $arguments -RedirectStandardError "$PWD\$label.log" -RedirectStandardOutput "$PWD\$label.out" -PassThru

@@ -7,15 +7,15 @@ decoded frames, polled every 250 µs) against `crates/engine/examples/serve.rs`
 streaming the synthetic desktop (`LATCH_TEST_PATTERN=sweep|noise`).
 
 - **Loopback:** both ends on a MacBook Pro (M3 Pro).
-- **Real path:** host on stuzha (Oracle A1, 4× Neoverse N1, shared with
+- **Real path:** host on arm-vps (Oracle A1, 4× Neoverse N1, shared with
   other work), viewer on the Mac, over Tailscale (12–15 ms round trip).
 
-Runs of the two builds were interleaved, because stuzha's load varies
+Runs of the two builds were interleaved, because arm-vps's load varies
 (other jobs used up to 2.4 of its 4 cores during these runs).
 
 ## 5.0.1 (main) → this branch
 
-stuzha → Mac, 1080p60, 20 Mb/s, 40 key presses per run, three interleaved runs each:
+arm-vps → Mac, 1080p60, 20 Mb/s, 40 key presses per run, three interleaved runs each:
 
 | | 5.0.1 | this branch |
 | --- | --- | --- |
@@ -28,7 +28,7 @@ Loopback, 1080p60: 46.9 → 59.9 fps, key to picture p50 24.5 → 14.5 ms, p95 2
 
 ## #32 (what the machines ran) → this branch
 
-stuzha → Mac, interleaved, each build with its own viewer:
+arm-vps → Mac, interleaved, each build with its own viewer:
 
 | | #32 | this branch |
 | --- | --- | --- |
@@ -50,7 +50,7 @@ frame interval sd 10.2 → 2.0 ms, p99 34.6 → 21 ms, key to picture p50
 | --- | --- |
 | Frames on a fixed grid (`video::Pacer`) | 5.0.1 paced from the end of each encode: 60 fps ran at 42–50 |
 | Media threads at user-interactive QoS / highest priority | loopback frame interval sd 1.8 → 1.35 ms; 720p encode 2.3 → 1.4 ms |
-| latch-codec NEON + real-time governor | [codec-simd](codec-simd/), [codec-realtime](codec-realtime/): stuzha 1080p motion 34.9 → 12.2 ms mean, 38.9 → 60 fps; desktop 25–40% faster, bit-identical where no effort was traded |
+| latch-codec NEON + real-time governor | [codec-simd](codec-simd/), [codec-realtime](codec-realtime/): arm-vps 1080p motion 34.9 → 12.2 ms mean, 38.9 → 60 fps; desktop 25–40% faster, bit-identical where no effort was traded |
 | FEC SSSE3/AVX2 split-nibble multiply | x86 encode 440 → 2700 MB/s, rebuild 4.7× faster; ARM 1.4–1.6× |
 | Data shards before parity | a frame that loses nothing never waits for parity arithmetic |
 | Congestion: back off from the rate actually sent; standing-queue test on the lowest ping of each window; parity floor by base round trip; pace only under loss or queueing | unit tests and `tests/bottleneck.rs`; on a clean path frames leave without pacing delay |
@@ -61,7 +61,7 @@ frame interval sd 10.2 → 2.0 ms, p99 34.6 → 21 ms, key to picture p50
 
 ## Not measured
 
-- Hermes (Windows, AMD RX 6600) was offline: the Windows pipeline changes
+- the Windows PC (Windows, AMD RX 6600) was offline: the Windows pipeline changes
   ran on CI's software encoder only.
 - A Mac as host still lacks Screen Recording and Accessibility permission.
 - Real congestion could not be produced on demand. The adaptive bitrate and
