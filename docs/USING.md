@@ -33,28 +33,47 @@ is sitting at it. Platform details are in [MACOS.md](MACOS.md) and
    (or if the router forwards UDP 9). Settings can offer sleep after a
    session; that is off by default.
 
+## When the connection drops
+
+If a stream loses its connection, leave the window open. Latch tries again
+after 2, 5 and 10 seconds, then every 20 to 30 seconds for five minutes,
+and at once when the machine shows as online again or this one wakes from
+sleep. The overlay shows the countdown; **Reconnect now** skips the wait
+and **Stop** goes back to the machine list. Each attempt is a new session,
+so a display or network that changed in the meantime is taken into account.
+
+Latch does not keep retrying when the other side said no: a refusal,
+another viewer taking the machine over, or the stream being ended there.
+**Try again** starts over when you are ready.
+
 ## Updates
 
-Automatic release fetching runs on macOS only. Windows receives pushes
-from a Mac or needs manual installation; Linux needs a tarball install or
-Docker rebuild. Every few hours the Mac app asks GitHub for
-the latest release. A newer app is downloaded, checked against the digest
-GitHub publishes and its own code signature, swapped into `/Applications`
-once no stream is running, and relaunched. A newer Latch Host is sent
-from the Mac to every PC whose host reports an older version, over the same
-Tailscale-authenticated control API that can put the PC to sleep; the host
-verifies the sender-supplied digest, replaces its executable and restarts.
-This checks corruption, not independent publisher authenticity. That path updates `latch-host.exe`, which contains the entire streaming engine. A PC that is asleep gets the host
-update the next time the Mac sees it. Nothing is downloaded on the PC, and
-no GitHub login is needed there.
+Every few hours Latch asks GitHub for the latest release. Settings has the
+switch and a **Check now** button.
 
-Public releases need no GitHub login. If the repository is private, the Mac
-uses the GitHub token git has stored for github.com,
-`LATCH_GITHUB_TOKEN`, or `github_token` in `client.toml`. Settings has the
-switch and a **Check now** button. Hosts installed before 3.1 need local
-or SSH installation of a current release. A Latch 5 viewer cannot stream
-the retired protocol to upgrade them. Ad-hoc Mac updates may require
-re-granting Screen Recording and Accessibility and restarting the app.
+- **macOS.** A newer app is downloaded, checked against the digest GitHub
+  publishes and its own code signature, swapped into `/Applications` once
+  no stream is running, and relaunched. The Mac also sends a newer
+  `latch-host.exe` to each of your PCs whose host reports an older version,
+  over the same Tailscale-authenticated control API that can put the PC to
+  sleep. A PC that is asleep gets it the next time the Mac sees it.
+- **Windows.** With the window open, Latch downloads a newer
+  `latch-host.exe` itself and installs it when no stream is running.
+  Whether an update is pulled or pushed from a Mac, the PC looks the
+  release up on GitHub and installs the file only if it matches the
+  SHA-256 published there; what the sender says about it is not enough. A
+  PC that cannot reach GitHub refuses the update.
+- **Linux.** Latch says a newer version exists and links to it. Install the
+  tarball as in [deploy/native/README.md](../deploy/native/README.md), or
+  rebuild the Docker node.
+
+Public releases need no GitHub login. For a private fork, Latch uses the
+GitHub token git has stored for github.com, `LATCH_GITHUB_TOKEN`, or
+`github_token` in `client.toml`. Hosts installed before 3.1 need a local or
+SSH installation of a current release: a Latch 5 viewer cannot stream the
+retired protocol to upgrade them. Mac builds are ad-hoc signed, so macOS may
+ask for Screen Recording and Accessibility again after an update
+([why](ROADMAP.md#signing-and-notarization)).
 
 ## Staying reachable
 
