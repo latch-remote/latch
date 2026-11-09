@@ -484,7 +484,11 @@ that is damaged with a queue or >10% loss cuts at once. A 50 ms window holds onl
 received/sent ratios are too coarse to be a signal on their own; they gate only
 the one-window collapse cut, together with loss above 10% or delay above 20 ms. The
 ping-jitter estimate starts at 3 ms and learns only from falling delay outside
-congestion. The wire floor is a fixed 1 Mbps, whatever the ceiling, so a
+congestion. An application-limited sender keeps that 3 ms floor after pacing
+starts: pacing freezes the estimate, so the floor is the only model of jitter
+the idle sender has not learned. Without it, the first scheduling spike turns
+a few milliseconds of path jitter into a standing queue and the next cut
+adopts one sparse window's send rate. The wire floor is a fixed 1 Mbps, whatever the ceiling, so a
 high-quality session can still fit a 2–5 Mbps link.
 
 A cut remembers the sustainable rate (what got through, raised to whatever the
