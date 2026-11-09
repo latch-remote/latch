@@ -493,3 +493,25 @@ fn gamepads_plug_in_follow_rumble_back_and_unplug() {
     wait_for(&|| session.finished());
     wait_for(&|| latch_engine::testmode::pads().iter().all(Option::is_none));
 }
+
+#[test]
+fn a_larger_synthetic_desktop_decodes_at_the_negotiated_size() {
+    let _exclusive = exclusive("scaled source");
+    std::env::set_var("LATCH_TEST_SOURCE_WIDTH", "1280");
+    std::env::set_var("LATCH_TEST_SOURCE_HEIGHT", "720");
+    let (session, frames, _events) = connect_with(host(), false, false);
+    let (_, frame) =
+        next_frame(&frames, 0, Duration::from_secs(10)).expect("scaled source decodes");
+    assert_eq!((frame.width, frame.height), (W, H));
+    session.stop();
+    let start = Instant::now();
+    while !session.finished() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "session did not stop"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::env::remove_var("LATCH_TEST_SOURCE_WIDTH");
+    std::env::remove_var("LATCH_TEST_SOURCE_HEIGHT");
+}

@@ -14,6 +14,7 @@
 
 use crate::yuv::Yuv420;
 mod pool;
+pub mod scale;
 mod simd;
 
 // BT.709 limited-range fixed-point coefficients scaled by 65536 (2^16):

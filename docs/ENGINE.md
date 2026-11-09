@@ -362,7 +362,21 @@ through `libc`.
   viewer is resized by the engine (`xrandr` semantics through RandR) or by
   the owner's prep command; Windows sets the virtual display's mode; macOS
   captures the main display (or `LATCH_MAC_DISPLAY`) and lets
-  ScreenCaptureKit scale it.
+  ScreenCaptureKit scale it. Linux's CPU pipeline also emits the negotiated
+  output size when the display stays at its native size, for software, NVENC
+  and VA-API alike. It aspect-fits with centred black bars, using the same
+  content rectangle for pointer injection as Windows and macOS. Reductions
+  use area averaging fused into BGRA-to-BT.709 limited-range YUV420 conversion;
+  enlargements use bilinear filtering. Filter footprints map capture damage
+  into output damage, including neighbouring chroma pairs. Equal-size frames
+  retain the original SIMD conversion path. Separate cursor shapes and
+  hotspots use output pixels; the viewer supplies the pointer position.
+  Conversion, software encoding, and the capacity probe share a worker
+  selection function of available parallelism and output dimensions. Its
+  conservative table remains capped at four pending a quiet-machine sweep;
+  Linux CPU quotas are respected, and Apple Silicon uses its performance-core
+  count. Two-core machines still use two workers. See the
+  [measurement record](measurements/2026-11-09-linux-output-size/README.md).
 
 ## Compatibility
 

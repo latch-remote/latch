@@ -329,7 +329,7 @@ impl Server {
         };
         let mut opened = video::open(&config);
         // A codec whose only encoder will not open here gives way to the
-        // next the viewer takes, at the same size.
+        // next the viewer takes, refitting its output limits.
         for &next in &candidates[1..] {
             match &opened {
                 Err(e) if video::Unencodable::is(e) => {
@@ -340,12 +340,18 @@ impl Server {
                         next == video::Codec::Hevc,
                         cfg!(any(target_os = "macos", windows)),
                     );
-                    config.bitrate_kbps = config.bitrate_kbps.min(video::limits(next).max_kbps);
+                    let limits = video::limits(next);
+                    (config.width, config.height, config.fps) =
+                        limits.fit(config.width, config.height, config.fps);
+                    config.bitrate_kbps = config.bitrate_kbps.min(limits.max_kbps);
                     if let Some(ceiling) =
                         crate::software::ceiling().filter(|_| !video::hardware_encodes(next))
                     {
-                        config.fps = ceiling.fit(config.width, config.height, config.fps).2;
+                        (config.width, config.height, config.fps) =
+                            ceiling.fit(config.width, config.height, config.fps);
                     }
+                    prepared.req.width = config.width;
+                    prepared.req.height = config.height;
                     prepared.req.fps = config.fps;
                     prepared.req.bitrate_kbps = config.bitrate_kbps;
                     prepared.codec = next;

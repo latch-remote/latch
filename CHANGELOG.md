@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Honour negotiated Linux/software output dimensions with damage-aware area scaling, aspect fitting, and matching cursor and input geometry.
+
 The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
 `## X.Y.Z (date)`.
