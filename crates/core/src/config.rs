@@ -475,6 +475,19 @@ pub fn machine_name() -> String {
         .unwrap_or_else(|| "This computer".into())
 }
 
+/// The header a program on this machine sends to control the service here.
+pub const LOCAL_CONTROL_HEADER: &str = "x-latch-local-control";
+/// The file in the data directory holding that header's value.
+pub const LOCAL_CONTROL_FILE: &str = "local-control-token";
+
+/// The token the service wrote for the user it runs as, if this process can
+/// read it. Only that user's programs can, which is the whole check.
+pub fn local_control_token() -> Option<String> {
+    let text = std::fs::read_to_string(data_dir().ok()?.join(LOCAL_CONTROL_FILE)).ok()?;
+    let token = text.trim();
+    (token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())).then(|| token.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

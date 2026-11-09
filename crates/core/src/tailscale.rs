@@ -339,10 +339,20 @@ pub struct WhoIs {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 pub struct WhoIsNode {
+    pub sharer: u64,
+    #[serde(deserialize_with = "null_as_default")]
+    pub tags: Vec<String>,
+    pub hostinfo: WhoIsHostinfo,
     pub addresses: Vec<String>,
     pub name: String,
     #[serde(rename = "ComputedName")]
     pub computed_name: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct WhoIsHostinfo {
+    pub sharee_node: bool,
 }
 
 pub fn whois(ip: std::net::IpAddr) -> Result<WhoIs> {

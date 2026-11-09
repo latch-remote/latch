@@ -42,7 +42,12 @@ $DestExe = Join-Path $DestDir "latch-host.exe"
 
 # A running service or panel holds the old exe open; stop them first.
 try {
-    Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:47850/v1/quit" -ContentType 'application/json' -Body '{}' -TimeoutSec 2 | Out-Null
+    $ControlHeaders = @{}
+    $ControlToken = Join-Path $DestDir 'local-control-token'
+    if (Test-Path -LiteralPath $ControlToken) {
+        $ControlHeaders['x-latch-local-control'] = (Get-Content -LiteralPath $ControlToken -Raw).Trim()
+    }
+    Invoke-RestMethod -Headers $ControlHeaders -Method Post -Uri "http://127.0.0.1:47850/v1/quit" -ContentType 'application/json' -Body '{}' -TimeoutSec 2 | Out-Null
     Start-Sleep -Milliseconds 800
 } catch {}
 Get-Process latch-host, brolink-host -ErrorAction SilentlyContinue | Stop-Process -Force
