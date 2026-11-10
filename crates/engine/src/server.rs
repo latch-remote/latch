@@ -1111,6 +1111,10 @@ impl RecoveryState {
     }
 }
 
+/// Encoded frames that may be outstanding (being sent, or waiting to be)
+/// before a paced session stops taking new pictures.
+const PACED_BACKLOG: u32 = 1;
+
 struct TransportState {
     probe: Mutex<Option<(u16, u8)>>,
     probe_pressure: AtomicBool,
@@ -1431,10 +1435,15 @@ fn encode_video(
     let audio = session.audio_enabled;
     let mut applied = 0;
     while !session.stopping() {
-        // Once pacing is needed, finish outstanding references before taking
-        // another picture. Never encode a stale picture just to drop its GOP.
+        // Once pacing is needed, do not take another picture while one
+        // encoded frame is already waiting behind the one being sent: it
+        // would only go stale in the queue. One frame may still be encoded
+        // while the previous one leaves, so that sending and encoding
+        // overlap; waiting for the sender to drain completely made a frame
+        // cost its send time plus its encode time, which lowered the frame
+        // rate whenever pacing was on.
         while session.pace_kbps.load(Ordering::Relaxed) != 0
-            && session.transport.pending.load(Ordering::Acquire) != 0
+            && session.transport.pending.load(Ordering::Acquire) > PACED_BACKLOG
         {
             if session.stopping() {
                 return;
