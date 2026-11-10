@@ -15,7 +15,7 @@ without a record is listed under [Not measured yet](#not-measured-yet).
   frames a second to a Mac at 1080p with 240 asked for, 213 at 1440p, and
   96 at 4K with 120 asked for, taking 3 to 10 ms from capture to send
   ([record](measurements/2026-11-03/windows-host/README.md)).
-- **Linux host.** A 2-core ARM server with no GPU holds 60 fps at 1080p in
+- **Linux host.** A 4-core ARM server with no GPU holds 60 fps at 1080p in
   software H.264, at 1.4 ms a frame on a moving test pattern
   ([record](measurements/2026-11-03-linux-host/README.md)).
 - **Bad networks.** Through a simulated 20 Mbps link the viewer showed 296
@@ -34,7 +34,7 @@ without a record is listed under [Not measured yet](#not-measured-yet).
 | --- | --- |
 | Apple M3 Pro laptop, 12 cores, macOS | host and viewer: VideoToolbox encode and decode, the software codec, loopback transport and recovery tests |
 | Windows 11 desktop, AMD Radeon RX 6600 | host and viewer: AMF and Media Foundation encode, DXVA decode, HDR readback, sound |
-| ARM64 Ubuntu virtual server, 2 cores, no GPU | Linux host: X11 capture and software H.264 |
+| ARM64 Ubuntu virtual server, 4 cores, no GPU | Linux host: X11 capture and software H.264 |
 
 That is every machine Latch has run on. No NVIDIA or Intel GPU, no GPU of
 any kind on Linux, no physical HDR display, and no wired network faster
