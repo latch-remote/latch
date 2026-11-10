@@ -31,10 +31,8 @@ with `lpcm-rice`, and the picture is drawn in Latch's own window under a toolbar
 
 ## Install a prebuilt app
 
-The current installer needs `curl` and either Python 3 or the GitHub CLI
-to read the release digest; these are not present on every fresh Mac.
-The manual path below avoids that parser dependency. Public releases
-download anonymously with `curl`. If the repository is private, install
+The installer uses only tools every Mac has (`curl`, `sed`, `shasum`).
+Public releases download anonymously. If the repository is private, install
 the [GitHub CLI](https://cli.github.com) and sign in
 (`brew install gh && gh auth login`) so the script can fall back to `gh`.
 
@@ -105,9 +103,10 @@ xcrun stapler staple dist.noindex/Latch.app
    first. A dot and one line say whether each is ready, asleep, or
    missing something on its side.
 3. Click **Connect** (**Wake and connect** for a machine that is asleep).
-   Untagged hosts authorize by Tailscale user ID, without pairing. Tagged
-   hosts match login to the tailnet name or domain rather than membership;
-   restrict reachability with Tailscale policy.
+   There is no pairing: a host answers devices signed in to its own
+   Tailscale account. A tagged host (a server with no account of its own)
+   answers the tailnet's owner, or on an organisation's tailnet the logins
+   in its `allowed_logins`.
    If Latch is not sharing on that machine, open Latch there and set up
    sharing on its **Sharing** tab first.
 4. The desktop appears.
@@ -559,9 +558,10 @@ PC whose Latch Host is older and already speaks `/v1/update` (3.1+).
 Hosts on 3.0 must be upgraded locally or over SSH using the current
 Windows release and installer. A Latch 5 viewer cannot stream the retired
 GameStream protocol to perform an upgrade through the desktop.
-Windows and Linux do not pull updates themselves. Windows can receive a
-push from a Mac; otherwise reinstall the current Windows zip manually.
-For Linux, install the new tarball or rebuild the Docker node.
+A Windows PC also updates itself while its window is open
+([WINDOWS.md](WINDOWS.md#updates)), and checks whatever it is sent against
+GitHub's digest for the release. A Linux host shows the new version;
+install the new tarball or rebuild the Docker node.
 
 Public releases need no GitHub login. If the repository is private, the
 app uses, in order: `github_token` in `client.toml`, `LATCH_GITHUB_TOKEN`

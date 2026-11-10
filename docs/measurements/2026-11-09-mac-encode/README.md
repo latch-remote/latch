@@ -64,7 +64,8 @@ milliseconds.
 
 Latch keeps at most two frames in the encoder at once. To see whether
 that holds the rate down, the same benchmark was run with
-`LATCH_VT_IN_FLIGHT` set to 2, 3, 4 and 6:
+`LATCH_VT_IN_FLIGHT` set to 2, 3, 4 and 6 (command and output in
+[raw-depth.txt](raw-depth.txt)):
 
 | Case | 2 in flight | 3 | 4 | 6 |
 |---|---|---|---|---|

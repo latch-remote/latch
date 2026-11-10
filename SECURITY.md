@@ -2,8 +2,9 @@
 
 ## Supported versions
 
-Only the latest release gets security fixes. Latch updates itself, so a
-machine that is switched on and reachable is normally on it.
+Only the latest release gets security fixes. Latch updates itself on Mac
+and Windows, so a machine that is switched on and reachable is normally on
+it; a Linux host shows a notice and is updated by hand.
 
 | Version | Supported |
 |---------|-----------|

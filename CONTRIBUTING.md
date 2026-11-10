@@ -155,4 +155,5 @@ GPL-3.0-or-later, like the rest of Latch.
 Maintainers cut a release by bumping `version` in `Cargo.toml`, dating the
 changelog section, and pushing a `v*` tag. `.github/workflows/release.yml`
 tests, builds and publishes the macOS, Windows and Linux archives with
-their SHA-256 digests. Installed copies update themselves from there.
+their SHA-256 digests. Installed Mac and Windows copies update themselves
+from there; Linux hosts show a notice.
