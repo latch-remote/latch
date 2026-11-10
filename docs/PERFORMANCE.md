@@ -103,14 +103,18 @@ the compositor, or the display
 
 "Shown" is lower than "decoded" in every row: the viewer keeps only the
 newest decoded picture, so one that has not been drawn when the next
-arrives is replaced, and 8% to 18% of pictures went that way here. Pacing
+arrives is replaced, and 6% to 19% of pictures went that way here. Pacing
 presentation to the display is on the [roadmap](ROADMAP.md).
 
 The Mac row was fed by a software-encoding host on the same loaded
 machine, which is why about half the frames asked for arrived; it measures
-the time per frame, not the Mac's decode rate. The RX 6600 does not decode
-4K at 120 fps: about 60 to 70 frames a second came out. Linux viewers
-decode H.264 in software and have not been measured.
+the time per frame, not the Mac's decode rate. The Windows viewer did not
+keep 4K at 120 fps in HEVC or AV1: about 60 to 70 pictures a second came
+out. The decode time here includes Latch's copy out of the decoder, so the
+record does not say how much of that is the card and how much is Latch; in
+an earlier run the same card decoded H.264 at 4K, 119 pictures a second in
+6.5 ms each. Separating the two is on the [roadmap](ROADMAP.md). Linux
+viewers decode H.264 in software and have not been measured.
 
 ## Network and loss recovery
 

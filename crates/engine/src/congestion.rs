@@ -530,8 +530,11 @@ impl Controller {
             // its own frames cancel the trains that would have measured.
             // Good delivery grows only the pace.
             let guess = (self.budget / 20).max(delivered.unwrap_or(0).saturating_mul(2));
+            // A train can also read low. What the path has just delivered is
+            // the firmer evidence, with one growth step of room above it.
+            let shown = delivered.unwrap_or(0).saturating_mul(5) / 4;
             let rate = measured
-                .map_or(guess, |path| path.saturating_mul(105) / 100)
+                .map_or(guess, |path| (path.saturating_mul(105) / 100).max(shown))
                 .max(self.floor);
             // A train that has just been measured replaces a guess, even
             // upwards.
@@ -542,6 +545,8 @@ impl Controller {
                 self.resume_step = now;
             }
         }
+        // Deliberately not held back by a queue or loss: delivery cannot
+        // exceed what the path carries, and the budget still answers both.
         if let Some(rate) = self.resume.filter(|_| self.resume_guessed) {
             let shown = delivered.unwrap_or(0).saturating_mul(2);
             if shown > rate {
@@ -1021,6 +1026,13 @@ mod tests {
         c.observe_sent(12_000);
         c.update(t, &report(12_000, 28_000), 150.0, 0.0);
         assert_eq!(c.pace_kbps(), 29_400);
+        // Trains that read lower than what is arriving do not pace under it.
+        for _ in 0..2 {
+            t += Duration::from_secs(1);
+            c.observe_sent(12_000);
+            c.update(t, &report(12_000, 8000), 150.0, 0.0);
+        }
+        assert_eq!(c.pace_kbps(), 15_000);
 
         // A still desktop shows nothing to go by: the old cautious pace.
         let mut c = Controller::new(40_000, start);

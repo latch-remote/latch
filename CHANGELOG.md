@@ -48,7 +48,7 @@ publishes for the release instead of trusting the machine that sent it.
   budget, whatever was already getting through. The pace is now never under
   twice what the viewer is receiving, and a measurement that arrives later
   replaces the guess
-  ([record](docs/measurements/2026-11-09-paced-batches/README.md)).
+  ([record](https://github.com/MrBeldum/latch/blob/main/docs/measurements/2026-11-09-paced-batches/README.md)).
 
 ### Viewer
 

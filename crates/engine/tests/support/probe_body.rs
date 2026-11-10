@@ -1,6 +1,6 @@
-// Review harness for PR #58 re-review (shared by main and head via shims).
-// Copied from the 58b review; probe trains (sent, metered and reported)
-// go through shim functions, which are no-ops for revisions without them.
+// A simulated sender, link and viewer for the probe-train tests. Probe
+// trains (sent, metered and reported) go through the shim functions the
+// including test defines.
 use latch_proto::{
     control::Report,
     sim::{Impairment, Link},

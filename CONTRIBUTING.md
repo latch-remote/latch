@@ -133,17 +133,18 @@ project has not seen, the output of these is worth an issue on its own.
 ## Pull requests
 
 - Branch from `main`; keep a pull request to one subject.
-- The three commands above pass, on your OS at least. CI runs them on
-  macOS, Windows and Linux (x64 and arm64).
+- `cargo fmt`, `cargo clippy` and `cargo test`, as written under
+  [Building](#building), pass on your OS at least. CI runs them on macOS,
+  Windows and Linux (x64 and arm64).
 - **Say how you checked it**, and what you could not check. "Not run on
   Windows hardware" is a normal and welcome sentence here; a claim nobody
   measured is not.
 - **Performance changes come with numbers**: before and after, the
   machine, and the command, so someone else can repeat it.
   [docs/PERFORMANCE.md](docs/PERFORMANCE.md) shows the form.
-- Anything a user would notice gets a line under `## Unreleased` at the top (add the heading if the
-  last release closed it) in
-  [CHANGELOG.md](CHANGELOG.md).
+- Anything a user would notice gets a line under `## Unreleased` at the
+  top of [CHANGELOG.md](CHANGELOG.md); add the heading if the last release
+  closed it.
 - Documentation states what is true of the code in the same pull request.
   Describe what Latch does and what was verified; leave out what it might
   do one day.

@@ -2,9 +2,11 @@
 
 ## Supported versions
 
-Only the latest release gets security fixes. Latch updates itself on Mac
-and Windows, so a machine that is switched on and reachable is normally on
-it; a Linux host shows a notice and is updated by hand.
+Only the latest release gets security fixes. A Mac updates itself while
+Latch runs. A Windows PC updates itself while its Latch window is open, or
+when a Mac on the same tailnet pushes the release to it; a PC that only
+runs the background host stays on its version until one of those happens.
+A Linux host shows a notice and is updated by hand.
 
 | Version | Supported |
 |---------|-----------|

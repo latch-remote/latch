@@ -50,6 +50,9 @@ date, and none of it is a tested capability until it leaves this list.
   the slower of the two does alone (157 fps at 1440p, against 191 from
   capture and 233 from the encoder). The copy, cursor and conversion
   passes between them need profiling and overlapping.
+- **Windows viewer at 4K and 120 fps.** HEVC and AV1 came out at 60 to
+  70 pictures a second on an RX 6600. The decoder's own time and Latch's
+  copy to the renderer have not been separated; that comes first.
 - **Windows ten-bit and HDR viewing without a CPU readback.**
 - **Mouse and keyboard sent from the OS event.** The viewer forwards them
   when its window next draws, which is at once on input but still waits

@@ -155,7 +155,14 @@ only less exposed. The 5 Mbps rows are unchanged: there the link, not the
 pace, is what limits the stream, and at 150 ms both builds lose 20 to 65
 frames while the controller finds the rate.
 
-The sender-alone table below was not repeated with this change.
+One more rule came after that table: a pace taken from a measured train
+is not set under 125% of what the viewer is receiving, since a train can
+read low. It was spot-checked with eight runs in five of the rows, not
+the full comparison: 299 in every run at 20 and at 50 Mbps with 150 ms,
+300 or 301 with no limit, 296 or 297 at 20 Mbps and 20 ms, and 286 to 289
+at 5 Mbps and 20 ms.
+
+The sender-alone table below was not repeated with these changes.
 
 ## Sender alone: three seconds of synthetic frames
 
@@ -201,6 +208,11 @@ Sleeps overshoot by about a quarter. The pacer sleeps to absolute deadlines
 and does not spin; nothing above justified spending a core on it.
 
 ## Not measured
+
+- **Content that changes rate.** The test pattern is a steady 9 Mbps. A
+  scene change while the pace is a guess ramps by doubling, one step per
+  report after a round trip, and a steady stream under a guessed pace is
+  spread over up to half its frame interval. Neither was timed.
 
 - **Linux GSO and Windows USO on real hardware.** The point of batching is
   fewer system calls on those two systems. The code paths are exercised by

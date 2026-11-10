@@ -504,7 +504,8 @@ queue delay or lossy delivery deficit to lower the target to 90% of the
 faster train. An ordinary ping immediately behind each burst independently
 measures its FIFO delay, relative to baseline RTT and learned ping jitter.
 It does not pollute the minimum-RTT samples. Without corroboration only
-resume pacing changes: 105% of a measured rate. When no train has been
+resume pacing changes: 105% of a measured rate, and not under 125% of the
+best rate received in a window of the last second. When no train has been
 measured the pace is a guess: the larger of 1/20 of the budget and twice the
 best rate the viewer reported receiving in any window of the last second. A
 stream can move at under half its budget, and its own frames then cancel the

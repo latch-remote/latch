@@ -82,7 +82,8 @@ Then open Latch and click **Connect** beside another machine. The
 | **macOS** | HEVC or H.264 on VideoToolbox; HDR10 | hardware AV1 (M3 and later), HEVC and H.264; HDR |
 | **Linux** | software H.264; NVENC and VA-API (not yet run on a GPU); virtual gamepads | software H.264 |
 
-Latch is young. Viewers are desktop apps only: for a phone, a TV or a
+Latch is young. HDR has been checked by reading pixels back, not yet by
+eye on an HDR panel. Viewers are desktop apps only: for a phone, a TV or a
 browser, use [Moonlight](https://moonlight-stream.org) today. What has and
 has not met real hardware is listed in
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md), and what is planned in the

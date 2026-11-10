@@ -3022,7 +3022,7 @@ pub(crate) mod snapshots {
                 96,
                 true,
             ),
-            ready_pc("d", "vps-sanjose", "linux", "100.64.0.14", 160, false),
+            ready_pc("d", "cloud-server", "linux", "100.64.0.14", 160, false),
             asleep_pc("e", "Office"),
             asleep_pc("f", "Living-room-PC"),
         ];
@@ -3486,7 +3486,7 @@ pub(crate) mod snapshots {
     #[test]
     fn a_linux_machine_is_never_offered_sleep() {
         let mut h = build(Setup::new(many()), TYPICAL, 1.0, false);
-        h.get_by_label("More for vps-sanjose").simulate_click();
+        h.get_by_label("More for cloud-server").simulate_click();
         h.run_steps(2);
         assert!(h.query_by_label("Restart…").is_some());
         assert!(h.query_by_label("Sleep").is_none(), "nothing could wake it");
@@ -3658,16 +3658,19 @@ pub(crate) mod snapshots {
         // A row near the bottom of the window, as the page first shows it:
         // its menu has no room below, so it opens upwards.
         let mut h = build(Setup::new(many()), MIN, 1.0, false);
-        h.get_by_label("More for vps-sanjose").simulate_click();
+        h.get_by_label("More for cloud-server").simulate_click();
         h.run_steps(3);
         let menu = ui::open_menu_rect(&h.ctx).expect("the menu is open");
-        let trigger = h.get_by_label("More for vps-sanjose").raw_bounds().unwrap();
+        let trigger = h
+            .get_by_label("More for cloud-server")
+            .raw_bounds()
+            .unwrap();
         assert!(
             f64::from(menu.bottom()) <= trigger.y0,
             "a low row's menu opens upwards: {menu:?}"
         );
         crate::stream::tests::assert_inside(
-            "vps-sanjose's menu",
+            "cloud-server's menu",
             menu,
             egui::Rect::from_min_size(egui::Pos2::ZERO, MIN),
         );
@@ -4246,16 +4249,19 @@ pub(crate) mod snapshots {
                 &file_name("client", "row-menu", MIN, ppp),
             );
             let mut h = build(Setup::new(many()), MIN, ppp, true);
-            h.get_by_label("More for vps-sanjose").simulate_click();
+            h.get_by_label("More for cloud-server").simulate_click();
             h.run_steps(3);
             let menu = ui::open_menu_rect(&h.ctx).expect("the menu is open");
-            let trigger = h.get_by_label("More for vps-sanjose").raw_bounds().unwrap();
+            let trigger = h
+                .get_by_label("More for cloud-server")
+                .raw_bounds()
+                .unwrap();
             assert!(
                 f64::from(menu.bottom()) <= trigger.y0,
                 "a low row's menu opens upwards: {menu:?}"
             );
             crate::stream::tests::assert_inside(
-                "vps-sanjose's menu",
+                "cloud-server's menu",
                 menu,
                 egui::Rect::from_min_size(egui::Pos2::ZERO, MIN),
             );
