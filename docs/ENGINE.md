@@ -504,8 +504,14 @@ queue delay or lossy delivery deficit to lower the target to 90% of the
 faster train. An ordinary ping immediately behind each burst independently
 measures its FIFO delay, relative to baseline RTT and learned ping jitter.
 It does not pollute the minimum-RTT samples. Without corroboration only
-resume pacing changes: 105% of a measured rate, or 1/20 of the budget when
-unknown. Lossless delivery filling that pace validates 25% increases once
+resume pacing changes: 105% of a measured rate. When no train has been
+measured the pace is a guess: the larger of 1/20 of the budget and twice the
+best rate the viewer reported receiving in any window of the last second. A
+stream can move at under half its budget, and its own frames then cancel the
+trains that would have measured the path, so what it delivers is the only
+evidence there is. A guess rises with delivery and is replaced, upwards too,
+by the first train measured after it. Lossless delivery filling the pace
+validates 25% increases once
 per feedback horizon. A fresh fast train removes this limit; later fast
 trains restore confirmed cuts. An older viewer gets no probes or limit.
 
