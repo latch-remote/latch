@@ -1,7 +1,7 @@
 # HDR10 and ten-bit streaming, 2026-11-03
 
 M3 Pro Mac viewer / encoder and Windows 11 RX 6600 host, in a separate
-`C:\Users\Daniel\dev\latch-gfn-hdr` checkout. Only test port 47895 was used;
+`C:\Users\dev\dev\latch-gfn-hdr` checkout. Only test port 47895 was used;
 the installed host was not stopped or replaced. Builds are optimized dev/test
 profiles, not release builds. Numbers below do not establish 4K120 capacity.
 
@@ -115,7 +115,7 @@ re-enabled. No installed host was deployed to or stopped.
 # Interactive PC task; bind is restricted by temporary Tailscale firewall rules:
 serve --bind 0.0.0.0 --port 47895 --telemetry
 # Mac, add --ten-bit for SDR10; add both --ten-bit --hdr for HDR10:
-view 100.106.23.40 --port 47895 --width 1280 --height 720 --fps 60 \
+view 100.64.0.10 --port 47895 --width 1280 --height 720 --fps 60 \
   --kbps 20000 --hevc --seconds 10
 # Interactive PC, with the test host already running; automatically restores
 # both original switches after at most 120 seconds or hdr-toggle-stop:

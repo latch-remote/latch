@@ -23,7 +23,7 @@ public class VddMotion : Form {
  }
 }
 '@
-$root='C:\Users\Daniel\dev\latch-fix-vdd'
-$server=Start-Process "$root\target\release\examples\serve.exe" -ArgumentList '--bind 100.106.23.40 --port 47897 --prepare-display' -WindowStyle Hidden -RedirectStandardError "$root\serve.log" -RedirectStandardOutput "$root\serve.out" -PassThru
+$root='C:\Users\dev\dev\latch-fix-vdd'
+$server=Start-Process "$root\target\release\examples\serve.exe" -ArgumentList '--bind 100.64.0.10 --port 47897 --prepare-display' -WindowStyle Hidden -RedirectStandardError "$root\serve.log" -RedirectStandardOutput "$root\serve.out" -PassThru
 $server.Id | Set-Content "$root\serve.pid"
 try { [VddMotion]::Run() } finally {Stop-Process -Id $server.Id -ErrorAction SilentlyContinue}

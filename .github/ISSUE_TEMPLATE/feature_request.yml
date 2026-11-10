@@ -1,0 +1,27 @@
+name: Feature request
+description: Something Latch should do, or do better.
+labels: ["enhancement", "needs triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The situation, not the solution. "I play on a TV across the house and..." beats "add option X".
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like Latch to do?
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What do you do today instead?
+      description: Another tool, a workaround, or nothing.
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Would you work on it?
+      options:
+        - label: I could open a pull request for this.
+        - label: I can test it on my hardware.

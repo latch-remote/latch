@@ -65,7 +65,7 @@ On Windows, run the ignored test in the signed-in desktop, through a hidden
 interactive scheduled task (session 0 cannot enumerate the GPU's output):
 
 ```powershell
-$env:LATCH_AMF_RECOVERY_DUMP = 'C:\Users\Daniel\dev\latch-gfn-rfi\recovery-dump'
+$env:LATCH_AMF_RECOVERY_DUMP = 'C:\Users\dev\dev\latch-gfn-rfi\recovery-dump'
 cargo test --locked -j 2 -p latch-engine --lib hardware_amf_recovery_across_slot_reuse -- --ignored --nocapture
 ```
 

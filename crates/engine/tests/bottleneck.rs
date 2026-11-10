@@ -322,11 +322,28 @@ fn noise_socket_measurement() {
     let mut mark = start;
     let mut sequence = frames.seq();
     let mut gaps = Vec::new();
+    // `PB_TRACE=1` prints the controller's view four times a second.
+    let trace = std::env::var_os("PB_TRACE").is_some();
+    let mut traced = start;
     while start.elapsed() < Duration::from_secs(5) {
         if frames.seq() != sequence {
             gaps.push(mark.elapsed().as_secs_f64() * 1000.0);
             mark = Instant::now();
             sequence = frames.seq();
+        }
+        if trace && traced.elapsed() >= Duration::from_millis(250) {
+            traced = Instant::now();
+            let s = session.stats();
+            eprintln!(
+                "TRACE t={:.2} frames={} budget={} queue_ms={:.2} rtt={} loss={:.1} app_limited={}",
+                start.elapsed().as_secs_f64(),
+                frames.seq(),
+                s.wire_budget_kbps,
+                s.pacing_queue_ms,
+                s.rtt_ms,
+                s.loss_pct,
+                s.application_limited
+            );
         }
         std::thread::sleep(Duration::from_millis(1));
     }

@@ -76,14 +76,14 @@ reconstruction for it: all equal, recovery frames included.
 ```sh
 # Linux host (software encoder, test pattern), cross-built on the Mac:
 cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.39 -p latch-engine --example serve
-LATCH_TEST_PATTERN=sweep ./serve --bind 100.70.121.94 --port 47893      # on linux
+LATCH_TEST_PATTERN=sweep ./serve --bind 100.64.0.31 --port 47893      # on linux
 # Windows host (AMF), in the signed-in session via a scheduled task:
-LATCH_WINDOWS_ENCODER=amf serve.exe --bind 100.106.23.40 --port 47893
+LATCH_WINDOWS_ENCODER=amf serve.exe --bind 100.64.0.10 --port 47893
 # Viewer on the Mac; add LATCH_TEST_NO_RECOVERY=1 for "before":
 LATCH_TEST_VIDEO_LOSS=1:3 cargo run --release -p latch-stream --example view -- \
-  100.70.121.94 --port 47893 --width 1280 --height 720 --fps 60 --kbps 6000 --seconds 60
+  100.64.0.31 --port 47893 --width 1280 --height 720 --fps 60 --kbps 6000 --seconds 60
 LATCH_TEST_VIDEO_LOSS=3:6 cargo run --release -p latch-stream --example view -- \
-  100.106.23.40 --port 47893 --width 1920 --height 1080 --fps 60 --kbps 20000 --hevc --seconds 60
+  100.64.0.10 --port 47893 --width 1920 --height 1080 --fps 60 --kbps 20000 --hevc --seconds 60
 ```
 
 The JSON files here are the view example's output; `recovery` holds the

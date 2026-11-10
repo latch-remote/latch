@@ -9,7 +9,7 @@ and negotiation/safety follow-up (`bd1f2a7`).
 1080p60 sweep, 20,000 kbps requested, 40 key presses, three interleaved runs
 per pair and path. Eight steady sampling seconds follow the key presses,
 so each host run lasts about 14–15 seconds. Noise uses 30,000 kbps and no
-keys. Loopback: M3 Pro MacBook Pro. Real path: stuzha A1/N1 → Mac over
+keys. Loopback: M3 Pro MacBook Pro. Real path: arm-vps A1/N1 → Mac over
 Tailscale. Only the temporary `/tmp/latch-bench/serve-*` processes are managed;
 no services or installed host binaries are changed by these runs.
 
@@ -34,7 +34,7 @@ not pooled with the quiet comparison. Binary SHA-256s are in `binaries.json`.
 Run `python3 summarize.py` to regenerate the table. `loopback.sh` and
 `remote.sh` invoke the provided harness. Build the merged ARM host in a
 separate Cargo target directory from the baseline, copy it to
-`stuzha:/tmp/latch-bench/serve-new`, and baseline to `serve-pr32`, before
+`arm-vps:/tmp/latch-bench/serve-new`, and baseline to `serve-pr32`, before
 running the remote matrix. Separate target directories avoid reusing local
 path-dependency artifacts from the other build.
 

@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-Set-Location C:\Users\Daniel\dev\latch-gfn-c
+Set-Location C:\Users\dev\dev\latch-gfn-c
 $env:RUST_LOG = 'latch_stream=info'
 foreach ($codec in @('av1','hevc')) {
   foreach ($case in @(@(1920,1080,60),@(1920,1080,120),@(1920,1080,240),@(3840,2160,60),@(3840,2160,120))) {

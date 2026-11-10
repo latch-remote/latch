@@ -179,6 +179,7 @@ jobs:
           sparse-checkout: |
             CHANGELOG.md
             Cargo.toml
+            scripts/release-notes.py
           sparse-checkout-cone-mode: false
       # The release is named after the tag and every program reports the
       # workspace version: a tag pushed before the bump would publish a
@@ -204,12 +205,11 @@ jobs:
             release-assets/latch-host.exe
       - name: release notes
         # The CHANGELOG.md section whose heading is this version, up to
-        # the next heading. A tag without one gets GitHub's generated notes.
+        # the next heading, with wrapped lines joined (GitHub renders each
+        # newline in a release body as a break). A tag without a section
+        # gets GitHub's generated notes.
         run: |
-          awk -v want="${GITHUB_REF_NAME#v}" '
-            /^## / { on = ($2 == want); next }
-            on { print }
-          ' CHANGELOG.md > notes.md
+          python3 scripts/release-notes.py "${GITHUB_REF_NAME}" CHANGELOG.md > notes.md
           if [ -s notes.md ]; then
             echo "NOTES=--notes-file notes.md" >> "$GITHUB_ENV"
           else

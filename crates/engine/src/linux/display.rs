@@ -1,4 +1,4 @@
-//! RandR uses the same mode policy as stuzha-display, without changing
+//! RandR uses the same mode policy as the old desktop-size script, without changing
 //! desktop scaling. Grow the framebuffer before the CRTC, shrink it after.
 
 use super::X11;

@@ -16,22 +16,44 @@ It is not the packet relay. The relay kit stays in `deploy/relay/`.
 - Optional Tailscale (`TS_AUTHKEY`), with kernel networking: the compose
   file gives the container `/dev/net/tun` and `NET_ADMIN`. Latch Host
   authorizes each peer from its own tailnet address; userspace Tailscale
-  would hand it every peer from `127.0.0.1`, which it trusts as the
-  machine itself, so the node refuses to start Tailscale without the device.
+  uses a different socket path: the service queries `whois` on loopback
+  connections when TUN is not true rather than trusting all of them as local.
+  This deployment kit nevertheless requires kernel networking and refuses
+  to start Tailscale without the device.
+
+The desktop and host run as root inside the container, with `NET_ADMIN`
+and persistent volumes. A streamed terminal has those privileges. Treat
+this as a trusted personal desktop, not a multi-user sandbox. Gamepads
+need explicit `/dev/uinput` access; Compose does not provision it.
 
 ## One node
+
+Install Docker Engine and its Compose plugin on a Linux host with
+`/dev/net/tun`, install Git, and clone the repository:
+
+```bash
+git clone https://github.com/MrBeldum/latch.git
+cd latch
+```
 
 From the Latch repository:
 
 ```bash
 cp deploy/node/env.example deploy/node/.env
+chmod 600 deploy/node/.env
 # edit .env: paste a Tailscale auth key, pick TS_HOSTNAME
 docker compose -f deploy/node/docker-compose.yml up -d --build
 ```
 
-Sign the auth key in at [the admin console](https://login.tailscale.com/admin/machines)
-if it asks. Open Latch on your Mac or Windows PC: the hostname appears
-under **Your machines**. Click **Connect**.
+If your tailnet requires device approval, approve the node at
+[the admin console](https://login.tailscale.com/admin/machines). Open Latch on your Mac or Windows PC: the hostname appears
+under **Machines**. Click **Connect**. Use the same Tailscale account for
+an untagged node. A tagged node has no account: on a personal tailnet it
+answers the tailnet's owner, and on an organisation's tailnet only the
+logins listed in `allowed_logins` in `host.toml`; with none listed it
+answers nobody.
+Keep `TS_AUTHKEY` in the protected `.env`: this kit starts its daemon only
+when that variable is nonempty, even when the identity volume exists.
 
 ## Several containers on one VPS
 
@@ -57,11 +79,12 @@ of being hidden as a relay.
 
 ## Build notes
 
-The image compiles `latch-host` (with `--locked`, from the dependencies
-`Cargo.lock` pins) and installs the Ubuntu 24.04 Sunshine
-package pinned to the same tag Windows setup uses (`v2026.906.222525`).
-The VPS in this project is aarch64; the Dockerfile picks the arm64 or
-amd64 `.deb` from `TARGETARCH`.
+The image builds one Rust `latch-host` with `--locked` from `Cargo.lock`,
+installs Ubuntu 24.04 desktop/runtime packages and copies the stable
+Tailscale client and daemon. There is no external streaming engine.
+To update Latch, pull the desired source revision and run the build command
+again. There is no in-app Linux binary updater. Native Linux GPU encoding
+remains unverified on hardware.
 
 `.dockerignore` keeps every `.env` out of the build context: the build
 stage copies the whole repository, and a layer keeps what it copied, so an

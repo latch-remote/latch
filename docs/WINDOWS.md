@@ -21,16 +21,36 @@ built-in streaming engine that captures and streams the desktop.
 ## Requirements
 
 - Windows 10 1809+ or Windows 11, 64-bit
-- A GPU the streaming engine can encode on (AMD, NVIDIA, Intel)
+- A graphics adapter and an active display for desktop capture. Hardware
+  encoding (AMD, NVIDIA, Intel) is strongly recommended; Microsoft CPU
+  and Rust H.264 software fallbacks exist.
+- A signed-in desktop session and a monitor, dummy plug, or optional
+  [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver).
+  Latch configures that driver if already installed; it does not install it.
+  Logged-out sessions and the secure desktop cannot be streamed.
 - [Tailscale](https://tailscale.com/download/windows), signed in with the
   same account as the Mac
 - Wired Ethernet if you want to wake the PC from the Mac
 
 ## Install
 
-1. Unzip the release and run `latch-host.exe`, or run `install-host.ps1`
-   to copy it to `%LOCALAPPDATA%\Latch`, add shortcuts and an entry in
-   Settings > Apps, and register the background service to start at logon.
+1. Download the Windows x64 zip from the release page. Compare its SHA-256
+   (`Get-FileHash .\latch-windows-x64.zip -Algorithm SHA256`) with the
+   asset digest shown by GitHub, then extract it. This checks download
+   integrity, not an independent publisher signature. In PowerShell, change
+   to the extracted folder and run:
+
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\install-host.ps1
+   ```
+
+   The build is unsigned. SmartScreen may show an unrecognized-app warning;
+   proceeding via **More info → Run anyway** trusts this download. Windows
+   Firewall may also ask about incoming connections as the service starts.
+   Sharing setup installs source-scoped firewall rules and removes stale
+   block rules from a denied prompt. The installer copies Latch to
+   `%LOCALAPPDATA%\Latch`, adds shortcuts and an entry in Settings > Apps,
+   and registers the background service to start at logon.
    The script stops a running Latch to replace it and starts the service
    again; `-NoStart` only keeps the window closed.
 2. Open the **Sharing** tab and click **Set up as administrator**. Windows
@@ -221,7 +241,8 @@ The **This PC** section of the Sharing tab has a **Network** line from
 `tailscale netcheck`. "Hard NAT without UPnP" means a machine on another
 network can only reach this PC
 through a Tailscale relay, which adds a detour. What the Mac asks for is
-the same either way, so a relayed stream is laggier, not blurrier; the Mac
+the same either way, but delay and quality can degrade as congestion control
+reduces bitrate to fit relay throughput. The Mac
 shows the same thing as **Relayed via …** next to the PC. Turn UPnP (or NAT-PMP) on in the router, or forward a UDP port to
 this PC, and Tailscale connects directly; IPv6 on both ends works too. The
 service logs the finding each time it changes.
@@ -364,6 +385,12 @@ then sets the driver's `VDDPATH` registry value. This maintains setup's
 protection against elevated writes through symlinks/junctions. Repeated
 setup does not write or restart when all requested modes are already listed.
 
+The hardware figures below are 2026-11-03 samples from a Windows 11
+Radeon RX 6600 host, with the recorded synthetic/desktop content and
+revisions in the linked measurements. They are not frame-rate guarantees.
+Linux GPU encoding and physical HDR panel output were not verified by
+these tests.
+
 ### RX 6600 reference/HDR probes
 
 The hardware test `hardware_capabilities` runs only when explicitly requested
@@ -391,7 +418,7 @@ requests, all JSON:
 |---------|--------|
 | `GET /v1/status` | Name, Tailscale login and IP, LAN IP and MAC, wake state, Fast Startup state, seconds since the last wake packet arrived, the engine's state and the encoder it uses, this PC's NAT report |
 | `POST /v1/stream` | Initiates streaming session via HTTP Upgrade to `latch-stream/1` |
-| `POST /v1/power {"action"}` | `sleep`, `restart`, or `shutdown` (closes the running app first) |
+| `POST /v1/power {"action"}` | `sleep`, `restart`, or `shutdown` (ends streaming first) |
 | `GET /v1/clipboard` | The clipboard as text, with Windows' clipboard sequence number |
 | `POST /v1/clipboard {"text"}` | Replaces the clipboard, so a ⌘V on the Mac pastes the Mac's text |
 | `POST /v1/update` | A new `latch-host.exe`; see Updates |
@@ -400,8 +427,11 @@ requests, all JSON:
 
 A request is answered only if it comes from loopback or from a Tailscale
 address that `tailscale whois` attributes to the account this PC is signed
-in as; a machine shared in from another tailnet is refused too. Anything
-else gets a 403 before any action. Loopback, and this PC's own Tailscale
+in as. A tagged host has no account of its own: on a personal tailnet it
+answers the tailnet's owner, and on an organisation's tailnet only the
+logins listed in `allowed_logins` in `host.toml`. Machines shared in from
+another tailnet, and tagged peers, are refused. Other remote callers get a
+403 before any action. Loopback, and this PC's own Tailscale
 address, can be a process of any Windows user signed in here, so they may
 not start a stream or use the clipboard, and anything beyond reading the
 status needs the per-user token (see Local control). With it, this PC's own
@@ -545,7 +575,6 @@ container installations must rebuild/redeploy their image.
 GitHub digests and build attestations establish the GitHub/TLS release boundary;
 they do not provide an independent publisher signature if GitHub is compromised.
 
-
 After authentication, the service stages `latch-host.exe.new` beside itself,
 renames the running file to `latch-host.exe.old`, moves the new file in and
 starts it with `--replaces <pid>`. The new service waits for the old one to
@@ -554,16 +583,10 @@ the replacement fails to become healthy. Installation is deferred during streams
 Local submissions from the Windows pull updater use this same authenticated
 route; `accept_updates = false` refuses them as well as peer pushes.
 
-Hosts older than 3.1 have no update route, and the Mac does not POST the
-executable at them (that used to show as a broken pipe). Instead the Mac
-installs 3.1 through the stream: from the stream's **PC → Update Latch
-Host…**, the Mac serves the new executable on its Tailscale address,
-presses Win+R here, types `powershell -ep bypass -c "irm
-http://<mac>:47851/u.ps1|iex"` and presses Enter. The script fetches the
-executable from the Mac, checks its SHA-256, asks the running service to
-quit, replaces the file where it is, registers it under the Run key and
-starts it. The desktop has to be unlocked. After that, updates are
-automatic.
+Hosts older than 3.1 need a local or SSH installation: download the
+release zip and run the PowerShell installer as above. A Latch 5 viewer
+cannot connect to their retired GameStream protocol to upgrade them
+through a stream.
 
 ## Staying reachable
 
@@ -591,7 +614,9 @@ loaded lazily so Windows without Media Foundation can still start.
 
 Decoders enable `CODECAPI_AVLowLatencyMode` before type negotiation. The
 streaming encoders must disable B-frame/reorder delay too. NV12 and Main10
-P010 decoder outputs are accepted and retain ten-bit samples for SDR/HDR presentation.
+P010 decoder outputs are accepted; normal sessions negotiate colour
+automatically and preserve ten-bit samples for native HDR/ten-bit
+presentation, with tone mapping on the renderer fallback path.
 Baseline retains the first-ten-access-unit fallback to `latch-codec`. Modern
 codecs have no pure-Rust software fallback.
 

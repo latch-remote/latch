@@ -29,13 +29,13 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
    Compiling toml_edit v0.22.27
    Compiling coreaudio-rs v0.14.2
    Compiling tracing v0.1.44
-   Compiling latch-proto v5.1.0 (/Users/daniel/.t3/worktrees/latch/t3-34d55af7/crates/proto)
+   Compiling latch-proto v5.1.0 (/Users/dev/.t3/worktrees/latch/t3-34d55af7/crates/proto)
    Compiling objc2-core-graphics v0.3.2
    Compiling directories v5.0.1
    Compiling if-addrs v0.15.0
    Compiling webpki-roots v1.0.11
    Compiling mach2 v0.6.0
-   Compiling latch-codec v5.1.0 (/Users/daniel/.t3/worktrees/latch/t3-34d55af7/crates/codec)
+   Compiling latch-codec v5.1.0 (/Users/dev/.t3/worktrees/latch/t3-34d55af7/crates/codec)
    Compiling rustls-graviola v0.4.0
    Compiling semver v1.0.28
    Compiling lazy_static v1.5.0
@@ -51,11 +51,11 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
    Compiling x11rb-protocol v0.13.2
    Compiling tracing-subscriber v0.3.23
    Compiling toml v0.8.23
-   Compiling latch-engine v5.1.0 (/Users/daniel/.t3/worktrees/latch/t3-34d55af7/crates/engine)
+   Compiling latch-engine v5.1.0 (/Users/dev/.t3/worktrees/latch/t3-34d55af7/crates/engine)
    Compiling image v0.25.10
-   Compiling latch-core v5.1.0 (/Users/daniel/.t3/worktrees/latch/t3-34d55af7/crates/core)
+   Compiling latch-core v5.1.0 (/Users/dev/.t3/worktrees/latch/t3-34d55af7/crates/core)
    Compiling x11rb v0.13.2
-   Compiling latch-stream v5.1.0 (/Users/daniel/.t3/worktrees/latch/t3-34d55af7/crates/stream)
+   Compiling latch-stream v5.1.0 (/Users/dev/.t3/worktrees/latch/t3-34d55af7/crates/stream)
     Finished `release` profile [optimized] target(s) in 2m 29s
      Running tests/transport_scenarios.rs (target/release/deps/transport_scenarios-4346293584bc7d77)
 

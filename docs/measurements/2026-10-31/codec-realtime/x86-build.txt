@@ -1,2 +1,0 @@
-   Compiling latch-codec v5.0.1 (/Users/daniel/.t3/worktrees/latch/t3-ada53532/crates/codec)
-    Finished `release` profile [optimized] target(s) in 2.62s

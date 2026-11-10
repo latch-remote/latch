@@ -145,7 +145,7 @@ The default tailnet name is `relay` (`TS_HOSTNAME` in `.env`). To rename an
 existing node, update `.env`, run
 `docker exec latch-relay tailscale set --hostname=relay`, then
 `docker compose up -d` to persist the container environment. This retains the
-node identity, IP address, tags, and pairing.
+Tailscale node identity, IP address and tags. Latch 5 has no streaming pairing.
 
 **Identity survives restarts.** State lives in the `relay-state` named volume mounted
 at `TS_STATE_DIR=/var/lib/tailscale`, and `TS_AUTH_ONCE=true` stops it re-logging in

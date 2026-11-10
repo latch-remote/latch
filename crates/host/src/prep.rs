@@ -181,14 +181,13 @@ mod tests {
     fn imports_the_owners_command_and_undo_without_changing_shell_text() {
         let conf = r#"# global_prep_cmd = ignored
 encoder = software
-global_prep_cmd = [{"do":"/usr/local/bin/stuzha-display $SUNSHINE_CLIENT_WIDTH $SUNSHINE_CLIENT_HEIGHT", "undo":"/usr/local/bin/stuzha-display idle"}]
+global_prep_cmd = [{"do":"/usr/local/bin/desktop-size $SUNSHINE_CLIENT_WIDTH $SUNSHINE_CLIENT_HEIGHT", "undo":"/usr/local/bin/desktop-size idle"}]
 "#;
         assert_eq!(
             legacy_commands(conf).unwrap(),
             Some((
-                "/usr/local/bin/stuzha-display $SUNSHINE_CLIENT_WIDTH $SUNSHINE_CLIENT_HEIGHT"
-                    .into(),
-                "/usr/local/bin/stuzha-display idle".into()
+                "/usr/local/bin/desktop-size $SUNSHINE_CLIENT_WIDTH $SUNSHINE_CLIENT_HEIGHT".into(),
+                "/usr/local/bin/desktop-size idle".into()
             ))
         );
         assert_eq!(legacy_commands("other = 1").unwrap(), None);

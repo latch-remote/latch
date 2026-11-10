@@ -87,9 +87,9 @@
       <section class="hero" aria-labelledby="hero-title">
         <div class="wrap">
           <p class="hero-meta">
-            <span>Latch 5.2.0</span>
+            <span>Latch 5.3.0</span>
             <span class="hero-meta-kind">Remote desktop over Tailscale</span>
-            <a href="https://github.com/MrBeldum/latch/releases/tag/v5.2.0"
+            <a href="https://github.com/MrBeldum/latch/releases/latest"
               >Release notes <span class="arr" aria-hidden="true">↗</span></a
             >
           </p>
@@ -103,7 +103,7 @@
             </p>
             <div class="actions">
               <a class="btn btn-primary" href="#download"
-                >Download 5.2.0 <span class="arr" aria-hidden="true">↓</span></a
+                >Download 5.3.0 <span class="arr" aria-hidden="true">↓</span></a
               >
               <a class="btn btn-ghost" href="https://github.com/MrBeldum/latch"
                 >Source on GitHub <span class="arr" aria-hidden="true">↗</span></a
@@ -369,9 +369,13 @@
                 Tailscale is the path and the identity&nbsp;check.
               </h2>
               <p class="intro">
-                A machine answers only peers signed in to the same Tailscale
-                account. There is no Latch account or password, and the control
-                port is open to your tailnet only.
+                A host answers only devices signed in to the same Tailscale
+                account as itself. A tagged host, which has no account of
+                its own, answers the tailnet's owner, or on an
+                organisation's tailnet the logins its owner lists. Sockets
+                listen on all interfaces, with that check and Windows
+                firewall rules scoped to Tailscale addresses. There is no
+                Latch account or password.
               </p>
             </div>
           </header>
@@ -490,7 +494,7 @@
             <div class="section-title">
               <h2 id="specs-title">What Latch asks the other machine&nbsp;for.</h2>
               <p class="intro">
-                These are the settings Latch 5.2.0 offers, not benchmarks. What
+                These are the settings Latch 5.3.0 offers, not benchmarks. What
                 you get depends on both machines and the path between them.
               </p>
             </div>
@@ -595,9 +599,11 @@
                 <dt>Codec</dt>
                 <dd>
                   <p>
-                    The best both machines have: AV1, then HEVC, then H.264.
-                    Any can be chosen; one either machine lacks falls back to
-                    H.264.
+                    The best both machines have: AV1, then HEVC, then H.264,
+                    except that ten-bit and HDR HEVC comes first when both
+                    can do it. Any can be chosen; negotiation and decoder
+                    failure recovery try the next supported codec,
+                    ultimately Baseline H.264.
                   </p>
                 </dd>
               </div>
@@ -700,7 +706,8 @@
                   </p>
                   <p class="sub">
                     It sends new Latch Host builds to Windows PCs over
-                    port 47850.
+                    port 47850; a Windows PC with its window open also
+                    updates itself. Linux shows a notice.
                   </p>
                 </dd>
               </div>
@@ -781,8 +788,8 @@
                 <div>
                   <dt>Share</dt>
                   <dd>
-                    Yes. Latch runs as a service, so the sign-in screen
-                    streams after a restart
+                    Yes. Sharing starts when someone signs in to Windows;
+                    the sign-in screen itself cannot be streamed
                   </dd>
                 </div>
               </dl>
@@ -856,19 +863,20 @@
           <header class="section-head">
             <p class="label"><span class="label-no">05</span>Download</p>
             <div class="section-title">
-              <h2 id="download-title">Latch 5.2.0</h2>
+              <h2 id="download-title">Latch 5.3.0</h2>
               <p class="intro">
-                Released 4 November 2026. First install
+                Released 9 November 2026. First install
                 <a class="link-inline" href="https://tailscale.com/download"
                   >Tailscale</a
                 >
-                on each machine and sign in with the same account. A copy that is
-                already installed updates itself and keeps its settings.
+                on each machine and sign in with the same account. On Mac and
+                Windows an installed copy updates itself and keeps its
+                settings; on Linux it tells you when there is a new one.
               </p>
               <p class="head-links">
                 <a
                   class="link"
-                  href="https://github.com/MrBeldum/latch/releases/tag/v5.2.0"
+                  href="https://github.com/MrBeldum/latch/releases/latest"
                   >Release notes <span class="arr" aria-hidden="true">↗</span></a
                 >
                 <a
@@ -1075,7 +1083,7 @@
         </nav>
       </div>
       <div class="wrap foot-base">
-        <span>Latch 5.2.0</span>
+        <span>Latch 5.3.0</span>
         <a href="https://github.com/MrBeldum/latch"
           >Source on GitHub
           <span class="arr" aria-hidden="true">↗</span></a

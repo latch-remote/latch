@@ -39,10 +39,14 @@ const KEEPALIVE: Duration = Duration::from_secs(1);
 const HELLO_FAST: Duration = Duration::from_millis(50);
 const HELLO_SLOW: Duration = Duration::from_secs(1);
 const PING_EVERY: Duration = Duration::from_millis(500);
-/// Complete frames waiting for the decoder. Past this the decoder cannot
-/// keep up: the queue is dropped and the stream restarts at a keyframe,
-/// rather than the picture falling further and further behind.
-const DECODE_QUEUE: usize = 3;
+/// Complete frames waiting for the decoder. A network stall delivers the
+/// frames it held back all at once, and a decoder that is fast enough works
+/// through them, so the count only has to bound memory. What says the
+/// decoder cannot keep up is the age of the oldest frame waiting
+/// ([`decode_max_age`]): past that the queue is dropped and the stream
+/// restarts at a keyframe, rather than the picture falling further behind.
+const DECODE_QUEUE: usize = 8;
+/// Three frame intervals, between 12 and 100 ms.
 fn decode_max_age(fps: u32) -> Duration {
     Duration::from_secs_f64((3.0 / f64::from(fps.max(1))).clamp(0.012, 0.100))
 }

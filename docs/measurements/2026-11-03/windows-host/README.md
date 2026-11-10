@@ -20,7 +20,7 @@ task, hidden with a wscript wrapper (SSH is session 0):
 $env:RUST_LOG='latch_engine=info'
 # Leave unset for the default; 'mf' forces Media Foundation for comparison.
 $env:LATCH_WINDOWS_ENCODER='amf'
-.\target\release\examples\serve.exe --bind 100.106.23.40 --port 47880 --telemetry --prepare-display
+.\target\release\examples\serve.exe --bind 100.64.0.10 --port 47880 --telemetry --prepare-display
 ```
 
 Keep a continuously animated window on the desktop: a WPF canvas with an
@@ -30,7 +30,7 @@ the same animation. This is desktop motion, not a game or full-screen noise.
 On the Mac, repeat for every table mode:
 
 ```sh
-target/release/examples/view 100.106.23.40 --port 47880 \
+target/release/examples/view 100.64.0.10 --port 47880 \
   --width 1920 --height 1080 --fps 240 --kbps 50000 --seconds 8 --hevc
 ```
 

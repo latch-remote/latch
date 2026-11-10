@@ -1,4 +1,4 @@
-   Compiling latch-proto v5.1.0 (/Users/daniel/.t3/worktrees/latch/t3-cf8a2264/crates/proto)
+   Compiling latch-proto v5.1.0 (/Users/dev/.t3/worktrees/latch/t3-cf8a2264/crates/proto)
     Finished `release` profile [optimized] target(s) in 24.16s
      Running unittests src/lib.rs (target/release/deps/latch_proto-b63c515e7f675670)
 

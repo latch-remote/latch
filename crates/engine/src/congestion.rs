@@ -1,5 +1,6 @@
 //! Delay/loss feedback over a wire budget (video, parity, headers and audio), with a fake-clock API.
 use latch_proto::control::Report;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// How long a policer's rate caps the climb before it is probed again.
@@ -11,6 +12,8 @@ const PROBE_EVERY: Duration = Duration::from_secs(1);
 const PROBE_PAIR: Duration = Duration::from_millis(200);
 /// Train rates older than this no longer describe the path.
 const PROBE_MEMORY: Duration = Duration::from_millis(2500);
+/// How far back the best delivered window counts as what the path carries.
+const DELIVERED_MEMORY: Duration = Duration::from_secs(1);
 /// Below this budget a resumed frame is too small to need probing.
 const PROBE_MIN_KBPS: u32 = 8000;
 /// Below this send rate a loss test has too few datagrams to mean anything.
@@ -40,7 +43,11 @@ pub(crate) struct Controller {
     /// Separate from the encoder target: cautiously spend uncertain idle
     /// capacity until delivery at this pace validates another step.
     resume: Option<u32>,
+    /// Whether that pace came from no measurement at all.
+    resume_guessed: bool,
     resume_step: Instant,
+    /// Viewer-reported received rates of the last second, a window each.
+    delivered: VecDeque<(u32, Instant)>,
     train_rtt: Option<(f32, Instant)>,
     /// The budget before probe trains measured a slower path while idle;
     /// later trains restore up to it.
@@ -111,7 +118,9 @@ impl Controller {
             trains: Vec::new(),
             path: None,
             resume: None,
+            resume_guessed: false,
             resume_step: now,
+            delivered: VecDeque::new(),
             train_rtt: None,
             held: None,
             restore: None,
@@ -502,17 +511,46 @@ impl Controller {
                 }
             }
         }
+        // What the path carried in its best window of the last second.
+        self.delivered.push_back((report.received_kbps, now));
+        while self
+            .delivered
+            .front()
+            .is_some_and(|(_, at)| now.duration_since(*at) > DELIVERED_MEMORY)
+        {
+            self.delivered.pop_front();
+        }
+        let delivered = self.delivered.iter().map(|(kbps, _)| *kbps).max();
         if measured.is_some_and(|path| path >= self.budget / 4 * 3) {
             self.resume = None;
         } else if self.idle_since.is_some() && self.idle_trains >= 2 {
             // No usable trains is unknown, not a low encoder budget. The
-            // fallback is conservative; good delivery grows only the pace.
+            // fallback is conservative, but never under twice what the path
+            // is carrying: a stream can move at under half its budget, and
+            // its own frames cancel the trains that would have measured.
+            // Good delivery grows only the pace.
+            let guess = (self.budget / 20).max(delivered.unwrap_or(0).saturating_mul(2));
+            // A train can also read low. What the path has just delivered is
+            // the firmer evidence, with one growth step of room above it.
+            let shown = delivered.unwrap_or(0).saturating_mul(5) / 4;
             let rate = measured
-                .map_or(self.budget / 20, |path| path.saturating_mul(105) / 100)
+                .map_or(guess, |path| (path.saturating_mul(105) / 100).max(shown))
                 .max(self.floor);
-            if self.resume.is_none_or(|old| rate < old) && queue_ms < 20.0 {
-                self.resume = Some(rate);
+            // A train that has just been measured replaces a guess, even
+            // upwards.
+            let replaces = self.resume_guessed && measured.is_some() && report.probe_kbps > 0;
+            if (replaces || self.resume.is_none_or(|old| rate < old)) && queue_ms < 20.0 {
+                self.resume = (rate < self.budget).then_some(rate);
+                self.resume_guessed = measured.is_none();
                 self.resume_step = now;
+            }
+        }
+        // Deliberately not held back by a queue or loss: delivery cannot
+        // exceed what the path carries, and the budget still answers both.
+        if let Some(rate) = self.resume.filter(|_| self.resume_guessed) {
+            let shown = delivered.unwrap_or(0).saturating_mul(2);
+            if shown > rate {
+                self.resume = (shown < self.budget).then_some(shown);
             }
         }
         if let Some(rate) = self.resume {
@@ -951,6 +989,90 @@ mod tests {
             assert_eq!(c.budget(), 50_000);
             assert!(c.probe_train(t).is_none());
         }
+    }
+
+    #[test]
+    fn an_unmeasured_path_is_not_paced_below_what_it_carries() {
+        // The noise measurement's shape: 12 Mbps of motion under a 40 Mbps
+        // budget counts as idle, and its frames cancel the probe trains, so
+        // none is ever measured.
+        let start = Instant::now();
+        let mut c = Controller::new(40_000, start);
+        let report = |received, probe_kbps| Report {
+            rtt_ms: 150.0,
+            received_kbps: received,
+            unrecovered_loss_pct: Some(0.0),
+            window_ms: 50,
+            probe_kbps,
+            ..Default::default()
+        };
+        let mut t = start;
+        let mut trains = 0;
+        while trains < 2 {
+            t += Duration::from_millis(50);
+            c.observe_sent(12_000);
+            c.update(t, &report(12_000, 0), 150.0, 0.0);
+            trains += usize::from(c.probe_train(t).is_some());
+        }
+        for _ in 0..40 {
+            t += Duration::from_millis(50);
+            c.observe_sent(12_000);
+            c.update(t, &report(12_000, 0), 150.0, 0.0);
+            assert_eq!(c.budget(), 40_000);
+            assert_eq!(c.pace_kbps(), 24_000, "twice what is getting through");
+        }
+        // A train that is measured replaces the guess, upwards too.
+        t += Duration::from_millis(50);
+        c.observe_sent(12_000);
+        c.update(t, &report(12_000, 28_000), 150.0, 0.0);
+        assert_eq!(c.pace_kbps(), 29_400);
+        // Trains that read lower than what is arriving do not pace under it.
+        for _ in 0..2 {
+            t += Duration::from_secs(1);
+            c.observe_sent(12_000);
+            c.update(t, &report(12_000, 8000), 150.0, 0.0);
+        }
+        assert_eq!(c.pace_kbps(), 15_000);
+
+        // A still desktop shows nothing to go by: the old cautious pace.
+        let mut c = Controller::new(40_000, start);
+        let mut t = start;
+        let mut trains = 0;
+        while trains < 2 {
+            t += Duration::from_millis(50);
+            c.observe_sent(300);
+            c.update(t, &report(300, 0), 150.0, 0.0);
+            trains += usize::from(c.probe_train(t).is_some());
+        }
+        t += Duration::from_millis(50);
+        c.observe_sent(300);
+        c.update(t, &report(300, 0), 150.0, 0.0);
+        assert_eq!(c.pace_kbps(), 2000);
+        // Its trains' answers arrive after the guess was made, a round trip
+        // later, and take its place.
+        t += Duration::from_millis(50);
+        c.observe_sent(300);
+        c.update(t, &report(300, 20_000), 150.0, 0.0);
+        assert_eq!(c.pace_kbps(), 21_000);
+        // Motion on a path nobody measured doubles its pace as it delivers.
+        let mut c = Controller::new(40_000, start);
+        let mut t = start;
+        let mut trains = 0;
+        while trains < 2 {
+            t += Duration::from_millis(50);
+            c.observe_sent(300);
+            c.update(t, &report(300, 0), 150.0, 0.0);
+            trains += usize::from(c.probe_train(t).is_some());
+        }
+        let mut paces = Vec::new();
+        for _ in 0..8 {
+            t += Duration::from_millis(50);
+            let sent = c.pace_kbps().max(2000);
+            c.observe_sent(sent);
+            c.update(t, &report(sent, 0), 150.0, 0.0);
+            paces.push(c.pace_kbps());
+        }
+        assert_eq!(paces[..5], [4000, 8000, 16_000, 32_000, 0], "{paces:?}");
     }
 
     #[test]

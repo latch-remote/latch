@@ -1,6 +1,6 @@
 # Run over elevated SSH after preserving any wanted logs/dumps.
 $ErrorActionPreference = 'Stop'
-$root = 'C:\Users\Daniel\dev\latch-rfi2'
+$root = 'C:\Users\dev\dev\latch-rfi2'
 $task = Get-ScheduledTask -TaskName 'LatchTestRfiMF' -ErrorAction SilentlyContinue
 if ($task) {
     Stop-ScheduledTask -InputObject $task

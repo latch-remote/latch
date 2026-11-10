@@ -1,6 +1,7 @@
-// Shim for this branch: copy body.rs, scenarios.rs and this file into
-// crates/engine/tests/ and run `cargo test --release -p latch-engine --test
-// this -- --nocapture` (R58B=<name> filters, R58B_V=1 prints timelines).
+// Probe-train scenarios against this tree's controller and pacer, through
+// the shims below. `cargo test --release -p latch-engine --test
+// probe_transport -- --nocapture`; R58B=<name> filters, R58B_V=1 prints
+// timelines.
 #[allow(dead_code)]
 #[path = "../src/congestion.rs"]
 mod congestion;
@@ -76,7 +77,7 @@ mod shim {
         }
     }
 }
-include!("../../../docs/measurements/2026-11-04/transport-fec/review58c/body.rs");
+include!("support/probe_body.rs");
 
 #[test]
 fn sparse_jitter_keeps_the_ceiling_and_clean_resume_keeps_its_latency() {

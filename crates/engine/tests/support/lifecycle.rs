@@ -807,7 +807,7 @@ fn paced_socket_measurement() {
             while Instant::now() < stop_at {
                 while std::env::var_os("PB_DROP").is_none()
                     && producer_session.pace_kbps.load(Ordering::Relaxed) != 0
-                    && producer_session.transport.pending.load(Ordering::Acquire) != 0
+                    && producer_session.transport.pending.load(Ordering::Acquire) > PACED_BACKLOG
                 {
                     std::thread::sleep(Duration::from_micros(200));
                 }

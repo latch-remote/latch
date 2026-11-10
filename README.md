@@ -1,275 +1,141 @@
+<div align="center">
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/brand/logo-dark.svg">
-  <img src="docs/brand/logo.svg" alt="Latch" width="64" height="64">
+  <img src="docs/brand/logo.svg" alt="" width="72" height="72">
 </picture>
 
 # Latch
 
-Your machines, on any of your machines: stream a desktop full screen over
-Tailscale. Mac, Windows, Linux, and a VPS container all run the same Latch
-app. Each one lists the others and can Connect; each one can share its own
-desktop.
+**Your machines, on any of your machines.**
 
-Latch 5 streams with its own engine, written in Rust and built into the
-one `latch-host` executable that also runs the control service and the
-window (`latch-engine` on the sharing side, `latch-stream` on the viewing
-side, `latch-proto` for the wire format, `latch-codec` for the software
-H.264 codec and the audio codec). Video and sound travel over UDP with
-Reed–Solomon forward error correction inside Tailscale's WireGuard; a frame
-lost anyway costs a small recovery frame where the encoder can make one,
-else a keyframe. A Mac shares with ScreenCaptureKit and VideoToolbox (HEVC
-or H.264), Windows with Desktop Duplication and AMD's AMF HEVC or the GPU's
-Media Foundation encoder (HEVC, AV1 or H.264; Microsoft's H.264, else
-`latch-codec`, if none works), and Linux with X11 Damage and NVENC or
-VA-API where there is a GPU (not yet tested on one), else `latch-codec`.
-Viewers decode AV1, HEVC and H.264 in hardware on a Mac or a Windows PC,
-and H.264 with `latch-codec` on Linux. HEVC streams between Macs and
-Windows PCs carry HDR10 or ten-bit colour when both ends and the display
-can. Latch sets no limits of its own: a stream asks for up to 500 fps,
-1 Gbps and 16384 pixels a side, fitted to what the sharing machine's
-encoder takes. Sound is 48 kHz, stereo, 5.1 or 7.1, coded losslessly with
-`lpcm-rice`; gamepads (with rumble) and, if you turn it on, the viewer's
-microphone go the other way. Nothing else is installed, and no crate in the build compiles C, C++ or
-assembler (`scripts/audit-native.sh` checks). [docs/ENGINE.md](docs/ENGINE.md) has the design and
-[docs/PROTOCOL.md](docs/PROTOCOL.md) the wire format.
+Low-latency desktop and game streaming between computers you own, over
+[Tailscale](https://tailscale.com). One app for macOS, Windows and Linux,
+written in Rust.
 
-[Tailscale](https://tailscale.com) is the path and the identity check. A
-machine answers only peers signed in to the same Tailscale account.
+[![CI](https://github.com/MrBeldum/latch/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MrBeldum/latch/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/MrBeldum/latch?label=release&color=4F8FE8)](https://github.com/MrBeldum/latch/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/MrBeldum/latch/total?color=4F8FE8)](https://github.com/MrBeldum/latch/releases)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-4F8FE8)](LICENSE)
 
-## How a session goes
+[Website](https://mrbeldum.github.io/latch/) ·
+[Download](https://github.com/MrBeldum/latch/releases/latest) ·
+[Docs](docs/README.md) ·
+[Roadmap](docs/ROADMAP.md) ·
+[Discussions](https://github.com/MrBeldum/latch/discussions)
 
-1. Open Latch. **Machines** lists every machine on your Tailscale
-   account, with a dot and a line for what it can do right now. The
-   **Sharing** tab sets this machine up so others can Connect here.
-2. Click **Connect**. If a Windows PC is asleep, Latch wakes it and waits.
-   Connections connect directly using Tailscale authentication without
-   pairing PINs.
-3. The desktop appears, full screen by default, and nothing else: the
-   mouse is captured the moment you click the picture, as in a game, so
-   games that read raw mouse movement work. **Ctrl+Alt** (Control-Option
-   on a Mac) is the host key, as in a hypervisor: it frees the mouse and
-   drops a toolbar over the
-   picture with the stream details, whether the path is direct or relayed,
-   the mouse mode, a **Keys** menu for Ctrl+Alt+Del and friends and what the
-   Command key does, **Stats** (frame rate, bitrate, round trip, loss and
-   latency over the picture's corner; the host key with S), full screen,
-   the PC's power menu, sound, **Stream settings** (Balanced, the default,
-   asks for this screen's own size at its own refresh rate; Competitive for
-   1080p at up to 360 fps; Cinematic for up to 4K at 120; the same on every
-   path) and **Disconnect**. Click the picture, or press Ctrl+Alt
-   again, and the toolbar goes away. The clipboard follows you both ways.
-4. Leave the PC on if you want to connect from anywhere. Asleep, Tailscale
-   is asleep too: this Mac can wake it only from that PC's own network
-   (or if the router forwards UDP 9). Settings can offer sleep after a
-   session; that is off by default.
+<br>
+
+<img src="site/img/lobby-1280.png" alt="The Latch window: every machine on your Tailscale account, with a Connect button beside each." width="820">
+
+</div>
+
+Install Latch on your computers, sign them in to the same Tailscale
+account, and click **Connect**. The other machine's desktop appears full
+screen with its sound, your keyboard, mouse and gamepads, and the
+clipboard. Every install can both share and view.
+
+- **Fast.** Hardware HEVC, AV1 and H.264, HDR10, surround sound, at this
+  display's own size and refresh rate. [What was measured](docs/PERFORMANCE.md).
+- **Nothing to configure.** No accounts, no pairing PINs, no port
+  forwarding. Tailscale is the sign-in and the encryption.
+- **Holds up on a bad network.** Forward error correction repairs lost
+  packets, and the bitrate follows the connection.
+- **Made for games.** Raw mouse input, Xbox and DualShock pads with rumble,
+  a latency overlay, and competitive and cinematic profiles.
+- **Reaches a sleeping PC.** Wake-on-LAN, remote sleep and restart, a
+  self-hosted relay kit, and updates that install themselves on Mac and
+  Windows.
+- **One small binary.** All Rust, with no bundled streaming server.
 
 ## Install
 
-### Windows PC
+Every machine needs [Tailscale](https://tailscale.com/download), signed in
+to the same account.
 
-1. Install [Tailscale](https://tailscale.com/download/windows) and sign in
-   with the account you use on the Mac.
-2. Download `latch-windows-x64.zip` from the
-   [latest release](https://github.com/MrBeldum/latch/releases/latest)
-   and unzip it. Run `latch-host.exe`, or `install-host.ps1` for
-   shortcuts and start-at-logon.
-3. On the **Sharing** tab, click **Set up as administrator**. Windows
-   asks once, naming the request Windows PowerShell: it copies Latch into
-   `%ProgramFiles%\Latch\Setup`, checks the copy, and runs it as
-   administrator. Setup opens TCP and UDP 47850 to Tailscale addresses only,
-   removes Latch 4's streaming engine (Sunshine) and its services, turns
-   Fast Startup off, keeps the PC awake on mains power, and arms the network
-   card for Wake-on-LAN. The same window lists every other machine on the
-   account; **Connect** opens their desktop.
+**Windows 10 or 11 (x64).** Download `latch-windows-x64.zip` from the
+[latest release](https://github.com/MrBeldum/latch/releases/latest), unzip
+it and run `latch-host.exe`. To share the PC, open the **Sharing** tab and
+click **Set up as administrator**. [More](docs/WINDOWS.md)
 
-`latch-host.exe --uninstall` (or Uninstall in Settings > Apps, after
-`install-host.ps1`) undoes setup and puts the power settings back. Details
-in [docs/WINDOWS.md](docs/WINDOWS.md).
-
-### Mac (Apple Silicon)
-
-Install [Tailscale](https://tailscale.com/download/mac) and sign in. One
-command downloads the app, clears the quarantine flag and copies it to
-`/Applications`:
+**macOS 13 or later (Apple Silicon).** [More](docs/MACOS.md)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MrBeldum/latch/main/scripts/install-macos-release.sh | bash
 ```
 
-Or download `latch-macos-arm64.tar.gz` from the
-[latest release](https://github.com/MrBeldum/latch/releases/latest) and
+**Linux (x64 and arm64, X11).** Download `latch-host-linux-x64.tar.gz` or
+`latch-host-linux-arm64.tar.gz` from the
+[latest release](https://github.com/MrBeldum/latch/releases/latest)
+(needs glibc 2.39 or later) and run `latch-host`. For a headless server
+there are [systemd units](deploy/native/README.md) and a
+[Docker container](deploy/node/NODE.md).
+
+Then open Latch and click **Connect** beside another machine. The
+[user guide](docs/USING.md) covers the rest.
+
+## Platforms
+
+| | Shares its desktop | Views |
+|---|---|---|
+| **Windows** | HEVC or H.264 on the GPU, AV1 where it has an encoder (not yet run on one); HDR10; virtual gamepads | hardware AV1, HEVC and H.264; HDR |
+| **macOS** | HEVC or H.264 on VideoToolbox; HDR10 | hardware AV1 (M3 and later), HEVC and H.264; HDR |
+| **Linux** | software H.264; NVENC and VA-API (not yet run on a GPU); virtual gamepads | software H.264 |
+
+Latch is young. HDR has been checked by reading pixels back, not yet by
+eye on an HDR panel. Viewers are desktop apps only: for a phone, a TV or a
+browser, use [Moonlight](https://moonlight-stream.org) today. What has and
+has not met real hardware is listed in
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md), and what is planned in the
+[roadmap](docs/ROADMAP.md).
+
+<details>
+<summary><b>How it compares</b></summary>
+
+| | Latch | Sunshine + Moonlight | Parsec | GeForce NOW |
+|---|---|---|---|---|
+| Streams | your own machines | your own machines | your own machines | NVIDIA's servers |
+| Sign-in | your Tailscale account | PIN pairing per device | Parsec account | NVIDIA account |
+| Reaching home from outside | Tailscale; no ports opened | port forwarding or your own VPN | Parsec's servers | n/a |
+| Apps to install | one, the same on every machine | a host and a client | one | one |
+| Viewers | macOS, Windows, Linux | nearly everything, phones and TVs included | desktops, Android, web | nearly everything |
+| Source | GPL-3.0, all Rust | GPL-3.0 | closed | closed |
+
+</details>
+
+<details>
+<summary><b>Build from source</b></summary>
+
+Rust stable and the platform's linker are all it takes; on Linux, also the
+`-dev` packages listed in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```bash
-tar xzf latch-macos-arm64.tar.gz
-xattr -dr com.apple.quarantine Latch.app
-open Latch.app
+cargo run --release -p latch-host        # the app
+cargo test --workspace                   # the tests
+./scripts/install-macos.sh               # macOS: build, bundle and install Latch.app
 ```
 
-The `xattr` step is needed for a browser download because the app is
-ad-hoc signed rather than Developer-ID signed and notarized
-([docs/ROADMAP.md](docs/ROADMAP.md) lists what that needs). Open Latch and
-set up sharing on the **Sharing** tab so a Windows PC (or another Mac) can
-Connect here; macOS asks for Screen Recording and Accessibility, and the
-tab links both settings panes and offers to restart Latch once they are
-allowed.
-`Latch.app/Contents/MacOS/Latch --uninstall` removes the login item and the
-permissions. Details, including the toolbar and keyboard behaviour, in
-[docs/MACOS.md](docs/MACOS.md).
+</details>
 
-### Linux / VPS (Docker)
+## Documentation
 
-A container that shares a virtual desktop on the tailnet, so Mac and
-Windows Latch can Connect to it. Several copies on one host are several
-machines. See [deploy/node/NODE.md](deploy/node/NODE.md).
+- [Using Latch](docs/USING.md), on [Windows](docs/WINDOWS.md) and [macOS](docs/MACOS.md)
+- [How the engine works](docs/ENGINE.md) and the [wire protocol](docs/PROTOCOL.md)
+- [Security model](SECURITY.md), and how to report a problem privately
+- [Changelog](CHANGELOG.md)
 
-```bash
-cp deploy/node/env.example deploy/node/.env
-# paste a Tailscale auth key, pick TS_HOSTNAME
-docker compose -f deploy/node/docker-compose.yml up -d --build
-```
+## Contributing
 
-A desktop can also run natively under systemd on the VPS, beside the
-relay, as this project's own VPS does: [deploy/native/README.md](deploy/native/README.md).
-The packet relay (when two NATs cannot punch through) is a separate kit:
-[deploy/relay/RELAY.md](deploy/relay/RELAY.md).
-
-## Upgrading from Latch 4 or BroLink
-
-An older install updates to Latch 5 and keeps its settings. Latch 5
-machines stream only with Latch 5 machines: a Latch 5 viewer that finds an
-older host sends it the update (or says which machine to update), and an
-older viewer finds no stream on a Latch 5 host and offers its own update.
-Setup removes the old engine, its pairing data and its services.
-
-- **Mac:** a BroLink app moves to `Latch.app` the first time it runs, and
-  its login item moves with it.
-- **Windows:** the host updates in place and keeps working. Run
-  **Set up as administrator** once on the **Sharing** tab: it removes the
-  `LatchStream` service, the `LatchEngineUser` task and
-  `%ProgramFiles%\Latch\engine`. `install-host.ps1` from the new zip also
-  moves a BroLink install to `%LOCALAPPDATA%\Latch`.
-- **Linux:** the first start registers `latch.service` and retires the old
-  service. For a native desktop, see [deploy/native/README.md](deploy/native/README.md).
-
-Use `LATCH_DATA_DIR` and `LATCH_GITHUB_TOKEN` for environment overrides.
-The equivalent names from versions before 4.1.0 still work.
-
-## Updates
-
-Latch keeps itself current. Every few hours the Mac app asks GitHub for
-the latest release. A newer app is downloaded, checked against the digest
-GitHub publishes and its own code signature, swapped into `/Applications`
-once no stream is running, and relaunched. A newer Latch Host is sent
-from the Mac to every PC whose host reports an older version, over the same
-Tailscale-authenticated control API that can put the PC to sleep; the host
-verifies the digest, replaces its executable and restarts. That path updates `latch-host.exe`, which contains the entire streaming engine. A PC that is asleep gets the host
-update the next time the Mac sees it. Nothing is downloaded on the PC, and
-no GitHub login is needed there.
-
-Public releases need no GitHub login. If the repository is private, the Mac
-uses the GitHub token git has stored for github.com,
-`LATCH_GITHUB_TOKEN`, or `github_token` in `client.toml`. Settings has the
-switch and a **Check now** button. Hosts installed before 3.1 do not have the
-update route: install that release on the PC once (through the stream works),
-after which updates are automatic.
-
-## Staying reachable
-
-A PC nobody can get to in person stays reachable when three things hold.
-Latch starts when someone signs in to Windows, by default, and turns this
-back on at every start unless the owner switches it off on the Sharing tab.
-It runs (and streams) in the signed-in session, so after a restart the PC
-answers once someone has signed in: a PC nobody sits at needs Windows'
-automatic sign-in. And the PC's Tailscale node key must not expire:
-Tailscale keys expire after 180 days unless key expiry is disabled for
-that machine in the [admin console](https://login.tailscale.com/admin/machines),
-and an expired key needs a sign-in at the PC. Latch shows the expiry of
-every machine it lists, this Mac included, until expiry is disabled. The
-PC's addresses are saved on the Mac, so PCs stay listed even while
-Tailscale on the Mac is off.
-
-## Waking the PC
-
-A wake packet has to reach the PC's network card on the PC's own network.
-Tailscale cannot deliver it, because the sleeping PC's Tailscale is asleep
-too. Latch sends the packet to the LAN broadcast, to the PC's LAN address
-and to the PC's public address.
-
-| Where the Mac is | Asleep | Shut down |
-|------------------|--------|-----------|
-| Same network as the PC | works | works if the board's firmware allows wake from power off |
-| Elsewhere | needs the PC's router to forward UDP 9 to the PC, or a Tailscale subnet router on that network | same, and the firmware condition |
-
-**Test waking it from this network** in a machine's **…** menu settles it for the network you are
-on: it sends the packet while the PC is awake and asks Latch there whether
-it arrived. Setup on the PC takes care of Windows' side (Fast Startup off,
-the adapter's wake keywords, wake allowed in power management). Wired
-Ethernet is strongly preferred; most Wi-Fi adapters cannot wake a PC.
-
-## Security
-
-- The host's control service listens on TCP 47850 and answers only
-  loopback and Tailscale addresses that `tailscale whois` attributes to the
-  account the PC is signed in as. A tagged server (the relay VPS) belongs
-  to no account and answers the people of its own tailnet, not other
-  tagged machines. Everyone else,
-  including machines shared in from other tailnets, gets a 403. A process
-  on the machine itself (any user signed in to it) can read the status but
-  cannot start a stream, push an update or use the clipboard. The firewall
-  rules setup adds are scoped to Tailscale's `100.64.0.0/10` and
-  `fd7a:115c:a1e0::/48`.
-- A stream starts with an HTTP upgrade on TCP 47850 that the same check
-  admits, then runs on UDP 47850 inside Tailscale's WireGuard, which is its
-  encryption; there is no pairing and no second layer. One viewer at a
-  time: a new one takes over.
-- No Latch account or password exists.
-- On Windows the administrator step never runs from the user's folder: it
-  runs a copy in `%ProgramFiles%\Latch\Setup` whose SHA-256 matches the
-  file the window was started from.
-- Remote power actions can be turned off on the Sharing tab.
-
-## Building
-
-Needs Rust and the platform's linker (Visual Studio Build Tools on
-Windows, the Xcode command line tools on a Mac); on Linux, the `-dev`
-packages the CI's `native deps` step installs.
-
-```powershell
-cargo build --release -p latch-host          # Windows
-```
-
-```bash
-./scripts/install-macos.sh                     # macOS: builds, bundles, installs
-```
-
-```bash
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the UI snapshots and the tests
-that need real hardware.
-
-## Layout
-
-```
-crates/core     control API types, small HTTP, Tailscale CLI, wake packets, config
-crates/proto    wire format, FEC, packetizer and reassembler, input reliability
-crates/codec    H.264 Constrained Baseline encoder and decoder, lpcm-rice audio
-crates/engine   sharing side: capture, encode, audio capture, input, session server
-crates/stream   viewing side: session, decoders, audio playback
-crates/host     control service, setup and uninstall, unified window (view + share)
-crates/client   viewer UI: machine list, wake, stream window and toolbar
-crates/ui       theme and widgets shared by both windows
-deploy/node/    Docker kit: virtual desktop + Latch on a VPS
-deploy/native/  systemd user units for the same desktop without Docker
-deploy/relay/   Docker kit: Tailscale peer relay
-docs/           design, protocol and platform notes
-scripts/        installers, the macOS bundle and the native-code audit
-```
+Bug reports, measurements from hardware we do not have, and pull requests
+are all welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), pick
+something labelled
+[good first issue](https://github.com/MrBeldum/latch/labels/good%20first%20issue)
+or [help wanted](https://github.com/MrBeldum/latch/labels/help%20wanted),
+or ask in [Discussions](https://github.com/MrBeldum/latch/discussions).
+Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## License
 
-GPL-3.0-or-later; see [LICENSE](LICENSE). Parts of the H.264 decoder are
-adapted from pith-h264 (MIT). Third-party notices, fonts included, are in
-[NOTICE](NOTICE).
+GPL-3.0-or-later; see [LICENSE](LICENSE) and [NOTICE](NOTICE). Latch is an
+independent project, not affiliated with Tailscale, NVIDIA, Parsec or the
+Sunshine and Moonlight projects.

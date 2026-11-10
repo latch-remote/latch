@@ -1,11 +1,11 @@
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
-$root='C:\Users\Daniel\dev\latch-fix-vdd'
+$root='C:\Users\dev\dev\latch-fix-vdd'
 foreach($task in @('LatchVddProbe','LatchVddMotion','LatchVddServe')) {
  Stop-ScheduledTask $task -ErrorAction SilentlyContinue
  Unregister-ScheduledTask $task -Confirm:$false -ErrorAction SilentlyContinue
 }
-Get-CimInstance Win32_Process | Where-Object {$_.Name -eq 'powershell.exe' -and ($_.CommandLine.EndsWith('-File C:\Users\Daniel\dev\latch-fix-vdd\motion.ps1') -or $_.CommandLine.EndsWith('-File C:\Users\Daniel\dev\latch-fix-vdd\live-stream.ps1'))} | ForEach-Object {Stop-Process -Id $_.ProcessId -ErrorAction SilentlyContinue}
+Get-CimInstance Win32_Process | Where-Object {$_.Name -eq 'powershell.exe' -and ($_.CommandLine.EndsWith('-File C:\Users\dev\dev\latch-fix-vdd\motion.ps1') -or $_.CommandLine.EndsWith('-File C:\Users\dev\dev\latch-fix-vdd\live-stream.ps1'))} | ForEach-Object {Stop-Process -Id $_.ProcessId -ErrorAction SilentlyContinue}
 $server=Get-Process -Id ([int](Get-Content "$root\serve.pid")) -ErrorAction SilentlyContinue
 if($server -and $server.Path -eq "$root\target\release\examples\serve.exe") {Stop-Process -Id $server.Id}
 Get-NetFirewallRule -DisplayName LatchVddTest -ErrorAction SilentlyContinue | Remove-NetFirewallRule
@@ -31,4 +31,4 @@ Get-PnpDevice -Class Display,Monitor | Format-Table Status,Class,FriendlyName,In
 "Input helper restored: $((Get-FileHash 'C:\Program Files\Latch\Input\latch-host.exe').Hash -eq (Get-FileHash "$root\input-main-backup.exe").Hash)"
 $installed=Get-Process -Id ([int](Get-Content "$root\installed-pid-before.txt"))
 "Installed process: $($installed.Id) $($installed.Path) session=$($installed.SessionId)"
-Get-FileHash 'C:\Users\Daniel\AppData\Local\Latch\latch-host.exe','C:\Program Files\Latch\Input\latch-host.exe'
+Get-FileHash 'C:\Users\dev\AppData\Local\Latch\latch-host.exe','C:\Program Files\Latch\Input\latch-host.exe'

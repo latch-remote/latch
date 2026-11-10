@@ -1,5 +1,5 @@
 {
- "what": "Latch 4.1.1 (8aa2165, Sunshine 2026.1014 x264 superfast zerolatency software, moonlight-common-c + VideoToolbox viewer) streaming stuzha's real :1 desktop (mostly still) to this Mac, 1280x720 asked at 60 fps, 10 Mbps, direct tailnet path 13 ms",
+ "what": "Latch 4.1.1 (8aa2165, Sunshine 2026.1014 x264 superfast zerolatency software, moonlight-common-c + VideoToolbox viewer) streaming arm-vps's real :1 desktop (mostly still) to this Mac, 1280x720 asked at 60 fps, 10 Mbps, direct tailnet path 13 ms",
  "host_cpu_pct_one_core": {
   "median": 71.0,
   "mean": 70.4,
@@ -17,5 +17,5 @@
  "host_capture_to_send_ms": {
   "median": 11.0
  },
- "caveat": "stuzha is shared: other build/bench work may have been running (load average in stuzha-env.txt was taken right after). Sunshine encodes every frame at 60 fps even when the desktop is still."
+ "caveat": "arm-vps is shared: other build/bench work may have been running (load average in arm-vps-env.txt was taken right after). Sunshine encodes every frame at 60 fps even when the desktop is still."
 }

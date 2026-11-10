@@ -1,58 +1,201 @@
 # Paced batches, 2026-11-09
 
-Results below include sender isolation measurements, **not decoded
-viewer latency or clean-NIC throughput claims**. No installed host or port 47850
-was used. No dependency was added.
+What changed in the sender, and what it measured.
+
+- **Paced batches.** A paced session used to send one datagram per system
+  call and sleep between them, which bypassed the batched and offloaded send
+  paths (`sendmmsg`/GSO on Linux, USO on Windows). It now sends a few
+  milliseconds' worth of datagrams per batch through those paths.
+- **Probes on the video sender.** Probe trains go out through the same
+  pacer and are counted against the same budget.
+- **Backpressure before capture.** A paced session does not take a new
+  picture while an encoded frame is already waiting behind the one being
+  sent.
+- **A bound on frame size**, with an explicit error instead of a frame the
+  wire format cannot describe.
+- **The pace on an unmeasured path** (found while measuring the above, and
+  older than it): the controller no longer paces a stream below twice what
+  the viewer is receiving. [Its own section](#the-pace-on-an-unmeasured-path)
+  has the cause and the numbers.
+
+No wire format changed. Sessions between this build and 5.1.0 and 5.2.0
+were run in both directions (`compat.py`) and all connected and streamed.
 
 ## Machine and method
 
-Apple M3 Pro, Mac15,6, 12 CPUs, arm64, Darwin 25.6.0. Shared interactive machine;
-initial load averages were 29.72/28.87/19.93. Other agents compiled concurrently.
-Single three-second samples are noisy and cannot establish small differences.
+An Apple M3 Pro laptop (12 cores, macOS), in use for other work during the
+runs: load average between 3 and 6. Everything is over loopback. Nothing
+here is a measurement of a real network, a network card, or of Linux or
+Windows.
 
-`server::tests::paced_socket_measurement` is an ignored release test using the
-production `paced_video`, packetizer, batch sender, controller and reassembler.
-It sends synthetic encoded payloads at 60 fps, initially requesting twice the
-FIFO capacity, with an initial 8x frame (larger than the FIFO). UDP goes through
-real loopback sockets and the deterministic `Link` rate-limited 50 ms FIFO.
-Propagation is half the named RTT; feedback is sampled every 50 ms in-process
-and uses known queue delay, rather than measuring TCP report/ping scheduling.
-Subsequent frames follow the controller's FEC-aware video allowance; recovery
-requests obey the production keyframe gap. Ordinary parity is 10%.
+Two harnesses, both ignored tests in `latch-engine`:
 
-Goodput counts payload in reference-valid frames completed at the reassembler,
-including a two-second drain, divided by the three-second source window.
-Queue age is encoder-output timestamp to sender completion including parity;
-frame delay is output timestamp to reassembly completion. Neither includes a
-real codec, capture or physical display. CPU is CLOCK_THREAD_CPUTIME_ID for
-just the sender. The macOS syscall count instruments send calls in test builds
-(no production instrumentation cost); batch retries can overcount if a partial
-batch fails. Other platforms currently print zero and must not interpret that
-as measured CPU/syscalls. Lost and skipped come from the production reassembler;
-keyframes count sender completions. These are **not** a noise-pattern software
-codec benchmark. The initial huge frame can lose before pacing activates.
+- `paced_socket_measurement` (`tests/support/lifecycle.rs`, compiled into
+  the library's tests) drives the production
+  pacer, packetizer, batch sender, controller and reassembler with
+  synthetic encoded frames at 60 fps for three seconds, through real UDP
+  sockets and a rate-limited FIFO with a 50 ms queue. It isolates the
+  sender: there is no codec, and feedback is sampled in-process.
+- `noise_socket_measurement` (`tests/bottleneck.rs`) runs a whole session
+  for five seconds: the 640×360 noise test pattern, software H.264 encode,
+  a UDP relay with the same FIFO, and a hardware-decoding viewer. It counts
+  the frames the viewer published and the gaps between them.
 
-## Exact commands
+Three builds were compared, five alternating rounds each, and the tables
+give the median of the five with the range in brackets:
+
+- **before**: the sender as it was before paced batches (`69539f0`);
+- **batches**: paced batches as first merged (`aec0dd5`);
+- **backlog**: the same with the backpressure rule corrected (`ed32f66`,
+  below).
+
+The controller fix came after these three and is compared separately,
+[further down](#the-pace-on-an-unmeasured-path).
+
+Every run's output line is kept: [session.txt](session.txt) for the whole
+session and [sender.txt](sender.txt) for the sender alone, where the three
+builds are labelled `old`, `new` and `fix`.
 
 ```sh
-export PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH TMPDIR=/tmp
 cargo test --release -p latch-engine --lib paced_socket_measurement --no-run
-sh docs/measurements/2026-11-09-paced-batches/run.sh
-# Retain the just-built binary to compare while editing without Cargo rebuilds:
-cp target/release/deps/latch_engine-921171a8f3a810a1 /tmp/pb-baseline
-PB_TEST_BIN=/tmp/pb-baseline sh docs/measurements/2026-11-09-paced-batches/run.sh
+cargo test --release -p latch-engine --test bottleneck --no-run
+# Each prints the test executable it built.
+PB_TEST_BIN=<lib executable> sh docs/measurements/2026-11-09-paced-batches/run.sh
+sh docs/measurements/2026-11-09-paced-batches/noise.sh <bottleneck executable>
 ```
 
-`PB_SECONDS` changes source duration. `PB_CAP=0 PB_RTT=0 PB_REQUEST=100000`
-(or 1000000) selects uncapped loopback. Baseline is origin/main 69539f0 with
-measurement hooks only. Raw measurements: before.txt; quantum.txt is batching
-alone. See the validation section for final local gates and remaining limits.
+`PB_CAP` is the FIFO's rate in kbps (0 for none), `PB_RTT` the round trip
+in ms, `PB_REQUEST` the requested bitrate in kbps (twice the cap when
+unset).
 
-## Timer measurement
+## Whole session: frames the viewer showed in five seconds
 
-1000 `thread::sleep` calls per duration, measured with Instant, under shared
-load. Exact source will be retained beside sleep.txt. Requested/actual p50,
-p95, maximum in microseconds:
+300 is every frame. Gap is the time between published frames, p50/p95.
+
+| Link (request) | before | batches | backlog |
+|---|---|---|---|
+| 5 Mbps, 20 ms (10) | 285 [285–288], 16.3/20.1 ms | 286 [280–288], 16.3/20.0 | 287 [284–290], 16.3/21.2 |
+| 5 Mbps, 150 ms (10) | 278 [263–278], 16.3/21.2 | 278 [249–278], 16.4/21.1 | 278 [264–278], 16.4/20.1 |
+| 20 Mbps, 20 ms (40) | 296 [296–297], 16.4/18.1 | 296 [296–297], 16.4/18.5 | 296 [296–297], 16.3/18.3 |
+| 20 Mbps, 150 ms (40) | 299 [299–299], 16.3/18.6 | 299 [297–299], 16.4/18.5 | 299 [169–300], 16.3/18.7 |
+| 50 Mbps, 20 ms (100) | 296 [278–298], 16.3/17.7 | 297 [243–297], 16.3/17.6 | 296 [270–297], 16.4/18.4 |
+| 50 Mbps, 150 ms (100) | 299 [259–300], 16.4/18.6 | 299 [299–300], 16.4/18.5 | 299 [221–300], 16.4/18.9 |
+| no limit (100) | 264 [259–281], 16.5/36.2 | **213** [213–263], 22.2/36.8 | 252 [249–262], 17.4/35.2 |
+| no limit (1000) | 300 [300–300], 16.4/18.8 | 300 [300–300], 16.3/18.4 | 300 [300–300], 16.3/18.5 |
+
+The "no limit (100)" row is the one that moved. Paced batches as first
+merged waited for the sender to be completely idle before taking the next
+picture, so a frame cost its send time plus its encode time, and a fifth
+of the frames went missing. Letting one frame be encoded while the
+previous one is sent (`PACED_BACKLOG` in `src/server.rs`) brought it most
+of the way back: 252 against the old sender's 264. The medians of the
+other rows do not differ.
+
+Two things in this table were first read wrongly. The no-limit row was put
+down to the software encoder being the slow part, and the low runs at 150
+ms (169 of 300 at 20 Mbps, 221 at 50 Mbps) to a loaded machine. Both were
+the controller, and neither was new with paced batches.
+
+## The pace on an unmeasured path
+
+A stream that sends less than half its budget counts as idle, even when
+it is moving: this test pattern is about 9 Mbps of video, 12 with parity,
+under budgets of 40 and 100 Mbps. An idle stream is probed with short
+trains of packets so that the controller knows what the path carries
+before motion fills it. When two trains had gone out and no measurement
+had come back, the controller fell back to pacing at a twentieth of the
+budget, whatever the stream was already delivering.
+
+That fallback was reached in two ways:
+
+- **A long round trip.** The second train goes out 200 ms after the
+  first. On a 150 ms round trip the first train's answer arrives at about
+  the same moment, and since paced batches a train is also cancelled when
+  a frame is waiting. Either way the count reached two with nothing
+  measured, and a stream delivering 12 Mbps was paced at 2. In fourteen
+  traced runs at 20 Mbps and 150 ms, three collapsed to about 12 frames a
+  second and took four seconds to climb back ([collapse.txt](collapse.txt)
+  has a good and a bad run side by side). The build as first merged did
+  the same in 3 runs of 20 (their output was not kept).
+- **A path too fast to measure.** With no rate limit and no delay the
+  trains gave no usable measurement at all, so the stream was paced at 5
+  Mbps (a twentieth of 100) for the whole session and its pace only crept
+  up to about what it was sending. That is the 264 of 300, with 34 ms
+  between frames at p95, that the "no limit (100)" row shows for every
+  build, the oldest included.
+
+The fallback is now the larger of a twentieth of the budget and twice the
+best rate the viewer reported receiving in the last second; it rises as
+delivery does, and the first train measured after it takes its place
+(before, a higher measurement could not replace a lower guess). A still
+desktop, which delivers almost nothing, gets the same cautious pace as
+before.
+
+Ten alternating rounds, the sender before paced batches against the
+current build (`12a1598`); every line is in
+[controller.txt](controller.txt). Median frames of 300, the range, and
+the median gap between frames (p50/p95):
+
+| Link (request) | before | now |
+|---|---|---|
+| 5 Mbps, 20 ms (10) | 286 [281–289], 16.5/20.6 ms | 285.5 [272–288], 16.6/21.0 |
+| 5 Mbps, 150 ms (10) | 264 [234–278], 16.5/20.9 | 267.5 [234–279], 16.5/21.4 |
+| 20 Mbps, 20 ms (40) | 297 [258–297], 16.4/18.6 | 296.5 [294–297], 16.4/18.6 |
+| 20 Mbps, 150 ms (40) | 299 [247–299], 16.4/18.8 | 299 [299–299], 16.4/18.5 |
+| 50 Mbps, 20 ms (100) | 297 [296–297], 16.4/17.7 | 297 [296–298], 16.4/17.7 |
+| 50 Mbps, 150 ms (100) | 299 [262–300], 16.4/19.0 | 299 [299–300], 16.4/17.7 |
+| no limit (100) | 265 [260–279], 16.6/33.8 | **300** [300–300], 16.4/19.0 |
+| no limit (1000) | 300 [300–300], 16.4/18.8 | 300 [300–300], 16.5/19.0 |
+
+The no-limit row now delivers every frame, and no run of the current
+build at 20 or 50 Mbps fell below 294. A further 25 traced runs at 20
+Mbps and 150 ms all completed (the last line of `collapse.txt`). The old
+sender has low runs of its own in three rows here; it was not immune,
+only less exposed. The 5 Mbps rows are unchanged: there the link, not the
+pace, is what limits the stream, and at 150 ms both builds lose 20 to 65
+frames while the controller finds the rate.
+
+One more rule came after that table: a pace taken from a measured train
+is not set under 125% of what the viewer is receiving, since a train can
+read low. It was spot-checked with eight runs in five of the rows, not
+the full comparison: 299 in every run at 20 and at 50 Mbps with 150 ms,
+300 or 301 with no limit, 296 or 297 at 20 Mbps and 20 ms, and 286 to 289
+at 5 Mbps and 20 ms.
+
+The sender-alone table below was not repeated with these changes.
+
+## Sender alone: three seconds of synthetic frames
+
+Goodput is payload in frames the reassembler completed. Queue is the p95
+age of a frame when the sender finished it. Lost is frames the reassembler
+gave up on (the first frame is deliberately larger than the FIFO).
+
+| Link (request) | before | batches | backlog |
+|---|---|---|---|
+| 5 Mbps, 20 ms (10) | 1.8 Mbps, 2.2 ms, 3 lost | 1.6, 2.8, 3 | 1.5, 2.0, 3 |
+| 5 Mbps, 150 ms (10) | 1.0, 0.1, 6 | 0.7, 0.0, 6 | 1.0, 0.0, 6 |
+| 20 Mbps, 20 ms (40) | 8.8, 4.9, 3 | 9.3, 5.2, 3 | 9.4, 5.0, 3 |
+| 20 Mbps, 150 ms (40) | 6.1, 4.9, 6 | 6.1, 4.7, 6 | 6.2, 4.9, 6 |
+| 50 Mbps, 20 ms (100) | 24.8, 5.2, 3 | 26.9, 5.7, 3 | 25.4, 5.6, 3 |
+| 50 Mbps, 150 ms (100) | 16.2, 5.2, 7 | 16.8, 5.2, 6 | 14.9, 5.3, 6 |
+| no limit (100) | 82.4, 1.0, 0 | 82.4, 1.0, 0 | 82.4, 1.0, 0 |
+| no limit (1000) | 737.7, 9.3, 8 | 737.8, 9.0, 8 | 734.3, 8.8, 9 |
+
+Through this harness the three senders are the same within noise. The
+harness has its own loop standing in for capture, and for these runs that
+loop did not use the corrected rule in any of the three builds, so this
+table compares the pacer and batch sender only; it says nothing about the
+backpressure rule. (The harness now follows `PACED_BACKLOG`.) On a Mac
+that is the expected result: macOS has no batched UDP send, so the batch
+path still makes one system call per datagram. The 1 Gbps row tops out near
+740 Mbps and loses frames in all three. The test's loopback relay is the
+likely limit, though it was not measured on its own; either way this is
+not a clean measurement of the sender.
+
+## Timers
+
+1000 `thread::sleep` calls per duration on the same Mac (`sleep.rs`),
+requested against actual, in microseconds:
 
 | Requested | p50 | p95 | max |
 |---:|---:|---:|---:|
@@ -61,241 +204,22 @@ p95, maximum in microseconds:
 | 500 | 630.8 | 641.0 | 831.2 |
 | 1000 | 1257.4 | 1269.0 | 1610.2 |
 
-No final spin has been added: quantum CPU/goodput measurements must first
-justify burning a core fraction. Windows timer behavior is unverified.
+Sleeps overshoot by about a quarter. The pacer sleeps to absolute deadlines
+and does not spin; nothing above justified spending a core on it.
 
-## Remaining verification
+## Not measured
 
-Decoded-viewer latency percentiles; clean high-rate codec throughput; independent
-feedback transport in the sender-isolation harness; Linux GSO on a NIC; Windows
-USO on hardware. These limitations must
-remain explicit even when the functional suites pass.
+- **Content that changes rate.** The test pattern is a steady 9 Mbps. A
+  scene change while the pace is a guess ramps by doubling, one step per
+  report after a round trip, and a steady stream under a guessed pace is
+  spread over up to half its frame interval. Neither was timed.
 
-Validation scheduling caveat: preliminary workspace and engine runs overlapped
-several native VideoToolbox test processes on this shared Mac. Duplicate own
-runs were cancelled rather than treating device contention as a product result;
-final runs must be serial. Other worktrees also ran native tests concurrently.
-No assertion was changed.
-
-## Sender isolation results
-
-Each cell is before → after. Single samples; shared-load differences are not
-statistically established. CPU is total sender milliseconds in a 3 s source run.
-Frame delay ends at reassembly, not the decoded viewer.
-
-| FIFO Mbps / RTT ms (request Mbps) | Goodput Mbps | Send age p50/p95/max ms | Frame delay p50/p95 ms | Lost/skipped | Keyframes | Syscalls/s (Mac) | CPU ms |
-|---|---|---|---|---|---|---|---|
-| 5 / 20 (10) | 2.062 → 2.078 | 0.126/2.271/7.512 → 0.082/1.929/7.196 | 18.655/19.717 → 18.571/18.733 | 3/3 → 3/3 | 2 → 2 | 337.3 → 339.0 | 21.644 → 16.152 |
-| 5 / 150 (10) | 1.003 → 0.906 | 0.120/0.259/8.919 → 0.083/1.781/8.463 | 79.589/80.196 → 79.482/82.803 | 6/5 → 6/5 | 3 → 3 | 239.0 → 228.7 | 20.988 → 13.684 |
-| 20 / 20 (40) | 8.413 → 7.507 | 0.314/5.191/5.598 → 0.382/5.514/8.922 | 18.344/29.477 → 17.581/19.091 | 3/4 → 3/4 | 2 → 2 | 1263.3 → 1172.7 | 70.703 → 55.827 |
-| 20 / 150 (40) | 6.126 → 5.391 | 0.239/4.763/6.873 → 0.176/4.903/10.704 | 81.613/82.231 → 80.498/81.630 | 6/5 → 6/5 | 3 → 3 | 1075.7 → 960.0 | 52.756 → 35.651 |
-| 50 / 20 (100) | 25.856 → 26.577 | 0.719/5.307/10.872 → 0.628/5.954/16.696 | 21.027/21.794 → 20.952/24.350 | 3/4 → 3/4 | 2 → 2 | 3710.0 → 3798.7 | 135.100 → 102.244 |
-| 50 / 150 (100) | 14.626 → 14.054 | 0.518/5.227/11.371 → 0.542/5.549/15.383 | 81.309/82.308 → 81.026/81.749 | 6/5 → 6/5 | 3 → 3 | 2522.0 → 2458.0 | 144.328 → 103.482 |
-| 0 / 0 (100) | 81.084 → 82.406 | 1.746/2.752/30.493 → 1.122/2.857/16.867 | 3.099/53.417 → 2.073/6.806 | 2/1 → 0/0 | 2 → 1 | 9808.0 → 9798.0 | 288.909 → 216.950 |
-| 0 / 0 (1000) | 71.851 → 175.194 | 5.517/174.438/306.310 → 7.605/114.541/218.412 | 5.210/50.123 → 6.472/78.230 | 43/22 → 46/21 | 13 → 13 | 29704.0 → 49900.0 | 808.335 → 1102.699 |
-
-The high-rate uncapped case is **not clean**: the synthetic relay/socket path
-loses frames at 1 Gbps requested. It cannot certify clean-path throughput or
-isolate the sender from relay CPU. macOS still sends one syscall per datagram;
-the change preserves Linux/Windows offload entry points, whose savings have
-not been measured on hardware here.
-
-## Backlog policy comparison
-
-Exact commands (same final test binary):
-
-```sh
-PB_CAP=5000 PB_RTT=150 PB_START_PACED=1 /tmp/pb-final paced_socket_measurement --ignored --nocapture
-PB_CAP=5000 PB_RTT=150 PB_START_PACED=1 PB_DROP=1 /tmp/pb-final paced_socket_measurement --ignored --nocapture
-```
-
-The test-only alternative drops queued output older than 1/60 s, abandons its
-reference chain and requests a gated keyframe. Both start with a keyframe
-larger than the 50 ms FIFO. Raw files: backlog-preserve.txt and backlog-drop.txt.
-
-| Policy | Goodput Mbps | Age p50/p95/max ms | Delivered | Network lost/skipped | Not emitted | Keyframes | CPU ms |
-|---|---:|---|---:|---|---:|---:|---:|
-| Backpressure before capture | 1.006 | 0.066/0.893/51.018 | 169 | 6/5 | 0 | 3 | 14.675 |
-| Drop stale output + recovery | 1.009 | 0.085/2.485/51.450 | 171 | 1/0 | 8 | 3 | 17.589 |
-
-Choose backpressure: similar delivered goodput, lower p95 output age, no
-extra reference discontinuity or recovery policy. Neither creates a keyframe
-storm in this sample; the claim that dropping necessarily storms is **not**
-established. Dropping changes loss accounting by removing frames before wire
-number assignment; network loss alone is misleading. Both retain unavoidable
-serialization and initial-keyframe loss through a too-small queue.
-
-## Live protocol compatibility
-
-Rebuilt exact tags v5.1.0 and v5.2.0 using their existing `serve`/`view`
-examples; this branch's examples were rebuilt too. `python3 compat.py` ran
-sweep 640×360@60, 20 Mbps requested, three seconds per session. All five
-sessions exited zero: new→5.1, 5.1→new, new→5.2, 5.2→new, new→new.
-Raw summaries and viewer/host logs are retained as compat*.txt. This checks
-interoperability, not impaired-link quality. Servers were terminated by the
-script in every case. The protocol number, datagram layouts and capability
-negotiation remain unchanged; probes still require the existing opt-in.
-
-Build commands (archives extracted into the named scratch directories):
-
-```sh
-git archive v5.1.0 | tar -x -C /tmp/pb-v51
-git archive v5.2.0 | tar -x -C /tmp/pb-v52
-CARGO_TARGET_DIR=/tmp/pb-compat-target cargo build --release --manifest-path /tmp/pb-v51/Cargo.toml -p latch-engine --example serve -p latch-stream --example view
-# Copy the examples to /tmp/pb-compat-bins/{serve,view}-v51; repeat for v52.
-cargo build --release -p latch-engine --example serve -p latch-stream --example view
-# Copy to /tmp/pb-compat-bins/{serve,view}-new.
-python3 docs/measurements/2026-11-09-paced-batches/compat.py
-```
-
-Existing `probe_transport` and `steady_transport` pass (probes-after.txt).
-The former retains its clean-resume 8/28/78/128 ms assertions; the latter's
-idle_motion remains 13 ms and both idle-drop cases retain zero lost/skipped.
-These deterministic suites still model historical packet pacing/probe emission;
-they verify controller regressions, **not** the new production probe scheduler's
-full idle-resume distribution. A direct sender unit test separately verifies
-probe byte accounting and cancellation under pressure. Real Windows/Linux
-sender timing and production idle→motion timing across the RTT matrix remain
-unverified.
-
-## Real noise-pattern codec / decoded viewer
-
-`noise_socket_measurement` in bottleneck.rs uses the shared real UDP relay,
-now with a downstream 50 ms FIFO. 640×360@60, software H.264 test pattern,
-hardware decoded viewer. Five seconds per case. The baseline is exact 69539f0
-extracted into /tmp/pb-before-src with only this test and support/relay.rs
-copied in. It was built in /tmp/pb-compat-target. Commands:
-
-```sh
-CARGO_TARGET_DIR=/tmp/pb-compat-target cargo test --release --manifest-path /tmp/pb-before-src/Cargo.toml -p latch-engine --test bottleneck --no-run
-sh docs/measurements/2026-11-09-paced-batches/noise.sh /tmp/pb-compat-target/release/deps/bottleneck-edefa656cdb9f7cc
-cargo test --release -p latch-engine --test bottleneck --no-run
-sh docs/measurements/2026-11-09-paced-batches/noise.sh target/release/deps/bottleneck-edefa656cdb9f7cc
-```
-
-Each cell is before → after. Payload Mbps is the **last stats-window mean**,
-not whole-run goodput. Frame intervals are sampled from published frame sequence
-changes every 1 ms; gaps do not measure capture-to-decode delay. A polling gap
-can conceal intermediate publications. Raw logs contain the complete last-window
-viewer stats, losses/drops and host pacing queue maxima. No sender CPU/syscalls
-are inferred from these runs.
-
-| FIFO Mbps / RTT ms (request Mbps) | Published frames | Gap p50/p95 ms | Last-window payload Mbps | Keyframes delivered |
-|---|---|---|---|---|
-| 5 / 20 (10) | 274 → 286 | 16.508/22.180 → 16.559/20.951 | 0.723 → 1.496 | 1 → 1 |
-| 5 / 150 (10) | 232 → 219 | 16.426/44.629 → 17.161/23.776 | 2.158 → 3.296 | 4 → 3 |
-| 20 / 20 (40) | 294 → 297 | 16.438/26.629 → 16.523/18.964 | 9.081 → 9.049 | 1 → 2 |
-| 20 / 150 (40) | 301 → 300 | 16.418/20.175 → 16.500/19.175 | 7.935 → 9.022 | 2 → 2 |
-| 50 / 20 (100) | 294 → 255 | 16.445/19.508 → 17.146/35.782 | 9.092 → 6.003 | 2 → 2 |
-| 50 / 150 (100) | 298 → 215 | 16.490/20.696 → 21.014/42.240 | 9.049 → 6.594 | 2 → 2 |
-| 0 / 0 (100) | 251 → 207 | 17.079/39.748 → 23.547/37.458 | 5.403 → 4.799 | 2 → 2 |
-| 0 / 0 (1000) | 299 → 300 | 16.471/19.168 → 16.523/19.970 | 9.094 → 9.038 | 2 → 2 |
-
-The existing noise pattern underfills high-rate requests (about 9 Mbps payload
-in uncapped loopback), and H.264 negotiation caps the 1 Gbps request at 800 Mbps.
-Therefore this does not establish real-codec 100 Mbps or 1 Gbps sender capacity.
-The synthetic encoded-payload harness deliberately avoids that encoder limit,
-but its uncapped 1 Gbps relay is itself lossy. A clean high-rate sender/NIC
-measurement remains outstanding. Decoded-viewer capture-to-display p50/p95
-remain outstanding; existing stats lack a per-picture cross-stage identity.
-
-## Decisions and limits
-
-- Keep paced batches: the source proves pressure formerly bypassed GSO/USO,
-  and the new path reuses those paths without a new wire format. On this Mac,
-  constrained sender CPU is lower in most samples; goodput improvements are
-  not established and clean-loopback variation is substantial. Mac syscall
-  count is unchanged by design. Physical offload benefits are unverified.
-- Keep pre-capture backpressure only while paced: the direct policy comparison
-  has similar goodput, lower p95 send age and fewer sender-side discontinuities
-  than dropping. Clean paths retain their existing overlap. It bounds encoded
-  backlog, not hardware-internal capture/encode queues or keyframe wire time.
-- Keep ordinary sleeps with absolute deadlines and no spin: the timer test
-  proves oversleep, but these results do not justify extra spin CPU. A stricter
-  high-rate pacing accuracy qualification remains outstanding.
-- Send probes on the same bucket and account successful bytes, aborting on
-  motion/pressure. The direct sender test verifies this. Existing fake-clock
-  idle-resume tests pass but do not yet model this new probe emission schedule.
-- Enforce the shared maximum and explicit errors: the boundary unit test accepts
-  exactly the representable layout and rejects one byte more without emitting
-  or consuming a frame number. Sender recovery also skips dependent output.
-
-This work does **not** fulfill a claim that Latch cannot be a bottleneck. Missing
-per-frame decoded-viewer delay instrumentation, an independently controlled
-clean high-rate path, and real Linux/Windows execution prevent that conclusion.
-
-## Local validation
-
-- `cargo fmt --all -- --check`: pass.
-- `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test --workspace`: pass (785 passing executions across result groups, including subprocess helper executions). A final repeat is also being retained.
-- Five serial runs of all nine engine integration targets and `cargo test -p latch-engine --lib server::tests`: pass, with no assertion changes.
-- Round five overlapped `CARGO_TARGET_DIR=/tmp/pb-hammer-target cargo build -p latch-engine --lib --target x86_64-apple-darwin`: both pass.
-- Existing release probe/steady suites and new direct pacer/probe units: pass.
-- No dependency changed, so a new local native audit was not required; PR CI native-audit passed on the first implementation head.
-
-Exact repeated-suite command (run for rounds 1 through 5):
-
-```sh
-cargo test -p latch-engine --test bottleneck --test ceiling --test impaired --test lifecycle --test loopback --test probe_transport --test recovery --test steady_transport --test transport_scenarios
-cargo test -p latch-engine --lib server::tests
-```
-
-All native encoder unit tests ran in the workspace gate; the five repetitions
-cover every engine integration target plus sender/lifecycle unit tests, not five
-repetitions of every native hardware encoder unit test. Logs are repeat-1.txt
-through repeat-5.txt and hammer.txt. The hammer target compiled for 47.42 s
-while round five ran. CI state belongs to the PR head, not these local results.
-
-
-### Loaded-baseline flake found in the final workspace repeat
-
-The first complete workspace gate and all five transport repetitions passed.
-The next workspace repeat failed bottleneck's queue phase: the first unloaded
-viewer stats had RTT 42 ms / variation 21 ms, versus stable 46 ms after the
-configured downstream delay changed from 5 to 45 ms. The old check required
-≥62 ms forever. Frames kept arriving at about 12 fps with no loss. This is a
-contaminated initial RTT snapshot, not a delivery failure. Failure output is
-workspace-loaded-baseline-failure.txt.
-
-The test now compares both phases against the fixed 25 ms midpoint of its
-known relay delays (queued ≥25 ms, recovered <25 ms), while retaining its
-frame-progress, FPS, loss and recovery requirements and deadlines. This removes
-the random first-window baseline from the oracle; it does not raise tolerances
-or extend deadlines. The deterministic controller test still checks rate
-adaptation against known RTT. Fresh reruns are recorded separately.
-
-The subsequent workspace attempt passed bottleneck but hit impaired's existing
-loaded-runner budget-collapse assertion: 58.8 fps average, FEC rebuilt 118
-shards, zero post-FEC loss, but final budgets 2137/2563/3049 kbps (required
-≥4800). The Nov 4 review58c validation records the same class of loaded-runner
-failure. No impaired assertion or controller threshold was changed. Retained
-as workspace-impaired-loaded-failure.txt; a standalone rerun and another full
-workspace run follow. Passing runs do not make this observed instability vanish.
-
-The revised bottleneck test passed five fresh full bottleneck-target runs
-(bottleneck-fixed-1.txt through -5.txt). `impaired` remained unchanged except
-for diagnostic RTT, local queue and application-limited fields in its log.
-Its first standalone debug rerun also failed (retained), so it was compared
-against exact main before considering controller changes.
-
-Three alternating **release** pairs, exact main 69539f0 versus this branch,
-all pass (impaired-main-*.txt / impaired-new-*.txt). These paired release runs
-do not reproduce or resolve the debug loaded-runner failure. No causal
-controller regression is established by them; debug scheduling instability
-remains a limitation, and is not hidden by the passing runs.
-
-Exact commands:
-
-```sh
-# Same instrumented impaired.rs copied into the main archive.
-CARGO_TARGET_DIR=/tmp/pb-compat-target cargo test --release --manifest-path /tmp/pb-before-src/Cargo.toml -p latch-engine --test impaired --no-run
-cargo test --release -p latch-engine --test impaired --no-run
-# Copy each printed executable to /tmp/pb-impaired-before and -after.
-/tmp/pb-impaired-before --nocapture
-/tmp/pb-impaired-after --nocapture
-# Repeat the pair three times.
-cargo test -p latch-engine --test bottleneck  # five fresh runs after oracle fix
-```
-
-Final local gates after the test-oracle fix and diagnostic logging: fmt, workspace clippy with warnings denied, and workspace tests **pass** (785 passing executions across result groups, including subprocess helpers). See workspace-final.txt and clippy-final.txt. All failures above remain retained.
+- **Linux GSO and Windows USO on real hardware.** The point of batching is
+  fewer system calls on those two systems. The code paths are exercised by
+  CI, but their effect on CPU and throughput has not been measured on a
+  network card.
+- **Latency of each frame from capture to display.** These runs count
+  frames and the gaps between them; they do not time a frame end to end.
+- **A clean path above about 700 Mbps.** The loopback relay loses frames
+  first.
+- **Timer behaviour on Windows.**

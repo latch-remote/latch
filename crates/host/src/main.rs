@@ -159,7 +159,7 @@ fn run_setup() -> Result<()> {
 /// What is logged when RUST_LOG says nothing.
 ///
 /// wgpu's Vulkan backend warns once for every presented frame whose
-/// swapchain reports suboptimal (`wgpu-hal`, `vulkan/mod.rs`). On Hermes
+/// swapchain reports suboptimal (`wgpu-hal`, `vulkan/mod.rs`). On the Windows test PC
 /// that is every frame the window draws, and it was **every line** of a
 /// 32 MB `panel.log` — the condition is normal and wgpu recreates the
 /// swapchain itself, so there is nothing to act on. Latch stays at info

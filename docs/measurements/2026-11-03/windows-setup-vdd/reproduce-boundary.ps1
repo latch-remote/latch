@@ -1,6 +1,6 @@
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
-$root='C:\Users\Daniel\dev\latch-fix-vdd'
+$root='C:\Users\dev\dev\latch-fix-vdd'
 $reg='HKLM:\SOFTWARE\MikeTheTech\VirtualDisplayDriver'
 $file='C:\VirtualDisplayDriver\vdd_settings.xml'
 $bytes=[IO.File]::ReadAllBytes($file)

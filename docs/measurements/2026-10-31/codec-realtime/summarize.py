@@ -8,7 +8,7 @@ import statistics
 
 root = pathlib.Path(__file__).resolve().parent
 groups = collections.defaultdict(list)
-for machine in ['mac', 'stuzha']:
+for machine in ['mac', 'arm-vps']:
     for row in csv.DictReader((root / machine / f'{machine}-matrix.csv').open()):
         groups[machine, int(row['width']), row['kind'], row['build']].append(row)
 
@@ -37,7 +37,7 @@ for (machine, width, kind, build), rows in sorted(groups.items(), key=lambda pai
 (root / 'results.md').write_text('\n'.join(output)+'\n')
 import json
 (root / 'summary.json').write_text(json.dumps(summary, indent=2)+'\n')
-for machine in ['mac','stuzha']:
+for machine in ['mac','arm-vps']:
     for width in [1280,1920]:
         frames = [f for repeat in [0,1] for f in frame_rows(machine,width,'motion','on',repeat)[1:]]
         levels = collections.Counter(f['effort'] for f in frames)

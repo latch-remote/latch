@@ -7,7 +7,7 @@ import statistics
 root = Path(__file__).parent
 print('| Machine | Size | Threads | Kind | Before ms / fps | After ms / fps | Speedup | PSNR dB | Actual kbps |')
 print('|---|---|---:|---|---:|---:|---:|---:|---:|')
-for machine in ['mac', 'stuzha']:
+for machine in ['mac', 'arm-vps']:
     rows = list(csv.DictReader((root / f'{machine}-paired.csv').open()))
     for w in ['1280', '1920']:
         for threads in ['2', '4']:

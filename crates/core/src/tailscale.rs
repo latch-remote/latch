@@ -170,7 +170,7 @@ impl Node {
         }
     }
     /// Display name for the peer: the first label of its MagicDNS name
-    /// (e.g. `"iphone.taile55421.ts.net."` → `"iphone"`), matching
+    /// (e.g. `"iphone.example-tailnet.ts.net."` → `"iphone"`), matching
     /// `tailscale status` and the admin console.
     ///
     /// iOS/iPadOS clients always report `HostName: "localhost"` because iOS
@@ -800,12 +800,12 @@ mod tests {
             Some("203.0.113.5".parse().unwrap())
         );
         assert_eq!(
-            at("116.125.113.36:41641").public_ipv4(),
-            Some("116.125.113.36".parse().unwrap())
+            at("203.0.113.36:41641").public_ipv4(),
+            Some("203.0.113.36".parse().unwrap())
         );
         // Two machines on one network go direct over the LAN.
         for lan in [
-            "192.168.55.57:41641",
+            "192.168.1.57:41641",
             "10.0.0.5:41641",
             "172.16.3.4:41641",
             "169.254.1.1:41641",
@@ -822,8 +822,8 @@ mod tests {
     fn an_idle_peer_has_an_unknown_path_whatever_its_home_relay() {
         let st = parse_status(
             r#"{"BackendState":"Running","Peer":{
-              "a": {"HostName":"stuzha","Online":true,"Active":false,"CurAddr":"","Relay":"sfo"},
-              "b": {"HostName":"hermes","Online":true,"Active":true,"CurAddr":"","Relay":"tok"},
+              "a": {"HostName":"studio","Online":true,"Active":false,"CurAddr":"","Relay":"sfo"},
+              "b": {"HostName":"harbor","Online":true,"Active":true,"CurAddr":"","Relay":"tok"},
               "c": {"HostName":"office","Online":true,"Active":false,"CurAddr":"203.0.113.9:41641","Relay":"lax"},
               "d": {"HostName":"pc","Online":true,"Active":false,"CurAddr":"","Relay":"lax",
                     "PeerRelay":"100.64.0.40:40000:vni:17"}
@@ -1001,7 +1001,7 @@ mod tests {
         assert!(is_tailnet("100.127.255.254".parse().unwrap()));
         assert!(!is_tailnet("100.128.0.1".parse().unwrap()));
         assert!(!is_tailnet("192.168.1.2".parse().unwrap()));
-        assert!(is_tailnet_ip("100.111.100.57".parse().unwrap()));
+        assert!(is_tailnet_ip("100.64.0.57".parse().unwrap()));
         assert!(is_tailnet_ip("fd7a:115c:a1e0::9e2a:381c".parse().unwrap()));
         assert!(!is_tailnet_ip("8.8.8.8".parse().unwrap()));
         assert!(!is_tailnet_ip("2001:4860:4860::8888".parse().unwrap()));

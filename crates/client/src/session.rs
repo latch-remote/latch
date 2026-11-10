@@ -1241,13 +1241,10 @@ mod tests {
     #[test]
     fn a_saved_lan_address_is_not_taken_for_the_public_one() {
         let saved = |s: &str| saved_public(Some(&s.to_string()));
-        assert_eq!(
-            saved("116.125.113.36"),
-            Some("116.125.113.36".parse().unwrap())
-        );
-        assert_eq!(saved("192.168.55.57"), None);
+        assert_eq!(saved("203.0.113.36"), Some("203.0.113.36".parse().unwrap()));
+        assert_eq!(saved("192.168.1.57"), None);
         assert_eq!(saved("10.0.2.15"), None);
-        assert_eq!(saved("100.106.23.40"), None, "a Tailscale address");
+        assert_eq!(saved("100.64.0.40"), None, "a Tailscale address");
         assert_eq!(saved("not an address"), None);
         assert_eq!(saved_public(None), None);
     }
@@ -1308,18 +1305,18 @@ mod tests {
 
     #[test]
     fn a_machine_that_left_the_tailnet_a_month_ago_is_forgotten() {
-        let here = Some("daniel@example.com");
+        let here = Some("alex@example.com");
         let mut pcs = BTreeMap::new();
-        pcs.insert("hermes".to_string(), known(here, Some(90)));
-        pcs.insert("artemis".to_string(), known(None, Some(31)));
+        pcs.insert("harbor".to_string(), known(here, Some(90)));
+        pcs.insert("attic".to_string(), known(None, Some(31)));
         pcs.insert("recent".to_string(), known(here, Some(2)));
         pcs.insert("never-seen".to_string(), known(here, None));
         pcs.insert("work".to_string(), known(Some("work.example"), Some(400)));
-        // Hermes is listed (asleep for months, still on the tailnet); a
+        // Harbor is listed (asleep for months, still on the tailnet); a
         // relay listed by Tailscale but not among the PCs is listed too.
-        let listed: BTreeSet<String> = ["hermes", "relay"].map(String::from).into();
+        let listed: BTreeSet<String> = ["harbor", "relay"].map(String::from).into();
         let gone = retired(&pcs, &listed, here, NOW);
-        assert_eq!(gone, ["artemis", "never-seen"], "{gone:?}");
+        assert_eq!(gone, ["attic", "never-seen"], "{gone:?}");
         // Nothing listed, or nothing to say it is this tailnet: nothing goes.
         assert!(retired(&pcs, &BTreeSet::new(), here, NOW).is_empty());
         let elsewhere: BTreeSet<String> = ["someone-else"].map(String::from).into();
@@ -1330,17 +1327,17 @@ mod tests {
         );
         // A Tailscale that names no tailnet forgets only unmarked entries,
         // and only when a saved machine is listed.
-        assert_eq!(retired(&pcs, &listed, None, NOW), ["artemis"]);
+        assert_eq!(retired(&pcs, &listed, None, NOW), ["attic"]);
     }
 
     #[test]
     fn learning_marks_the_tailnet_and_a_failed_scan_forgets_nothing() {
         let mut cfg = ClientConfig::default();
-        cfg.pcs.insert("artemis".into(), known(None, Some(40)));
-        cfg.pcs.insert("hermes".into(), known(None, Some(1)));
-        let hermes = Pc {
-            node_id: "hermes".into(),
-            name: "Hermes".into(),
+        cfg.pcs.insert("attic".into(), known(None, Some(40)));
+        cfg.pcs.insert("harbor".into(), known(None, Some(1)));
+        let harbor = Pc {
+            node_id: "harbor".into(),
+            name: "Harbor".into(),
             ..Default::default()
         };
         // Tailscale down: the list is what was saved, and nothing changes.
@@ -1352,18 +1349,18 @@ mod tests {
         let before = cfg.clone();
         learn_into(&mut cfg, &down, NOW);
         assert_eq!(cfg, before);
-        // Tailscale up: Hermes is listed and marked; artemis is not.
+        // Tailscale up: Harbor is listed and marked; attic is not.
         let up = Discovery {
-            pcs: vec![hermes],
-            listed: Some(["hermes".to_string()].into()),
-            tailnet: Some("daniel@example.com".into()),
+            pcs: vec![harbor],
+            listed: Some(["harbor".to_string()].into()),
+            tailnet: Some("alex@example.com".into()),
             ..Default::default()
         };
         learn_into(&mut cfg, &up, NOW);
-        assert_eq!(cfg.pcs.keys().collect::<Vec<_>>(), ["hermes"]);
+        assert_eq!(cfg.pcs.keys().collect::<Vec<_>>(), ["harbor"]);
         assert_eq!(
-            cfg.pcs["hermes"].tailnet.as_deref(),
-            Some("daniel@example.com")
+            cfg.pcs["harbor"].tailnet.as_deref(),
+            Some("alex@example.com")
         );
     }
 
@@ -1514,7 +1511,7 @@ mod tests {
     fn a_target_carries_the_hosts_limits_and_os() {
         let pc = Pc {
             node_id: "n".into(),
-            name: "artemis".into(),
+            name: "attic".into(),
             os: "linux".into(),
             ip: Some("100.64.0.9".parse().unwrap()),
             online: true,

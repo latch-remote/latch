@@ -213,7 +213,7 @@ This is a compile check, not a linked Windows executable or native release run. 
 the PC (83 tests at the earlier validated revision, 9dda649). The #53 scratch edge
 harness passed 64 seeds; the wrap harness passed 65,560 frames. FFmpeg
 independently decoded eight seed streams plus the wrap stream, all exact.
-Scratch sources were reused temporarily and removed; [log](review53-scratch.txt).
+Scratch sources were reused temporarily and removed.
 
 Windows release compilation on the PC crashed in rustc, first with 0xc0000409
 and then invalid compiler metadata. A -j2 retry, -j1 retry and clean release
@@ -231,7 +231,7 @@ host was changed, and no remote reboot was attempted.
 
 Cleanup is deferred by the owner until the PC is reachable. Remove:
 
-- Build directory: `C:\Users\Daniel\dev\latch-rfi2` (including logs, dump
+- Build directory: `C:\Users\dev\dev\latch-rfi2` (including logs, dump
   files and any still-running cargo/rustc processes targeting that directory).
 - Scheduled task: `LatchTestRfiMF` (hidden hardware test launcher).
 - Firewall allow rule: `LatchTest rfi-vt-mf tests`.

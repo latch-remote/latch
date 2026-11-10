@@ -127,7 +127,7 @@ cargo test --release -p latch-engine --test transport_scenarios -- --nocapture
 cargo test --release -p latch-engine --lib congestion::tests::recovery -- --nocapture
 # Before: a worktree at 16ac72a with this steady_transport.rs, assertions removed;
 # main: the same with 9fe0ae9's crates/engine/src/congestion.rs.
-# Windows (C:\Users\Daniel\dev\latch-gfn-b2):
+# Windows (C:\Users\dev\dev\latch-gfn-b2):
 cargo test --release -p latch-stream --lib batch_receive_rearms
 ```
 
@@ -241,7 +241,7 @@ cargo build --locked --release -p latch-proto --example transport
 LATCH_UDP_OFFLOAD=0 target/release/examples/transport receive 127.0.0.1:47881
 LATCH_UDP_OFFLOAD=0 target/release/examples/transport send 127.0.0.1:47881 300 5 120
 # Linux: cross-build as below, scp to ~/gfn-b2/transport, run there.
-# Windows: C:\Users\Daniel\dev\latch-gfn-b2, cargo build as above;
+# Windows: C:\Users\dev\dev\latch-gfn-b2, cargo build as above;
 # set $env:LATCH_UDP_OFFLOAD='0' (then '1') in both PowerShell processes.
 # Tailnet: replace loopback destination with peer Tailscale IP; 50 Mbps.
 cargo test --locked --release -p latch-engine --test transport_scenarios -- --nocapture
@@ -386,11 +386,11 @@ target/release/examples/transport send 127.0.0.1:47881 300 5 120
 # Repeat with rates 1000 and 0 (unlimited), then the baseline binary.
 cargo zigbuild --release -p latch-proto --example transport --target aarch64-unknown-linux-gnu.2.39
 scp target/aarch64-unknown-linux-gnu/release/examples/transport linux:gfn-b/transport-after
-ssh linux '~/gfn-b/transport-after receive 0.0.0.0:47881 100.111.100.57:47881'
-target/release/examples/transport send 100.70.121.94:47881 50 5 120
+ssh linux '~/gfn-b/transport-after receive 0.0.0.0:47881 100.64.0.2:47881'
+target/release/examples/transport send 100.64.0.31:47881 50 5 120
 # Reverse, in separate shells; repeat at 100 and 300:
-target/release/examples/transport receive 0.0.0.0:47881 100.70.121.94:47881
-ssh linux '~/gfn-b/transport-after send 100.111.100.57:47881 50 5 120'
+target/release/examples/transport receive 0.0.0.0:47881 100.64.0.31:47881
+ssh linux '~/gfn-b/transport-after send 100.64.0.2:47881 50 5 120'
 cargo run --release --manifest-path /tmp/latch-gfn/b-baseline/Cargo.toml --example scenarios
 cargo test --release -p latch-engine --test transport_scenarios -- --nocapture
 cargo test --release -p latch-engine --test bottleneck -- --nocapture

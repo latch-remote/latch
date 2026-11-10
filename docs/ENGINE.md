@@ -1,36 +1,5 @@
 # The Latch 5 streaming engine
 
-### Viewer negotiation and decoder load
-
-Auto can rank colour before codec order when the host advertises
-`streamer.prefer_color` and the viewer opts in. HEVC currently carries ten-bit
-SDR and HDR10; other implemented codecs negotiate SDR8. Without opt-in the
-viewer's order is unchanged. Each encoder fallback refits width, height, FPS
-and bitrate from the original request, including software limits, and undoes
-and repeats desktop preparation for that geometry.
-
-The encoded decoder queue holds at most three pending frames; its age budget
-is three frame intervals clamped to 12–100 ms. Overflow still resets the
-reference chain and requests a keyframe. A rolling 60-service-time window
-reports overload when mean decode time exceeds the negotiated frame interval
-by 10%, once per attempt. Stats show decode p95 over each stats window and a
-local throughput estimate. This detection does **not** lower the host's FPS:
-users must lower FPS/size in Stream settings. Sustained overload can still
-cause repeated recovery. A negotiated session FPS control and safe capture/
-encoder retiming, with slow-decoder loopback evidence, remain required.
-
-Failures are scoped by remote address/port, codec, and failure kind: opening
-failures cool down for five minutes, runtime decode failures for 15 seconds.
-The next connection after expiry attempts the codec again; a running fallback
-session does not upgrade itself. A codec is tried only once per connection's
-fallback chain. Apply and reconnect clears cooldowns immediately. Baseline
-software decoding remains available. Hardware capability probes remain cached.
-
-Stats count UI-observed pictures, not scanout. Modelled delay adds
-host processing, half RTT, measured assembly/queue/decode/preparation and half
-refresh; GPU completion, compositor, panel response and scanout are unmeasured.
-
-
 Latch 4 shared a desktop through Sunshine (C++) and viewed it through
 moonlight-common-c (C), OpenH264 (C++) and libopus (C). Latch 5 does both
 in Rust, inside the one `latch-host` executable that already runs the
@@ -103,8 +72,10 @@ KeyframeRequest (fallback, older hosts) ────▶ next frame is IDR
 The viewer lists what it decodes; the host picks the first it can encode,
 then fits the request to that encoder (`video::Limits`, reported to
 viewers as `streamer.codecs`; see `docs/PROTOCOL.md`, "Encoder limits").
-Latch adds no ceiling of its own beyond the request range (16384 pixels a
-side, 500 fps, 1 Gbps): the codec's top level, the encoder's own limit
+The request ceilings in `crates/proto/src/control.rs` are 16384 pixels a
+side, 500 fps and 1 Gbps, above what current hardware delivers. A session
+is fitted to what the two machines' encoders, decoders and displays report.
+Other bounds include the codec's top level and the encoder's own limit
 where it has one (VideoToolbox, found by trying; NVENC and VA-API, as
 their drivers say), and on the software path the frame rate this CPU was
 measured to encode (`software::measure_fps`, held by the server through
@@ -129,17 +100,17 @@ the codec cools down for this host (five minutes for opening failures,
 decoder that gives nothing) breaks decoders on purpose to test this.
 Unknown codec names in an offer are skipped by protocol-1 hosts.
 
-Main10 input is supported by the platform decoders. Mac callers can choose
-P010 with `new_decoder_with_format`; its two 16-bit Metal planes retain ten
-bits. Sessions negotiate NV12/SDR8 or HEVC P010/ten-bit SDR/HDR. Windows accepts
-NV12 or P010 MFT output and preserves ten-bit samples for the renderer.
-With a D3D12 renderer on the same adapter, NV12 pictures use a bounded pool
-of shared D3D11 textures opened as wgpu plane views. A D3D11 fence completes
-the GPU copy before publication; the renderer retains each surface through
-GPU completion before the decoder can reuse it. Headless tools, P010, odd
-picture sizes, pool exhaustion and unsupported sharing use staging readback.
-A failed import disables sharing for subsequent pictures.
-Neither path negotiates HDR, tone maps, or changes the display's colour mode.
+Normal sessions offer ten-bit colour when the viewer GPU supports it and HDR
+when its display reports a peak luminance. HEVC Main10 retains P010 samples
+through decode and presentation. Mac uses native EDR presentation; Windows
+uses its native HDR10 presenter when available. The wgpu fallback tone maps
+HDR to SDR. See the HDR section below for negotiation and metadata.
+
+On Windows, NV12 pictures can use a bounded pool of shared D3D11 textures
+opened as D3D12/wgpu plane views on the same adapter. A fence completes the
+copy before publication; the renderer retains surfaces through GPU completion.
+P010 and unsupported sharing paths use staging readback, retaining ten-bit
+samples for the renderer. A failed import disables sharing for later pictures.
 
 The client requests `AutoNoVsync` and maximum frame latency 1, wakes egui on
 every published picture, and samples the newest `FrameSlot` in the paint
@@ -165,12 +136,14 @@ The software encoder is built for desktops, not films: a macroblock whose
 source pixels did not change since the last frame costs a skip and no
 search; changed macroblocks get a small motion search seeded by their
 neighbours and a scroll detector, and intra prediction. Rate control is a
-per-frame QP from a one-frame VBV, so a frame never takes much longer than
-its interval on the wire. Its hot loops (colour conversion, SAD, residual
+per-frame QP from a one-frame VBV, targeting a frame-sized wire budget;
+individual frames can exceed it. Its hot loops (colour conversion, SAD, residual
 reconstruction, deblocking) use NEON or SSE/AVX2 through `std::arch`, and
-a governor keeps each frame's encode under 65% of the frame interval by
-trading search effort, not frames, so a slow or busy host still sends
-every frame it was asked for. The Linux host hands it what X Damage says
+a governor targets 65% of the frame interval by reducing search effort.
+This cannot bound capture, memory contention or minimum encoding work.
+Software capacity measurement limits requested fps; the pacer resets after
+missed deadlines. Received, decoded, drawn and dropped frame counts show
+what the session actually achieves. The Linux host hands it what X Damage says
 changed: only those rectangles are read from the X server and converted
 (split across cores), and outside them macroblocks are skipped without
 being compared; the bitstream is the one a full comparison gives.
@@ -300,11 +273,11 @@ lets tests check audio bit for bit. Opus is gone.
   sound into a microphone without a driver, so the host plays it into a
   virtual cable's output (VB-CABLE, BlackHole, or the output named by
   `LATCH_MIC_DEVICE`) and programs record the cable's input.
-* **Measured glass to glass.** `LATCH_TEST_AUDIO=clicks[:period_ms]` on a
+* **Estimated capture-to-output timing.** `LATCH_TEST_AUDIO=clicks[:period_ms]` on a
   host replaces its sound with a click on every wall-clock quarter second,
   delivered a device period at a time; `LATCH_AUDIO_PROBE=1` on the viewer
-  notes when each click reaches the speaker (callback time plus the
-  device's own playback delay) and `view` reports them as
+  estimates when each click reaches output (callback time plus the
+  device's reported playback delay, assuming synchronized wall clocks) and `view` reports them as
   `audio_click_ms`. `LATCH_AUDIO_TRACE` on a Windows host logs loopback
   packet sizes and QPC ages.
 
@@ -335,12 +308,45 @@ the platform's own. None of this compiles C: ViGEmBus's IOCTL layouts are
 declared in Rust from its MIT-licensed headers, and evdev/uinput are ioctls
 through `libc`.
 
+### Viewer negotiation and decoder load
+
+Auto can rank colour before codec order when the host advertises
+`streamer.prefer_color` and the viewer opts in. HEVC currently carries ten-bit
+SDR and HDR10; other implemented codecs negotiate SDR8. Without opt-in the
+viewer's order is unchanged. Each encoder fallback refits width, height, FPS
+and bitrate from the original request, including software limits, and undoes
+and repeats desktop preparation for that geometry.
+
+The queue of encoded frames waiting for the decoder is bounded by age: three
+frame intervals, clamped to 12–100 ms. Up to eight frames may wait, so the
+burst a network stall releases is decoded rather than discarded. Past either
+bound the reference chain is reset and a keyframe requested. A rolling 60-service-time window
+reports overload when mean decode time exceeds the negotiated frame interval
+by 10%, once per attempt. Stats show decode p95 over each stats window and a
+local throughput estimate. This detection does **not** lower the host's frame rate:
+the viewer says what this machine manages and the person lowers the frame
+rate or size in Stream settings. Sustained overload can still cause repeated
+recovery; adapting the session by itself is on the [roadmap](ROADMAP.md).
+
+Failures are scoped by remote address/port, codec, and failure kind: opening
+failures cool down for five minutes, runtime decode failures for 15 seconds.
+The next connection after expiry attempts the codec again; a running fallback
+session does not upgrade itself. A codec is tried only once per connection's
+fallback chain. Apply and reconnect clears cooldowns immediately. Baseline
+software decoding remains available. Hardware capability probes remain cached.
+
+Stats count UI-observed pictures, not scanout. Modelled delay adds
+host processing, half RTT, measured assembly/queue/decode/preparation and half
+refresh; GPU completion, compositor, panel response and scanout are unmeasured.
+
 ## Decisions
 
-* **No pairing.** The control service's authorization (same Tailscale
-  account, or the tailnet of a tagged host) already guards `/v1/update`,
-  which replaces the executable. A stream needs no stronger check. The
-  session token travels inside WireGuard.
+* **No pairing.** The control service's authorization (the same Tailscale
+  user ID; for a tagged host, the tailnet's owner or its `allowed_logins`)
+  already guards `/v1/update`, which replaces the executable. A Windows
+  host also checks a pushed update against the SHA-256 GitHub publishes
+  for that release, so the sender cannot choose the bytes; there is no
+  publisher signature yet. The session token travels inside WireGuard.
 * **UDP + FEC + a recovery frame on loss**, as GeForce NOW does, keyframe
   where the encoder cannot, without RTSP, ENet or a second encryption layer.
   Input is reliable by redundancy, not timers.
@@ -427,6 +433,13 @@ ever sends datagram kinds 9–12 to a peer that does not know them.
 
 ## Evidence
 
+The 5.0 rewrite shipped on 2026-10-29, replacing the external streaming
+engine and viewer libraries with protocol 1 and the in-process Rust crates.
+The [dated evidence](measurements/2026-10-29/) records conformance,
+encoder comparisons and short loopback/tailnet runs. Those results apply
+to the recorded revisions, hardware and content, not all desktops or
+hours-long sessions. Current codec and native-build checks live in CI.
+
 What shows the engine is right, other than its authors:
 
 * the ITU-T H.264.1 conformance bitstreams: the decoder's output must equal
@@ -438,7 +451,7 @@ What shows the engine is right, other than its authors:
 * bit-exact audio through the whole pipeline;
 * the impairment simulator (loss, bursts, reordering, duplication, delay)
   for the transport, and measured loss on the real campus Wi-Fi path;
-* input-to-photon timing measured on the viewer's own clock: the viewer
+* input-to-decoded-picture timing measured on the viewer's own clock: the viewer
   presses a key, a pattern on the host changes colour, the viewer times
   until it decodes the change;
 * CPU, memory and energy of host and viewer, measured against Latch 4 at
@@ -452,7 +465,9 @@ is inside the interval; a deadline missed by a whole interval resets the grid to
 actual capture time, without catch-up trains (`video::Pacer`). Idle repeats remain bounded at 100 ms.
 Encoding feeds a two-frame bounded channel to a dedicated video sender;
 backpressure preserves encoded references. When pacing is active, the producer
-waits for outstanding sends before capturing the next picture. This bounds
+does not capture the next picture while an encoded frame is already queued
+behind the one being sent (`PACED_BACKLOG`), so one frame can be encoded
+while the previous one leaves. This bounds
 encoded backlog without dropping P references or generating extra recovery IDRs;
 a large keyframe still takes its unavoidable wire serialization time. Clean
 paths retain the two-frame overlap. Cancellation may discard queued
@@ -489,8 +504,15 @@ queue delay or lossy delivery deficit to lower the target to 90% of the
 faster train. An ordinary ping immediately behind each burst independently
 measures its FIFO delay, relative to baseline RTT and learned ping jitter.
 It does not pollute the minimum-RTT samples. Without corroboration only
-resume pacing changes: 105% of a measured rate, or 1/20 of the budget when
-unknown. Lossless delivery filling that pace validates 25% increases once
+resume pacing changes: 105% of a measured rate, and not under 125% of the
+best rate received in a window of the last second. When no train has been
+measured the pace is a guess: the larger of 1/20 of the budget and twice the
+best rate the viewer reported receiving in any window of the last second. A
+stream can move at under half its budget, and its own frames then cancel the
+trains that would have measured the path, so what it delivers is the only
+evidence there is. A guess rises with delivery and is replaced, upwards too,
+by the first train measured after it. Lossless delivery filling the pace
+validates 25% increases once
 per feedback horizon. A fresh fast train removes this limit; later fast
 trains restore confirmed cuts. An older viewer gets no probes or limit.
 
@@ -582,8 +604,10 @@ macOS receives up to 32 with `recvmsg_x`; sends retain `send_to`, since Darwin's
 batch-send API disallows destination addresses on the shared unconnected socket.
 Batch storage is reused, and data flushes before parity computation. Batches
 never wait to fill. Unsupported batch receive syscalls fall back to scalar I/O
-on the nonblocking media socket. Windows retains its existing scalar socket
-path; USO/URO and Linux UDP GSO/GRO are not implemented here. Protocol 1 retains
+on the nonblocking media socket. Windows retains a scalar socket
+fallback. Windows supports USO/URO and Linux supports UDP GSO/GRO,
+with ordinary batch/scalar I/O when unsupported. Set `LATCH_UDP_OFFLOAD=0`
+to disable segmentation and receive coalescing. Protocol 1 retains
 the 1200-byte datagram limit; route MTU discovery/negotiation remains outstanding.
 
 Host and viewer UDP request 8 MiB in both directions through the one
@@ -599,7 +623,7 @@ frames on the batch path are handed to decode after each datagram, before
 processing the rest of the batch or waiting for readiness: waiting at the
 end of a receive batch held each complete picture until the next datagram. Video
 shard storage is reused with a 4096-buffer pool cap. Decode queues are
-bounded by three frames and three frame intervals (12–100 ms) of age; exceeding either restarts at an
+bounded by eight frames and three frame intervals (12–100 ms) of age; exceeding either restarts at an
 IDR rather than decoding an increasing backlog. A missing initial IDR
 triggers recovery on the first complete P-frame, or after 500 ms without
 a delivered keyframe. Requests retry at max(50 ms, RTT), and at once when

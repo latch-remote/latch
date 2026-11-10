@@ -1,146 +1,161 @@
-# Contributing
+# Contributing to Latch
+
+Thanks for looking. Latch is a young project with a small set of test
+machines, so the most useful contributions are often not code: a bug
+report with the stats overlay's numbers, or a measurement from a GPU the
+project has never run on (any NVIDIA or Intel GPU on Windows, any GPU at
+all on Linux, an HDR monitor), moves it further than most patches.
+
+- **Questions and ideas:** [Discussions](https://github.com/MrBeldum/latch/discussions).
+- **Bugs:** an [issue](https://github.com/MrBeldum/latch/issues/new/choose).
+- **Security problems:** privately, as [SECURITY.md](SECURITY.md) says.
+- **Code:** read on.
+
+Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## Building
 
-Rust stable. No C compiler or CMake is required; Latch 5 uses a pure-Rust
-engine and codecs.
+Rust stable (`rust-toolchain.toml` selects it) and the platform's linker.
+No C compiler, CMake or system library is compiled in: the engine and the
+codecs are Rust, and `scripts/audit-native.sh` fails CI if a dependency
+brings C, C++ or assembler into the build.
 
-```powershell
-cargo fmt --all
+| OS | Needs |
+|----|-------|
+| macOS 13+ (Apple Silicon) | Xcode command line tools |
+| Windows 10/11 x64 | Visual Studio Build Tools (MSVC) |
+| Linux (X11) | `sudo apt-get install pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev` |
+
+```bash
+cargo run -p latch-host                 # the app, as a debug build
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-`LATCH_SKIP_C=1` skips the C build for a quick cross-target check, for
-example `LATCH_SKIP_C=1 cargo check -p latch-client --target
-aarch64-apple-darwin` from Windows after `rustup target add`.
-
-`cargo test` and `cargo run` keep Latch's settings, pairing identity and
-logs in `target/latch-data` (`.cargo/config.toml` sets
-`LATCH_DATA_DIR`), so neither touches an installed Latch's files. To
-point a development build at an installed one's data on purpose, set
-`LATCH_DATA_DIR` yourself, for example to `%LOCALAPPDATA%\Latch` on
-the development PC before `cargo run -p latch-host -- --background`.
+`cargo test` and `cargo run` keep settings and logs in `target/latch-data`
+(`.cargo/config.toml` sets `LATCH_DATA_DIR`), apart from an installed
+Latch's. That separates the files, not the machine: `cargo run -p
+latch-host` is still the real app. It starts a background service on port
+47850 if none is running, and its Sharing tab can register a login item or
+change system settings when you ask it to. To exercise streaming without
+any of that, use the loopback tools below. Some engine integration tests
+stream through an emulated bad network and take a few minutes; a few
+codec tests compare against FFmpeg and the ITU conformance streams
+(`scripts/fetch-h264-conformance.sh`) and skip quietly when those are not
+there.
 
 ## Where things live
 
-- `crates/proto`: wire format, Reed–Solomon FEC, packetizer, input
-  reliability, and control framing.
-- `crates/codec`: pure-Rust H.264 Constrained Baseline encoder/decoder and
-  `lpcm-rice` audio codec.
-- `crates/engine`: capture, hardware/software encode, display sizing, and
-  the host streaming server.
-- `crates/stream`: viewer session, decoders (VideoToolbox, Media Foundation,
-  `latch-codec`), and audio playback.
-- `crates/client`: the viewer UI (a library plus `latch-client`).
-  `session.rs` is the path from a listed machine to a live stream;
-  `stream.rs` is the toolbar and input while streaming; `video.rs` draws
-  frames with wgpu.
-- `crates/host`: the node (`latch-host`): control service, engine setup,
-  and the unified window that both views other machines and shares this
-  one. Windows administrator work stays in the generated setup script in
-  `setup.rs`. macOS/Linux setup is `unix_setup.rs`.
-- `crates/core`: the control API, a small HTTP client and server, the
-  Tailscale CLI wrapper and wake packets.
-- `crates/ui`: one palette, one typeface, one set of cards, rows, pills and
-  buttons. New visual elements go there rather than inline.
+| Crate | What is in it |
+|-------|---------------|
+| `crates/proto` | The wire format: datagram kinds, Reed–Solomon FEC, packetizer and reassembler, input reliability, control framing. No I/O. |
+| `crates/codec` | The software H.264 encoder and decoder and the `lpcm-rice` audio codec. |
+| `crates/engine` | The sharing side: capture, hardware and software encode, display sizing, audio capture, input injection, congestion control, and the session server. One directory per OS (`mac/`, `windows/`, `linux/`). |
+| `crates/stream` | The viewing side: session, receive loop, decoders (VideoToolbox, Media Foundation, `latch-codec`), audio playback, gamepads. |
+| `crates/client` | The viewer UI. `session.rs` is the path from a listed machine to a live stream, `stream.rs` the toolbar and input while streaming, `video.rs` the wgpu presenter. |
+| `crates/host` | The app (`latch-host`): control service, setup and uninstall, updates, and the window that both lists machines and shares this one. Windows administrator work is the generated script in `setup.rs`; macOS and Linux setup is `unix_setup.rs`. |
+| `crates/core` | The control API types, a small HTTP client and server, the Tailscale CLI wrapper, wake packets, config files. |
+| `crates/ui` | One palette, one typeface, one set of cards, rows, pills and buttons. |
 
-The control API (`crates/core/src/api.rs`) is read by older clients and
-hosts at times: new JSON fields get `#[serde(default)]` and existing ones
-keep their meaning.
+[docs/ENGINE.md](docs/ENGINE.md) explains the design stage by stage and
+[docs/PROTOCOL.md](docs/PROTOCOL.md) the wire format.
 
-## Seeing the UI without a Mac or a PC
+Two compatibility rules:
+
+- **The control API** (`crates/core/src/api.rs`) is read by older hosts and
+  viewers. New JSON fields get `#[serde(default)]`; existing ones keep
+  their meaning.
+- **The stream protocol** is version 1, and everything added since is
+  negotiated inside it. A new datagram kind or field must be ignored by,
+  and never sent to, a peer that did not offer it, and PROTOCOL.md says
+  what it is.
+
+Names from before the project was called Latch live only in
+`crates/core/src/legacy.rs` and `crates/host/src/legacy.rs`, which exist
+to migrate old installs.
+
+## Streaming without a second machine
+
+Two example programs are a host and a viewer with no window, no service
+and no Tailscale check. Run them on loopback (never on a port other
+people can reach: `serve` skips the identity check):
+
+```bash
+# a host streaming a synthetic desktop on 127.0.0.1:47860
+LATCH_TEST_PATTERN=sweep cargo run --release -p latch-engine --example serve
+
+# a viewer that decodes for ten seconds and prints fps, bitrate and latency as JSON
+cargo run --release -p latch-stream --example view -- 127.0.0.1 \
+  --width 1920 --height 1080 --fps 120 --kbps 50000 --seconds 10 --hevc
+```
+
+Without `LATCH_TEST_PATTERN`, `serve` captures the real screen (macOS
+asks for Screen Recording). `view --keys 20` measures input-to-picture
+latency against the pattern. Both list their options at the top of
+`crates/engine/examples/serve.rs` and `crates/stream/examples/view.rs`.
+
+`cargo run --release -p latch-engine --example pipeline_bench` runs the
+host's capture-convert-encode pipeline with no network and prints
+per-stage times; `cargo run --release -p latch-stream --example
+stream_decode_bench` does the same for a decoder.
+
+## Seeing the UI
 
 ```bash
 cargo test -p latch-client -p latch-host snapshots -- --ignored
 ```
 
 renders every screen to `target/ui-snapshots/*.png`: each state of the
-machine list, Settings, the Sharing page and the stream overlay at the
-minimum window (640×420), a typical one (1280×800) and a large one
-(1920×1200), at 1× and 2× (`client-lobby-1280x800@2x.png`); `*-full.png`
-show whole scrolling pages. The window is built headless with default
-settings, so nothing reads or writes your real configuration. The same
-states run unignored, checking that nothing runs past the window and no
-two controls overlap, at the minimum and the large size.
+machine list, Settings, the Sharing page and the stream toolbar, at the
+smallest window (640×420), a typical one and a large one, at 1× and 2×.
+It needs a GPU but no second machine and no real configuration. The same
+states run in the ordinary test suite as layout checks: nothing may run
+past the window and no two controls may overlap.
 
-Every colour, size and distance comes from `crates/ui/src/theme.rs`, and
-every control from `crates/ui/src/widgets.rs`; a screen that needs
-something new adds it there, with accesskit info and a focus ring.
+Every colour, size and distance comes from `crates/ui/src/theme.rs` and
+every control from `crates/ui/src/widgets.rs`. A screen that needs
+something new adds it there, with an accessible name and a focus ring.
 
-## Tests against a real Sunshine
+## Tests that need hardware
 
-With Sunshine running on the development PC and Latch Host's service
-started (`cargo run -p latch-host -- --background`, pointed at the
-installed data directory as above so it has the engine login):
+Tests marked `#[ignore]` need something CI does not have: a GPU, a
+specific encoder, a real display. Their names say what
+(`hardware_amf`, `benchmark_mac_encoder`, `hdr10_child_window_…`), and
 
 ```bash
-cargo test -p latch-stream pair_real -- --ignored --nocapture     # five-phase pairing
-cargo test -p latch-stream stream_real -- --ignored --nocapture   # ten seconds of video
-LATCH_DEV_LOCAL=1 cargo test -p latch-client stream_snapshot -- --ignored --nocapture
-cargo test -p latch-client wake_test_real -- --ignored            # wake packet round trip
+cargo test -p latch-engine hardware_ -- --ignored --nocapture
 ```
 
-`LATCH_DEV_LOCAL=1` also makes the client app list this PC at 127.0.0.1,
-so `cargo run -p latch-client` on Windows streams the PC to itself for
-trying the toolbar and input.
+runs the ones for the machine you are on. If you have hardware the
+project has not seen, the output of these is worth an issue on its own.
 
-The Windows client decodes with OpenH264 in software; that path exists for
-development only. The Mac path (VideoToolbox) is the one that ships.
+## Pull requests
 
-On a Mac, the snapshot test can use an already saved PC and its existing
-pairing. It verifies decoded video, renders the stream, and disconnects:
+- Branch from `main`; keep a pull request to one subject.
+- `cargo fmt`, `cargo clippy` and `cargo test`, as written under
+  [Building](#building), pass on your OS at least. CI runs them on macOS,
+  Windows and Linux (x64 and arm64).
+- **Say how you checked it**, and what you could not check. "Not run on
+  Windows hardware" is a normal and welcome sentence here; a claim nobody
+  measured is not.
+- **Performance changes come with numbers**: before and after, the
+  machine, and the command, so someone else can repeat it.
+  [docs/PERFORMANCE.md](docs/PERFORMANCE.md) shows the form.
+- Anything a user would notice gets a line under `## Unreleased` at the
+  top of [CHANGELOG.md](CHANGELOG.md); add the heading if the last release
+  closed it.
+- Documentation states what is true of the code in the same pull request.
+  Describe what Latch does and what was verified; leave out what it might
+  do one day.
 
-```bash
-LATCH_TEST_PC='Gaming-PC' cargo test -p latch-client stream_snapshot -- --ignored --nocapture
-cargo test -p latch-client decoded_frame_reaches -- --ignored
-```
+By contributing you agree that your work is licensed under
+GPL-3.0-or-later, like the rest of Latch.
 
-`stream_real` streams from another machine too: `LATCH_TEST_IP` is its
-Tailscale address, `LATCH_TEST_DIR` a directory holding copies of the files in the
-Mac's `identity/` directory and the PC's certificate as `server.der`, and
-`LATCH_TEST_WIDTH`, `_HEIGHT`, `_FPS`, `_BITRATE_KBPS`, `_SECONDS` and
-`LATCH_TEST_HEVC=1` shape the stream.
+## Releases
 
-`LATCH_TEST_CODEC=h264` or `hevc` selects the codec. A black capture fails
-the live test by default; `LATCH_TEST_EXPECT_BLACK=1` instead verifies the
-persistent black-picture diagnosis when testing a PC without an active
-display. The GPU test uses a synthetic NV12 image to check that the picture
-is drawn with the correct orientation and range and retained between frames.
-
-## Rust engine rewrite evidence
-
-The [rewrite brief](docs/RUST_REWRITE_PROMPT.md) defines the Rust/native
-boundary and release gates. The [execution record](docs/RUST_REWRITE_STATUS.md)
-distinguishes completed preparation from the unfinished engine replacement.
-
-The decoder component baseline needs no host, pairing or screen capture:
-
-```bash
-cargo test --locked -p latch-stream --example stream_decode_bench
-cargo build --locked --release -p latch-stream --example stream_decode_bench
-target/release/examples/decode_bench --warmup 30 --iterations 300 > decode.json
-```
-
-On Windows the executable ends in `.exe`. Add `--require-hardware` to fail
-unless every decode uses the initialized hardware backend. Windows/Linux
-currently use OpenH264, so that gate is expected to fail there. A backend
-change during warmup or measurement also fails rather than mixing results.
-
-The default is the 64×64 bars fixture: its visible pixel samples are checked
-on every measured frame. `--fixture path/to/frame.h264` accepts a single
-Annex B H.264 IDR slice with SPS and PPS (at most 32 MiB), not a container,
-multi-frame video, multi-slice picture or packet capture. A custom fixture
-gets plane validation and a null pixel-oracle result. Collect a representative
-access unit separately for resolution-specific measurements.
-
-JSON includes the fixture hash, actual decoder, configuration, ordered raw
-decode timings and nearest-rank p50/p95/p99. Decode time includes the
-decoder's CPU output copy; total loop time also includes validation. Output
-plane byte counts are not GPU transfer measurements. Neither result measures
-capture, encoding, network, audio, presentation or input-to-display latency.
-Record revision/diff, hardware, OS/driver and power state beside each run.
-
-CI runs `cargo test --locked --workspace --all-targets`, including the
-example's deterministic checks. Live and hardware performance gates still
-require the appropriate machines and explicit runs.
+Maintainers cut a release by bumping `version` in `Cargo.toml`, dating the
+changelog section, and pushing a `v*` tag. `.github/workflows/release.yml`
+tests, builds and publishes the macOS, Windows and Linux archives with
+their SHA-256 digests. Installed Mac and Windows copies update themselves
+from there; Linux hosts show a notice.

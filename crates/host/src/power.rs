@@ -198,7 +198,7 @@ fn linux_kind(systemd: bool, container: bool, vm: bool) -> Kind {
 /// Why `name`, a machine of `kind`, will not do `action` for another
 /// machine; `None` when it will. Sleep is refused where nothing can wake
 /// the machine again: it would drop off the tailnet until someone reached
-/// it by hand (stuzha, an OCI VM in s2idle, would need the cloud console).
+/// it by hand (a cloud VM in s2idle would need the provider's console).
 /// Shut down stays: the owner allowed it, and the Mac asks first.
 pub fn refusal(kind: Kind, action: PowerAction, name: &str) -> Option<String> {
     match (kind, action) {
@@ -411,10 +411,10 @@ mod tests {
         use PowerAction::*;
         assert!(refusal(Kind::Pc, Sleep, "PC").is_none());
         assert!(refusal(Kind::Linux, Sleep, "box").is_none());
-        let vm = refusal(Kind::LinuxVm, Sleep, "stuzha").unwrap();
-        assert!(vm.contains("stuzha is a virtual machine"), "{vm}");
-        assert!(refusal(Kind::LinuxVm, Restart, "stuzha").is_none());
-        assert!(refusal(Kind::LinuxVm, Shutdown, "stuzha").is_none());
+        let vm = refusal(Kind::LinuxVm, Sleep, "studio").unwrap();
+        assert!(vm.contains("studio is a virtual machine"), "{vm}");
+        assert!(refusal(Kind::LinuxVm, Restart, "studio").is_none());
+        assert!(refusal(Kind::LinuxVm, Shutdown, "studio").is_none());
         assert!(refusal(Kind::Mac, Sleep, "MacBook").is_some());
         assert!(refusal(Kind::Mac, Restart, "MacBook").is_none());
         for a in [Sleep, Restart, Shutdown] {

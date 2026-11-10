@@ -1,107 +1,155 @@
-# Native desktop on the relay VPS
+# Native Linux desktop
 
-The deployed `relay` desktop runs directly on Ubuntu as user `ubuntu`, not in
-Docker. The four remaining containers provide the Tailscale peer relay and the
-three website services. Tailscale identity and streaming pairing were preserved
-when retiring `latch-node` on 2026-09-21 UTC.
+This guide installs a headless X11 desktop on a fresh Ubuntu 24.04 machine,
+x64 or arm64, with a normal user who can run `sudo`. Releases require glibc
+2.39 or later. Run the commands as that user, including over SSH. Do not
+run the desktop as root. Wayland capture is not supported yet.
 
-## Runtime
+## Install Tailscale
 
-- Xvfb provides a headless 1920x1080 display on `:1`; XFCE runs on the VPS host.
-- `latch-host` runs the streaming engine in-process, capturing X11 and encoding
-  H.264 in software via `latch-codec`. No external engine package is required.
-- `/usr/local/bin/latch-host` runs the Latch control service.
-- `/usr/local/bin/tailscale` is the CLI only. It uses the existing relay
-  container's socket at `/var/run/tailscale/tailscaled.sock`; no second daemon
-  or Tailscale identity is installed on the host.
-- `ubuntu` has systemd lingering enabled so the desktop starts without SSH login
-  and keeps running after one ends; `migrate-legacy.sh` turns it on.
-- The host name is `relay`; cloud-init is configured to preserve it.
-
-## Files and services
-
-The `.service` files in this directory are installed in
-`~/.config/systemd/user/`. Latch maintains its own `latch.service` base unit;
-`latch.service.d/desktop.conf` adds the display environment and engine startup
-ordering without conflicting with Latch's automatic registration.
-`wait-engine.py` is installed as `/usr/local/libexec/latch-wait-engine.py`.
-
-`latch-display.service` carries `CPUWeight=1000` so the X server gets prioritized
-CPU share on a small VPS. `latch.service` runs the streaming engine in-process
-with display environment from `latch.service.d/desktop.conf`, pulling in
-`latch-desktop.service` and `latch-display.service`. PulseAudio runs as its standard
-user service. Check them as `ubuntu`:
+Install the Ubuntu 24.04 repository key and package list, then the daemon
+and CLI. These are downloaded files, not a script piped into a root shell:
 
 ```sh
-systemctl --user status latch latch-desktop latch-display
-journalctl --user -u latch -n 50
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg
+curl -fsSLo /tmp/tailscale-keyring.gpg https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg
+curl -fsSLo /tmp/tailscale.list https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list
+sudo install -m 0644 /tmp/tailscale-keyring.gpg /usr/share/keyrings/tailscale-archive-keyring.gpg
+sudo install -m 0644 /tmp/tailscale.list /etc/apt/sources.list.d/tailscale.list
+sudo apt-get update
+sudo apt-get install -y tailscale
+sudo systemctl enable --now tailscaled
+sudo tailscale up
+tailscale status
 ```
 
-Latch's host configuration lives in `~/.local/share/latch/host.toml`.
-Legacy Sunshine configurations and `latch-engine.service` are removed by
-`migrate-legacy.sh` and `latch-host --setup`.
+Follow the printed login URL and sign in with the same account as the
+viewing machine. Tailnet policy must allow TCP and UDP 47850 between them.
+An untagged host answers only devices signed in to its own Tailscale
+account. A tagged host has no account: on a personal tailnet it answers
+the tailnet's owner, and on an organisation's tailnet only the logins
+listed in `allowed_logins` in `host.toml`
+(`allowed_logins = ["you@example.com"]`); with none listed it answers
+nobody. Prefer an untagged personal host and restrict reachability with
+Tailscale policy. A fresh install uses the native daemon, not a relay
+container's socket. Do not run two daemons against the same identity.
 
-The X server disables TCP and uses an authentication cookie in
-`/run/user/1001/latch.Xauthority`. Mouse and keyboard input are injected
-directly via XTest.
-
-## Installing and updating latch-host
-
-Releases publish the Linux host as `latch-host-linux-arm64.tar.gz` and
-`latch-host-linux-x64.tar.gz`, each with a `.sha256` beside it. They are built
-and tested on Ubuntu 24.04 by the release workflow, so they need glibc 2.39
-or later. The Mac pushes updates to Windows hosts only; a Linux host is
-updated by installing the next release the same way:
+## Install runtime packages
 
 ```sh
-tag=vX.Y.Z    # the release to install
-arch=arm64    # or x64
-base=https://github.com/MrBeldum/latch/releases/download/$tag
-curl -fLO "$base/latch-host-linux-$arch.tar.gz"
-curl -fLO "$base/latch-host-linux-$arch.tar.gz.sha256"
-sha256sum -c "latch-host-linux-$arch.tar.gz.sha256"
-tar xzf "latch-host-linux-$arch.tar.gz"
-sudo install -m 0755 "latch-host-linux-$arch/latch-host" /usr/local/bin/latch-host
-systemctl --user restart latch.service
+sudo apt-get install -y --no-install-recommends \
+  sudo systemd dbus-user-session dbus-x11 \
+  xvfb xauth x11-utils util-linux xfce4 xfce4-terminal \
+  pulseaudio libasound2t64 \
+  libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libvulkan1 libgl1 libegl1 \
+  libxrandr2 libxi6 libxcursor1 libx11-xcb1 \
+  libxcb-render0 libxcb-shape0 libxcb-xfixes0
 ```
 
-The archive also carries this directory as `native/`. Re-running
-`migrate-legacy.sh` from it (safe twice) reinstalls the units and
-reloads systemd, which is how a change to them (such as the desktop's
-restart policy) reaches a running node without restarting anything.
+Xvfb provides display `:1` at 1920×1080. XFCE supplies the desktop;
+PulseAudio runs as a user service. X11 capture and software H.264 need no
+GPU. Optional NVENC/VA-API encoding needs the appropriate GPU and drivers
+and remains unverified on physical Linux hardware. Linux viewers currently
+use software H.264 decode.
 
-## A desktop that takes the viewer's size
+## Download and verify
 
-Xvfb cannot change size. Latch captures the relay desktop at its native
-1920x1080 and scales into the negotiated stream size in its CPU colour
-conversion pass, including when feeding NVENC or VA-API. Different aspect
-ratios use centred black bars, with pointer input mapped into the desktop
-content. A smaller request reduces the encoded picture without changing
-Xvfb's desktop size. Software conversion and encoding retain the conservative
-four-worker cap (two on a two-CPU quota) pending the documented worker sweep.
-An X server that
-can resize (Xorg with the dummy driver) can instead switch to each stream's
-size: give Sunshine a `global_prep_cmd` that runs `xrandr` with
-`SUNSHINE_CLIENT_WIDTH` and `SUNSHINE_CLIENT_HEIGHT`, and set
-`LATCH_DISPLAY_FOLLOWS_VIEWER=1` in `latch.service.d/desktop.conf` so Latch
-Host stops reporting a fixed capture size. Use a mode at 60 Hz for every size
-(`xrandr --newmode` with a pixel clock of 60 x htotal x vtotal): the
-compositor and browsers draw at the mode's rate.
+Choose a published tag from [Releases](https://github.com/MrBeldum/latch/releases).
+Replace `vX.Y.Z` below. The archive includes the binary and this native kit.
 
-In Latch 5, prep commands are specified in `host.toml` (`prep_do` / `prep_undo`)
-and executed per session with `LATCH_CLIENT_WIDTH`, `LATCH_CLIENT_HEIGHT`, and
-`LATCH_CLIENT_FPS` in the environment. Any existing Sunshine `global_prep_cmd`
-is imported automatically during setup.
+```sh
+tag=vX.Y.Z
+case "$(uname -m)" in
+  x86_64) arch=x64 ;;
+  aarch64) arch=arm64 ;;
+  *) echo 'Unsupported architecture'; exit 1 ;;
+esac
+base="https://github.com/MrBeldum/latch/releases/download/$tag"
+name="latch-host-linux-$arch"
+curl -fLO "$base/$name.tar.gz"
+curl -fLO "$base/$name.tar.gz.sha256"
+sha256sum -c "$name.tar.gz.sha256"
+tar xzf "$name.tar.gz"
+cd "$name"
+```
+
+Stop if checksum verification fails. The checksum comes from the same
+GitHub release as the binary; it checks integrity, not independent
+publisher provenance.
+
+## Headless server
+
+The installer prints its actions, installs the binary and user units,
+enables lingering so they survive logout, and starts the stack:
+
+```sh
+bash native/install.sh "$PWD/latch-host"
+systemctl --user --no-pager status latch-display.service latch-desktop.service latch.service
+journalctl --user -u latch -u latch-desktop -u latch-display -n 80
+```
+
+It is safe to repeat; it replaces the shipped headless units and drop-in.
+Save local unit customizations before upgrading. `--install-only` installs
+files without enabling lingering or touching running services. If
+`systemctl --user` cannot connect to the bus, log out and back in through
+SSH after installing `dbus-user-session`; do not substitute `sudo systemctl`.
+Check lingering with `loginctl show-user "$USER" -p Linger`.
+
+The display disables TCP and uses a cookie at `%t/latch.Xauthority`
+(`%t` is the user's runtime directory). Input uses XTest. The host runs
+capture and encoding in-process; no separate streaming engine is installed.
+
+On another machine, install Latch, sign in to Tailscale with the same
+account, open **Machines**, select this server and click **Connect**. Check
+that XFCE appears and that pointer and keyboard input work, then disconnect.
+A healthy unit alone does not prove a stream. If the server is missing,
+check `tailscale status`, account identity, tailnet policy and the journal.
+Do not expose 47850 publicly to diagnose it.
+
+## Existing X11 desktop
+
+For a signed-in X11 desktop, install the runtime packages, then install
+only the binary and run it in that desktop's terminal:
+
+```sh
+sudo install -m 0755 latch-host /usr/local/bin/latch-host
+latch-host
+```
+
+Use the **Sharing** tab for setup. Do not install the headless units: they
+capture their own virtual desktop rather than your existing session.
+Wayland sessions are not supported, even if Xwayland is present.
+
+## Updates and old installations
+
+Linux has no in-app binary updater. Download and verify the next release,
+then repeat the headless installer, or replace the binary and restart
+Latch in your existing X11 session. The installer restarts the headless
+host, ending any active stream.
+
+`migrate-legacy.sh` is only for upgrades from pre-4.1 BroLink unit names or
+Latch 4's separate engine service. Install the runtime prerequisites and
+new binary first, then run it as the desktop user. It preserves existing
+display units and imports legacy prep commands. Settings and Tailscale
+identity can survive an upgrade; Latch 5 does not use the old streaming
+pairing credentials.
+
+## Display sizing
+
+Xvfb's desktop stays at 1920×1080. A stream of another size is scaled from
+it, with black bars when the shape differs.
+With a resizable Xorg display, `host.toml` can set `prep_do` and `prep_undo`
+to a display script. It receives `LATCH_CLIENT_WIDTH`, `LATCH_CLIENT_HEIGHT`
+and `LATCH_CLIENT_FPS`. Set `LATCH_DISPLAY_FOLLOWS_VIEWER=1` in the service
+environment only when that script can actually resize the display.
+Configuration lives in `~/.local/share/latch/host.toml`.
 
 ## Gamepads
 
-A viewer's gamepads become Xbox 360 pads made through `/dev/uinput`, which
-games, SDL and Steam read like a pad the `xpad` driver made; the game's
-rumble goes back to the viewer. Creating them needs write access to
-`/dev/uinput`, which Ubuntu gives only to root and the `input` group.
-Without it the stream works and the viewer's toolbar says the host takes no
-gamepads, with the reason. Rather than adding the user to `input` (which
-also lets it read every keyboard), give one group the device:
+Linux gamepads need write access to `/dev/uinput`. Without it, streaming
+still works but the toolbar explains why the host takes no gamepads.
+A dedicated group avoids granting access to all keyboard devices:
 
 ```sh
 sudo groupadd -f latch-pads
@@ -109,37 +157,10 @@ sudo usermod -aG latch-pads "$USER"
 echo 'KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="latch-pads", MODE="0660", OPTIONS+="static_node=uinput"' |
   sudo tee /etc/udev/rules.d/60-latch-uinput.rules
 sudo modprobe uinput
-sudo udevadm control --reload && sudo udevadm trigger --name-match=uinput
-systemctl --user restart latch.service   # after signing in again, for the group
+sudo udevadm control --reload
+sudo udevadm trigger --name-match=uinput
 ```
 
-On a desktop with a seat, `TAG+="uaccess"` instead of the group gives the
-signed-in user the device (Steam's rule does that). The pads Latch makes
-are readable by the desktop's user as any pad is.
-
-## Upgrading from versions before 4.1.0
-
-Nodes set up before 4.1.0 use earlier names for their services, host binary,
-display cookie and data folder. `migrate-legacy.sh` in this directory swaps
-the units, cookie name and wait script for the current ones and starts
-Latch. On its first run, `latch-host` moves the data folder and the engine's
-login file, keeping the pairing and Tailscale identity.
-
-```sh
-sudo install -m 0755 latch-host /usr/local/bin/latch-host
-bash migrate-legacy.sh
-```
-
-## Migration and recovery
-
-The old container's complete `.config` and `.local` directories are saved in
-`/home/ubuntu/latch-native-migration/container-backup/` with private permissions.
-They contain pairing credentials; do not commit or publish them.
-The original Docker recipe remains available in `deploy/node/` for other uses,
-but it must not be started on this VPS alongside the native services because
-both would claim the same streaming and control ports.
-
-Verified through the installed Mac Latch app: existing pairing, 1080p/60 H.264
-video, mouse clicks, terminal keyboard input, host identity (`relay`, `ubuntu`,
-`kvm`, `/home/ubuntu`), and clean disconnect. User-manager restart is checked to
-verify automatic startup without rebooting the websites or packet relay.
+Sign out and back in for group membership. A lingering user manager may
+retain its old groups until it is restarted; arrange this outside a stream.
+The viewer's pads appear as Xbox 360 pads, with rumble sent back.

@@ -13,7 +13,7 @@ OwningProcess : 6084
 
 
 Id        : 6084
-Path      : C:\Users\Daniel\AppData\Local\Latch\latch-host.exe
+Path      : C:\Users\dev\AppData\Local\Latch\latch-host.exe
 SessionId : 1
 
 

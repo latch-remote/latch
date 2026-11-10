@@ -234,7 +234,7 @@
     "kbps": 8279.072
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1280,
     "kind": "typing",
     "build": "before",
@@ -247,7 +247,7 @@
     "kbps": 699.349
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1280,
     "kind": "typing",
     "build": "off",
@@ -260,7 +260,7 @@
     "kbps": 698.853
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1280,
     "kind": "typing",
     "build": "on",
@@ -273,7 +273,7 @@
     "kbps": 698.853
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1280,
     "kind": "scroll",
     "build": "before",
@@ -286,7 +286,7 @@
     "kbps": 3721.115
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1280,
     "kind": "scroll",
     "build": "off",
@@ -299,7 +299,7 @@
     "kbps": 3720.0
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1280,
     "kind": "scroll",
     "build": "on",
@@ -312,7 +312,7 @@
     "kbps": 3720.0
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1280,
     "kind": "motion",
     "build": "before",
@@ -325,7 +325,7 @@
     "kbps": 8019.125
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1280,
     "kind": "motion",
     "build": "off",
@@ -338,7 +338,7 @@
     "kbps": 8008.027
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1280,
     "kind": "motion",
     "build": "on",
@@ -351,7 +351,7 @@
     "kbps": 8040.077499999999
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1920,
     "kind": "typing",
     "build": "before",
@@ -364,7 +364,7 @@
     "kbps": 1124.581
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1920,
     "kind": "typing",
     "build": "off",
@@ -377,7 +377,7 @@
     "kbps": 1122.752
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1920,
     "kind": "typing",
     "build": "on",
@@ -390,7 +390,7 @@
     "kbps": 1122.752
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1920,
     "kind": "scroll",
     "build": "before",
@@ -403,7 +403,7 @@
     "kbps": 5434.837
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1920,
     "kind": "scroll",
     "build": "off",
@@ -416,7 +416,7 @@
     "kbps": 5408.827
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1920,
     "kind": "scroll",
     "build": "on",
@@ -429,7 +429,7 @@
     "kbps": 5408.827
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1920,
     "kind": "motion",
     "build": "before",
@@ -442,7 +442,7 @@
     "kbps": 9628.645
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1920,
     "kind": "motion",
     "build": "off",
@@ -455,7 +455,7 @@
     "kbps": 9592.731
   },
   {
-    "machine": "stuzha",
+    "machine": "arm-vps",
     "width": 1920,
     "kind": "motion",
     "build": "on",

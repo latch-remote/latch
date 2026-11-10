@@ -1,20 +1,5 @@
 # Latch stream protocol, version 1
 
-### Optional joint colour ranking (protocol 1)
-
-Host status may advertise `streamer.prefer_color: true` (absent means false).
-Only an Auto viewer seeing that offer sends `StreamRequest.prefer_color: true`.
-False is omitted. The host then stably ranks offered, supported codecs by
-negotiated HDR and bit depth before their existing codec order. Current
-implementations provide ten-bit/HDR through HEVC. Explicit codec selection and
-old viewers omit the flag; old hosts receive no new request field and keep
-legacy selection. No version bump or new control message is introduced.
-
-Decoder-overload detection is local only. No session FPS reduction is sent;
-old and new hosts continue the accepted rate until reconnection. Queue recovery
-still uses the existing keyframe messages.
-
-
 Latch 5 streams a desktop with its own protocol. It replaces the
 GameStream/Moonlight protocol that Sunshine and moonlight-common-c spoke
 until Latch 4. Every byte of it is implemented in Rust in `crates/proto`.
@@ -530,7 +515,7 @@ host's 240-sample packets therefore advance by 5000 us at 48 kHz. Rice
 encoding falls back to existing independent verbatim subframes when needed
 to enforce the 3 + 2*(1 + 2*n) byte bound; no new audio format is introduced.
 
-## Performance integration on the consumer branch
+## Current transport behavior
 
 Protocol 1 and every UDP layout remain unchanged. Cursor support is opt-in:
 `StreamRequest.cursor` and `Accept.cursor` default to false, so plain #32 and
@@ -621,3 +606,18 @@ and MaxCLL/MaxFALL in cd/m². `chroma` is the 4:2:0 chroma siting, `left`
 host produces left-sited chroma. Live desktop HDR uses a canonical 1000-nit
 BT.2020 container. Prefix SEI repeats the metadata at every HDR IDR.
 Old peers ignore the new fields; missing capabilities never enable HDR.
+
+### Choosing codec and colour together (additive)
+
+Host status may advertise `streamer.prefer_color: true` (absent means false).
+Only an Auto viewer seeing that offer sends `StreamRequest.prefer_color: true`.
+False is omitted. The host then stably ranks offered, supported codecs by
+negotiated HDR and bit depth before their existing codec order. Current
+implementations provide ten-bit/HDR through HEVC. Explicit codec selection and
+old viewers omit the flag; old hosts receive no new request field and keep
+legacy selection. No version bump or new control message is introduced.
+
+A viewer whose decoder cannot keep up notices it locally and says so; no
+message asks the host for a lower frame rate, so the accepted rate holds
+until the viewer reconnects. Recovery of a dropped decode queue uses the
+existing keyframe messages.
