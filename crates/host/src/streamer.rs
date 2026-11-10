@@ -66,6 +66,8 @@ pub fn capacity(encoder: &str, streaming: bool) -> (u32, Vec<CodecCaps>) {
                     .iter()
                     .any(|&c| latch_engine::video::hardware_encodes(c));
                 let ceiling = if software {
+                    // The probe uses the session's shared worker policy and
+                    // emits this output geometry, even on a larger desktop.
                     let fps = latch_engine::software::measure_fps(size[0], size[1], MEASURE_FOR);
                     Some(Ceiling {
                         width: size[0],

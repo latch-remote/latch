@@ -37,6 +37,11 @@ GitHub release notes, so each version gets a heading of the form
   of membership. Tagged and shared-in peers are refused.
 - The clipboard is shared only with the machine that is streaming, or was
   in the last five seconds, and has a switch on the Sharing tab.
+- A Linux host sends the size the viewer asked for. A desktop that cannot
+  change size (a headless server's) is scaled into the stream, with black
+  bars when the shapes differ, and the pointer and clicks land where they
+  should. Before, the viewer got the desktop's own size whatever it asked
+  for.
 - **Auto** keeps ten-bit colour and HDR: when both machines can do HEVC
   Main10 it is chosen ahead of eight-bit AV1. A codec picked by hand is
   left alone.

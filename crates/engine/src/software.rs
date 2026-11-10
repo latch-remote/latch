@@ -110,17 +110,92 @@ pub trait PictureEncoder: Send {
 pub type OpenEncoder =
     Box<dyn FnMut(u32, u32, &VideoConfig) -> anyhow::Result<Box<dyn PictureEncoder>> + Send>;
 
+/// Conservative worker limits by output pixel count. Raise a tier only after
+/// the quiet-machine sweep in docs/measurements/2026-11-09-linux-output-size.
+const WORKER_LIMITS: [(u64, usize); 3] = [(1920 * 1080, 4), (2560 * 1440, 4), (u64::MAX, 4)];
+
+/// Shared by conversion, encoding and the capacity probe. The default table
+/// preserves the four-worker policy; small pictures cannot have more slices
+/// than macroblock rows. Larger future limits must leave a CPU for capture,
+/// audio and sending. Two-core machines retain their two workers.
+pub fn worker_count(available: usize, width: u32, height: u32) -> usize {
+    let pixels = u64::from(width) * u64::from(height);
+    let cap = WORKER_LIMITS
+        .iter()
+        .find(|(limit, _)| pixels <= *limit)
+        .map_or(4, |(_, cap)| *cap);
+    let budget = if available > 4 {
+        available - 1
+    } else {
+        available.max(1)
+    };
+    let rows = (height as usize).div_ceil(16).max(1);
+    // Future limits above four retain at least 128 pixels per slice;
+    // the existing small-picture policy stays unchanged.
+    cap.min(budget).min((rows / 8).max(4)).min(rows)
+}
+
+/// Rust accounts for affinity and Linux cgroup CPU quotas. On Apple Silicon,
+/// prefer the performance-core count rather than treating efficiency cores
+/// as interchangeable encoder workers. Never exceed available parallelism.
+fn available_workers() -> usize {
+    let available = std::thread::available_parallelism().map_or(1, usize::from);
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn sysctlbyname(
+                name: *const std::ffi::c_char,
+                old: *mut std::ffi::c_void,
+                old_len: *mut usize,
+                new: *mut std::ffi::c_void,
+                new_len: usize,
+            ) -> i32;
+        }
+        let mut cores = 0u32;
+        let mut length = std::mem::size_of_val(&cores);
+        // SAFETY: the key is NUL-terminated and the output points to `length`
+        // writable bytes; there is no new value, so this is read-only.
+        let result = unsafe {
+            sysctlbyname(
+                c"hw.perflevel0.physicalcpu".as_ptr(),
+                (&mut cores as *mut u32).cast(),
+                &mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result == 0 && cores > 0 {
+            return available.min(cores as usize);
+        }
+    }
+    available
+}
+
 /// `latch-codec`'s H.264 Constrained Baseline encoder.
 pub struct LatchEncoder(Encoder, (u64, Option<u64>));
 
 impl LatchEncoder {
     pub fn open(width: u32, height: u32, config: &VideoConfig) -> anyhow::Result<Self> {
+        Self::with_workers(
+            width,
+            height,
+            config,
+            worker_count(available_workers(), width, height),
+        )
+    }
+
+    pub fn with_workers(
+        width: u32,
+        height: u32,
+        config: &VideoConfig,
+        workers: usize,
+    ) -> anyhow::Result<Self> {
         let mut encoder = Encoder::new(EncoderConfig {
             width,
             height,
             fps: config.fps,
             bitrate_kbps: config.bitrate_kbps,
-            threads: std::thread::available_parallelism().map_or(1, |n| n.get().min(4)),
+            threads: workers,
         })?;
         encoder.set_recovery_depth(recovery_depth(width, height, config.fps));
         Ok(Self(encoder, (0, None)))
@@ -187,7 +262,7 @@ impl PictureEncoder for LatchEncoder {
 
 /// [`CpuCapture`] → [`latch_codec::color`] → a [`PictureEncoder`]
 /// (`latch-codec` unless [`SoftwarePipeline::with_encoder`] says otherwise).
-/// Sends the source's own size (no scaling); repeats the last picture as
+/// Aspect-fits the source into the negotiated size; repeats the last picture as
 /// an all-skip frame when idle; re-creates the encoder if the source's size
 /// changes.
 pub struct SoftwarePipeline<C: CpuCapture> {
@@ -198,6 +273,11 @@ pub struct SoftwarePipeline<C: CpuCapture> {
     encoder: Option<Box<dyn PictureEncoder>>,
     /// The size `encoder` was opened for.
     encoder_size: (u32, u32),
+    source_size: (u32, u32),
+    scaler: Option<latch_codec::color::scale::Scaler>,
+    cursor: Option<crate::video::CursorUpdate>,
+    cursor_dirty: bool,
+    cursor_serial: u32,
     open: OpenEncoder,
     /// The encoder's name, whether it is hardware, its codec, and whether
     /// it makes recovery frames.
@@ -224,7 +304,8 @@ impl<C: CpuCapture> SoftwarePipeline<C> {
         );
         ensure!(config.bitrate_kbps > 0, "bitrate must be positive");
         let (width, height) = capture.size();
-        validate_size(width, height)?;
+        validate_capture_size(width, height)?;
+        validate_size(config.width, config.height)?;
         Ok(Self {
             capture,
             config: config.clone(),
@@ -232,6 +313,11 @@ impl<C: CpuCapture> SoftwarePipeline<C> {
             picture: Yuv420::default(),
             encoder: None,
             encoder_size: (0, 0),
+            source_size: (0, 0),
+            scaler: None,
+            cursor: None,
+            cursor_dirty: false,
+            cursor_serial: 0,
             open: Box::new(|width, height, config| {
                 Ok(Box::new(LatchEncoder::open(width, height, config)?))
             }),
@@ -245,7 +331,7 @@ impl<C: CpuCapture> SoftwarePipeline<C> {
             last_sent: None,
             captured: Instant::now(),
             timings: SoftwareTimings::default(),
-            threads: std::thread::available_parallelism().map_or(1, |n| n.get().min(4)),
+            threads: worker_count(available_workers(), config.width, config.height),
             recovering: false,
             picture_base: 0,
             last_picture: 0,
@@ -259,7 +345,7 @@ impl<C: CpuCapture> SoftwarePipeline<C> {
         config: &VideoConfig,
         mut open: OpenEncoder,
     ) -> anyhow::Result<Self> {
-        let (width, height) = capture.size();
+        let (width, height) = (config.width, config.height);
         let encoder = open(width, height, config)?;
         let mut this = Self::new(capture, config)?;
         this.describe = (
@@ -272,6 +358,17 @@ impl<C: CpuCapture> SoftwarePipeline<C> {
         this.encoder_size = (width, height);
         this.open = open;
         Ok(this)
+    }
+
+    /// Explicit worker counts for repeatable software benchmarks. Session
+    /// pipelines use the machine policy in `new` and `LatchEncoder::open`.
+    pub fn with_workers(capture: C, config: &VideoConfig, workers: usize) -> anyhow::Result<Self> {
+        ensure!((1..=64).contains(&workers), "workers must be in 1..=64");
+        let mut pipeline = Self::new(capture, config)?;
+        pipeline.open =
+            Box::new(move |w, h, c| Ok(Box::new(LatchEncoder::with_workers(w, h, c, workers)?)));
+        pipeline.threads = workers;
+        Ok(pipeline)
     }
 
     /// Continue a pipeline's picture identities when replacing another backend.
@@ -423,11 +520,16 @@ pub fn set_ceiling(ceiling: Option<Ceiling>) {
     *CEILING.lock() = ceiling.filter(|c| c.fps > 0 && c.width > 0 && c.height > 0);
 }
 
-fn validate_size(width: u32, height: u32) -> anyhow::Result<()> {
+fn validate_capture_size(width: u32, height: u32) -> anyhow::Result<()> {
     ensure!(
         width > 0 && height > 0 && width <= 16384 && height <= 16384,
         "capture dimensions must be in 1..=16384"
     );
+    Ok(())
+}
+
+fn validate_size(width: u32, height: u32) -> anyhow::Result<()> {
+    validate_capture_size(width, height)?;
     ensure!(
         width.is_multiple_of(2) && height.is_multiple_of(2),
         "software H.264 requires even dimensions"
@@ -436,7 +538,7 @@ fn validate_size(width: u32, height: u32) -> anyhow::Result<()> {
 }
 
 fn validate_frame(frame: &Bgra) -> anyhow::Result<()> {
-    validate_size(frame.width, frame.height)?;
+    validate_capture_size(frame.width, frame.height)?;
     ensure!(
         frame.stride >= frame.width as usize * 4,
         "short BGRA stride"
@@ -451,11 +553,7 @@ fn validate_frame(frame: &Bgra) -> anyhow::Result<()> {
 
 impl<C: CpuCapture> VideoPipeline for SoftwarePipeline<C> {
     fn info(&self) -> VideoInfo {
-        let (width, height) = if self.frame.data.is_empty() {
-            self.capture.size()
-        } else {
-            (self.frame.width, self.frame.height)
-        };
+        let (width, height) = (self.config.width, self.config.height);
         let (name, hardware, codec, _) = &self.describe;
         VideoInfo {
             color: Default::default(),
@@ -471,10 +569,14 @@ impl<C: CpuCapture> VideoPipeline for SoftwarePipeline<C> {
     fn next(&mut self, keyframe: bool, idle: Duration) -> anyhow::Result<EncodedVideo> {
         let changed = self.acquire(keyframe || self.recovering, idle)?;
         self.recovering = false;
+        let size = (self.config.width, self.config.height);
+        let source = (self.frame.width, self.frame.height);
         let resized =
-            (self.picture.width, self.picture.height) != (self.frame.width, self.frame.height);
-        let size = (self.frame.width, self.frame.height);
-        if self.encoder.is_none() || self.encoder_size != size {
+            (self.picture.width, self.picture.height) != size || self.source_size != source;
+        if self.encoder.is_none()
+            || self.encoder_size != size
+            || (self.source_size != (0, 0) && self.source_size != source)
+        {
             self.encoder = None;
             // A new encoder holds none of the old one's pictures.
             self.picture_base = self.last_picture;
@@ -491,7 +593,29 @@ impl<C: CpuCapture> VideoPipeline for SoftwarePipeline<C> {
             self.encoder_size = size;
         }
         if resized {
-            self.picture = Yuv420::new(self.frame.width, self.frame.height);
+            self.picture = Yuv420::new(size.0, size.1);
+            self.source_size = source;
+            self.cursor_dirty = true;
+            self.scaler = if source == size {
+                None
+            } else {
+                let fit = DisplayRect {
+                    width: source.0,
+                    height: source.1,
+                    ..Default::default()
+                }
+                .fitted(size.0, size.1);
+                Some(latch_codec::color::scale::Scaler::new(
+                    source,
+                    size,
+                    Rect {
+                        x: fit.x as u32,
+                        y: fit.y as u32,
+                        width: fit.width,
+                        height: fit.height,
+                    },
+                ))
+            };
         }
         let started = Instant::now();
         // What differs from the picture encoded last: a repeat changes
@@ -505,15 +629,32 @@ impl<C: CpuCapture> VideoPipeline for SoftwarePipeline<C> {
                 height: self.frame.height,
             }];
             damage = if resized { None } else { self.capture.damage() };
-            latch_codec::color::bgra_to_yuv420_rects(
-                &self.frame.data,
-                self.frame.width,
-                self.frame.height,
-                self.frame.stride,
-                damage.as_deref().unwrap_or(&whole),
-                self.threads,
-                &mut self.picture,
-            );
+            if let Some(scaler) = &self.scaler {
+                damage = damage.map(|rects| scaler.damage(&rects));
+                let whole = [Rect {
+                    x: 0,
+                    y: 0,
+                    width: size.0,
+                    height: size.1,
+                }];
+                scaler.convert(
+                    &self.frame.data,
+                    self.frame.stride,
+                    damage.as_deref().unwrap_or(&whole),
+                    self.threads,
+                    &mut self.picture,
+                );
+            } else {
+                latch_codec::color::bgra_to_yuv420_rects(
+                    &self.frame.data,
+                    self.frame.width,
+                    self.frame.height,
+                    self.frame.stride,
+                    damage.as_deref().unwrap_or(&whole),
+                    self.threads,
+                    &mut self.picture,
+                );
+            }
         }
         self.timings.convert = started.elapsed();
         // A repeat shows the old picture, but it was taken up now: what the
@@ -580,8 +721,75 @@ impl<C: CpuCapture> VideoPipeline for SoftwarePipeline<C> {
     }
 
     fn take_cursor(&mut self) -> Option<crate::video::CursorUpdate> {
-        self.capture.take_cursor()
+        let update = self.capture.take_cursor();
+        if let Some(mut update) = update {
+            if update.shape.is_none() {
+                update.shape = self.cursor.as_ref().and_then(|c| c.shape.clone());
+            }
+            self.cursor = Some(update);
+            self.cursor_dirty = true;
+        }
+        if !std::mem::take(&mut self.cursor_dirty) {
+            return None;
+        }
+        let mut update = self.cursor.clone()?;
+        if let Some(shape) = update.shape.as_mut() {
+            let source = self.capture.size();
+            let fit = DisplayRect {
+                width: source.0,
+                height: source.1,
+                ..Default::default()
+            }
+            .fitted(self.config.width, self.config.height);
+            if (fit.width, fit.height) != source {
+                scale_cursor(shape, source, (fit.width, fit.height));
+            }
+            // The viewer caches textures by serial; a source resize changes
+            // the scaled shape even when XFixes' original serial is unchanged.
+            self.cursor_serial = self.cursor_serial.wrapping_add(1);
+            shape.serial = self.cursor_serial;
+        }
+        Some(update)
     }
+}
+
+/// The separate plane's shape and hotspot are in output pixels. Position is
+/// the viewer's local pointer, whose events map through DisplayRect::map;
+/// no absolute X11 cursor position is sent by this protocol.
+fn scale_cursor(
+    shape: &mut latch_proto::control::CursorShape,
+    source: (u32, u32),
+    content: (u32, u32),
+) {
+    let Ok(rgba) = shape.decode_rgba() else {
+        return;
+    };
+    if shape.width == 0
+        || shape.height == 0
+        || rgba.len() != (shape.width * shape.height * 4) as usize
+    {
+        return;
+    }
+    let mut w = (u64::from(shape.width) * u64::from(content.0) / u64::from(source.0)).max(1) as u32;
+    let mut h =
+        (u64::from(shape.height) * u64::from(content.1) / u64::from(source.1)).max(1) as u32;
+    let largest = w.max(h);
+    if largest > 96 {
+        w = (w * 96 / largest).max(1);
+        h = (h * 96 / largest).max(1);
+    }
+    let mut scaled = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let at = ((y * shape.height / h) * shape.width + x * shape.width / w) as usize * 4;
+            scaled.extend_from_slice(&rgba[at..at + 4]);
+        }
+    }
+    shape.hot_x = shape.hot_x * w / shape.width;
+    shape.hot_y = shape.hot_y * h / shape.height;
+    shape.width = w;
+    shape.height = h;
+    shape.rgba = latch_proto::base64::encode(&scaled);
 }
 
 #[cfg(test)]
@@ -630,8 +838,8 @@ mod tests {
             },
             &VideoConfig {
                 color: Default::default(),
-                width: 1920,
-                height: 1080,
+                width: 16,
+                height: 16,
                 fps: 100,
                 bitrate_kbps: 1000,
                 codec: Codec::H264Baseline,
@@ -689,7 +897,7 @@ mod tests {
         p.capture.size = (32, 16);
         p.capture.changed = true;
         assert!(p.acquire(false, Duration::ZERO).unwrap());
-        assert_eq!(p.info().width, 32);
+        assert_eq!(p.info().width, 16);
         p.set_bitrate(2000);
         assert_eq!(p.config.bitrate_kbps, 2000);
     }
@@ -731,6 +939,71 @@ mod tests {
     }
 
     #[test]
+    fn odd_capture_is_fitted_into_the_even_output_without_stretching() {
+        let mut pipeline = pipeline();
+        pipeline.capture.size = (17, 15);
+        pipeline.next(true, Duration::ZERO).unwrap();
+        assert_eq!((pipeline.info().width, pipeline.info().height), (16, 16));
+        assert_eq!(
+            (
+                pipeline.info().display.width,
+                pipeline.info().display.height
+            ),
+            (17, 15)
+        );
+        assert!(pipeline.scaler.is_some());
+        let picture = &pipeline.picture;
+        // 17:15 fits into 16×14 at y=1, leaving a black row at each edge.
+        assert_eq!(&picture.y[..16], &[16; 16]);
+        assert_eq!(
+            &picture.y[15 * picture.y_stride..15 * picture.y_stride + 16],
+            &[16; 16]
+        );
+        assert_eq!(picture.y[picture.y_stride], 126);
+    }
+
+    #[test]
+    fn worker_policy_preserves_the_default_cap_and_small_machines() {
+        for (w, h) in [(1920, 1080), (2560, 1440), (3840, 2160)] {
+            for available in [1, 2, 4, 6, 8, 16, 64] {
+                assert_eq!(worker_count(available, w, h), available.min(4));
+            }
+        }
+        assert_eq!(worker_count(2, 1920, 1080), 2);
+        assert_eq!(worker_count(64, 16, 16), 1);
+        assert_eq!(worker_count(0, 0, 0), 1);
+    }
+
+    #[test]
+    fn cursor_shape_and_hotspot_use_output_pixels() {
+        let mut shape =
+            latch_proto::control::CursorShape::new(7, 32, 24, 8, 6, &vec![255; 32 * 24 * 4]);
+        scale_cursor(&mut shape, (3840, 2160), (1920, 1080));
+        assert_eq!(
+            (shape.width, shape.height, shape.hot_x, shape.hot_y),
+            (16, 12, 4, 3)
+        );
+        assert_eq!(shape.decode_rgba().unwrap(), vec![255; 16 * 12 * 4]);
+        let desktop = DisplayRect {
+            width: 3840,
+            height: 2160,
+            ..Default::default()
+        };
+        assert_eq!(desktop.map(960, 540, 1920, 1080), (1920, 1080));
+        // Same rounding as capture when the requested aspect differs.
+        assert_eq!(
+            desktop.fitted(1920, 1200),
+            DisplayRect {
+                x: 0,
+                y: 60,
+                width: 1920,
+                height: 1080
+            }
+        );
+        assert_eq!(desktop.map(960, 600, 1920, 1200), (1920, 1080));
+    }
+
+    #[test]
     fn rejects_bad_frames_and_config() {
         let mut p = pipeline();
         p.config.fps = 0;
@@ -754,7 +1027,7 @@ mod tests {
         p.capture.size = (32, 16);
         p.capture.changed = true;
         assert!(p.next(false, Duration::ZERO).unwrap().keyframe);
-        assert_eq!(p.info().width, 32);
+        assert_eq!(p.info().width, 16);
     }
 
     struct Counting {
@@ -813,6 +1086,6 @@ mod tests {
         p.capture.changed = true;
         let resized = p.next(false, Duration::ZERO).unwrap();
         assert!(resized.keyframe, "a new size starts with a keyframe");
-        assert_eq!(*opened.lock().unwrap(), [(16, 16), (32, 16)]);
+        assert_eq!(*opened.lock().unwrap(), [(16, 16), (16, 16)]);
     }
 }

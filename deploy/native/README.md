@@ -134,7 +134,8 @@ pairing credentials.
 
 ## Display sizing
 
-Xvfb's desktop stays at 1920×1080; smaller stream sizes scale it down.
+Xvfb's desktop stays at 1920×1080. A stream of another size is scaled from
+it, with black bars when the shape differs.
 With a resizable Xorg display, `host.toml` can set `prep_do` and `prep_undo`
 to a display script. It receives `LATCH_CLIENT_WIDTH`, `LATCH_CLIENT_HEIGHT`
 and `LATCH_CLIENT_FPS`. Set `LATCH_DISPLAY_FOLLOWS_VIEWER=1` in the service
