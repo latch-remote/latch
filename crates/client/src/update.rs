@@ -1373,10 +1373,10 @@ mod tests {
     fn a_linux_host_behind_the_release_is_named_and_others_are_not() {
         let r = rel("4.1.2");
         let old = Version::new(4, 1, 1);
-        let msg = manual_update_message("stuzha", "linux", &old, &r).expect("a line");
-        assert!(msg.contains("stuzha") && msg.contains("4.1.1") && msg.contains("4.1.2"));
+        let msg = manual_update_message("studio", "linux", &old, &r).expect("a line");
+        assert!(msg.contains("studio") && msg.contains("4.1.1") && msg.contains("4.1.2"));
         assert_eq!(
-            manual_update_message("stuzha", "linux", &Version::new(4, 1, 2), &r),
+            manual_update_message("studio", "linux", &Version::new(4, 1, 2), &r),
             None
         );
         for os in ["windows", "", "macOS"] {

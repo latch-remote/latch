@@ -2662,13 +2662,13 @@ mod tests {
 
     #[test]
     fn a_host_this_mac_cannot_update_is_named_once_a_release_is_out() {
-        let mut stuzha = power_pc("s", "linux", "100.64.0.5", true);
-        stuzha.name = "stuzha".into();
-        let h = stuzha.host.as_mut().unwrap();
+        let mut studio = power_pc("s", "linux", "100.64.0.5", true);
+        studio.name = "studio".into();
+        let h = studio.host.as_mut().unwrap();
         h.version = "4.1.1".into();
         h.os = "linux".into();
         let disc = Discovery {
-            pcs: vec![stuzha],
+            pcs: vec![studio],
             ..Default::default()
         };
         let rel = latch_core::update::Release {
@@ -2680,7 +2680,7 @@ mod tests {
         assert!(path_warnings(&disc, None).is_empty());
         let w = path_warnings(&disc, Some(&rel));
         assert_eq!(w.len(), 1, "{w:?}");
-        assert!(w[0].contains("stuzha runs Latch Host 4.1.1"), "{}", w[0]);
+        assert!(w[0].contains("studio runs Latch Host 4.1.1"), "{}", w[0]);
     }
 
     fn a_relay(online: bool) -> Relay {

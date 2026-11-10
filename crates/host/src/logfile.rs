@@ -3,7 +3,7 @@
 //! `init_logging` opened `panel.log` and `service.log` in append mode and
 //! nothing ever pruned them. Both processes run for days — the panel for as
 //! long as the window is open, the service until the machine restarts — so
-//! the files only grew: Hermes reached a 32 MB `panel.log`, on the system
+//! the files only grew: one PC reached a 32 MB `panel.log`, on the system
 //! drive, for a program whose whole install is 14 MB.
 //!
 //! Writes roll over at `MAX_BYTES`. The previous contents move to
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn an_already_oversized_log_rolls_over_on_the_next_write() {
-        // The case on Hermes: 32 MB written by a build that never rotated.
+        // The case seen on a real PC: 32 MB written by a build that never rotated.
         let dir = tmpdir("oversized");
         let path = dir.join("service.log");
         std::fs::write(&path, vec![b'x'; 500]).unwrap();

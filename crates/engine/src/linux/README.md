@@ -76,7 +76,7 @@ cargo zigbuild --release --target aarch64-unknown-linux-gnu -p latch-engine --ex
 ```
 
 Run Linux tests and examples with `nice` on an isolated X server. Never use
-Stuzha's automation display `:1` for injection or resizing. `linux_input`
+The test server's automation display `:1` for injection or resizing. `linux_input`
 refuses displays other than `:9`; it creates its own receiver window, checks
 pointer coordinates, button and key events, scroll remainders, keyboard
 mapping restoration, known captured pixels, damage, cursor movement, and
@@ -89,7 +89,7 @@ and encoding times. `linux_capture 5 --capture-only` forces fresh full-root
 grabs at 60 Hz without calling the codec. `linux_audio 4` checks the monitor
 for non-silent samples; play a quiet tone with `paplay` during the capture.
 
-## Verified on Stuzha, 2026-10-28
+## Verified on the ARM64 test server, 2026-10-28
 
 A second dummy-driver Xorg on `:9` ran the input, resize, and known-pixel
 checks. A subsequent authenticated server with MIT-SHM disabled passed the
@@ -113,7 +113,7 @@ bitrate changes inside a live encoder are not measured. VK-key injection
 also awaits the shared keymap. Rotated and multiple-output RandR setups
 and PipeWire's PulseAudio server have not been tested.
 
-## Qualification on Stuzha, 2026-10-30
+## Qualification on the ARM64 test server, 2026-10-30
 
 The bootstrap implementation and concurrent-initialization fix (497f431) passed
 eight regressions on ARM Linux, including abstract sockets, a full connect

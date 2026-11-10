@@ -613,9 +613,9 @@ mod tests {
     fn a_size_this_build_does_not_know_keeps_the_machines() {
         let text = "github_token = \"t\"\n\
                     [stream]\nquality = \"Custom\"\nresolution = \"P9999\"\nfps = 90\ncodec = \"Hevc\"\n\
-                    [pcs.n1]\nname = \"Hermes\"\nmac = \"02:00:00:00:00:01\"\n\
+                    [pcs.n1]\nname = \"Harbor\"\nmac = \"02:00:00:00:00:01\"\n\
                     public_ip = \"116.125.113.36\"\nserver_cert = \"3082\"\n\
-                    [pcs.n2]\nname = \"stuzha\"\nlast_seen_unix = \"bad\"\n";
+                    [pcs.n2]\nname = \"studio\"\nlast_seen_unix = \"bad\"\n";
         let (c, dropped): (ClientConfig, _) = latch_core::config::parse_lenient(text).unwrap();
         assert_eq!(
             dropped,
@@ -629,7 +629,7 @@ mod tests {
         assert_eq!(c.github_token.as_deref(), Some("t"));
         assert_eq!(c.pcs["n1"].mac.as_deref(), Some("02:00:00:00:00:01"));
         assert_eq!(c.pcs["n1"].public_ip.as_deref(), Some("116.125.113.36"));
-        assert_eq!(c.pcs["n2"].name, "stuzha");
+        assert_eq!(c.pcs["n2"].name, "studio");
         assert_eq!(c.pcs["n2"].last_seen_unix, None);
         // Text that is not TOML at all is still an error (and set aside).
         assert!(latch_core::config::parse_lenient::<ClientConfig>("[stream").is_err());
@@ -706,7 +706,7 @@ mod tests {
     #[test]
     fn a_forgotten_machine_leaves_others_alone() {
         let mut c = ClientConfig::default();
-        for id in ["artemis", "stuzha"] {
+        for id in ["attic", "studio"] {
             c.pcs.insert(
                 id.into(),
                 KnownPc {
@@ -715,9 +715,9 @@ mod tests {
                 },
             );
         }
-        assert!(c.forget("artemis"));
-        assert!(!c.forget("artemis"), "gone already");
-        assert_eq!(c.pcs.keys().collect::<Vec<_>>(), ["stuzha"]);
+        assert!(c.forget("attic"));
+        assert!(!c.forget("attic"), "gone already");
+        assert_eq!(c.pcs.keys().collect::<Vec<_>>(), ["studio"]);
         // A file without the newer fields still reads.
         let back: ClientConfig =
             toml::from_str("[pcs.n]\nname = \"Gaming-PC\"\nserver_cert = \"3082\"\n").unwrap();

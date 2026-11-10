@@ -505,7 +505,7 @@ mod tests {
     fn the_software_baseline_is_always_offered() {
         let codecs = encodable();
         assert_eq!(codecs.last(), Some(&Codec::H264Baseline));
-        // With no NVIDIA driver and no VA-API driver (CI, stuzha: libva and
+        // With no NVIDIA driver and no VA-API driver (CI, a server without a GPU: libva and
         // a render node it cannot use) nothing else is.
         if !nvenc::present() && !vaapi::opens() {
             assert_eq!(codecs, [Codec::H264Baseline]);
