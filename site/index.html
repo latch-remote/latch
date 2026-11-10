@@ -369,11 +369,13 @@
                 Tailscale is the path and the identity&nbsp;check.
               </h2>
               <p class="intro">
-                Untagged hosts authorize peers by Tailscale user ID. Tagged hosts
-                match the tailnet name or login domain; that is broader than
-                a membership check. Sockets listen on all interfaces, with
-                application authorization and Windows source-scoped firewall
-                rules. There is no Latch account or password.
+                A host answers only devices signed in to the same Tailscale
+                account as itself. A tagged host, which has no account of
+                its own, answers the tailnet's owner, or on an
+                organisation's tailnet the logins its owner lists. Sockets
+                listen on all interfaces, with that check and Windows
+                firewall rules scoped to Tailscale addresses. There is no
+                Latch account or password.
               </p>
             </div>
           </header>
@@ -597,9 +599,11 @@
                 <dt>Codec</dt>
                 <dd>
                   <p>
-                    The best both machines have: AV1, then HEVC, then H.264.
-                    Any can be chosen; negotiation and decoder failure recovery try
-                    the next supported codec, ultimately Baseline H.264.
+                    The best both machines have: AV1, then HEVC, then H.264,
+                    except that ten-bit and HDR HEVC comes first when both
+                    can do it. Any can be chosen; negotiation and decoder
+                    failure recovery try the next supported codec,
+                    ultimately Baseline H.264.
                   </p>
                 </dd>
               </div>
@@ -783,8 +787,8 @@
                 <div>
                   <dt>Share</dt>
                   <dd>
-                    Yes. Latch runs as a service, so the sign-in screen
-                    streams after a restart
+                    Yes. Sharing starts when someone signs in to Windows;
+                    the sign-in screen itself cannot be streamed
                   </dd>
                 </div>
               </dl>

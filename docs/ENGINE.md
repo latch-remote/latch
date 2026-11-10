@@ -341,11 +341,12 @@ refresh; GPU completion, compositor, panel response and scanout are unmeasured.
 
 ## Decisions
 
-* **No pairing.** The control service's authorization (same Tailscale
-  user ID, or login-name/domain matching for a tagged host) already guards `/v1/update`,
-  which replaces the executable. Pushed updates currently trust the sender
-  to supply both bytes and digest, not an independent publisher signature. The
-  session token travels inside WireGuard.
+* **No pairing.** The control service's authorization (the same Tailscale
+  user ID; for a tagged host, the tailnet's owner or its `allowed_logins`)
+  already guards `/v1/update`, which replaces the executable. A Windows
+  host also checks a pushed update against the SHA-256 GitHub publishes
+  for that release, so the sender cannot choose the bytes; there is no
+  publisher signature yet. The session token travels inside WireGuard.
 * **UDP + FEC + a recovery frame on loss**, as GeForce NOW does, keyframe
   where the encoder cannot, without RTSP, ENet or a second encryption layer.
   Input is reliable by redundancy, not timers.

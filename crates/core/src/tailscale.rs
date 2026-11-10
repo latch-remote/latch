@@ -800,8 +800,8 @@ mod tests {
             Some("203.0.113.5".parse().unwrap())
         );
         assert_eq!(
-            at("116.125.113.36:41641").public_ipv4(),
-            Some("116.125.113.36".parse().unwrap())
+            at("203.0.113.36:41641").public_ipv4(),
+            Some("203.0.113.36".parse().unwrap())
         );
         // Two machines on one network go direct over the LAN.
         for lan in [

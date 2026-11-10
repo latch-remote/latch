@@ -1241,10 +1241,7 @@ mod tests {
     #[test]
     fn a_saved_lan_address_is_not_taken_for_the_public_one() {
         let saved = |s: &str| saved_public(Some(&s.to_string()));
-        assert_eq!(
-            saved("116.125.113.36"),
-            Some("116.125.113.36".parse().unwrap())
-        );
+        assert_eq!(saved("203.0.113.36"), Some("203.0.113.36".parse().unwrap()));
         assert_eq!(saved("192.168.1.57"), None);
         assert_eq!(saved("10.0.2.15"), None);
         assert_eq!(saved("100.64.0.40"), None, "a Tailscale address");

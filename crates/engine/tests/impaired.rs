@@ -178,18 +178,15 @@ fn a_bad_network_slows_the_picture_but_loses_no_key() {
         recovered > 0,
         "FEC never had to rebuild anything: was there loss?"
     );
-    // Random loss must not hold the budget down: it stays near the request
-    // for most of the run and is there at the end. One second may dip. On a
-    // busy machine (a CI runner) a ping that waits for the CPU looks like a
-    // queue, the controller cuts this underfilled stream's budget, and
-    // gives it back about a second later; that is not what this guards.
+    // Random loss must not hold the budget down: it is near the request
+    // for most of the run (at most three of the eight seconds below it)
+    // and back there within six seconds of the end. A dip is allowed
+    // because on a busy machine (a CI runner) a ping that waits for the
+    // CPU looks like a queue: the controller cuts this underfilled
+    // stream's budget and gives it back a second or two later.
     let budgets: Vec<u32> = seconds.iter().map(|s| s.wire_budget_kbps).collect();
-    let mut sorted = budgets.clone();
-    sorted.sort_unstable();
-    assert!(
-        sorted[sorted.len() / 2] >= 4800,
-        "random loss collapsed the budget: {budgets:?}"
-    );
+    let low = budgets.iter().filter(|kbps| **kbps < 4800).count();
+    assert!(low <= 3, "random loss collapsed the budget: {budgets:?}");
     let deadline = Instant::now() + Duration::from_secs(6);
     let mut budget = session.stats().wire_budget_kbps;
     while budget < 4800 && Instant::now() < deadline {

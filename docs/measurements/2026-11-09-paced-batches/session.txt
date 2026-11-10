@@ -1,0 +1,240 @@
+== old 1
+NOISE cap=5000 rtt=20 request=10000 decoded=285 gap_p50/p95_ms=16.421/19.826 keys=1 fps=59.56066 mbps=2.3417983 lost=0 dropped=0
+== new 1
+NOISE cap=5000 rtt=20 request=10000 decoded=280 gap_p50/p95_ms=16.654/20.105 keys=1 fps=59.86532 mbps=2.27319 lost=0 dropped=0
+== fix 1
+NOISE cap=5000 rtt=20 request=10000 decoded=287 gap_p50/p95_ms=17.145/22.300 keys=1 fps=63.812607 mbps=2.8976984 lost=0 dropped=0
+== old 1
+NOISE cap=5000 rtt=150 request=10000 decoded=278 gap_p50/p95_ms=16.428/20.039 keys=3 fps=59.746807 mbps=2.7577853 lost=0 dropped=0
+== new 1
+NOISE cap=5000 rtt=150 request=10000 decoded=278 gap_p50/p95_ms=16.439/21.094 keys=3 fps=59.29917 mbps=1.3626475 lost=0 dropped=0
+== fix 1
+NOISE cap=5000 rtt=150 request=10000 decoded=278 gap_p50/p95_ms=16.444/19.855 keys=3 fps=59.550083 mbps=1.4969145 lost=0 dropped=0
+== old 1
+NOISE cap=20000 rtt=20 request=40000 decoded=296 gap_p50/p95_ms=16.395/18.653 keys=1 fps=59.98717 mbps=8.445074 lost=0 dropped=0
+== new 1
+NOISE cap=20000 rtt=20 request=40000 decoded=296 gap_p50/p95_ms=16.401/18.624 keys=1 fps=59.479908 mbps=8.962528 lost=0 dropped=0
+== fix 1
+NOISE cap=20000 rtt=20 request=40000 decoded=296 gap_p50/p95_ms=16.420/18.429 keys=1 fps=59.642315 mbps=8.986999 lost=0 dropped=0
+== old 1
+NOISE cap=20000 rtt=150 request=40000 decoded=299 gap_p50/p95_ms=16.374/18.710 keys=2 fps=59.913956 mbps=9.038348 lost=0 dropped=0
+== new 1
+NOISE cap=20000 rtt=150 request=40000 decoded=299 gap_p50/p95_ms=16.381/18.896 keys=2 fps=59.990074 mbps=9.057125 lost=0 dropped=0
+== fix 1
+NOISE cap=20000 rtt=150 request=40000 decoded=299 gap_p50/p95_ms=16.375/18.706 keys=2 fps=59.863247 mbps=9.039797 lost=0 dropped=0
+== old 1
+NOISE cap=50000 rtt=20 request=100000 decoded=296 gap_p50/p95_ms=16.366/17.673 keys=2 fps=59.951725 mbps=9.037107 lost=0 dropped=0
+== new 1
+NOISE cap=50000 rtt=20 request=100000 decoded=243 gap_p50/p95_ms=16.425/46.679 keys=2 fps=27.890766 mbps=4.225403 lost=0 dropped=0
+== fix 1
+NOISE cap=50000 rtt=20 request=100000 decoded=296 gap_p50/p95_ms=16.369/17.704 keys=1 fps=59.906464 mbps=9.026802 lost=0 dropped=0
+== old 1
+NOISE cap=50000 rtt=150 request=100000 decoded=269 gap_p50/p95_ms=16.421/34.510 keys=2 fps=59.98885 mbps=9.040496 lost=0 dropped=0
+== new 1
+NOISE cap=50000 rtt=150 request=100000 decoded=299 gap_p50/p95_ms=16.387/17.642 keys=2 fps=59.990173 mbps=9.038935 lost=0 dropped=0
+== fix 1
+NOISE cap=50000 rtt=150 request=100000 decoded=300 gap_p50/p95_ms=16.377/18.922 keys=2 fps=59.99525 mbps=9.047316 lost=0 dropped=0
+== old 1
+NOISE cap=0 rtt=0 request=100000 decoded=265 gap_p50/p95_ms=16.638/32.777 keys=2 fps=47.69664 mbps=7.186612 lost=0 dropped=0
+== new 1
+NOISE cap=0 rtt=0 request=100000 decoded=214 gap_p50/p95_ms=21.796/36.664 keys=2 fps=31.934263 mbps=4.837881 lost=0 dropped=0
+== fix 1
+NOISE cap=0 rtt=0 request=100000 decoded=262 gap_p50/p95_ms=16.883/32.274 keys=2 fps=59.758602 mbps=9.031868 lost=0 dropped=0
+== old 1
+NOISE cap=0 rtt=0 request=1000000 decoded=300 gap_p50/p95_ms=16.406/18.752 keys=2 fps=59.69505 mbps=9.013698 lost=0 dropped=0
+== new 1
+NOISE cap=0 rtt=0 request=1000000 decoded=300 gap_p50/p95_ms=16.403/18.367 keys=2 fps=59.046207 mbps=8.918245 lost=0 dropped=0
+== fix 1
+NOISE cap=0 rtt=0 request=1000000 decoded=300 gap_p50/p95_ms=16.437/18.890 keys=2 fps=55.85629 mbps=9.036494 lost=0 dropped=0
+== old 2
+NOISE cap=5000 rtt=20 request=10000 decoded=287 gap_p50/p95_ms=16.991/22.173 keys=1 fps=59.119785 mbps=0.31915224 lost=0 dropped=0
+== new 2
+NOISE cap=5000 rtt=20 request=10000 decoded=287 gap_p50/p95_ms=16.492/19.995 keys=1 fps=59.825905 mbps=2.9861262 lost=0 dropped=0
+== fix 2
+NOISE cap=5000 rtt=20 request=10000 decoded=284 gap_p50/p95_ms=16.582/21.233 keys=1 fps=59.734165 mbps=2.1379733 lost=0 dropped=0
+== old 2
+NOISE cap=5000 rtt=150 request=10000 decoded=278 gap_p50/p95_ms=16.424/21.220 keys=3 fps=55.697987 mbps=1.2224593 lost=0 dropped=0
+== new 2
+NOISE cap=5000 rtt=150 request=10000 decoded=278 gap_p50/p95_ms=16.394/20.449 keys=3 fps=59.854122 mbps=1.9783783 lost=0 dropped=0
+== fix 2
+NOISE cap=5000 rtt=150 request=10000 decoded=277 gap_p50/p95_ms=16.409/20.616 keys=1 fps=59.784874 mbps=1.472621 lost=0 dropped=0
+== old 2
+NOISE cap=20000 rtt=20 request=40000 decoded=296 gap_p50/p95_ms=16.385/18.720 keys=1 fps=59.95379 mbps=9.039528 lost=0 dropped=0
+== new 2
+NOISE cap=20000 rtt=20 request=40000 decoded=296 gap_p50/p95_ms=16.399/18.597 keys=1 fps=59.109608 mbps=8.90673 lost=0 dropped=0
+== fix 2
+NOISE cap=20000 rtt=20 request=40000 decoded=296 gap_p50/p95_ms=16.319/17.769 keys=1 fps=59.64666 mbps=8.987654 lost=0 dropped=0
+== old 2
+NOISE cap=20000 rtt=150 request=40000 decoded=299 gap_p50/p95_ms=16.318/18.002 keys=2 fps=59.979916 mbps=9.03579 lost=0 dropped=0
+== new 2
+NOISE cap=20000 rtt=150 request=40000 decoded=299 gap_p50/p95_ms=16.319/17.583 keys=2 fps=59.975 mbps=9.059903 lost=0 dropped=0
+== fix 2
+NOISE cap=20000 rtt=150 request=40000 decoded=299 gap_p50/p95_ms=16.314/18.237 keys=2 fps=59.88949 mbps=9.041939 lost=0 dropped=0
+== old 2
+NOISE cap=50000 rtt=20 request=100000 decoded=278 gap_p50/p95_ms=16.315/20.074 keys=1 fps=59.375378 mbps=8.948139 lost=0 dropped=0
+== new 2
+NOISE cap=50000 rtt=20 request=100000 decoded=297 gap_p50/p95_ms=16.316/17.575 keys=2 fps=60.704857 mbps=8.594594 lost=0 dropped=0
+== fix 2
+NOISE cap=50000 rtt=20 request=100000 decoded=297 gap_p50/p95_ms=16.314/18.430 keys=2 fps=59.999126 mbps=9.060988 lost=0 dropped=0
+== old 2
+NOISE cap=50000 rtt=150 request=100000 decoded=299 gap_p50/p95_ms=16.329/17.702 keys=2 fps=59.95888 mbps=9.054239 lost=0 dropped=0
+== new 2
+NOISE cap=50000 rtt=150 request=100000 decoded=299 gap_p50/p95_ms=16.380/17.660 keys=2 fps=59.992012 mbps=9.039212 lost=0 dropped=0
+== fix 2
+NOISE cap=50000 rtt=150 request=100000 decoded=299 gap_p50/p95_ms=16.373/17.678 keys=2 fps=59.95963 mbps=9.034333 lost=0 dropped=0
+== old 2
+NOISE cap=0 rtt=0 request=100000 decoded=263 gap_p50/p95_ms=16.435/36.218 keys=2 fps=39.88718 mbps=6.0252934 lost=0 dropped=0
+== new 2
+NOISE cap=0 rtt=0 request=100000 decoded=213 gap_p50/p95_ms=22.341/36.934 keys=2 fps=43.911415 mbps=6.628899 lost=0 dropped=0
+== fix 2
+NOISE cap=0 rtt=0 request=100000 decoded=252 gap_p50/p95_ms=17.449/34.732 keys=2 fps=59.490086 mbps=8.992458 lost=0 dropped=0
+== old 2
+NOISE cap=0 rtt=0 request=1000000 decoded=300 gap_p50/p95_ms=16.315/18.694 keys=2 fps=59.889965 mbps=9.047505 lost=0 dropped=0
+== new 2
+NOISE cap=0 rtt=0 request=1000000 decoded=300 gap_p50/p95_ms=16.320/18.056 keys=2 fps=60.71758 mbps=8.596091 lost=0 dropped=0
+== fix 2
+NOISE cap=0 rtt=0 request=1000000 decoded=300 gap_p50/p95_ms=16.317/18.623 keys=2 fps=59.938957 mbps=9.05903 lost=0 dropped=0
+== old 3
+NOISE cap=5000 rtt=20 request=10000 decoded=285 gap_p50/p95_ms=16.321/20.082 keys=1 fps=62.57249 mbps=1.2263583 lost=0 dropped=0
+== new 3
+NOISE cap=5000 rtt=20 request=10000 decoded=286 gap_p50/p95_ms=16.317/19.963 keys=1 fps=59.56667 mbps=1.2475325 lost=0 dropped=0
+== fix 3
+NOISE cap=5000 rtt=20 request=10000 decoded=290 gap_p50/p95_ms=16.318/20.065 keys=1 fps=59.582413 mbps=1.0483327 lost=0 dropped=0
+== old 3
+NOISE cap=5000 rtt=150 request=10000 decoded=278 gap_p50/p95_ms=16.322/21.208 keys=3 fps=63.5732 mbps=1.1858308 lost=0 dropped=0
+== new 3
+NOISE cap=5000 rtt=150 request=10000 decoded=278 gap_p50/p95_ms=16.363/21.091 keys=3 fps=59.995945 mbps=1.7644567 lost=0 dropped=0
+== fix 3
+NOISE cap=5000 rtt=150 request=10000 decoded=264 gap_p50/p95_ms=16.401/20.860 keys=3 fps=59.738 mbps=0.38726154 lost=0 dropped=0
+== old 3
+NOISE cap=20000 rtt=20 request=40000 decoded=296 gap_p50/p95_ms=16.386/17.679 keys=2 fps=58.394638 mbps=8.797036 lost=0 dropped=0
+== new 3
+NOISE cap=20000 rtt=20 request=40000 decoded=297 gap_p50/p95_ms=16.375/18.476 keys=2 fps=59.544926 mbps=8.969022 lost=0 dropped=0
+== fix 3
+NOISE cap=20000 rtt=20 request=40000 decoded=296 gap_p50/p95_ms=16.370/18.462 keys=1 fps=62.162334 mbps=8.785123 lost=0 dropped=0
+== old 3
+NOISE cap=20000 rtt=150 request=40000 decoded=299 gap_p50/p95_ms=16.371/18.758 keys=2 fps=59.947346 mbps=9.050674 lost=0 dropped=0
+== new 3
+NOISE cap=20000 rtt=150 request=40000 decoded=297 gap_p50/p95_ms=16.360/18.641 keys=2 fps=59.95268 mbps=9.048826 lost=0 dropped=0
+== fix 3
+NOISE cap=20000 rtt=150 request=40000 decoded=169 gap_p50/p95_ms=18.329/86.106 keys=2 fps=15.863152 mbps=2.3934958 lost=0 dropped=0
+== old 3
+NOISE cap=50000 rtt=20 request=100000 decoded=298 gap_p50/p95_ms=16.349/17.644 keys=1 fps=59.987816 mbps=9.034581 lost=0 dropped=0
+== new 3
+NOISE cap=50000 rtt=20 request=100000 decoded=296 gap_p50/p95_ms=16.385/17.640 keys=1 fps=59.78789 mbps=9.011327 lost=0 dropped=0
+== fix 3
+NOISE cap=50000 rtt=20 request=100000 decoded=270 gap_p50/p95_ms=16.543/31.663 keys=1 fps=35.850025 mbps=5.395126 lost=0 dropped=0
+== old 3
+NOISE cap=50000 rtt=150 request=100000 decoded=259 gap_p50/p95_ms=17.127/34.579 keys=2 fps=59.994293 mbps=9.039076 lost=0 dropped=0
+== new 3
+NOISE cap=50000 rtt=150 request=100000 decoded=300 gap_p50/p95_ms=16.314/19.534 keys=2 fps=59.97878 mbps=9.037602 lost=0 dropped=0
+== fix 3
+NOISE cap=50000 rtt=150 request=100000 decoded=299 gap_p50/p95_ms=16.324/17.584 keys=2 fps=59.95356 mbps=9.053435 lost=0 dropped=0
+== old 3
+NOISE cap=0 rtt=0 request=100000 decoded=264 gap_p50/p95_ms=16.386/36.255 keys=2 fps=51.876442 mbps=7.8245635 lost=0 dropped=0
+== new 3
+NOISE cap=0 rtt=0 request=100000 decoded=213 gap_p50/p95_ms=22.175/36.822 keys=2 fps=35.854145 mbps=5.4307714 lost=0 dropped=0
+== fix 3
+NOISE cap=0 rtt=0 request=100000 decoded=249 gap_p50/p95_ms=17.375/35.217 keys=2 fps=55.719727 mbps=8.403872 lost=0 dropped=0
+== old 3
+NOISE cap=0 rtt=0 request=1000000 decoded=300 gap_p50/p95_ms=16.393/18.851 keys=2 fps=59.906456 mbps=9.048335 lost=0 dropped=0
+== new 3
+NOISE cap=0 rtt=0 request=1000000 decoded=300 gap_p50/p95_ms=16.476/18.814 keys=2 fps=59.81816 mbps=9.034999 lost=0 dropped=0
+== fix 3
+NOISE cap=0 rtt=0 request=1000000 decoded=300 gap_p50/p95_ms=16.318/18.339 keys=2 fps=59.70518 mbps=9.017934 lost=0 dropped=0
+== old 4
+NOISE cap=5000 rtt=20 request=10000 decoded=288 gap_p50/p95_ms=16.331/18.848 keys=1 fps=55.845127 mbps=2.9814916 lost=0 dropped=0
+== new 4
+NOISE cap=5000 rtt=20 request=10000 decoded=288 gap_p50/p95_ms=16.327/20.828 keys=1 fps=59.95158 mbps=2.374946 lost=0 dropped=0
+== fix 4
+NOISE cap=5000 rtt=20 request=10000 decoded=287 gap_p50/p95_ms=16.327/20.629 keys=1 fps=59.561478 mbps=1.8518696 lost=0 dropped=0
+== old 4
+NOISE cap=5000 rtt=150 request=10000 decoded=277 gap_p50/p95_ms=16.327/19.917 keys=1 fps=59.881344 mbps=2.3565145 lost=0 dropped=0
+== new 4
+NOISE cap=5000 rtt=150 request=10000 decoded=249 gap_p50/p95_ms=16.334/21.323 keys=3 fps=59.99415 mbps=0.27706096 lost=0 dropped=0
+== fix 4
+NOISE cap=5000 rtt=150 request=10000 decoded=278 gap_p50/p95_ms=16.325/20.085 keys=3 fps=63.91898 mbps=1.6800784 lost=0 dropped=0
+== old 4
+NOISE cap=20000 rtt=20 request=40000 decoded=297 gap_p50/p95_ms=16.317/17.952 keys=2 fps=59.94393 mbps=9.036636 lost=0 dropped=0
+== new 4
+NOISE cap=20000 rtt=20 request=40000 decoded=296 gap_p50/p95_ms=16.355/18.125 keys=2 fps=55.892433 mbps=9.03621 lost=0 dropped=0
+== fix 4
+NOISE cap=20000 rtt=20 request=40000 decoded=297 gap_p50/p95_ms=16.336/17.593 keys=2 fps=59.88658 mbps=9.020484 lost=0 dropped=0
+== old 4
+NOISE cap=20000 rtt=150 request=40000 decoded=299 gap_p50/p95_ms=16.327/18.583 keys=2 fps=59.90125 mbps=9.043715 lost=0 dropped=0
+== new 4
+NOISE cap=20000 rtt=150 request=40000 decoded=299 gap_p50/p95_ms=16.354/18.486 keys=2 fps=58.806232 mbps=8.878392 lost=0 dropped=0
+== fix 4
+NOISE cap=20000 rtt=150 request=40000 decoded=299 gap_p50/p95_ms=16.317/17.665 keys=2 fps=59.874683 mbps=9.039704 lost=0 dropped=0
+== old 4
+NOISE cap=50000 rtt=20 request=100000 decoded=297 gap_p50/p95_ms=16.325/18.392 keys=2 fps=59.96589 mbps=8.42308 lost=0 dropped=0
+== new 4
+NOISE cap=50000 rtt=20 request=100000 decoded=297 gap_p50/p95_ms=16.330/18.435 keys=1 fps=59.396786 mbps=8.981047 lost=0 dropped=0
+== fix 4
+NOISE cap=50000 rtt=20 request=100000 decoded=270 gap_p50/p95_ms=16.753/31.887 keys=2 fps=31.915173 mbps=4.8174996 lost=0 dropped=0
+== old 4
+NOISE cap=50000 rtt=150 request=100000 decoded=299 gap_p50/p95_ms=16.353/17.573 keys=2 fps=59.942627 mbps=9.039348 lost=0 dropped=0
+== new 4
+NOISE cap=50000 rtt=150 request=100000 decoded=300 gap_p50/p95_ms=16.353/18.859 keys=2 fps=59.37624 mbps=8.953969 lost=0 dropped=0
+== fix 4
+NOISE cap=50000 rtt=150 request=100000 decoded=221 gap_p50/p95_ms=18.707/41.243 keys=2 fps=43.81613 mbps=6.6157894 lost=0 dropped=0
+== old 4
+NOISE cap=0 rtt=0 request=100000 decoded=281 gap_p50/p95_ms=16.471/30.239 keys=2 fps=35.980927 mbps=5.425476 lost=0 dropped=0
+== new 4
+NOISE cap=0 rtt=0 request=100000 decoded=263 gap_p50/p95_ms=17.304/31.060 keys=2 fps=31.868448 mbps=4.8108926 lost=0 dropped=0
+== fix 4
+NOISE cap=0 rtt=0 request=100000 decoded=253 gap_p50/p95_ms=17.408/35.675 keys=2 fps=51.915863 mbps=8.465864 lost=0 dropped=0
+== old 4
+NOISE cap=0 rtt=0 request=1000000 decoded=300 gap_p50/p95_ms=16.379/18.983 keys=2 fps=59.77714 mbps=9.028803 lost=0 dropped=0
+== new 4
+NOISE cap=0 rtt=0 request=1000000 decoded=300 gap_p50/p95_ms=16.334/18.397 keys=2 fps=61.330322 mbps=8.684435 lost=0 dropped=0
+== fix 4
+NOISE cap=0 rtt=0 request=1000000 decoded=300 gap_p50/p95_ms=16.322/17.589 keys=2 fps=59.540947 mbps=8.990429 lost=0 dropped=0
+== old 5
+NOISE cap=5000 rtt=20 request=10000 decoded=285 gap_p50/p95_ms=16.326/20.085 keys=1 fps=55.9172 mbps=2.112328 lost=0 dropped=0
+== new 5
+NOISE cap=5000 rtt=20 request=10000 decoded=285 gap_p50/p95_ms=16.322/19.768 keys=1 fps=59.96445 mbps=2.5434523 lost=0 dropped=0
+== fix 5
+NOISE cap=5000 rtt=20 request=10000 decoded=288 gap_p50/p95_ms=16.330/21.235 keys=1 fps=63.247078 mbps=1.7358476 lost=0 dropped=0
+== old 5
+NOISE cap=5000 rtt=150 request=10000 decoded=263 gap_p50/p95_ms=16.327/22.270 keys=3 fps=59.73452 mbps=2.4405453 lost=0 dropped=0
+== new 5
+NOISE cap=5000 rtt=150 request=10000 decoded=278 gap_p50/p95_ms=16.332/20.095 keys=3 fps=59.865314 mbps=2.5460477 lost=0 dropped=0
+== fix 5
+NOISE cap=5000 rtt=150 request=10000 decoded=278 gap_p50/p95_ms=16.323/19.956 keys=3 fps=60.900257 mbps=1.7037456 lost=0 dropped=0
+== old 5
+NOISE cap=20000 rtt=20 request=40000 decoded=297 gap_p50/p95_ms=16.332/18.090 keys=2 fps=55.89717 mbps=8.421276 lost=0 dropped=0
+== new 5
+NOISE cap=20000 rtt=20 request=40000 decoded=296 gap_p50/p95_ms=16.332/17.593 keys=2 fps=59.876972 mbps=8.427612 lost=0 dropped=0
+== fix 5
+NOISE cap=20000 rtt=20 request=40000 decoded=297 gap_p50/p95_ms=16.331/18.281 keys=2 fps=59.886375 mbps=9.02518 lost=0 dropped=0
+== old 5
+NOISE cap=20000 rtt=150 request=40000 decoded=299 gap_p50/p95_ms=16.332/17.585 keys=2 fps=59.87516 mbps=9.032496 lost=0 dropped=0
+== new 5
+NOISE cap=20000 rtt=150 request=40000 decoded=299 gap_p50/p95_ms=16.321/17.587 keys=2 fps=59.882843 mbps=9.021166 lost=0 dropped=0
+== fix 5
+NOISE cap=20000 rtt=150 request=40000 decoded=300 gap_p50/p95_ms=16.313/19.665 keys=2 fps=59.919106 mbps=9.025351 lost=0 dropped=0
+== old 5
+NOISE cap=50000 rtt=20 request=100000 decoded=296 gap_p50/p95_ms=16.329/17.597 keys=1 fps=59.997482 mbps=9.042917 lost=0 dropped=0
+== new 5
+NOISE cap=50000 rtt=20 request=100000 decoded=297 gap_p50/p95_ms=16.327/17.627 keys=2 fps=59.718544 mbps=9.001225 lost=0 dropped=0
+== fix 5
+NOISE cap=50000 rtt=20 request=100000 decoded=297 gap_p50/p95_ms=16.353/17.616 keys=2 fps=59.714638 mbps=8.994585 lost=0 dropped=0
+== old 5
+NOISE cap=50000 rtt=150 request=100000 decoded=300 gap_p50/p95_ms=16.368/18.588 keys=2 fps=59.956024 mbps=9.056845 lost=0 dropped=0
+== new 5
+NOISE cap=50000 rtt=150 request=100000 decoded=299 gap_p50/p95_ms=16.320/18.483 keys=2 fps=59.968224 mbps=9.034029 lost=0 dropped=0
+== fix 5
+NOISE cap=50000 rtt=150 request=100000 decoded=300 gap_p50/p95_ms=16.324/19.788 keys=2 fps=59.97231 mbps=9.642236 lost=0 dropped=0
+== old 5
+NOISE cap=0 rtt=0 request=100000 decoded=259 gap_p50/p95_ms=16.467/37.514 keys=2 fps=31.895233 mbps=4.833276 lost=0 dropped=0
+== new 5
+NOISE cap=0 rtt=0 request=100000 decoded=213 gap_p50/p95_ms=22.179/37.779 keys=2 fps=35.981052 mbps=5.445261 lost=0 dropped=0
+== fix 5
+NOISE cap=0 rtt=0 request=100000 decoded=252 gap_p50/p95_ms=17.360/35.969 keys=2 fps=51.95222 mbps=7.2322927 lost=0 dropped=0
+== old 5
+NOISE cap=0 rtt=0 request=1000000 decoded=300 gap_p50/p95_ms=16.414/18.693 keys=2 fps=59.970253 mbps=9.061809 lost=0 dropped=0
+== new 5
+NOISE cap=0 rtt=0 request=1000000 decoded=300 gap_p50/p95_ms=16.324/18.346 keys=2 fps=63.684425 mbps=9.021599 lost=0 dropped=0
+== fix 5
+NOISE cap=0 rtt=0 request=1000000 decoded=300 gap_p50/p95_ms=16.324/18.529 keys=2 fps=59.957294 mbps=9.048339 lost=0 dropped=0

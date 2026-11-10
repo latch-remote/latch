@@ -27,7 +27,9 @@ is H.264 High.
 
 ## Results
 
-One run. Time is per frame, submission to output, in milliseconds.
+One run, at commit `a2e4d32`; the benchmark's own output is in
+[raw.txt](raw.txt). Time is per frame, submission to output, in
+milliseconds.
 
 | Codec | Size | Asked fps | Got fps | p50 | p95 | max |
 |---|---|---:|---:|---:|---:|---:|

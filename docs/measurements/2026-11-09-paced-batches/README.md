@@ -42,7 +42,12 @@ give the median of the five with the range in brackets:
 
 - **before**: the sender as it was before paced batches (`69539f0`);
 - **batches**: paced batches as first merged (`aec0dd5`);
-- **now**: the same with the backpressure rule corrected (below).
+- **now**: the same with the backpressure rule corrected (`ed32f66`,
+  below).
+
+Every run's output line is kept: [session.txt](session.txt) for the whole
+session and [sender.txt](sender.txt) for the sender alone, where the three
+builds are labelled `old`, `new` and `fix`.
 
 ```sh
 cargo test --release -p latch-engine --lib paced_socket_measurement --no-run

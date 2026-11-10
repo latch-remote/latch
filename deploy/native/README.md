@@ -26,9 +26,12 @@ tailscale status
 
 Follow the printed login URL and sign in with the same account as the
 viewing machine. Tailnet policy must allow TCP and UDP 47850 between them.
-An untagged host checks the caller's Tailscale user ID. Tagged hosts match
-login against the tailnet name or its domain; this is not a membership
-lookup. Prefer an untagged personal host and restrict reachability with
+An untagged host answers only devices signed in to its own Tailscale
+account. A tagged host has no account: on a personal tailnet it answers
+the tailnet's owner, and on an organisation's tailnet only the logins
+listed in `allowed_logins` in `host.toml`
+(`allowed_logins = ["you@example.com"]`); with none listed it answers
+nobody. Prefer an untagged personal host and restrict reachability with
 Tailscale policy. A fresh install uses the native daemon, not a relay
 container's socket. Do not run two daemons against the same identity.
 
