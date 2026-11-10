@@ -170,7 +170,7 @@ impl Node {
         }
     }
     /// Display name for the peer: the first label of its MagicDNS name
-    /// (e.g. `"iphone.taile55421.ts.net."` → `"iphone"`), matching
+    /// (e.g. `"iphone.example-tailnet.ts.net."` → `"iphone"`), matching
     /// `tailscale status` and the admin console.
     ///
     /// iOS/iPadOS clients always report `HostName: "localhost"` because iOS

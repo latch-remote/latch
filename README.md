@@ -44,9 +44,9 @@ clipboard. Every install can both share and view.
 - **Made for games.** Raw mouse input, Xbox and DualShock pads with rumble,
   a latency overlay, and competitive and cinematic profiles.
 - **Reaches a sleeping PC.** Wake-on-LAN, remote sleep and restart, a
-  self-hosted relay kit, and updates that install themselves.
-- **One small binary.** All Rust; no bundled streaming server and no
-  drivers to hunt for.
+  self-hosted relay kit, and updates that install themselves on Mac and
+  Windows.
+- **One small binary.** All Rust, with no bundled streaming server.
 
 ## Install
 

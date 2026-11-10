@@ -82,7 +82,8 @@ on. Paced batches as first merged waited for the sender to be completely
 idle before taking the next picture, so a frame cost its send time plus
 its encode time, and a fifth of the frames went missing. Letting one frame
 be encoded while the previous one is sent (`PACED_BACKLOG` in
-`src/server.rs`) brings it back to within the spread of the old sender.
+`src/server.rs`) brings it most of the way back: 252 against the old
+sender's 264, with ranges that just overlap.
 The other rows do not differ beyond their run-to-run spread; every build
 has an occasional low run on this loaded machine.
 

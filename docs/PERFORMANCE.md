@@ -73,6 +73,16 @@ figures are
 medians of two short runs. None of these is a game, and none measures the
 time from an input to light leaving a screen.
 
+The Windows host does not reach 240 fps. On that PC, capturing the
+animated desktop with nothing after it supplied 223 updates a second at
+1080p, 191 at 1440p and 107 at 4K, and the AMF encoder alone, fed noise,
+reached 413, 233 and 108. So desktop capture is the first limit at 1080p
+and 1440p and the encoder at 4K, and a stream lands near the lower of the
+two. The capture figure includes Latch's own GPU copy and cursor pass as
+well as Windows' compositor, and the two have not been separated: "the
+hardware is the limit" is established for the Mac's encoder, and not yet
+for capture on Windows.
+
 ## Decoding and presenting
 
 Decode is the decoder's own time. "To the renderer" ends when the frame has
@@ -82,14 +92,16 @@ the compositor, or the display
 
 | Machine and stream | Decode | To the renderer | Decoded / shown |
 | --- | --- | --- | --- |
-| M3 Pro, 1080p at 120, ten seconds | 1.17 ms mean | 2.95 ms p50, 7.30 ms p95 | 613 / 556 |
+| M3 Pro, 1080p with 120 asked, ten seconds (about 61 fps arrived) | 1.17 ms mean | 2.95 ms p50, 7.30 ms p95 | 613 / 556 |
 | RX 6600, HEVC 1080p at 120, six seconds | 4.92 ms p50 | 0.12 ms p50 | 725 / 667 |
 | RX 6600, HEVC 4K at 120 | 16.23 ms p50 | 12.04 ms p50 | 373 / 352 |
 | RX 6600, AV1 4K at 120 | 16.70 ms p50 | 6.92 ms p50 | 417 / 340 |
 
-The RX 6600 does not decode 4K at 120 fps: about 60 to 70 frames a second
-came out. Linux viewers decode H.264 in software and have not been
-measured.
+The Mac row was fed by a software-encoding host on the same loaded
+machine, which is why about half the frames asked for arrived; it measures
+the time per frame, not the Mac's decode rate. The RX 6600 does not decode
+4K at 120 fps: about 60 to 70 frames a second came out. Linux viewers
+decode H.264 in software and have not been measured.
 
 ## Network and loss recovery
 
@@ -103,7 +115,11 @@ measured.
 | Mac, sender alone over loopback, 1 Gbps asked | 734 Mbps, with frames lost; the loopback relay is the limit | same |
 
 Forward error correction costs bitrate, and it does not remove loss: mixed
-loss on a long round trip still damages frames. Recovery frames in place
+loss on a long round trip still damages frames. One known weakness is a
+host whose CPU is busy: a delayed ping reads as a queue on the path, and
+the controller can cut a lightly loaded stream's bitrate to its floor for
+a second or two before restoring it. It shows up on loaded CI runners; how
+often it happens on a PC running a game has not been measured. Recovery frames in place
 of keyframes are on by default for the software encoder and AMD's AMF, and
 opt-in for VideoToolbox and Media Foundation
 ([record](measurements/2026-11-04/rfi-vt-mf/README.md)).
