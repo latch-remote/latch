@@ -13,6 +13,10 @@ What changed in the sender, and what it measured.
   sent.
 - **A bound on frame size**, with an explicit error instead of a frame the
   wire format cannot describe.
+- **The pace on an unmeasured path** (found while measuring the above, and
+  older than it): the controller no longer paces a stream below twice what
+  the viewer is receiving. [Its own section](#the-pace-on-an-unmeasured-path)
+  has the cause and the numbers.
 
 No wire format changed. Sessions between this build and 5.1.0 and 5.2.0
 were run in both directions (`compat.py`) and all connected and streamed.
@@ -42,8 +46,11 @@ give the median of the five with the range in brackets:
 
 - **before**: the sender as it was before paced batches (`69539f0`);
 - **batches**: paced batches as first merged (`aec0dd5`);
-- **now**: the same with the backpressure rule corrected (`ed32f66`,
+- **backlog**: the same with the backpressure rule corrected (`ed32f66`,
   below).
+
+The controller fix came after these three and is compared separately,
+[further down](#the-pace-on-an-unmeasured-path).
 
 Every run's output line is kept: [session.txt](session.txt) for the whole
 session and [sender.txt](sender.txt) for the sender alone, where the three
@@ -65,7 +72,7 @@ unset).
 
 300 is every frame. Gap is the time between published frames, p50/p95.
 
-| Link (request) | before | batches | now |
+| Link (request) | before | batches | backlog |
 |---|---|---|---|
 | 5 Mbps, 20 ms (10) | 285 [285–288], 16.3/20.1 ms | 286 [280–288], 16.3/20.0 | 287 [284–290], 16.3/21.2 |
 | 5 Mbps, 150 ms (10) | 278 [263–278], 16.3/21.2 | 278 [249–278], 16.4/21.1 | 278 [264–278], 16.4/20.1 |
@@ -76,18 +83,79 @@ unset).
 | no limit (100) | 264 [259–281], 16.5/36.2 | **213** [213–263], 22.2/36.8 | 252 [249–262], 17.4/35.2 |
 | no limit (1000) | 300 [300–300], 16.4/18.8 | 300 [300–300], 16.3/18.4 | 300 [300–300], 16.3/18.5 |
 
-The "no limit (100)" row is the one that moved. In that case the software
-encoder on this machine is the slow part, and the controller turns pacing
-on. Paced batches as first merged waited for the sender to be completely
-idle before taking the next picture, so a frame cost its send time plus
-its encode time, and a fifth of the frames went missing. Letting one frame
-be encoded while the previous one is sent (`PACED_BACKLOG` in
-`src/server.rs`) brings it most of the way back: 252 against the old
-sender's 264, with ranges that just overlap.
-The medians of the other rows do not differ. Every build has an
-occasional low run on this loaded machine, and the lowest single run of
-all (169 of 300, at 20 Mbps and 150 ms) belongs to the current build; five
-rounds cannot say whether that is chance.
+The "no limit (100)" row is the one that moved. Paced batches as first
+merged waited for the sender to be completely idle before taking the next
+picture, so a frame cost its send time plus its encode time, and a fifth
+of the frames went missing. Letting one frame be encoded while the
+previous one is sent (`PACED_BACKLOG` in `src/server.rs`) brought it most
+of the way back: 252 against the old sender's 264. The medians of the
+other rows do not differ.
+
+Two things in this table were first read wrongly. The no-limit row was put
+down to the software encoder being the slow part, and the low runs at 150
+ms (169 of 300 at 20 Mbps, 221 at 50 Mbps) to a loaded machine. Both were
+the controller, and neither was new with paced batches.
+
+## The pace on an unmeasured path
+
+A stream that sends less than half its budget counts as idle, even when
+it is moving: this test pattern is about 9 Mbps of video, 12 with parity,
+under budgets of 40 and 100 Mbps. An idle stream is probed with short
+trains of packets so that the controller knows what the path carries
+before motion fills it. When two trains had gone out and no measurement
+had come back, the controller fell back to pacing at a twentieth of the
+budget, whatever the stream was already delivering.
+
+That fallback was reached in two ways:
+
+- **A long round trip.** The second train goes out 200 ms after the
+  first. On a 150 ms round trip the first train's answer arrives at about
+  the same moment, and since paced batches a train is also cancelled when
+  a frame is waiting. Either way the count reached two with nothing
+  measured, and a stream delivering 12 Mbps was paced at 2. In fourteen
+  traced runs at 20 Mbps and 150 ms, three collapsed to about 12 frames a
+  second and took four seconds to climb back ([collapse.txt](collapse.txt)
+  has a good and a bad run side by side). The build as first merged did
+  the same in 3 runs of 20 (their output was not kept).
+- **A path too fast to measure.** With no rate limit and no delay the
+  trains gave no usable measurement at all, so the stream was paced at 5
+  Mbps (a twentieth of 100) for the whole session and its pace only crept
+  up to about what it was sending. That is the 264 of 300, with 34 ms
+  between frames at p95, that the "no limit (100)" row shows for every
+  build, the oldest included.
+
+The fallback is now the larger of a twentieth of the budget and twice the
+best rate the viewer reported receiving in the last second; it rises as
+delivery does, and the first train measured after it takes its place
+(before, a higher measurement could not replace a lower guess). A still
+desktop, which delivers almost nothing, gets the same cautious pace as
+before.
+
+Ten alternating rounds, the sender before paced batches against the
+current build (`12a1598`); every line is in
+[controller.txt](controller.txt). Median frames of 300, the range, and
+the median gap between frames (p50/p95):
+
+| Link (request) | before | now |
+|---|---|---|
+| 5 Mbps, 20 ms (10) | 286 [281–289], 16.5/20.6 ms | 285.5 [272–288], 16.6/21.0 |
+| 5 Mbps, 150 ms (10) | 264 [234–278], 16.5/20.9 | 267.5 [234–279], 16.5/21.4 |
+| 20 Mbps, 20 ms (40) | 297 [258–297], 16.4/18.6 | 296.5 [294–297], 16.4/18.6 |
+| 20 Mbps, 150 ms (40) | 299 [247–299], 16.4/18.8 | 299 [299–299], 16.4/18.5 |
+| 50 Mbps, 20 ms (100) | 297 [296–297], 16.4/17.7 | 297 [296–298], 16.4/17.7 |
+| 50 Mbps, 150 ms (100) | 299 [262–300], 16.4/19.0 | 299 [299–300], 16.4/17.7 |
+| no limit (100) | 265 [260–279], 16.6/33.8 | **300** [300–300], 16.4/19.0 |
+| no limit (1000) | 300 [300–300], 16.4/18.8 | 300 [300–300], 16.5/19.0 |
+
+The no-limit row now delivers every frame, and no run of the current
+build at 20 or 50 Mbps fell below 294. A further 25 traced runs at 20
+Mbps and 150 ms all completed (the last line of `collapse.txt`). The old
+sender has low runs of its own in three rows here; it was not immune,
+only less exposed. The 5 Mbps rows are unchanged: there the link, not the
+pace, is what limits the stream, and at 150 ms both builds lose 20 to 65
+frames while the controller finds the rate.
+
+The sender-alone table below was not repeated with this change.
 
 ## Sender alone: three seconds of synthetic frames
 
@@ -95,7 +163,7 @@ Goodput is payload in frames the reassembler completed. Queue is the p95
 age of a frame when the sender finished it. Lost is frames the reassembler
 gave up on (the first frame is deliberately larger than the FIFO).
 
-| Link (request) | before | batches | now |
+| Link (request) | before | batches | backlog |
 |---|---|---|---|
 | 5 Mbps, 20 ms (10) | 1.8 Mbps, 2.2 ms, 3 lost | 1.6, 2.8, 3 | 1.5, 2.0, 3 |
 | 5 Mbps, 150 ms (10) | 1.0, 0.1, 6 | 0.7, 0.0, 6 | 1.0, 0.0, 6 |
@@ -106,7 +174,11 @@ gave up on (the first frame is deliberately larger than the FIFO).
 | no limit (100) | 82.4, 1.0, 0 | 82.4, 1.0, 0 | 82.4, 1.0, 0 |
 | no limit (1000) | 737.7, 9.3, 8 | 737.8, 9.0, 8 | 734.3, 8.8, 9 |
 
-Through this harness the three senders are the same within noise. On a Mac
+Through this harness the three senders are the same within noise. The
+harness has its own loop standing in for capture, and for these runs that
+loop did not use the corrected rule in any of the three builds, so this
+table compares the pacer and batch sender only; it says nothing about the
+backpressure rule. (The harness now follows `PACED_BACKLOG`.) On a Mac
 that is the expected result: macOS has no batched UDP send, so the batch
 path still makes one system call per datagram. The 1 Gbps row tops out near
 740 Mbps and loses frames in all three. The test's loopback relay is the

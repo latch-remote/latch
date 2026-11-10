@@ -141,7 +141,8 @@ project has not seen, the output of these is worth an issue on its own.
 - **Performance changes come with numbers**: before and after, the
   machine, and the command, so someone else can repeat it.
   [docs/PERFORMANCE.md](docs/PERFORMANCE.md) shows the form.
-- Anything a user would notice gets a line under *Unreleased* in
+- Anything a user would notice gets a line under `## Unreleased` at the top (add the heading if the
+  last release closed it) in
   [CHANGELOG.md](CHANGELOG.md).
 - Documentation states what is true of the code in the same pull request.
   Describe what Latch does and what was verified; leave out what it might

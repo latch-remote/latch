@@ -78,7 +78,7 @@ Then open Latch and click **Connect** beside another machine. The
 
 | | Shares its desktop | Views |
 |---|---|---|
-| **Windows** | HEVC, AV1 or H.264 on the GPU; HDR10; virtual gamepads | hardware AV1, HEVC and H.264; HDR |
+| **Windows** | HEVC or H.264 on the GPU, AV1 where it has an encoder (not yet run on one); HDR10; virtual gamepads | hardware AV1, HEVC and H.264; HDR |
 | **macOS** | HEVC or H.264 on VideoToolbox; HDR10 | hardware AV1 (M3 and later), HEVC and H.264; HDR |
 | **Linux** | software H.264; NVENC and VA-API (not yet run on a GPU); virtual gamepads | software H.264 |
 

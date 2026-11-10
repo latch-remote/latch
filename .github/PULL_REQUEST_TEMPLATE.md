@@ -13,4 +13,4 @@
 - [ ] `cargo test --workspace`
 - [ ] UI changes: snapshots regenerated and looked at (`cargo test -p latch-client -p latch-host snapshots -- --ignored`)
 - [ ] Wire or control-API changes: older hosts and viewers still work, and `docs/PROTOCOL.md` says what is new
-- [ ] `CHANGELOG.md` has a line under *Unreleased* for anything a user would notice
+- [ ] `CHANGELOG.md` has a line under `## Unreleased` (add the heading if it is not there) for anything a user would notice

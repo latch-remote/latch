@@ -42,6 +42,13 @@ publishes for the release instead of trusting the machine that sent it.
   being sent, instead of queueing frames that go stale; counts bandwidth probes against the wire budget and stops
   them under pressure; and reports an encoded frame too large for the
   protocol (19 MB) instead of dropping it silently.
+- A stream that keeps moving but uses less than half the bitrate it asked
+  for no longer falls to a few frames a second. When the host had no
+  measurement of the path it paced such a stream at a twentieth of the
+  budget, whatever was already getting through. The pace is now never under
+  twice what the viewer is receiving, and a measurement that arrives later
+  replaces the guess
+  ([record](docs/measurements/2026-11-09-paced-batches/README.md)).
 
 ### Viewer
 

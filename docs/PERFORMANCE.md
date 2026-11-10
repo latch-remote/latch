@@ -12,15 +12,17 @@ without a record is listed under [Not measured yet](#not-measured-yet).
   settings, keeps 240 fps at 1080p, about 195 fps at 1440p and about 97
   fps at 4K in HEVC, encoder alone
   ([record](measurements/2026-11-09-mac-encode/README.md)).
-- **Windows host.** A PC with a Radeon RX 6600 delivered 217 decoded
-  frames a second to a Mac at 1080p with 240 asked for, 213 at 1440p, and
-  96 at 4K with 120 asked for, taking 3 to 10 ms from capture to send
-  ([record](measurements/2026-11-03/windows-host/README.md)).
+- **Windows host.** A PC with a Radeon RX 6600 captures and encodes 202
+  frames a second at 1080p and 157 at 1440p with 240 asked for, and 90 at
+  4K with 120 asked for, in 3 to 10 ms a frame
+  ([record](measurements/2026-11-03/windows-host/README.md)). Part of the
+  shortfall is Latch's own ([below](#encoding)).
 - **Linux host.** A 4-core ARM server with no GPU holds 60 fps at 1080p in
   software H.264, at 1.4 ms a frame on a moving test pattern
   ([record](measurements/2026-11-03-linux-host/README.md)).
-- **Bad networks.** Through a simulated 20 Mbps link the viewer showed 296
-  of 300 frames in five seconds
+- **Bad networks.** Through a simulated 5 Mbps link, half of what the
+  stream asked for, the viewer showed about 285 of 300 frames in five
+  seconds; with the same link at a 150 ms round trip, about 265
   ([record](measurements/2026-11-09-paced-batches/README.md)). Under 12%
   random loss the software encoder's recovery delivered 1,543 of 1,800
   pictures intact
@@ -99,6 +101,11 @@ the compositor, or the display
 | RX 6600, HEVC 4K at 120 | 16.23 ms p50 | 12.04 ms p50 | 373 / 352 |
 | RX 6600, AV1 4K at 120 | 16.70 ms p50 | 6.92 ms p50 | 417 / 340 |
 
+"Shown" is lower than "decoded" in every row: the viewer keeps only the
+newest decoded picture, so one that has not been drawn when the next
+arrives is replaced, and 8% to 18% of pictures went that way here. Pacing
+presentation to the display is on the [roadmap](ROADMAP.md).
+
 The Mac row was fed by a software-encoding host on the same loaded
 machine, which is why about half the frames asked for arrived; it measures
 the time per frame, not the Mac's decode rate. The RX 6600 does not decode
@@ -113,7 +120,10 @@ decode H.264 in software and have not been measured.
 | Simulated 20 Mbps link, 5% random loss with bursts and jitter | 32.6 frames lost a minute; parity is 34.8% of what is sent | [Transport FEC](measurements/2026-11-04/transport-fec/README.md) |
 | Software H.264 recovery, simulated 12% random loss | 1,543 of 1,800 pictures delivered and checked; 114 ms p95 to resume | [Recovery](measurements/2026-11-03/rfi/review-fixes/README.md) |
 | RX 6600, AMF HEVC recovery frames | all 112 delivered pictures identical to an uninterrupted decode, across four recoveries | same |
-| Mac, whole session through a simulated 20 Mbps, 20 ms link | 296 of 300 frames in five seconds; 16.3 ms p50 and 18.3 ms p95 between frames | [Paced batches](measurements/2026-11-09-paced-batches/README.md) |
+| Mac, whole 640×360 session asking 10 Mbps through a simulated 5 Mbps, 20 ms link | 285.5 of 300 frames in five seconds (median of ten runs, 272 to 288); 16.6 ms p50 and 21.0 ms p95 between frames | [Paced batches](measurements/2026-11-09-paced-batches/README.md) |
+| same, 5 Mbps at a 150 ms round trip | 267.5 of 300 (234 to 279) | same |
+| same, asking 40 Mbps through 20 Mbps at 150 ms | 299 of 300 in each of ten runs | same |
+| same, asking 100 Mbps with no limit | 300 of 300 in each of ten runs | same |
 | Mac, sender alone over loopback, 1 Gbps asked | 734 Mbps, with frames lost; probably the test's loopback relay, which was not measured separately | same |
 
 Forward error correction costs bitrate, and it does not remove loss: mixed

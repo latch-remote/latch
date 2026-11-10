@@ -48,8 +48,10 @@ docker compose -f deploy/node/docker-compose.yml up -d --build
 If your tailnet requires device approval, approve the node at
 [the admin console](https://login.tailscale.com/admin/machines). Open Latch on your Mac or Windows PC: the hostname appears
 under **Machines**. Click **Connect**. Use the same Tailscale account for
-an untagged node. Tagged hosts instead match login to the tailnet name or
-domain, which is broader than a membership check; restrict access in policy.
+an untagged node. A tagged node has no account: on a personal tailnet it
+answers the tailnet's owner, and on an organisation's tailnet only the
+logins listed in `allowed_logins` in `host.toml`; with none listed it
+answers nobody.
 Keep `TS_AUTHKEY` in the protected `.env`: this kit starts its daemon only
 when that variable is nonempty, even when the identity volume exists.
 
