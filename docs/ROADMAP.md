@@ -70,6 +70,9 @@ date, and none of it is a tested capability until it leaves this list.
   qualified on AMD (AMF) and opt-in elsewhere; other encoders repair a
   lost frame with a full keyframe. Per-device qualification, NVENC
   reference invalidation and intra refresh are open.
+- **Pacing that costs no frames when the encoder is the slow part.** In
+  that case a paced stream still delivers about 5% fewer frames than an
+  unpaced one did ([record](measurements/2026-11-09-paced-batches/README.md)).
 - **Per-packet delivery feedback.** The receiver reports in 50 ms
   aggregates over the control connection. Sequence-numbered feedback over
   UDP would let the controller tell network queueing from scheduling.

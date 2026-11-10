@@ -84,8 +84,10 @@ its encode time, and a fifth of the frames went missing. Letting one frame
 be encoded while the previous one is sent (`PACED_BACKLOG` in
 `src/server.rs`) brings it most of the way back: 252 against the old
 sender's 264, with ranges that just overlap.
-The other rows do not differ beyond their run-to-run spread; every build
-has an occasional low run on this loaded machine.
+The medians of the other rows do not differ. Every build has an
+occasional low run on this loaded machine, and the lowest single run of
+all (169 of 300, at 20 Mbps and 150 ms) belongs to the current build; five
+rounds cannot say whether that is chance.
 
 ## Sender alone: three seconds of synthetic frames
 
@@ -107,8 +109,9 @@ gave up on (the first frame is deliberately larger than the FIFO).
 Through this harness the three senders are the same within noise. On a Mac
 that is the expected result: macOS has no batched UDP send, so the batch
 path still makes one system call per datagram. The 1 Gbps row tops out near
-740 Mbps and loses frames in all three; the loopback relay is the limit
-there, not a clean measurement of the sender.
+740 Mbps and loses frames in all three. The test's loopback relay is the
+likely limit, though it was not measured on its own; either way this is
+not a clean measurement of the sender.
 
 ## Timers
 

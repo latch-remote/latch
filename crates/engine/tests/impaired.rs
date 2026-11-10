@@ -180,10 +180,12 @@ fn a_bad_network_slows_the_picture_but_loses_no_key() {
     );
     // Random loss must not hold the budget down: it is near the request
     // for most of the run (at most three of the eight seconds below it)
-    // and back there within six seconds of the end. A dip is allowed
-    // because on a busy machine (a CI runner) a ping that waits for the
-    // CPU looks like a queue: the controller cuts this underfilled
-    // stream's budget and gives it back a second or two later.
+    // and back there soon after (checked for up to six seconds from
+    // here, which is after the three-second look at the square). A dip
+    // is allowed because on a busy machine (a CI runner) a ping that
+    // waits for the CPU looks like a queue: the controller cuts this
+    // underfilled stream's budget and gives it back a second or two
+    // later.
     let budgets: Vec<u32> = seconds.iter().map(|s| s.wire_budget_kbps).collect();
     let low = budgets.iter().filter(|kbps| **kbps < 4800).count();
     assert!(low <= 3, "random loss collapsed the budget: {budgets:?}");

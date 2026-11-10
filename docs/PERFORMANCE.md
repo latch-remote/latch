@@ -114,7 +114,7 @@ decode H.264 in software and have not been measured.
 | Software H.264 recovery, simulated 12% random loss | 1,543 of 1,800 pictures delivered and checked; 114 ms p95 to resume | [Recovery](measurements/2026-11-03/rfi/review-fixes/README.md) |
 | RX 6600, AMF HEVC recovery frames | all 112 delivered pictures identical to an uninterrupted decode, across four recoveries | same |
 | Mac, whole session through a simulated 20 Mbps, 20 ms link | 296 of 300 frames in five seconds; 16.3 ms p50 and 18.3 ms p95 between frames | [Paced batches](measurements/2026-11-09-paced-batches/README.md) |
-| Mac, sender alone over loopback, 1 Gbps asked | 734 Mbps, with frames lost; the loopback relay is the limit | same |
+| Mac, sender alone over loopback, 1 Gbps asked | 734 Mbps, with frames lost; probably the test's loopback relay, which was not measured separately | same |
 
 Forward error correction costs bitrate, and it does not remove loss: mixed
 loss on a long round trip still damages frames. One known weakness is a
@@ -154,6 +154,8 @@ Nobody has yet seen a Latch HDR stream on an HDR panel.
 - NVIDIA and Intel GPUs on Windows.
 - HDR on a physical HDR display: brightness, colour, and a whole HDR
   session to a Windows viewer.
+- A Mac host's rate from screen capture to send. The Mac figures above
+  are the encoder alone.
 - Input to photon: the time from a key or mouse movement to the change on
   the viewer's screen, measured with a camera.
 - What Linux GSO and Windows USO save on a real network card.

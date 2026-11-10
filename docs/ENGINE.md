@@ -465,7 +465,9 @@ is inside the interval; a deadline missed by a whole interval resets the grid to
 actual capture time, without catch-up trains (`video::Pacer`). Idle repeats remain bounded at 100 ms.
 Encoding feeds a two-frame bounded channel to a dedicated video sender;
 backpressure preserves encoded references. When pacing is active, the producer
-waits for outstanding sends before capturing the next picture. This bounds
+does not capture the next picture while an encoded frame is already queued
+behind the one being sent (`PACED_BACKLOG`), so one frame can be encoded
+while the previous one leaves. This bounds
 encoded backlog without dropping P references or generating extra recovery IDRs;
 a large keyframe still takes its unavoidable wire serialization time. Clean
 paths retain the two-frame overlap. Cancellation may discard queued

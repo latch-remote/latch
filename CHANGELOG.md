@@ -54,7 +54,9 @@ publishes for the release instead of trusting the machine that sent it.
   tries it again at once.
 - The viewer drops a decode backlog by its age (three frame intervals)
   instead of a fixed 50 ms, and says so when this machine decodes fewer
-  frames a second than the stream sends.
+  frames a second than the stream sends. The queue itself stays eight
+  frames deep, as before, so the burst that arrives after a network stall
+  is decoded and not thrown away.
 - The stats overlay shows the decoder's 95th-percentile time against the
   frame budget, and labels what it counts (pictures handed to the window,
   and a modelled delay) for what they are.
