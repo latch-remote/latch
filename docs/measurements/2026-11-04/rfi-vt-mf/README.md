@@ -213,7 +213,7 @@ This is a compile check, not a linked Windows executable or native release run. 
 the PC (83 tests at the earlier validated revision, 9dda649). The #53 scratch edge
 harness passed 64 seeds; the wrap harness passed 65,560 frames. FFmpeg
 independently decoded eight seed streams plus the wrap stream, all exact.
-Scratch sources were reused temporarily and removed; [log](review53-scratch.txt).
+Scratch sources were reused temporarily and removed.
 
 Windows release compilation on the PC crashed in rustc, first with 0xc0000409
 and then invalid compiler metadata. A -j2 retry, -j1 retry and clean release

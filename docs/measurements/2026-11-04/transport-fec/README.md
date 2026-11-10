@@ -1,6 +1,7 @@
 # FEC-first transport, 2026-11-04
 
-**Latest follow-up:** [C1/C2 confidence fix and final validation](review58c/README.md).
+The harness body used by the follow-up runs is kept as a test:
+`crates/engine/tests/support/probe_body.rs`.
 The tables below record the earlier review rounds through `54dcbc5`; the
 follow-up supersedes their idle train estimator and downward-decision rules.
 
@@ -83,7 +84,8 @@ SOFTFAIL lines. Raw output: [sim-main.txt](sim-main.txt),
 
 The review-58b harness (60 fps, 50 ms reports, a simulated FIFO, its idle,
 desktop, sparse, spike, overshoot and legacy scenarios) is kept in
-[review58b/](review58b/) with one shim per revision; the three-way table is
+the repository's history (`docs/measurements/2026-11-04/transport-fec/review58b/`
+at tag `v5.2.0`) with one shim per revision; the three-way table is
 [review58b.txt](review58b.txt).
 
 ## Random loss and parity cost
@@ -270,7 +272,8 @@ python3 docs/measurements/2026-11-04/transport-fec/compare.py e2fad22 /tmp/old .
 (cd /tmp/old && CARGO_TARGET_DIR=/tmp/old-target cargo test --release -p latch-engine \
   --test steady_transport --test transport_scenarios -- --nocapture)
 # The review-58b harness, in any of the three checkouts:
-cp docs/measurements/2026-11-04/transport-fec/review58b/{body.rs,scenarios.rs,this.rs} crates/engine/tests/
+git archive v5.2.0 docs/measurements/2026-11-04/transport-fec/review58b | tar -x -C /tmp
+cp /tmp/docs/measurements/2026-11-04/transport-fec/review58b/{body.rs,scenarios.rs,this.rs} crates/engine/tests/
 cargo test --release -p latch-engine --test this -- --nocapture   # main.rs / e2fad22.rs in those trees
 ```
 

@@ -76,7 +76,7 @@ mod shim {
         }
     }
 }
-include!("../../../docs/measurements/2026-11-04/transport-fec/review58c/body.rs");
+include!("support/probe_body.rs");
 
 #[test]
 fn sparse_jitter_keeps_the_ceiling_and_clean_resume_keeps_its_latency() {

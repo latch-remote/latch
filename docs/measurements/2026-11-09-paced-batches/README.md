@@ -26,7 +26,8 @@ Windows.
 
 Two harnesses, both ignored tests in `latch-engine`:
 
-- `paced_socket_measurement` (`src/server.rs`) drives the production
+- `paced_socket_measurement` (`tests/support/lifecycle.rs`, compiled into
+  the library's tests) drives the production
   pacer, packetizer, batch sender, controller and reassembler with
   synthetic encoded frames at 60 fps for three seconds, through real UDP
   sockets and a rate-limited FIFO with a 50 ms queue. It isolates the

@@ -4,39 +4,27 @@ The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
 `## X.Y.Z (date)`.
 
-## Unreleased
+## 5.3.0 (2026-11-09)
+
+5.2.0 was tagged on 4 November but its release was never published, so
+this is the first release that carries its work as well: quality profiles
+that follow the display, the stats overlay, hardware decoding on Mac and
+Windows viewers, HDR10 and ten-bit colour, gamepads, surround sound and the
+microphone. Those are listed under
+[5.2.0](https://github.com/MrBeldum/latch/blob/main/CHANGELOG.md#520-2026-11-04);
+what follows is new since then.
+
+A Windows PC still on 5.1.0 or earlier takes this update the usual way.
+From 5.3.0 on, a Windows host checks each update against the file GitHub
+publishes for the release instead of trusting the machine that sent it.
+
+### Connection and picture
 
 - A stream that loses its connection keeps trying for five minutes
   instead of three attempts: after 2, 5 and 10 seconds, then every 20 to 30,
   and at once when the machine shows as online again or this one wakes.
   **Reconnect now** and **Stop** stay on screen. A refusal, another viewer
   taking over, or the host ending the stream stops the retries.
-- Windows viewer: a hardware decoder that stops answering no longer freezes
-  the stream. Every wait on Media Foundation has a deadline; a stalled
-  decoder is abandoned and reopened at the next keyframe.
-- Windows hosts check every pushed update against the SHA-256 GitHub
-  publishes for that release's `latch-host.exe`, not against the hash the
-  sender supplies. A release without that file, or a PC that cannot reach
-  GitHub, refuses the update; install such a release on the PC by hand once.
-- Windows updates itself: with the window open it checks every six hours
-  (and from Settings) and installs a verified release when no stream is
-  running. Linux shows the new version and where to get it.
-- Releases carry the bare Windows executable and a `SHA256SUMS` for every
-  file, with build provenance attestations. Workflow actions are pinned to
-  commits, jobs have only the permissions they use, and a release runs the
-  same tests as CI.
-- Controlling administrator windows on a Windows host is now a choice:
-  new installs leave the helper off, and the Sharing tab explains what
-  turning it on allows. A PC that already had it keeps it. The helper
-  answers only the installed Latch.
-- The service on a machine takes control requests from that machine only
-  with a private per-user token, so another account signed in there can
-  read its status and nothing else.
-- A tagged host on an organisation's tailnet answers only the logins
-  listed in `allowed_logins` in `host.toml`; an email domain is not proof
-  of membership. Tagged and shared-in peers are refused.
-- The clipboard is shared only with the machine that is streaming, or was
-  in the last five seconds, and has a switch on the Sharing tab.
 - A Linux host sends the size the viewer asked for. A desktop that cannot
   change size (a headless server's) is scaled into the stream, with black
   bars when the shapes differ, and the pointer and clicks land where they
@@ -48,6 +36,18 @@ GitHub release notes, so each version gets a heading of the form
 - When the first encoder will not open and the host falls back to another
   codec, the size, frame rate and bitrate are fitted again for that codec
   instead of carried over.
+- Under network pressure the host paces video in batches instead of one
+  packet per timer sleep, re-reading the rate as it goes; holds back
+  capture while more than one encoded frame is waiting to be sent,
+  instead of queueing frames that go stale; counts bandwidth probes against the wire budget and stops
+  them under pressure; and reports an encoded frame too large for the
+  protocol (19 MB) instead of dropping it silently.
+
+### Viewer
+
+- Windows viewer: a hardware decoder that stops answering no longer freezes
+  the stream. Every wait on Media Foundation has a deadline; a stalled
+  decoder is abandoned and reopened at the next keyframe.
 - A decoder that fails is avoided for that host and codec for a while (five
   minutes if it would not open, fifteen seconds if it failed mid-stream)
   instead of for every host until Latch restarts; **Apply and reconnect**
@@ -58,14 +58,39 @@ GitHub release notes, so each version gets a heading of the form
 - The stats overlay shows the decoder's 95th-percentile time against the
   frame budget, and labels what it counts (pictures handed to the window,
   and a modelled delay) for what they are.
-- Under network pressure the host paces video in batches instead of one
-  packet per timer sleep, re-reading the rate as it goes; holds back
-  capture while the paced sender is behind, instead of queueing frames
-  that go stale; counts bandwidth probes against the wire budget and stops
-  them under pressure; and reports an encoded frame too large for the
-  protocol (19 MB) instead of dropping it silently.
+
+### Security
+
+- The service on a machine takes control requests from that machine only
+  with a private per-user token, so another account signed in there can
+  read its status and nothing else.
+- A tagged host on an organisation's tailnet answers only the logins
+  listed in `allowed_logins` in `host.toml`; an email domain is not proof
+  of membership. Tagged and shared-in peers are refused.
+- The clipboard is shared only with the machine that is streaming, or was
+  in the last five seconds, and has a switch on the Sharing tab.
+- Controlling administrator windows on a Windows host is now a choice:
+  new installs leave the helper off, and the Sharing tab explains what
+  turning it on allows. A PC that already had it keeps it. The helper
+  answers only the installed Latch.
+
+### Updates and releases
+
+- Windows updates itself: with the window open it checks every six hours
+  (and from Settings) and installs a verified release when no stream is
+  running. Linux shows the new version and where to get it.
+- Windows hosts check every pushed update against the SHA-256 GitHub
+  publishes for that release's `latch-host.exe`, not against the hash the
+  sender supplies. A release without that file, or a PC that cannot reach
+  GitHub, refuses the update; install such a release on the PC by hand once.
+- Releases carry the bare Windows executable and a `SHA256SUMS` for every
+  file, with build provenance attestations. Workflow actions are pinned to
+  commits, jobs have only the permissions they use, and a release runs the
+  same tests as CI.
 
 ## 5.2.0 (2026-11-04)
+
+Tagged, but never published as a release; first shipped in 5.3.0.
 
 Request ceilings are 16384 pixels a side, 500 fps and 1 Gbps
 (`crates/proto/src/control.rs`), above what current hardware delivers.
