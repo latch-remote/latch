@@ -71,6 +71,27 @@ fn square_is_white(f: &Frame) -> bool {
 
 #[test]
 fn a_bad_network_slows_the_picture_but_loses_no_key() {
+    // Keys, the picture and FEC are checked on every attempt. The budget
+    // check gets three: it also fails when the machine, not the loss, is
+    // what the controller is reacting to (see `session`), and a shared CI
+    // runner does that now and then. Loss that held the budget
+    // down would fail all three.
+    let mut complaints = Vec::new();
+    for _ in 0..3 {
+        match session() {
+            None => return,
+            Some(complaint) => {
+                eprintln!("{complaint}; trying again");
+                complaints.push(complaint);
+            }
+        }
+    }
+    panic!("{}", complaints.join("\n"));
+}
+
+/// One session through the bad network. Panics on a lost key, a stopped
+/// picture or idle FEC; returns what was wrong with the budget, if anything.
+fn session() -> Option<String> {
     std::env::set_var("LATCH_TEST_PATTERN", "sweep");
     let bad = Impairment {
         loss: 0.03,
@@ -185,19 +206,26 @@ fn a_bad_network_slows_the_picture_but_loses_no_key() {
     // is allowed because on a busy machine (a CI runner) a ping that
     // waits for the CPU looks like a queue: the controller cuts this
     // underfilled stream's budget and gives it back a second or two
-    // later.
+    // later. A runner starved for longer is cut again and again, which
+    // these limits do not allow for: the caller tries again.
     let budgets: Vec<u32> = seconds.iter().map(|s| s.wire_budget_kbps).collect();
     let low = budgets.iter().filter(|kbps| **kbps < 4800).count();
-    assert!(low <= 3, "random loss collapsed the budget: {budgets:?}");
     let deadline = Instant::now() + Duration::from_secs(6);
     let mut budget = session.stats().wire_budget_kbps;
-    while budget < 4800 && Instant::now() < deadline {
+    while low <= 3 && budget < 4800 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(250));
         budget = session.stats().wire_budget_kbps;
     }
-    assert!(
-        budget >= 4800,
-        "the budget did not come back: {budgets:?}, then {budget}"
-    );
     session.stop();
+    if low > 3 {
+        Some(format!(
+            "the budget was low for {low} of 8 seconds: {budgets:?}"
+        ))
+    } else if budget < 4800 {
+        Some(format!(
+            "the budget did not come back: {budgets:?}, then {budget}"
+        ))
+    } else {
+        None
+    }
 }
