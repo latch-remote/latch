@@ -38,8 +38,8 @@ publishes for the release instead of trusting the machine that sent it.
   instead of carried over.
 - Under network pressure the host paces video in batches instead of one
   packet per timer sleep, re-reading the rate as it goes; holds back
-  capture while more than one encoded frame is waiting to be sent,
-  instead of queueing frames that go stale; counts bandwidth probes against the wire budget and stops
+  capture while an encoded frame is already waiting behind the one
+  being sent, instead of queueing frames that go stale; counts bandwidth probes against the wire budget and stops
   them under pressure; and reports an encoded frame too large for the
   protocol (19 MB) instead of dropping it silently.
 

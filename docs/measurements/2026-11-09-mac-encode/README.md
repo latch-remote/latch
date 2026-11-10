@@ -10,9 +10,10 @@ average about 3 before and after.
 
 `realtime_benchmark` is an ignored test in `latch-engine`
 (`src/mac/encoder/tests.rs`). It submits prefilled IOSurfaces to the
-production encoder on the stream's frame grid for four seconds, with a
-keyframe once a second, and times each frame from submission to the
-encoded output. There is no capture, network, decode or display, and the
+production encoder with the settings a stream uses (real time, no frame
+reordering or delay, two frames in flight) on the stream's frame grid for
+four seconds, with a keyframe once a second, and times each frame from
+submission to the encoded output. There is no capture, network, decode or display, and the
 pictures are synthetic, so this is the encoder's ceiling on this machine
 and not a stream's frame rate.
 
@@ -51,13 +52,31 @@ milliseconds.
 ## What it says
 
 - HEVC keeps 240 fps at 1080p, about 195 at 1440p and about 97 at 4K. A
-  Mac host cannot share 4K at 120 fps: the encoder, not Latch, is the
-  limit.
+  Mac host cannot share 4K at 120 fps, and that is the encoder's limit,
+  not the two-frame pipeline's (next section).
 - H.264 is slower than HEVC on this chip at every size above 1080p60, and
   does not reach 60 fps at 4K. Auto prefers HEVC when the viewer decodes
   it.
 - A frame takes less time at 240 fps (6 ms at 1080p) than at 60 (8.5 ms),
   so the 60 fps rows do not show the encoder working as fast as it can.
+
+## More frames in flight
+
+Latch keeps at most two frames in the encoder at once. To see whether
+that holds the rate down, the same benchmark was run with
+`LATCH_VT_IN_FLIGHT` set to 2, 3, 4 and 6:
+
+| Case | 2 in flight | 3 | 4 | 6 |
+|---|---|---|---|---|
+| HEVC 3840×2160, 120 asked | 95.4 fps, 20.6 ms | 96.8, 30.8 | 96.8, 41.1 | 96.8, 61.8 |
+| HEVC 2560×1440, 240 asked | 193.8, 9.8 | 203.3, 14.7 | 203.5, 19.6 | 203.5, 29.4 |
+| H.264 3840×2160, 60 asked | 53.1, 36.7 | 53.6, 55.0 | 53.6, 73.5 | 53.6, 110.2 |
+| H.264 1920×1080, 240 asked | 190.4, 10.0 | 196.2, 15.0 | 197.2, 19.9 | 196.4, 30.0 |
+
+Each cell is frames a second and the p50 frame time. A third frame in
+flight gains 1% to 5% and adds half as much delay again; beyond that the
+rate does not move and every extra frame is one more frame time of delay.
+The encoder hardware sets these rates, and two in flight stays.
 
 ## Not measured
 

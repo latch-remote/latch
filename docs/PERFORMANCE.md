@@ -8,8 +8,9 @@ without a record is listed under [Not measured yet](#not-measured-yet).
 
 ## The short version
 
-- **Mac host.** An M3 Pro's hardware encoder keeps 240 fps at 1080p, about
-  195 fps at 1440p and about 97 fps at 4K in HEVC, encoder alone
+- **Mac host.** An M3 Pro's hardware encoder, with Latch's low-latency
+  settings, keeps 240 fps at 1080p, about 195 fps at 1440p and about 97
+  fps at 4K in HEVC, encoder alone
   ([record](measurements/2026-11-09-mac-encode/README.md)).
 - **Windows host.** A PC with a Radeon RX 6600 delivered 217 decoded
   frames a second to a Mac at 1080p with 240 asked for, 213 at 1440p, and
@@ -73,15 +74,16 @@ figures are
 medians of two short runs. None of these is a game, and none measures the
 time from an input to light leaving a screen.
 
-The Windows host does not reach 240 fps. On that PC, capturing the
-animated desktop with nothing after it supplied 223 updates a second at
-1080p, 191 at 1440p and 107 at 4K, and the AMF encoder alone, fed noise,
-reached 413, 233 and 108. So desktop capture is the first limit at 1080p
-and 1440p and the encoder at 4K, and a stream lands near the lower of the
-two. The capture figure includes Latch's own GPU copy and cursor pass as
-well as Windows' compositor, and the two have not been separated: "the
-hardware is the limit" is established for the Mac's encoder, and not yet
-for capture on Windows.
+The Windows host does not reach 240 fps, and part of that is Latch. On
+that PC, capturing the animated desktop with nothing after it supplied 223
+updates a second at 1080p, 191 at 1440p and 107 at 4K, and the AMF encoder
+alone, fed noise, reached 413, 233 and 108. Capture and encode together on
+the PC gave 202, 157 and 90: between 9% and 18% under the slower of the
+two stages. That shortfall is in Latch's own path from capture to encoder
+(a GPU copy, the cursor pass, colour conversion and the hand-off), and
+closing it is on the [roadmap](ROADMAP.md). The capture figure itself
+mixes Windows' compositor with Latch's copy, and those have not been
+separated either.
 
 ## Decoding and presenting
 
