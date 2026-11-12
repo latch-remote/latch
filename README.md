@@ -13,16 +13,16 @@ Low-latency desktop and game streaming between computers you own, over
 [Tailscale](https://tailscale.com). One app for macOS, Windows and Linux,
 written in Rust.
 
-[![CI](https://github.com/MrBeldum/latch/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MrBeldum/latch/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/MrBeldum/latch?label=release&color=4F8FE8)](https://github.com/MrBeldum/latch/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/MrBeldum/latch/total?color=4F8FE8)](https://github.com/MrBeldum/latch/releases)
+[![CI](https://github.com/runefoo/latch/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/runefoo/latch/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/runefoo/latch?label=release&color=4F8FE8)](https://github.com/runefoo/latch/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/runefoo/latch/total?color=4F8FE8)](https://github.com/runefoo/latch/releases)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-4F8FE8)](LICENSE)
 
-[Website](https://mrbeldum.github.io/latch/) ·
-[Download](https://github.com/MrBeldum/latch/releases/latest) ·
+[Website](https://runefoo.github.io/latch/) ·
+[Download](https://github.com/runefoo/latch/releases/latest) ·
 [Docs](docs/README.md) ·
 [Roadmap](docs/ROADMAP.md) ·
-[Discussions](https://github.com/MrBeldum/latch/discussions)
+[Discussions](https://github.com/runefoo/latch/discussions)
 
 <br>
 
@@ -54,19 +54,19 @@ Every machine needs [Tailscale](https://tailscale.com/download), signed in
 to the same account.
 
 **Windows 10 or 11 (x64).** Download `latch-windows-x64.zip` from the
-[latest release](https://github.com/MrBeldum/latch/releases/latest), unzip
+[latest release](https://github.com/runefoo/latch/releases/latest), unzip
 it and run `latch-host.exe`. To share the PC, open the **Sharing** tab and
 click **Set up as administrator**. [More](docs/WINDOWS.md)
 
 **macOS 13 or later (Apple Silicon).** [More](docs/MACOS.md)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MrBeldum/latch/main/scripts/install-macos-release.sh | bash
+curl -fsSL https://raw.githubusercontent.com/runefoo/latch/main/scripts/install-macos-release.sh | bash
 ```
 
 **Linux (x64 and arm64, X11).** Download `latch-host-linux-x64.tar.gz` or
 `latch-host-linux-arm64.tar.gz` from the
-[latest release](https://github.com/MrBeldum/latch/releases/latest)
+[latest release](https://github.com/runefoo/latch/releases/latest)
 (needs glibc 2.39 or later) and run `latch-host`. For a headless server
 there are [systemd units](deploy/native/README.md) and a
 [Docker container](deploy/node/NODE.md).
@@ -129,9 +129,9 @@ cargo test --workspace                   # the tests
 Bug reports, measurements from hardware we do not have, and pull requests
 are all welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), pick
 something labelled
-[good first issue](https://github.com/MrBeldum/latch/labels/good%20first%20issue)
-or [help wanted](https://github.com/MrBeldum/latch/labels/help%20wanted),
-or ask in [Discussions](https://github.com/MrBeldum/latch/discussions).
+[good first issue](https://github.com/runefoo/latch/labels/good%20first%20issue)
+or [help wanted](https://github.com/runefoo/latch/labels/help%20wanted),
+or ask in [Discussions](https://github.com/runefoo/latch/discussions).
 Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## License
