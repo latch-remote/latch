@@ -281,7 +281,7 @@ pub(crate) fn filter_frame(
             // edge y=4*e on all 16 columns.
             for band in 0..4usize {
                 let y0 = mb_y * 16 + band * 4;
-                for e in 0..4usize {
+                for (e, edge) in bs.v.iter().enumerate() {
                     let x = mb_x * 16 + e * 4;
                     let mut qp_p = [0u8; 4];
                     if e == 0 {
@@ -296,7 +296,7 @@ pub(crate) fn filter_frame(
                     } else {
                         qp_p.fill(cur.qp_y);
                     }
-                    let one = bs.v[e][band];
+                    let one = edge[band];
                     filter_v_edge(
                         y, stride, x, y0, &[one; 4], qp_p[0], cur.qp_y, off_a, off_b, false,
                     );
