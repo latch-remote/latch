@@ -1,0 +1,25 @@
+{
+  "utc": "2026-11-14T10:45:50Z",
+  "files": [
+    {
+      "path": "crates/relay/src/client.rs",
+      "sha256": "42222397501a12b46526be225e8397938a28751311f535d442531edd0435b0a9",
+      "bytes": 37531
+    },
+    {
+      "path": "crates/relay/src/wire.rs",
+      "sha256": "81c27161b5406ef1ad2e3651789440f82a125a29918021db48ca97969908afca",
+      "bytes": 17420
+    },
+    {
+      "path": "crates/relay/tests/transport.rs",
+      "sha256": "60f06e57f6263649adb216ab45cd3c9341960b0588fcba64708999bd1089ca7c",
+      "bytes": 21421
+    },
+    {
+      "path": "crates/stream/src/session.rs",
+      "sha256": "144cd1b8efa7ab5eb5c26a77183634e532665cb82c23f584954ce9e6b2946625",
+      "bytes": 148671
+    }
+  ]
+}

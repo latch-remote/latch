@@ -43,6 +43,26 @@ impl Mic {
         udp: UdpSocket,
         host: SocketAddr,
     ) -> Result<Self> {
+        Self::start_routed(
+            format,
+            session,
+            udp,
+            host,
+            Arc::new(crate::session::RelayRoute::new(
+                session,
+                latch_relay::Role::Viewer,
+                None,
+            )),
+        )
+    }
+
+    pub(crate) fn start_routed(
+        format: &AudioFormat,
+        session: u32,
+        udp: UdpSocket,
+        host: SocketAddr,
+        relay: Arc<crate::session::RelayRoute>,
+    ) -> Result<Self> {
         if format.codec != "lpcm-rice"
             || format.channels != 1
             || format.frame_samples == 0
@@ -54,6 +74,7 @@ impl Mic {
         let (stop, stopped) = mpsc::channel();
         let state = Arc::new(Mutex::new(MicState::Opening));
         let shared = Sender {
+            relay,
             packetizer: AudioPacketizer::mic(session),
             udp,
             host,
@@ -85,6 +106,7 @@ impl Mic {
 
 /// Frames, codes and sends what the device captures.
 struct Sender {
+    relay: Arc<crate::session::RelayRoute>,
     packetizer: AudioPacketizer,
     udp: UdpSocket,
     host: SocketAddr,
@@ -114,8 +136,11 @@ impl Sender {
             let pts = (self.sent * 1_000_000 / u64::from(self.rate)) as u32;
             self.sent += self.frame as u64;
             let (udp, host) = (&self.udp, self.host);
+            let relay = &self.relay;
             self.packetizer.packetize(pts, &self.coded, |datagram| {
-                let _ = udp.send_to(datagram, host);
+                if crate::session::routed_datagram(relay, udp, datagram, host).is_err() {
+                    relay.fail();
+                }
             });
         }
         self.pending.drain(..at);
@@ -281,6 +306,11 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let mut sender = Sender {
+            relay: Arc::new(crate::session::RelayRoute::new(
+                1,
+                latch_relay::Role::Viewer,
+                None,
+            )),
             packetizer: AudioPacketizer::mic(7),
             udp: UdpSocket::bind("127.0.0.1:0").unwrap(),
             host: socket.local_addr().unwrap(),

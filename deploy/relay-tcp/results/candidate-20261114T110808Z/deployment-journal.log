@@ -1,0 +1,15 @@
+2026-11-14T11:29:54.423375+00:00 ip-172-26-14-232 latch-relay[3142]: network_bytes=3902543122 quota_reserved_bytes=4092002304 accepted=249 rejected=9 grants=24 connections=0 sessions=0
+2026-11-14T11:29:55.421641+00:00 ip-172-26-14-232 systemd[1]: Stopping latch-relay.service - Latch native TCP/TLS rendezvous relay...
+2026-11-14T11:29:55.423425+00:00 ip-172-26-14-232 systemd[1]: latch-relay.service: Deactivated successfully.
+2026-11-14T11:29:55.423733+00:00 ip-172-26-14-232 systemd[1]: Stopped latch-relay.service - Latch native TCP/TLS rendezvous relay.
+2026-11-14T11:29:55.423803+00:00 ip-172-26-14-232 systemd[1]: latch-relay.service: Consumed 1min 11.149s CPU time, 2.6M memory peak, 0B memory swap peak.
+2026-11-14T11:29:55.429087+00:00 ip-172-26-14-232 systemd[1]: Started latch-relay.service - Latch native TCP/TLS rendezvous relay.
+2026-11-14T11:29:55.485318+00:00 ip-172-26-14-232 latch-relay[6541]: latch-relay listening on 0.0.0.0:443
+2026-11-14T11:29:55.591046+00:00 ip-172-26-14-232 latch-relay[6541]: relay connection closed phase=request role=none lane=none category=peer_closed kind=UnexpectedEof
+2026-11-14T11:30:25.485873+00:00 ip-172-26-14-232 latch-relay[6541]: network_bytes=4333 quota_reserved_bytes=4092067840 accepted=1 rejected=0 grants=0 connections=0 sessions=0
+2026-11-14T11:30:28.009052+00:00 ip-172-26-14-232 latch-relay[6541]: relay connection closed phase=request role=none lane=none category=partial_record_timeout kind=TimedOut
+2026-11-14T11:30:55.485994+00:00 ip-172-26-14-232 latch-relay[6541]: network_bytes=10836 quota_reserved_bytes=4092133376 accepted=2 rejected=0 grants=0 connections=0 sessions=0
+2026-11-14T11:31:25.486111+00:00 ip-172-26-14-232 latch-relay[6541]: network_bytes=10836 quota_reserved_bytes=4092133376 accepted=2 rejected=0 grants=0 connections=0 sessions=0
+2026-11-14T11:31:55.486175+00:00 ip-172-26-14-232 latch-relay[6541]: network_bytes=10836 quota_reserved_bytes=4092133376 accepted=2 rejected=0 grants=0 connections=0 sessions=0
+2026-11-14T11:32:25.486276+00:00 ip-172-26-14-232 latch-relay[6541]: network_bytes=10836 quota_reserved_bytes=4092133376 accepted=2 rejected=0 grants=0 connections=0 sessions=0
+2026-11-14T11:32:55.486357+00:00 ip-172-26-14-232 latch-relay[6541]: network_bytes=10836 quota_reserved_bytes=4092133376 accepted=2 rejected=0 grants=0 connections=0 sessions=0

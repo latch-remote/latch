@@ -108,7 +108,9 @@ fn sparse_jitter_keeps_the_ceiling_and_clean_resume_keeps_its_latency() {
         assert_eq!(o.mean_enc, f64::from(s.ceiling));
         assert_eq!((o.lost, o.skipped), (0, 0));
     }
-    for (rtt, latency) in [(10, 8), (50, 28), (150, 78), (250, 128)] {
+    // The first motion frame is paced at its 20 Mbps wire budget. Its
+    // serialization adds 10–11 ms, depending on the RTT parity floor.
+    for (rtt, latency) in [(10, 19), (50, 38), (150, 88), (250, 138)] {
         let s = Scenario {
             name: "clean_resume",
             fps: 60,
@@ -128,7 +130,8 @@ fn sparse_jitter_keeps_the_ceiling_and_clean_resume_keeps_its_latency() {
             seed: 17,
         };
         let o = run(&s);
-        assert_eq!(o.full_rate_at, Some(latency));
+        assert_eq!(o.final_budget, s.ceiling);
+        assert_eq!(o.full_rate_at, Some(latency), "{rtt} ms RTT");
         assert_eq!((o.lost, o.skipped), (0, 0));
     }
 }

@@ -1,0 +1,17 @@
+
+running 12 tests
+test cancelling_silent_tls_handshake_and_drop_are_bounded ... ok
+test daemon_restart_preserves_spent_transfer_reservations ... ok
+test delayed_ack_path_does_not_limit_video_to_eight_frames_per_round_trip ... ok
+test exhausted_receive_queue_closes_attempt_and_propagates_failure ... ok
+test frame_ack_elapsed_is_authenticated_and_consumed_on_the_callers_cadence ... ok
+test pilot_admission_bounds_outstanding_grants_per_creator_ip ... ok
+test pre_cancelled_dns_and_connect_stop_without_waiting ... ok
+test public_roots_reject_test_certificate ... ok
+test real_tls_two_lanes_complete_frame_and_authenticated_control ... ok
+test repeated_frames_advance_the_bounded_authenticated_ack_window ... ok
+test replayed_attachment_cannot_rejoin ... ok
+test wrong_keys_never_reach_ready ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 49.82s
+

@@ -1,0 +1,3 @@
+# Preserve captured validation evidence byte for byte across platform checkouts.
+docs/measurements/2026-11-14-latch6-field/** -text -whitespace linguist-generated=true
+deploy/relay-tcp/results/** -text -whitespace linguist-generated=true

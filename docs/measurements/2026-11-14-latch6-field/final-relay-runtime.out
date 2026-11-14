@@ -1,0 +1,179 @@
+
+running 8 tests
+test actual_relay_audio_and_microphone_reach_pcm_sinks ... FAILED
+test automatic_blackhole_recovery_real_tls_input_and_udp_fallback ... [2m2026-11-14T10:53:04.509017Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) [3msend_bytes[0m[2m=[0m8388608 [3mreceive_bytes[0m[2m=[0m8388608
+[2m2026-11-14T10:53:04.742833Z[0m [34mDEBUG[0m [2mlatch_stream::video::mediafoundation[0m[2m:[0m decoder ICodecAPI low-latency mode: Invalid argument (VT_UI4 != pValue->vt) (0x80070057)
+[2m2026-11-14T10:53:04.801765Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+[2m2026-11-14T10:53:04.801796Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test is watching: 128├ù128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+[2m2026-11-14T10:53:04.802654Z[0m [34mDEBUG[0m [2mlatch_stream::video::mediafoundation[0m[2m:[0m decoder ICodecAPI low-latency mode: Invalid argument (VT_UI4 != pValue->vt) (0x80070057)
+[2m2026-11-14T10:53:05.844866Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:53:06.131632Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:53:06.424816Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mReady
+[2m2026-11-14T10:53:06.424899Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mCommit
+[2m2026-11-14T10:53:06.424918Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1
+[2m2026-11-14T10:53:06.424983Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mCommitted
+[2m2026-11-14T10:53:06.424997Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1
+[2m2026-11-14T10:54:06.425263Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mUdpProbe { first: 512, kbps: 2500 }
+[2m2026-11-14T10:54:08.433123Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mUdpProbeResult { first: 512, received: 240, span_us: 988805 }
+[2m2026-11-14T10:54:08.433225Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mDirect
+[2m2026-11-14T10:54:08.435230Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mDirectReady
+[2m2026-11-14T10:54:10.450327Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:54:10.733529Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:54:11.055378Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mReady
+[2m2026-11-14T10:54:11.055474Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mCommit
+[2m2026-11-14T10:54:11.055491Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2
+[2m2026-11-14T10:54:11.055553Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mCommitted
+[2m2026-11-14T10:54:11.055563Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2
+[2m2026-11-14T10:54:11.071681Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay closed, falling back to UDP [3mrole[0m[2m=[0mHost [3mkind[0m[2m=[0mUnexpectedEof relay Priority: relay socket closed
+[2m2026-11-14T10:54:11.071709Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay closed, falling back to UDP [3mrole[0m[2m=[0mViewer [3mkind[0m[2m=[0mUnexpectedEof relay Priority: relay socket closed
+[2m2026-11-14T10:54:11.071807Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mAbort
+[2m2026-11-14T10:54:13.076250Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:54:13.353756Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:54:13.658513Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mReady
+[2m2026-11-14T10:54:13.658592Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mCommit
+[2m2026-11-14T10:54:13.658604Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m3
+[2m2026-11-14T10:54:13.658661Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mCommitted
+[2m2026-11-14T10:54:13.658671Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m3
+[2m2026-11-14T10:54:14.138145Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test stopped watching after 1 min: the viewer disconnected
+[2m2026-11-14T10:54:14.150645Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) [3msend_bytes[0m[2m=[0m8388608 [3mreceive_bytes[0m[2m=[0m8388608
+[2m2026-11-14T10:54:14.151223Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+[2m2026-11-14T10:54:14.151238Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test is watching: 128├ù128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+[2m2026-11-14T10:54:14.172517Z[0m [34mDEBUG[0m [2mlatch_stream::video::mediafoundation[0m[2m:[0m decoder ICodecAPI low-latency mode: Invalid argument (VT_UI4 != pValue->vt) (0x80070057)
+[2m2026-11-14T10:54:16.302607Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:54:16.581487Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:54:16.878475Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mReady
+[2m2026-11-14T10:54:16.878568Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mCommit
+[2m2026-11-14T10:54:16.878584Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1
+[2m2026-11-14T10:54:16.878658Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mCommitted
+[2m2026-11-14T10:54:16.878671Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1
+[2m2026-11-14T10:54:17.420079Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test stopped watching after 3 s: the viewer disconnected
+ok
+test cancelled_prepare_joins_its_worker_and_rejects_endpoint_role_and_generation ... [2m2026-11-14T10:54:17.433455Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:54:17.688596Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mReady
+[2m2026-11-14T10:54:17.961161Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:54:17.961215Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:54:17.961242Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:54:17.961269Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mOffer([REDACTED])
+ok
+test finite_byte_grants_renew_after_actual_video_transfer ... [2m2026-11-14T10:54:17.964377Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) [3msend_bytes[0m[2m=[0m8388608 [3mreceive_bytes[0m[2m=[0m8388608
+[2m2026-11-14T10:54:17.964978Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+[2m2026-11-14T10:54:17.964997Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test is watching: 128├ù128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+[2m2026-11-14T10:54:17.986632Z[0m [34mDEBUG[0m [2mlatch_stream::video::mediafoundation[0m[2m:[0m decoder ICodecAPI low-latency mode: Invalid argument (VT_UI4 != pValue->vt) (0x80070057)
+[2m2026-11-14T10:54:19.032391Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:54:19.309236Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:54:19.598755Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mReady
+[2m2026-11-14T10:54:19.598844Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mCommit
+[2m2026-11-14T10:54:19.598859Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1
+[2m2026-11-14T10:54:19.598924Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mCommitted
+[2m2026-11-14T10:54:19.598935Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1
+[2m2026-11-14T10:54:22.741014Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mRenew
+[2m2026-11-14T10:54:24.757337Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:54:25.051937Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:54:25.360543Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mReady
+[2m2026-11-14T10:54:25.360637Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mCommit
+[2m2026-11-14T10:54:25.360655Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2
+[2m2026-11-14T10:54:25.360728Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mCommitted
+[2m2026-11-14T10:54:25.360739Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2
+[2m2026-11-14T10:54:28.509393Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mRenew
+[2m2026-11-14T10:54:30.523292Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:54:30.819617Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:54:31.113527Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mReady
+[2m2026-11-14T10:54:31.113662Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mCommit
+[2m2026-11-14T10:54:31.113678Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m3
+[2m2026-11-14T10:54:31.113747Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mCommitted
+[2m2026-11-14T10:54:31.113763Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m3
+[2m2026-11-14T10:54:34.315352Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mRenew
+[2m2026-11-14T10:54:36.322104Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m4 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:54:36.603170Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m4 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:54:36.892155Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m4 [3maction[0m[2m=[0mReady
+[2m2026-11-14T10:54:36.892238Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m4 [3maction[0m[2m=[0mCommit
+[2m2026-11-14T10:54:36.892250Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m4
+[2m2026-11-14T10:54:36.892307Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m4 [3maction[0m[2m=[0mCommitted
+[2m2026-11-14T10:54:36.892316Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m4
+[2m2026-11-14T10:54:37.009320Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test stopped watching after 19 s: the viewer disconnected
+ok
+test finite_grants_get_fresh_authorization_without_stranding_media ... [2m2026-11-14T10:54:37.037222Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) [3msend_bytes[0m[2m=[0m8388608 [3mreceive_bytes[0m[2m=[0m8388608
+[2m2026-11-14T10:54:37.037788Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+[2m2026-11-14T10:54:37.037806Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test is watching: 128├ù128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+[2m2026-11-14T10:54:37.058949Z[0m [34mDEBUG[0m [2mlatch_stream::video::mediafoundation[0m[2m:[0m decoder ICodecAPI low-latency mode: Invalid argument (VT_UI4 != pValue->vt) (0x80070057)
+[2m2026-11-14T10:54:38.106968Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:54:38.392569Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:54:38.682669Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mReady
+[2m2026-11-14T10:54:38.682746Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mCommit
+[2m2026-11-14T10:54:38.682762Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1
+[2m2026-11-14T10:54:38.682835Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mCommitted
+[2m2026-11-14T10:54:38.682845Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1
+[2m2026-11-14T10:54:40.864449Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mRenew
+[2m2026-11-14T10:54:42.867617Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:54:43.160388Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:54:43.436713Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mReady
+[2m2026-11-14T10:54:43.436794Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mCommit
+[2m2026-11-14T10:54:43.436809Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2
+[2m2026-11-14T10:54:43.436881Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mCommitted
+[2m2026-11-14T10:54:43.436890Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2
+[2m2026-11-14T10:54:45.619802Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mRenew
+[2m2026-11-14T10:54:47.631677Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:54:47.928248Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:54:48.221754Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mReady
+[2m2026-11-14T10:54:48.221820Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mCommit
+[2m2026-11-14T10:54:48.221838Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m3
+[2m2026-11-14T10:54:48.221911Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mCommitted
+[2m2026-11-14T10:54:48.221921Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m3
+[2m2026-11-14T10:54:50.386801Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mRenew
+[2m2026-11-14T10:54:52.399435Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m4 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:54:52.692942Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m4 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:54:53.015394Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m4 [3maction[0m[2m=[0mReady
+[2m2026-11-14T10:54:53.015490Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m4 [3maction[0m[2m=[0mCommit
+[2m2026-11-14T10:54:53.015507Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m4
+[2m2026-11-14T10:54:53.015588Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m4 [3maction[0m[2m=[0mCommitted
+[2m2026-11-14T10:54:53.015610Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m4
+[2m2026-11-14T10:54:53.673128Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test stopped watching after 16 s: the viewer disconnected
+ok
+test monthly_cap_fails_closed_with_bounded_retry_and_direct_recovery ... [2m2026-11-14T10:54:53.691385Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) [3msend_bytes[0m[2m=[0m8388608 [3mreceive_bytes[0m[2m=[0m8388608
+[2m2026-11-14T10:54:53.692073Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+[2m2026-11-14T10:54:53.692096Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test is watching: 128├ù128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+[2m2026-11-14T10:54:53.713254Z[0m [34mDEBUG[0m [2mlatch_stream::video::mediafoundation[0m[2m:[0m decoder ICodecAPI low-latency mode: Invalid argument (VT_UI4 != pValue->vt) (0x80070057)
+[2m2026-11-14T10:54:54.752168Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:54:55.034597Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:54:55.284251Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay closed, falling back to UDP [3mrole[0m[2m=[0mHost [3mkind[0m[2m=[0mConnectionReset relay Priority: An existing connection was forcibly closed by the remote host. (os error 10054)
+[2m2026-11-14T10:54:55.284355Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mAbort
+[2m2026-11-14T10:54:57.290751Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:54:59.565738Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay preparation failed [3merror[0m[2m=[0mNo connection could be made because the target machine actively refused it. (os error 10061)
+[2m2026-11-14T10:54:59.565952Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mAbort
+[2m2026-11-14T10:55:00.075186Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test stopped watching after 6 s: the viewer disconnected
+ok
+test negotiation_rejects_stale_malformed_and_unconfigured_offers ... [2m2026-11-14T10:55:00.078477Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:55:00.078518Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mCommit
+[2m2026-11-14T10:55:00.078529Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mOffer([REDACTED])
+ok
+test resource_rejection_retries_after_the_occupied_grant_expires ... [2m2026-11-14T10:55:00.357887Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) [3msend_bytes[0m[2m=[0m8388608 [3mreceive_bytes[0m[2m=[0m8388608
+[2m2026-11-14T10:55:00.358466Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+[2m2026-11-14T10:55:00.358489Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test is watching: 128├ù128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+[2m2026-11-14T10:55:00.379895Z[0m [34mDEBUG[0m [2mlatch_stream::video::mediafoundation[0m[2m:[0m decoder ICodecAPI low-latency mode: Invalid argument (VT_UI4 != pValue->vt) (0x80070057)
+[2m2026-11-14T10:55:01.440216Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:55:01.710841Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay preparation failed [3merror[0m[2m=[0mrelay socket closed
+[2m2026-11-14T10:55:01.710951Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mAbort
+[2m2026-11-14T10:55:03.719828Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:55:03.998710Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:55:04.315431Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mReady
+[2m2026-11-14T10:55:04.315524Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mCommit
+[2m2026-11-14T10:55:04.315535Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2
+[2m2026-11-14T10:55:04.315590Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mCommitted
+[2m2026-11-14T10:55:04.315606Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2
+[2m2026-11-14T10:55:04.827592Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test stopped watching after 4 s: the viewer disconnected
+ok
+
+failures:
+
+---- actual_relay_audio_and_microphone_reach_pcm_sinks stdout ----
+
+thread 'actual_relay_audio_and_microphone_reach_pcm_sinks' (14840) panicked at crates\engine\tests\relay_runtime.rs:721:50:
+called `Result::unwrap()` on an `Err` value: Refusal { status: 500, message: "could not capture the screen: enumerate outputs: A resource is not available at the time of the call, but may become available later. (0x887A0022)" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    actual_relay_audio_and_microphone_reach_pcm_sinks
+
+test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 120.42s
+

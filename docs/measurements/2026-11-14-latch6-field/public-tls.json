@@ -1,0 +1,56 @@
+{
+  "utc": "2026-11-14T10:30:17Z",
+  "peer": [
+    "54.116.93.176",
+    443
+  ],
+  "tls": "TLSv1.3",
+  "alpn": "latch-relay/1",
+  "elapsed_s": 0.30829254095442593,
+  "certificate": {
+    "subject": [
+      [
+        [
+          "commonName",
+          "relay.latch.rune.foo"
+        ]
+      ]
+    ],
+    "issuer": [
+      [
+        [
+          "countryName",
+          "US"
+        ]
+      ],
+      [
+        [
+          "organizationName",
+          "Let's Encrypt"
+        ]
+      ],
+      [
+        [
+          "commonName",
+          "YE2"
+        ]
+      ]
+    ],
+    "version": 3,
+    "serialNumber": "0674BF1154B672EE91754B3EF3C9AF19E4DA",
+    "notBefore": "Nov 14 09:03:49 2026 GMT",
+    "notAfter": "Feb 12 09:03:48 2027 GMT",
+    "subjectAltName": [
+      [
+        "DNS",
+        "relay.latch.rune.foo"
+      ]
+    ],
+    "caIssuers": [
+      "http://ye2.i.lencr.org/"
+    ],
+    "crlDistributionPoints": [
+      "http://ye2.c.lencr.org/91.crl"
+    ]
+  }
+}

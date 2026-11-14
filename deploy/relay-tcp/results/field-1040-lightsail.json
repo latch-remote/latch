@@ -1,0 +1,80 @@
+{
+  "BurstCapacityPercentage": {
+    "metricName": "BurstCapacityPercentage",
+    "metricData": [
+      {
+        "average": 1.8108546238425927,
+        "maximum": 1.8108546238425927,
+        "minimum": 1.8108546238425927,
+        "timestamp": "2026-11-14T02:45:00-08:00",
+        "unit": "Percent"
+      },
+      {
+        "average": 1.2592316637731482,
+        "maximum": 1.2592316637731482,
+        "minimum": 1.2592316637731482,
+        "timestamp": "2026-11-14T02:35:00-08:00",
+        "unit": "Percent"
+      },
+      {
+        "average": 1.536310396412037,
+        "maximum": 1.536310396412037,
+        "minimum": 1.536310396412037,
+        "timestamp": "2026-11-14T02:40:00-08:00",
+        "unit": "Percent"
+      }
+    ]
+  },
+  "BurstCapacityTime": {
+    "metricName": "BurstCapacityTime",
+    "metricData": [
+      {
+        "average": 312.915679,
+        "maximum": 312.915679,
+        "minimum": 312.915679,
+        "timestamp": "2026-11-14T02:45:00-08:00",
+        "unit": "Seconds"
+      },
+      {
+        "average": 217.5952315,
+        "maximum": 217.5952315,
+        "minimum": 217.5952315,
+        "timestamp": "2026-11-14T02:35:00-08:00",
+        "unit": "Seconds"
+      },
+      {
+        "average": 265.4744365,
+        "maximum": 265.4744365,
+        "minimum": 265.4744365,
+        "timestamp": "2026-11-14T02:40:00-08:00",
+        "unit": "Seconds"
+      }
+    ]
+  },
+  "CPUUtilization": {
+    "metricName": "CPUUtilization",
+    "metricData": [
+      {
+        "average": 4.62842965376665,
+        "maximum": 5.549621123610508,
+        "minimum": 4.26888127017941,
+        "timestamp": "2026-11-14T02:40:00-08:00",
+        "unit": "Percent"
+      },
+      {
+        "average": 3.4859562548402194,
+        "maximum": 4.683489449648322,
+        "minimum": 2.7310082180797757,
+        "timestamp": "2026-11-14T02:35:00-08:00",
+        "unit": "Percent"
+      },
+      {
+        "average": 3.0069047766965578,
+        "maximum": 3.3285069981859636,
+        "minimum": 2.685302555207152,
+        "timestamp": "2026-11-14T02:45:00-08:00",
+        "unit": "Percent"
+      }
+    ]
+  }
+}

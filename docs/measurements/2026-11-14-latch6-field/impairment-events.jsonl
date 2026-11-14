@@ -1,0 +1,22 @@
+{"utc": "2026-11-14T10:40:13Z", "action": "UDP denied", "scope": "private field forwarder UDP only"}
+{"utc": "2026-11-14T10:40:48Z", "action": "UDP restored", "scope": "private field forwarder UDP only"}
+{"utc": "2026-11-14T10:43:42Z", "action": "UDP denied before auto-noise-720-120 startup", "scope": "private field forwarder UDP only"}
+{"utc": "2026-11-14T10:44:41Z", "action": "UDP restored after auto-noise-720-120", "scope": "private field forwarder UDP only"}
+{"utc": "2026-11-14T10:47:39Z", "action": "UDP denied", "scope": "private field forwarder UDP only", "run": "diagnostic-auto-noise-1080-60"}
+{"utc": "2026-11-14T10:48:37Z", "action": "UDP restored", "scope": "private field forwarder UDP only", "run": "diagnostic-auto-noise-1080-60"}
+{"utc": "2026-11-14T11:07:13Z", "action": "UDP denied", "scope": "private field forwarder UDP only", "run": "controller-auto-noise-1080-60"}
+{"utc": "2026-11-14T11:08:11Z", "action": "UDP restored", "scope": "private field forwarder UDP only", "run": "controller-auto-noise-1080-60"}
+{"utc": "2026-11-14T11:09:11Z", "action": "UDP denied", "scope": "private field forwarder UDP only", "run": "controller2-auto-noise-1080-60"}
+{"utc": "2026-11-14T11:10:09Z", "action": "UDP restored", "scope": "private field forwarder UDP only", "run": "controller2-auto-noise-1080-60"}
+{"utc": "2026-11-14T11:11:34Z", "action": "UDP denied before synthetic input test", "scope": "private field forwarder UDP only", "run": "controller-input"}
+{"utc": "2026-11-14T11:11:53Z", "action": "UDP restored after synthetic input test", "scope": "private field forwarder UDP only", "run": "controller-input"}
+{"utc": "2026-11-14T11:13:22Z", "action": "UDP denied for sustained public TCP validation", "scope": "private field forwarder UDP only", "run": "controller-long-noise-1080-60"}
+{"utc": "2026-11-14T11:23:22Z", "action": "UDP restored after sustained public TCP validation", "scope": "private field forwarder UDP only", "run": "controller-long-noise-1080-60"}
+{"utc": "2026-11-14T11:37:57Z", "action": "UDP denied to select public relay", "scope": "private field forwarder UDP only", "run": "final-outage-noise-1080-60"}
+{"utc": "2026-11-14T11:38:09Z", "action": "UDP restored before public TCP denial", "scope": "private field forwarder UDP only", "run": "final-outage-noise-1080-60"}
+{"utc": "2026-11-14T11:38:24Z", "action": "UDP denied again to select a fresh public relay attempt", "scope": "private field forwarder UDP only", "run": "final-outage-noise-1080-60"}
+{"utc": "2026-11-14T11:38:54Z", "action": "UDP restored after scoped outage test", "scope": "private field forwarder UDP only", "run": "final-outage-noise-1080-60"}
+{"utc": "2026-11-14T11:40:44Z", "run": "final-outage2-noise-1080-60", "action": "private UDP denied"}
+{"utc": "2026-11-14T11:40:56Z", "run": "final-outage2-noise-1080-60", "action": "private UDP restored before public TCP denial"}
+{"utc": "2026-11-14T11:41:11Z", "run": "final-outage2-noise-1080-60", "action": "private UDP denied for fresh public attachment"}
+{"utc": "2026-11-14T11:41:39Z", "run": "final-outage2-noise-1080-60", "action": "private UDP restored"}

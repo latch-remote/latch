@@ -1,0 +1,7 @@
+localhost_resolution_ms=3.501
+address=[::1]:58682 connect=Err(Os { code: 10035, kind: WouldBlock, message: "A non-blocking socket operation could not be completed immediately." }) elapsed_ms=0.312
+early_peer=Ok([::1]:58682)
+address=[::1]:58682 readiness=Err(Os { code: 10061, kind: ConnectionRefused, message: "No connection could be made because the target machine actively refused it." }) elapsed_ms=2034.032
+address=127.0.0.1:58682 connect=Err(Os { code: 10035, kind: WouldBlock, message: "A non-blocking socket operation could not be completed immediately." }) elapsed_ms=0.392
+early_peer=Ok(127.0.0.1:58682)
+address=127.0.0.1:58682 readiness=Ok(true) elapsed_ms=0.422

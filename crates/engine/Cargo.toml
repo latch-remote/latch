@@ -7,7 +7,9 @@ authors.workspace = true
 description = "The host side of a Latch stream: capture, encode, audio, input, and the session server"
 
 [dependencies]
+latch-relay.workspace = true
 latch-proto.workspace = true
+latch-stream.workspace = true
 latch-codec.workspace = true
 anyhow.workspace = true
 serde = { workspace = true }
@@ -28,8 +30,6 @@ futures = "0.3"
 libloading = "0.8"
 
 [target.'cfg(windows)'.dependencies]
-# Reuse the platform decoder for the encoder-open LTR conformance probe.
-latch-stream.workspace = true
 windows-core = "0.58"
 windows = { version = "0.58", features = [
     # COM callbacks (#[implement]): the MFT event callback and the default-
@@ -76,8 +76,7 @@ objc2-core-video = { version = "0.3", default-features = false, features = ["std
 dispatch2 = "0.3"
 
 [dev-dependencies]
-# The loopback test runs a real viewer against this engine.
-latch-stream.workspace = true
+rustls = { version = "=0.23.46", default-features = false, features = ["std"] }
 latch-core.workspace = true
 # `serve` prints the engine's log (RUST_LOG=latch_engine=debug).
 tracing-subscriber.workspace = true

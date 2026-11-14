@@ -4,6 +4,82 @@ The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
 `## X.Y.Z (date)`.
 
+## 6.0.0 (2026-11-14)
+
+### Streaming and recovery
+
+- Add a public native TCP/TLS relay with ALPN `latch-relay/1`, separate
+  video and priority lanes, and end-to-end ChaCha20-Poly1305 records with
+  HKDF-SHA256-derived traffic keys. Fresh lane tickets and session keys
+  travel only over authorized Tailscale control.
+- Attempt relay recovery after missing video, sustained UDP damage, or
+  persistently limited busy video when
+  both peers advertise support. Complete encoded frames bypass UDP
+  packetization and FEC. Sound, microphone, input, gamepad feedback and
+  bounded control messages use the priority lane. All cursor and terminal
+  messages retain the original ordered control connection.
+- Bound negotiation, queues, frame acknowledgements, stalls and retries.
+  Relay failure returns routing to UDP. Priority backpressure ends the
+  session and releases held input. Probe for recovered UDP and renew finite
+  grants. Healthy handoffs and host retry deferrals do not count as relay
+  failures. Keep relay bitrate recovery separate from decoder backlog.
+- Preserve explicit Stop and takeover through relay teardown. Bound both
+  relay control inboxes and classify priority exhaustion as recoverable.
+- Race bounded IPv4/IPv6 connection attempts and wait for actual socket
+  readiness before TLS, including Windows pending-connect behavior.
+- Reduce software H.264 picture size when the current bitrate cannot fit a
+  bounded frame; restore size when bandwidth returns.
+- Keep reconnecting after unexpected drops with 2, 5 and 10 second waits,
+  then jittered 20–30 second waits until stopped. Discovery and resume can
+  advance a retry. Refusal, takeover and intentional host termination stop
+  automatic retries. Missing or stalled decoded video and unacknowledged
+  input end unhealthy sessions independently of control keepalives.
+- Keep host input acknowledgments pending while retrying failed injection
+  for up to two seconds, then drop a persistently failing event so later
+  input can proceed. Bound the viewer's pending input and acknowledgment
+  watchdog so teardown can release held keys and buttons.
+- Require the local control token before collecting local request bodies,
+  including update uploads.
+
+### Distribution and deployment
+
+- Move consumer downloads to public `latch-remote/latch-releases` while
+  development source stays private in `latch-remote/latch`. Publish the
+  corresponding GPL source snapshot, license and notices with every
+  release. The license remains GPL-3.0-or-later.
+- Read public static `release.json` without consumer credentials. Validate
+  exact version-tagged URLs, byte sizes and SHA-256 digests. Receiving
+  Windows hosts fetch the claimed version's manifest independently.
+- Scope the publisher App token to the distribution repository. Assemble
+  and verify a bounded asset set before making its draft release public.
+- Use GitHub-hosted Linux runners by default, with optional
+  `LINUX_X64_RUNNER` and `LINUX_ARM64_RUNNER` overrides. Blacksmith capacity
+  remains subject to external verification. Pages and private-source
+  attestations are opt-in. Builds have no new publisher signing or
+  notarization guarantee.
+- Add durable relay quota accounting and bounded anonymous pilot
+  admission. The dedicated AWS Lightsail endpoint `relay.latch.rune.foo:443`
+  has public TLS and a persistent monthly budget. Quota exhaustion refuses
+  new work without restarting the daemon. Failure logs use bounded,
+  non-sensitive categories. Synthetic campus field tests exercise real
+  relay traffic; large-concurrency qualification remains outstanding.
+
+### Upgrading and privacy
+
+Install 6.0.0 once from the public release page if an older copy still uses
+the former update endpoint. An older Windows host can reject a push from a
+new Mac for the same reason. Preserve settings and restart the host service
+after changing its relay endpoint. Installation and migration steps are in
+`README.md` in the corresponding source snapshot.
+[Source snapshot](https://github.com/latch-remote/latch-releases/releases/download/v6.0.0/latch-6.0.0-source.tar.gz)
+
+The relay can observe public IP addresses, timing and traffic volume.
+Opt out in **Settings → Stream relay → Recover automatically through the
+Latch relay**. Native TLS needs compatible network policy and supported
+CPU features, and relay use has session, byte and monthly transfer limits.
+Tailscale-authenticated control remains required. `docs/USING.md` in the
+source snapshot describes relay behavior and limits.
+
 ## 5.3.0 (2026-11-09)
 
 5.2.0 was tagged on 4 November but its release was never published, so

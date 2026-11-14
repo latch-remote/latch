@@ -1,0 +1,335 @@
+{
+  "requested_start": "2026-11-14T09:48:43.311517+00:00",
+  "requested_end": "2026-11-14T10:28:43.311517+00:00",
+  "metrics": {
+    "BurstCapacityPercentage": {
+      "metricName": "BurstCapacityPercentage",
+      "metricData": [
+        {
+          "average": 0.0,
+          "maximum": 0.0,
+          "minimum": 0.0,
+          "sum": 0.0,
+          "timestamp": "2026-11-14T02:05:00-08:00",
+          "unit": "Percent"
+        },
+        {
+          "average": 0.1824606452546296,
+          "maximum": 0.1824606452546296,
+          "minimum": 0.1824606452546296,
+          "sum": 0.1824606452546296,
+          "timestamp": "2026-11-14T02:10:00-08:00",
+          "unit": "Percent"
+        },
+        {
+          "average": 0.38251094907407407,
+          "maximum": 0.38251094907407407,
+          "minimum": 0.38251094907407407,
+          "sum": 0.38251094907407407,
+          "timestamp": "2026-11-14T02:15:00-08:00",
+          "unit": "Percent"
+        },
+        {
+          "average": 0.40569286747685185,
+          "maximum": 0.40569286747685185,
+          "minimum": 0.40569286747685185,
+          "sum": 0.40569286747685185,
+          "timestamp": "2026-11-14T02:20:00-08:00",
+          "unit": "Percent"
+        },
+        {
+          "average": 0.6984587008101851,
+          "maximum": 0.6984587008101851,
+          "minimum": 0.6984587008101851,
+          "sum": 0.6984587008101851,
+          "timestamp": "2026-11-14T02:25:00-08:00",
+          "unit": "Percent"
+        },
+        {
+          "average": 0.0963475462962963,
+          "maximum": 0.0963475462962963,
+          "minimum": 0.0963475462962963,
+          "sum": 0.0963475462962963,
+          "timestamp": "2026-11-14T01:55:00-08:00",
+          "unit": "Percent"
+        },
+        {
+          "average": 0.13470635127314814,
+          "maximum": 0.13470635127314814,
+          "minimum": 0.13470635127314814,
+          "sum": 0.13470635127314814,
+          "timestamp": "2026-11-14T02:00:00-08:00",
+          "unit": "Percent"
+        }
+      ]
+    },
+    "BurstCapacityTime": {
+      "metricName": "BurstCapacityTime",
+      "metricData": [
+        {
+          "average": 0.0,
+          "maximum": 0.0,
+          "minimum": 0.0,
+          "sum": 0.0,
+          "timestamp": "2026-11-14T02:05:00-08:00",
+          "unit": "Seconds"
+        },
+        {
+          "average": 31.529199499999997,
+          "maximum": 31.529199499999997,
+          "minimum": 31.529199499999997,
+          "sum": 31.529199499999997,
+          "timestamp": "2026-11-14T02:10:00-08:00",
+          "unit": "Seconds"
+        },
+        {
+          "average": 66.097892,
+          "maximum": 66.097892,
+          "minimum": 66.097892,
+          "sum": 66.097892,
+          "timestamp": "2026-11-14T02:15:00-08:00",
+          "unit": "Seconds"
+        },
+        {
+          "average": 70.1037275,
+          "maximum": 70.1037275,
+          "minimum": 70.1037275,
+          "sum": 70.1037275,
+          "timestamp": "2026-11-14T02:20:00-08:00",
+          "unit": "Seconds"
+        },
+        {
+          "average": 120.69366349999999,
+          "maximum": 120.69366349999999,
+          "minimum": 120.69366349999999,
+          "sum": 120.69366349999999,
+          "timestamp": "2026-11-14T02:25:00-08:00",
+          "unit": "Seconds"
+        },
+        {
+          "average": 16.648856000000002,
+          "maximum": 16.648856000000002,
+          "minimum": 16.648856000000002,
+          "sum": 16.648856000000002,
+          "timestamp": "2026-11-14T01:55:00-08:00",
+          "unit": "Seconds"
+        },
+        {
+          "average": 23.2772575,
+          "maximum": 23.2772575,
+          "minimum": 23.2772575,
+          "sum": 23.2772575,
+          "timestamp": "2026-11-14T02:00:00-08:00",
+          "unit": "Seconds"
+        }
+      ]
+    },
+    "CPUUtilization": {
+      "metricName": "CPUUtilization",
+      "metricData": [
+        {
+          "average": 3.1641894191803592,
+          "maximum": 4.227274240255634,
+          "minimum": 2.708243058564715,
+          "sum": 15.820947095901795,
+          "timestamp": "2026-11-14T02:20:00-08:00",
+          "unit": "Percent"
+        },
+        {
+          "average": 20.926928866850865,
+          "maximum": 71.15752683698094,
+          "minimum": 3.18704545076306,
+          "sum": 104.63464433425433,
+          "timestamp": "2026-11-14T02:15:00-08:00",
+          "unit": "Percent"
+        },
+        {
+          "average": 0.100891312661617,
+          "maximum": 0.1997137436341244,
+          "minimum": 0.0020688816891096,
+          "sum": 0.201782625323234,
+          "timestamp": "2026-11-14T01:50:00-08:00",
+          "unit": "Percent"
+        },
+        {
+          "average": 3.3059464465317916,
+          "maximum": 4.681788593460517,
+          "minimum": 2.65004416740279,
+          "sum": 13.223785786127166,
+          "timestamp": "2026-11-14T02:25:00-08:00",
+          "unit": "Percent"
+        },
+        {
+          "average": 27.892105418852218,
+          "maximum": 96.07238158772516,
+          "minimum": 0.17462455720201558,
+          "sum": 139.4605270942611,
+          "timestamp": "2026-11-14T02:00:00-08:00",
+          "unit": "Percent"
+        },
+        {
+          "average": 19.8001192249177,
+          "maximum": 49.856456135665645,
+          "minimum": 0.2751972246776857,
+          "sum": 99.0005961245885,
+          "timestamp": "2026-11-14T01:55:00-08:00",
+          "unit": "Percent"
+        },
+        {
+          "average": 6.621408730115791,
+          "maximum": 16.13091661659657,
+          "minimum": 2.6877246704832913,
+          "sum": 26.485634920463163,
+          "timestamp": "2026-11-14T02:10:00-08:00",
+          "unit": "Percent"
+        },
+        {
+          "average": 5.961354677015625,
+          "maximum": 19.235904796875523,
+          "minimum": 2.4183998532281468,
+          "sum": 29.806773385078124,
+          "timestamp": "2026-11-14T02:05:00-08:00",
+          "unit": "Percent"
+        }
+      ]
+    },
+    "NetworkIn": {
+      "metricName": "NetworkIn",
+      "metricData": [
+        {
+          "average": 1128.0,
+          "maximum": 1128.0,
+          "minimum": 1128.0,
+          "sum": 1128.0,
+          "timestamp": "2026-11-14T01:50:00-08:00",
+          "unit": "Bytes"
+        },
+        {
+          "average": 63797291.6,
+          "maximum": 280489604.0,
+          "minimum": 720.0,
+          "sum": 318986458.0,
+          "timestamp": "2026-11-14T01:55:00-08:00",
+          "unit": "Bytes"
+        },
+        {
+          "average": 5521561.2,
+          "maximum": 27242286.0,
+          "minimum": 720.0,
+          "sum": 27607806.0,
+          "timestamp": "2026-11-14T02:20:00-08:00",
+          "unit": "Bytes"
+        },
+        {
+          "average": 3902551.5,
+          "maximum": 13471154.0,
+          "minimum": 852.0,
+          "sum": 15610206.0,
+          "timestamp": "2026-11-14T02:25:00-08:00",
+          "unit": "Bytes"
+        },
+        {
+          "average": 1922448.6,
+          "maximum": 5448236.0,
+          "minimum": 720.0,
+          "sum": 9612243.0,
+          "timestamp": "2026-11-14T02:10:00-08:00",
+          "unit": "Bytes"
+        },
+        {
+          "average": 32165338.6,
+          "maximum": 160072531.0,
+          "minimum": 4328.0,
+          "sum": 160826693.0,
+          "timestamp": "2026-11-14T02:15:00-08:00",
+          "unit": "Bytes"
+        },
+        {
+          "average": 35137.2,
+          "maximum": 116884.0,
+          "minimum": 720.0,
+          "sum": 175686.0,
+          "timestamp": "2026-11-14T02:00:00-08:00",
+          "unit": "Bytes"
+        },
+        {
+          "average": 1159616.4,
+          "maximum": 5675136.0,
+          "minimum": 720.0,
+          "sum": 5798082.0,
+          "timestamp": "2026-11-14T02:05:00-08:00",
+          "unit": "Bytes"
+        }
+      ]
+    },
+    "NetworkOut": {
+      "metricName": "NetworkOut",
+      "metricData": [
+        {
+          "average": 1224.0,
+          "maximum": 1224.0,
+          "minimum": 1224.0,
+          "sum": 1224.0,
+          "timestamp": "2026-11-14T01:50:00-08:00",
+          "unit": "Bytes"
+        },
+        {
+          "average": 192650.4,
+          "maximum": 748925.0,
+          "minimum": 720.0,
+          "sum": 963252.0,
+          "timestamp": "2026-11-14T01:55:00-08:00",
+          "unit": "Bytes"
+        },
+        {
+          "average": 5486803.4,
+          "maximum": 27072989.0,
+          "minimum": 720.0,
+          "sum": 27434017.0,
+          "timestamp": "2026-11-14T02:20:00-08:00",
+          "unit": "Bytes"
+        },
+        {
+          "average": 3345456.5,
+          "maximum": 13367275.0,
+          "minimum": 1026.0,
+          "sum": 13381826.0,
+          "timestamp": "2026-11-14T02:25:00-08:00",
+          "unit": "Bytes"
+        },
+        {
+          "average": 1867656.4,
+          "maximum": 5308596.0,
+          "minimum": 720.0,
+          "sum": 9338282.0,
+          "timestamp": "2026-11-14T02:10:00-08:00",
+          "unit": "Bytes"
+        },
+        {
+          "average": 32028578.2,
+          "maximum": 160075877.0,
+          "minimum": 12788.0,
+          "sum": 160142891.0,
+          "timestamp": "2026-11-14T02:15:00-08:00",
+          "unit": "Bytes"
+        },
+        {
+          "average": 15242.6,
+          "maximum": 34488.0,
+          "minimum": 720.0,
+          "sum": 76213.0,
+          "timestamp": "2026-11-14T02:00:00-08:00",
+          "unit": "Bytes"
+        },
+        {
+          "average": 21424.4,
+          "maximum": 69428.0,
+          "minimum": 720.0,
+          "sum": 107122.0,
+          "timestamp": "2026-11-14T02:05:00-08:00",
+          "unit": "Bytes"
+        }
+      ]
+    }
+  }
+}

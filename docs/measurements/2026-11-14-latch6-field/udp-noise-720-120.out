@@ -1,0 +1,7 @@
+[2m2026-11-14T10:42:26.051750Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) [3msend_bytes[0m[2m=[0m8388608 [3mreceive_bytes[0m[2m=[0m8388608
+[2m2026-11-14T10:42:53.758542Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m the decoder fell behind; restarting at a keyframe
+[2m2026-11-14T10:42:54.271563Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m the decoder fell behind; restarting at a keyframe
+[2m2026-11-14T10:42:55.457251Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m the decoder fell behind; restarting at a keyframe
+[2m2026-11-14T10:42:56.299823Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m the decoder fell behind; restarting at a keyframe
+[2m2026-11-14T10:42:57.350213Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m the decoder fell behind; restarting at a keyframe
+[2m2026-11-14T10:42:57.877541Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m the decoder fell behind; restarting at a keyframe

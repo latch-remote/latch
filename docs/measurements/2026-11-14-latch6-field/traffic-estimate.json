@@ -1,0 +1,88 @@
+{
+  "method": "Integrate per-sample application Mbps over sample_duration_s, accepting 0 < dt < 5 seconds. max(video,received) compensates earlier TCP display omission. Includes invalidated runs for traffic accounting. Excludes unlogged startup, IP/TCP/TLS, retransmissions and other test traffic.",
+  "total": {
+    "seconds": 1395.68,
+    "video_bytes": 1802850344.4986773,
+    "max_video_received_bytes": 1927603381.0783858
+  },
+  "runs": [
+    {
+      "run": "controller-auto-noise-1080-60.metrics",
+      "seconds": 109.878,
+      "video_bytes": 170306660.30037498,
+      "max_video_received_bytes": 174102055.9231
+    },
+    {
+      "run": "controller2-auto-noise-1080-60.metrics",
+      "seconds": 118.117,
+      "video_bytes": 186063730.574,
+      "max_video_received_bytes": 191017892.77863127
+    },
+    {
+      "run": "diagnostic-auto-noise-1080-60.metrics",
+      "seconds": 93.558,
+      "video_bytes": 32327366.70928625,
+      "max_video_received_bytes": 34994825.033806235
+    },
+    {
+      "run": "final-natural-noise-1080-60.metrics",
+      "seconds": 58.017,
+      "video_bytes": 81962455.07425001,
+      "max_video_received_bytes": 104196053.189
+    },
+    {
+      "run": "auto-noise-1080-60.metrics",
+      "seconds": 78.52900000000001,
+      "video_bytes": 57740693.88815624,
+      "max_video_received_bytes": 74041639.48762473
+    },
+    {
+      "run": "udp-noise-720-120.metrics",
+      "seconds": 33.14000000000001,
+      "video_bytes": 46290165.76663751,
+      "max_video_received_bytes": 61772803.32245001
+    },
+    {
+      "run": "final-outage2-noise-1080-60.metrics",
+      "seconds": 88.19800000000001,
+      "video_bytes": 127226894.60515003,
+      "max_video_received_bytes": 142656129.63708198
+    },
+    {
+      "run": "auto-noise-720-120.metrics",
+      "seconds": 48.429,
+      "video_bytes": 5140086.946447499,
+      "max_video_received_bytes": 5140086.946447499
+    },
+    {
+      "run": "final-outage-noise-1080-60.metrics",
+      "seconds": 73.184,
+      "video_bytes": 80980970.64595251,
+      "max_video_received_bytes": 99328079.04967529
+    },
+    {
+      "run": "udp-noise-1080-60.metrics",
+      "seconds": 43.785999999999994,
+      "video_bytes": 33303213.559562497,
+      "max_video_received_bytes": 48369063.309124984
+    },
+    {
+      "run": "controller-long-noise-1080-60.metrics",
+      "seconds": 598.71,
+      "video_bytes": 978794550.4142259,
+      "max_video_received_bytes": 985612632.4935751
+    },
+    {
+      "run": "windows-host-mac-udp-720-60.metrics",
+      "seconds": 33.99699999999999,
+      "video_bytes": 1522229.2544762497,
+      "max_video_received_bytes": 3632891.6236325
+    },
+    {
+      "run": "final-reverse-render.metrics",
+      "seconds": 18.137,
+      "video_bytes": 1191326.7601575,
+      "max_video_received_bytes": 2739228.28423625
+    }
+  ]
+}

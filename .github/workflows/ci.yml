@@ -5,6 +5,9 @@ on:
     branches: [main, master]
   pull_request:
 
+permissions:
+  contents: read
+
 # A newer push to the same pull request replaces its older run; main keeps
 # every run.
 concurrency:
@@ -24,10 +27,14 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -146,6 +153,7 @@ jobs:
           name: latch-host-windows
           path: target/release/latch-host.exe
           if-no-files-found: error
+          retention-days: 3
 
   test-macos:
     permissions:
@@ -155,11 +163,22 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.11'
+      - name: release publisher manifest and publication checks
+        run: python3 -m unittest discover -s scripts -p 'test_publish_release.py' -v
+      - name: public manifest installer checks
+        run: bash scripts/test-release-manifest.sh
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-apple-darwin
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
       # FFmpeg decodes the VideoToolbox encoder's output in the tests: an
       # independent decoder, never part of Latch.
       - name: ffmpeg for the encoder tests
@@ -173,7 +192,9 @@ jobs:
       - name: bundle
         run: bash scripts/bundle-macos.sh
 
-  # Test both common VPS architectures.
+  # Set each runner variable only after verifying its Ubuntu 24.04 image
+  # and architecture with the provider (including optional Blacksmith).
+  # Unset variables use GitHub-hosted runners.
   test-linux:
     permissions:
       contents: read
@@ -182,19 +203,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ${{ vars.LINUX_X64_RUNNER || 'ubuntu-24.04' }}
             arch: x64
-          - runner: ubuntu-24.04-arm
+            machine: x86_64
+          - runner: ${{ vars.LINUX_ARM64_RUNNER || 'ubuntu-24.04-arm' }}
             arch: arm64
+            machine: aarch64
     runs-on: ${{ matrix.runner }}
     # A hung test fails the job instead of holding a runner for hours.
     timeout-minutes: 45
     steps:
+      - name: verify native architecture
+        run: test "$(uname -m)" = '${{ matrix.machine }}'
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: native deps
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - name: clippy
@@ -203,37 +232,48 @@ jobs:
         run: cargo test --locked --workspace --all-targets
       - name: release host
         run: cargo build --locked --release -p latch-host
+      - name: native TCP relay deployment checks
+        run: |
+          cargo build --locked -p latch-relay
+          python3 deploy/relay-tcp/selftest.py --binary target/debug/latch-relay
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: latch-host-linux-${{ matrix.arch }}
           path: target/release/latch-host
           if-no-files-found: error
+          retention-days: 3
 
   deploy-selftest:
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_X64_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: node kit selftest
         run: bash deploy/node/selftest.sh
   native-display-selftest:
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_X64_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - run: sudo apt-get update && sudo apt-get install -y xauth
       - run: bash deploy/native/selftest.sh
   relay-selftest:
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_X64_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: relay installer selftest
         run: bash deploy/relay/selftest.sh
 
@@ -241,11 +281,16 @@ jobs:
   native-audit:
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_X64_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: no C, C++ or assembler in the build graph
         run: bash scripts/audit-native.sh
 
@@ -254,12 +299,16 @@ jobs:
   codec-conformance:
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_X64_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: fetch the conformance bitstreams
         run: sh scripts/fetch-h264-conformance.sh
       - name: decode them

@@ -1,0 +1,2 @@
+workers=1 samples=20 errors=0 wall_ms=8.391 mean_ms=0.411 p50_ms=0.186 p95_ms=4.800 max_ms=4.800
+workers=16 samples=320 errors=0 wall_ms=17.149 mean_ms=0.796 p50_ms=0.787 p95_ms=1.003 max_ms=1.151

@@ -1,5 +1,67 @@
-//! Shared socket configuration. This module is the protocol crate's only I/O helper.
-use std::{io, net::UdpSocket};
+//! Shared socket configuration and readiness. This is the protocol crate's I/O helper.
+use std::{
+    io,
+    net::{TcpStream, UdpSocket},
+    time::Duration,
+};
+
+/// Wait for completion of a nonblocking TCP connect, including its error.
+/// `peer_addr()` is insufficient on Windows: it can name a peer while the SYN
+/// is still pending, before even TCP_NODELAY or the first write can succeed.
+pub fn tcp_connect_ready(stream: &TcpStream, wait: Duration) -> io::Result<bool> {
+    let ready = tcp_writable(stream, wait)?;
+    match stream.take_error()? {
+        Some(error) => Err(error),
+        None => Ok(ready),
+    }
+}
+
+#[cfg(unix)]
+fn tcp_writable(stream: &TcpStream, wait: Duration) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let mut fd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let timeout = wait.as_millis().min(i32::MAX as u128) as i32;
+    // SAFETY: one valid pollfd for the duration of the bounded call.
+    match unsafe { libc::poll(&mut fd, 1, timeout) } {
+        -1 => {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+        0 => Ok(false),
+        _ if fd.revents & libc::POLLNVAL != 0 => Err(io::ErrorKind::InvalidInput.into()),
+        _ => Ok(fd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0),
+    }
+}
+
+#[cfg(windows)]
+fn tcp_writable(stream: &TcpStream, wait: Duration) -> io::Result<bool> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAGetLastError, WSAPoll, POLLERR, POLLHUP, POLLNVAL, POLLWRNORM, WSAPOLLFD,
+    };
+    let mut fd = WSAPOLLFD {
+        fd: stream.as_raw_socket() as usize,
+        events: POLLWRNORM,
+        revents: 0,
+    };
+    let timeout = wait.as_millis().min(i32::MAX as u128) as i32;
+    // SAFETY: one valid WSAPOLLFD for the duration of the bounded call.
+    match unsafe { WSAPoll(&mut fd, 1, timeout) } {
+        // SAFETY: no preconditions.
+        -1 => Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() })),
+        0 => Ok(false),
+        _ if fd.revents & POLLNVAL != 0 => Err(io::ErrorKind::InvalidInput.into()),
+        _ => Ok(fd.revents & (POLLWRNORM | POLLERR | POLLHUP) != 0),
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SocketBuffers {

@@ -1,0 +1,12 @@
+cargo.exe :    Compiling latch-engine v6.0.0 
+(C:\Users\Daniel\dev\latch6-field-final-20261114\crates\engine)
+At line:1 char:475
++ ... "Continue"; & "$env:USERPROFILE\.cargo\bin\cargo.exe" test --locked - ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling la...\crates\engine):String) [], Remote 
+   Exception
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    Finished `test` profile [optimized + debuginfo] target(s) in 2.94s
+     Running tests\relay_runtime.rs 
+(C:\Users\Daniel\dev\latch6-field-20261114\target\debug\deps\relay_runtime-cfaa75fb44058758.exe)

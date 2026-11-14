@@ -535,7 +535,9 @@ fn measure_path_on(
             }
         }
     }
-    let mut best: Option<u32> = prior.rtt_ms;
+    // A reconnect can follow a network change. Only these probes describe
+    // its latency; discovery's earlier minimum belongs to the old path.
+    let mut best: Option<u32> = None;
     for _ in 0..3 {
         if stale() {
             break;
@@ -1090,7 +1092,7 @@ fn run(c: &Connect, generation: u64) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let ctx = c.ctx.clone();
     let test = test_serve();
-    let session = Session::start(
+    let session = Session::start_with_relay(
         Server {
             address: test.map_or(IpAddr::V4(t.ip), |a| a.ip()),
             port: test.map_or(CONTROL_PORT, |a| a.port()),
@@ -1114,6 +1116,7 @@ fn run(c: &Connect, generation: u64) -> Result<()> {
         frames.clone(),
         tx,
         move || ctx.request_repaint(),
+        latch_stream::session::relay_config(&settings.relay),
     );
     let mut live_guard = c.live.lock();
     let mut prog_guard = c.progress.lock();
@@ -1478,6 +1481,19 @@ mod tests {
             },
         );
         assert_eq!(checks, 2);
+    }
+
+    #[test]
+    fn failed_path_measurement_discards_the_previous_networks_latency() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let prior = Path {
+            rtt_ms: Some(1),
+            ..Default::default()
+        };
+        let path = measure_path_on("test-node", Ipv4Addr::LOCALHOST, port, &prior, || false);
+        assert_eq!(path.rtt_ms, None);
     }
 
     #[test]

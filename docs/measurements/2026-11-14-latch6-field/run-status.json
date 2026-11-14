@@ -1,0 +1,24 @@
+{
+  "controller-auto-noise-1080-60": {
+    "status": "invalidated",
+    "reason": "field forwarder lifetime expired at36.162s"
+  },
+  "controller-long-noise-1080-60": {
+    "status": "completed_with_transport_recovery",
+    "revision": "controller-refresh.json",
+    "renderer_censored_after_s": 330.762,
+    "reason": "video ACK deadline at548s, fresh attempt recovered"
+  },
+  "controller2-auto-noise-1080-60": {
+    "status": "passed",
+    "revision": "controller-refresh.json"
+  },
+  "diagnostic-auto-noise-1080-60": {
+    "status": "completed_with_budget_collapse",
+    "revision": "diagnostic-refresh.json"
+  },
+  "windows-host-mac-input": {
+    "status": "failed",
+    "reason": "software encoder FrameTooLarge terminated stream,2of10inputresponses"
+  }
+}

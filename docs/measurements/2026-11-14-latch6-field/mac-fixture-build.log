@@ -1,0 +1,168 @@
+    Updating crates.io index
+     Locking 479 packages to highest compatible versions
+      Adding eframe v0.31.1 (available: v0.37.0)
+      Adding egui v0.31.1 (available: v0.37.0)
+      Adding egui-wgpu v0.31.1 (available: v0.37.0)
+      Adding generic-array v0.14.7 (available: v0.14.9)
+      Adding graviola v0.4.2 (available: v0.4.5)
+ Downloading crates ...
+  Downloaded bytemuck_derive v1.12.1
+  Downloaded crc32fast v1.5.5
+  Downloaded cc v1.11.2
+  Downloaded arboard v3.7.0
+  Downloaded immutable-chunkmap v2.1.5
+  Downloaded litrs v1.0.1
+  Downloaded mio v1.2.5
+  Downloaded objc2 v0.5.3
+  Downloaded rustls-webpki v0.103.17
+  Downloaded rustls-pki-types v1.16.0
+  Downloaded syn v3.0.10
+  Downloaded webpki-roots v1.0.12
+  Downloaded webbrowser v1.2.7
+   Compiling unicode-ident v1.0.27
+   Compiling libc v0.2.191
+   Compiling cfg-if v1.0.5
+   Compiling objc2 v0.6.5
+   Compiling smallvec v1.16.5
+   Compiling zerocopy v0.8.63
+   Compiling log v0.4.35
+   Compiling equivalent v1.0.3
+   Compiling crc32fast v1.5.5
+   Compiling bitflags v2.13.2
+   Compiling utf_types v1.0.0
+   Compiling objc2 v0.5.3
+   Compiling indexmap v2.14.2
+   Compiling icu_normalizer_data v2.4.0
+   Compiling proc-macro2 v1.0.107
+   Compiling utf8_iter v1.1.0
+   Compiling icu_properties_data v2.4.0
+   Compiling zeroize v1.9.1
+   Compiling thiserror v2.0.21
+   Compiling rustls-pki-types v1.16.0
+   Compiling serde_json v1.0.154
+   Compiling quote v1.0.47
+   Compiling block2 v0.5.1
+   Compiling rustls-webpki v0.103.17
+   Compiling syn v3.0.10
+   Compiling syn v2.0.119
+   Compiling objc2-foundation v0.2.2
+   Compiling itoa v1.0.19
+   Compiling rustls v0.23.46
+   Compiling wgpu-types v24.0.0
+   Compiling block2 v0.6.2
+   Compiling flate2 v1.1.11
+   Compiling objc2-core-audio-types v0.3.2
+   Compiling immutable-chunkmap v2.1.5
+   Compiling dispatch2 v0.3.1
+   Compiling core-foundation v0.9.4
+   Compiling parking_lot_core v0.9.12
+   Compiling objc2-core-foundation v0.3.2
+   Compiling parking_lot v0.12.5
+   Compiling core-graphics-types v0.1.3
+   Compiling png v0.18.1
+   Compiling malloc_buf v0.0.6
+   Compiling getrandom v0.4.3
+   Compiling objc v0.2.7
+   Compiling graviola v0.4.2
+   Compiling socket2 v0.6.5
+   Compiling litrs v1.0.1
+   Compiling synstructure v0.14.0
+   Compiling objc2-app-kit v0.2.2
+   Compiling objc2-foundation v0.3.2
+   Compiling objc2-core-graphics v0.3.2
+   Compiling dirs-sys v0.4.1
+   Compiling rustls-graviola v0.4.0
+   Compiling document-features v0.2.12
+   Compiling accesskit_consumer v0.26.0
+   Compiling cpufeatures v0.2.17
+   Compiling getrandom v0.2.17
+   Compiling webpki-roots v1.0.12
+   Compiling sha2 v0.10.9
+   Compiling rand_core v0.6.4
+   Compiling directories v5.0.1
+   Compiling if-addrs v0.15.0
+   Compiling lazy_static v1.5.1
+   Compiling mio v1.2.5
+   Compiling sharded-slab v0.1.7
+   Compiling objc2-app-kit v0.3.2
+   Compiling objc2-core-audio v0.3.2
+   Compiling accesskit_macos v0.18.1
+   Compiling objc2-core-haptics v0.3.2
+   Compiling objc2-audio-toolbox v0.3.2
+   Compiling tracing-log v0.2.0
+   Compiling coreaudio-rs v0.14.2
+   Compiling thread_local v1.1.10
+   Compiling objc2-game-controller v0.3.2
+   Compiling latch-codec v6.0.0 (/private/tmp/latch6-field-mac-20261114/crates/codec)
+   Compiling cpal v0.18.2
+   Compiling zerofrom-derive v0.1.8
+   Compiling yoke-derive v0.8.4
+   Compiling zerocopy-derive v0.8.63
+   Compiling zerovec-derive v0.11.7
+   Compiling displaydoc v0.2.7
+   Compiling bytemuck_derive v1.12.1
+   Compiling foreign-types-macros v0.2.4
+   Compiling tracing-attributes v0.1.31
+   Compiling serde_derive v1.0.229
+   Compiling strum_macros v0.26.4
+   Compiling thiserror-impl v2.0.21
+   Compiling foreign-types v0.5.0
+   Compiling core-graphics v0.23.2
+   Compiling metal v0.31.0
+   Compiling thiserror-impl v1.0.69
+   Compiling bytemuck v1.25.2
+   Compiling tracing v0.1.44
+   Compiling strum v0.26.3
+   Compiling emath v0.31.1
+   Compiling ecolor v0.31.1
+   Compiling winit v0.30.13
+   Compiling tracing-subscriber v0.3.23
+   Compiling naga v24.0.0
+   Compiling serde v1.0.229
+   Compiling zerofrom v0.1.8
+   Compiling thiserror v1.0.69
+   Compiling accesskit_winit v0.23.1
+   Compiling yoke v0.8.4
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling latch-proto v6.0.0 (/private/tmp/latch6-field-mac-20261114/crates/proto)
+   Compiling toml_edit v0.22.27
+   Compiling half v2.7.1
+   Compiling ahash v0.8.12
+   Compiling epaint v0.31.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling tiff v0.11.3
+   Compiling zerovec v0.11.9
+   Compiling zerotrie v0.2.5
+   Compiling rand_chacha v0.3.1
+   Compiling rand v0.8.8
+   Compiling latch-relay v6.0.0 (/private/tmp/latch6-field-mac-20261114/crates/relay)
+   Compiling egui v0.31.1
+   Compiling image v0.25.10
+   Compiling toml v0.8.23
+   Compiling tinystr v0.8.5
+   Compiling icu_locale_core v2.4.0
+   Compiling potential_utf v0.1.6
+   Compiling icu_collections v2.4.0
+   Compiling icu_provider v2.4.0
+   Compiling icu_properties v2.4.0
+   Compiling icu_normalizer v2.4.0
+   Compiling wgpu-hal v24.0.4
+   Compiling idna_adapter v1.2.2
+   Compiling idna v1.1.0
+   Compiling arboard v3.7.0
+   Compiling url v2.5.8
+   Compiling wgpu-core v24.0.5
+   Compiling webbrowser v1.2.7
+   Compiling latch-core v6.0.0 (/private/tmp/latch6-field-mac-20261114/crates/core)
+   Compiling egui-winit v0.31.1
+   Compiling latch-ui v6.0.0 (/private/tmp/latch6-field-mac-20261114/crates/ui)
+   Compiling latch-stream v6.0.0 (/private/tmp/latch6-field-mac-20261114/crates/stream)
+   Compiling wgpu v24.0.5
+   Compiling egui-wgpu v0.31.1
+   Compiling eframe v0.31.1
+   Compiling latch-client v6.0.0 (/private/tmp/latch6-field-mac-20261114/crates/client)
+   Compiling latch-field-viewer v0.0.0 (/tmp/latch6-field-viewer-20261114)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 1m 01s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

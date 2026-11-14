@@ -1,0 +1,38 @@
+Stage("Asking for the stream…")
+2026-11-14T11:54:22.733822Z  INFO latch_stream::session: viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) send_bytes=8388608 receive_bytes=8388608
+2026-11-14T11:54:23.179820Z  INFO latch_stream::audio: audio: playing on MacBook Pro Speakers at 48000 Hz, 2 channels (FL FR), 120-frame buffer
+2026-11-14T11:54:25.083130Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=1
+negotiated color: ColorDescription { primaries: 1, transfer: 1, matrix: 1, full_range: false, bit_depth: 8, hdr: None, chroma: Left }
+connected in 2.61857575s
+        audio: queued 66.0 ms, device 5.5 ms, jitter 51.2 ms, 7 underruns; 0 clicks at -0.0 ms
+  6.91s  58.9 fps   0.41 Mbps rtt 180 ms decode  0.76 ms host  0.71 ms assembly  0.00 ms queue  0.17 ms loss  0.0% fec   0 1280x720 H.264 · hardware | audio → MacBook Pro Speakers
+        audio: queued 63.2 ms, device 5.5 ms, jitter 50.5 ms, 7 underruns; 0 clicks at -0.0 ms
+  7.91s  63.0 fps   0.47 Mbps rtt 180 ms decode  0.73 ms host  0.74 ms assembly  0.00 ms queue  0.19 ms loss  0.0% fec   0 1280x720 H.264 · hardware | audio → MacBook Pro Speakers
+        audio: queued 61.1 ms, device 5.5 ms, jitter 54.4 ms, 7 underruns; 0 clicks at -0.0 ms
+  8.92s  58.9 fps   0.64 Mbps rtt 179 ms decode  0.74 ms host  0.85 ms assembly  0.00 ms queue  0.16 ms loss  0.0% fec   0 1280x720 H.264 · hardware | audio → MacBook Pro Speakers
+        audio: queued 59.7 ms, device 5.5 ms, jitter 51.9 ms, 7 underruns; 0 clicks at -0.0 ms
+  9.92s  58.3 fps   0.49 Mbps rtt 180 ms decode  0.71 ms host  0.79 ms assembly  0.00 ms queue  0.16 ms loss  0.0% fec   0 1280x720 H.264 · hardware | audio → MacBook Pro Speakers
+        audio: queued 56.6 ms, device 5.5 ms, jitter 37.0 ms, 7 underruns; 0 clicks at -0.0 ms
+ 10.93s  59.1 fps   0.58 Mbps rtt 178 ms decode  0.68 ms host  0.81 ms assembly  0.00 ms queue  0.14 ms loss  0.0% fec   0 1280x720 H.264 · hardware | audio → MacBook Pro Speakers
+        audio: queued 54.3 ms, device 5.5 ms, jitter 146.7 ms, 10 underruns; 0 clicks at -0.0 ms
+ 11.94s  62.8 fps   0.58 Mbps rtt 188 ms decode  0.99 ms host  0.84 ms assembly  0.00 ms queue  0.28 ms loss  0.0% fec   0 1280x720 H.264 · hardware | audio → MacBook Pro Speakers
+        audio: queued 48.6 ms, device 5.5 ms, jitter 148.4 ms, 10 underruns; 0 clicks at -0.0 ms
+ 12.95s  58.4 fps   0.49 Mbps rtt 188 ms decode  1.16 ms host  0.75 ms assembly  0.00 ms queue  0.28 ms loss  0.0% fec   0 1280x720 H.264 · hardware | audio → MacBook Pro Speakers
+        audio: queued 45.2 ms, device 5.5 ms, jitter 148.4 ms, 10 underruns; 0 clicks at -0.0 ms
+ 13.95s  58.6 fps   0.57 Mbps rtt 187 ms decode  1.98 ms host  0.83 ms assembly  0.00 ms queue  0.44 ms loss  0.0% fec   0 1280x720 H.264 · hardware | audio → MacBook Pro Speakers
+        audio: queued 42.7 ms, device 5.5 ms, jitter 148.4 ms, 10 underruns; 0 clicks at -0.0 ms
+ 14.96s  62.6 fps   0.46 Mbps rtt 185 ms decode  1.44 ms host  0.79 ms assembly  0.00 ms queue  0.40 ms loss  0.0% fec   0 1280x720 H.264 · hardware | audio → MacBook Pro Speakers
+        audio: queued 40.7 ms, device 5.5 ms, jitter 30.5 ms, 10 underruns; 0 clicks at -0.0 ms
+ 15.97s  58.1 fps   0.41 Mbps rtt 182 ms decode  0.88 ms host  0.81 ms assembly  0.00 ms queue  0.18 ms loss  0.0% fec   0 1280x720 H.264 · hardware | audio → MacBook Pro Speakers
+        audio: queued 40.5 ms, device 5.5 ms, jitter 30.1 ms, 10 underruns; 0 clicks at -0.0 ms
+ 16.98s  60.0 fps   0.66 Mbps rtt 182 ms decode  2.17 ms host  0.87 ms assembly  0.00 ms queue  0.46 ms loss  0.0% fec   0 1280x720 H.264 · hardware | audio → MacBook Pro Speakers
+2026-11-14T11:54:42.736313Z  WARN latch_stream::session: the decoder fell behind; restarting at a keyframe
+        audio: queued 40.6 ms, device 5.5 ms, jitter 30.3 ms, 10 underruns; 0 clicks at -0.0 ms
+ 17.99s  55.2 fps   1.70 Mbps rtt 179 ms decode  0.90 ms host  1.52 ms assembly  0.42 ms queue  0.26 ms loss  0.0% fec   0 1280x720 H.264 · hardware | audio → MacBook Pro Speakers
+        audio: queued 40.1 ms, device 5.5 ms, jitter 30.3 ms, 10 underruns; 0 clicks at -0.0 ms
+ 18.99s  59.9 fps   0.68 Mbps rtt 182 ms decode  0.71 ms host  0.83 ms assembly  0.00 ms queue  0.15 ms loss  0.0% fec   0 1280x720 H.264 · hardware | audio → MacBook Pro Speakers
+        audio: queued 40.3 ms, device 5.5 ms, jitter 36.1 ms, 10 underruns; 0 clicks at -0.0 ms
+ 20.00s  62.2 fps   0.51 Mbps rtt 184 ms decode  0.77 ms host  0.71 ms assembly  0.00 ms queue  0.20 ms loss  0.0% fec   0 1280x720 H.264 · hardware | audio → MacBook Pro Speakers
+        audio: queued 41.0 ms, device 5.5 ms, jitter 36.1 ms, 10 underruns; 0 clicks at -0.0 ms
+ 21.01s  61.5 fps   0.51 Mbps rtt 183 ms decode  2.02 ms host  0.80 ms assembly  0.00 ms queue  0.55 ms loss  0.0% fec   0 1280x720 H.264 · hardware | audio → MacBook Pro Speakers
+stream stopped in 15.016375ms

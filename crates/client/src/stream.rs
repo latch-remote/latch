@@ -155,21 +155,13 @@ impl ReconnectState {
     }
 
     pub fn next_attempt(&self, now: Instant) -> Option<Self> {
-        if now.saturating_duration_since(self.started) >= Duration::from_secs(5 * 60) {
-            None
-        } else {
-            let mut next = Self::with_attempt(self.attempt.saturating_add(1), now);
-            next.started = self.started;
-            if next.attempt > 3 {
-                // Spread retrying viewers over 20–30 seconds after quick retries.
-                next.deadline =
-                    now + Duration::from_millis(rand::random::<u64>() % 10_001 + 20_000);
-            }
-            next.deadline = next
-                .deadline
-                .min(self.started + Duration::from_secs(5 * 60));
-            Some(next)
+        let mut next = Self::with_attempt(self.attempt.saturating_add(1), now);
+        next.started = self.started;
+        if next.attempt > 3 {
+            // Spread retrying viewers over 20–30 seconds throughout an outage.
+            next.deadline = now + Duration::from_millis(rand::random::<u64>() % 10_001 + 20_000);
         }
+        Some(next)
     }
 }
 
@@ -507,8 +499,6 @@ impl View {
             Some(Interruption::Reconnecting(state)) => {
                 if let Some(next) = state.next_attempt(now) {
                     *state = next;
-                } else {
-                    self.interrupted = Some(Interruption::Failed);
                 }
             }
             Some(Interruption::Failed)
@@ -940,7 +930,12 @@ impl View {
                 ui::clipped_scroll(ui, "stream-performance", room, |ui| {
                     let path = env.path.as_ref().unwrap_or(&live.path);
                     ui.horizontal_wrapped(|ui| {
-                        ui::tag(ui, Some(path.tone()), &path.label());
+                        let route = if live.session.relay_active() {
+                            "Latch TLS relay".into()
+                        } else {
+                            path.label()
+                        };
+                        ui::tag(ui, Some(path.tone()), &route);
                         ui::tag(ui, None, &profile_label(&live.settings));
                     });
                     ui.add_space(space::SM);
@@ -1119,8 +1114,12 @@ impl View {
                                 );
                             }
                             if !overflow {
-                                let tag = ui::tag(ui, Some(path.tone()), &path.label());
-                                if path.relayed() {
+                                let relay = live.session.relay_active();
+                                let route = if relay { "Latch TLS relay".into() } else { path.label() };
+                                let tag = ui::tag(ui, Some(path.tone()), &route);
+                                if relay {
+                                    tag.on_hover_text("Video, sound and input use the Latch TLS relay.");
+                                } else if path.relayed() {
                                     tag.on_hover_text("The route in use right now. A relay adds delay; Latch never lowers the bitrate for it.");
                                 } else if path.direct == Some(true) {
                                     tag.on_hover_text("Packets go straight to the machine.");
@@ -5047,7 +5046,7 @@ pub(crate) mod tests {
         assert_eq!(s3.remaining_secs(t2 + Duration::from_secs(10)), 0);
         assert!(s3.is_due(t2 + Duration::from_secs(10)));
 
-        // Retries continue beyond the initial three, but stop after five minutes.
+        // Retries retain intent throughout a prolonged outage.
         let t3 = t2 + Duration::from_secs(10);
         view.handle_interruption_at(t3);
         let Some(Interruption::Reconnecting(ref s4)) = view.interrupted else {
@@ -5055,8 +5054,24 @@ pub(crate) mod tests {
         };
         assert_eq!(s4.attempt, 4);
         assert!((Duration::from_secs(20)..=Duration::from_secs(30)).contains(&s4.remaining(t3)));
-        view.handle_interruption_at(t0 + Duration::from_secs(300));
-        assert_eq!(view.interrupted, Some(Interruption::Failed));
+        for hours in [1, 6, 24, 72] {
+            let now = t0 + Duration::from_secs(hours * 60 * 60);
+            view.handle_interruption_at(now);
+            let Some(Interruption::Reconnecting(state)) = &view.interrupted else {
+                panic!("retry intent expired after {hours} hours");
+            };
+            assert_eq!(state.started, t0);
+            assert!(
+                (Duration::from_secs(20)..=Duration::from_secs(30)).contains(&state.remaining(now))
+            );
+        }
+        view.cancel_reconnect();
+        view.observe_recovery(
+            true,
+            std::time::SystemTime::now(),
+            t0 + Duration::from_secs(100 * 60 * 60),
+        );
+        assert!(view.interrupted.is_none());
     }
 
     #[test]

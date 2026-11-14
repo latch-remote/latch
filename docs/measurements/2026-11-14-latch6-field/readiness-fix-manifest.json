@@ -1,0 +1,27 @@
+[
+  {
+    "path": "crates/proto/src/transport.rs",
+    "sha256": "faf1d9c1f0d6bbb4431596648dc06f91a352de16ae349ed1cdfb1b000cabf234",
+    "bytes": 18302
+  },
+  {
+    "path": "crates/relay/src/client.rs",
+    "sha256": "5ca267d1952e5c652fca3b9692112c2db48908f8d2bcba36389b331424549edd",
+    "bytes": 35912
+  },
+  {
+    "path": "crates/core/src/http.rs",
+    "sha256": "a9cf562f3d52ed2915ebb0a85147984b89f53ea69f7be426a6ce44fb8858633b",
+    "bytes": 45495
+  },
+  {
+    "path": "crates/core/Cargo.toml",
+    "sha256": "346ee7e625b652177b7bd88d6f30a92ce8f60724edfc204a018f76420bc57ce2",
+    "bytes": 1129
+  },
+  {
+    "path": "Cargo.lock",
+    "sha256": "30489af800d6a7b34abc6b3140c8709069465c8ef2ea6e5e73396e7059ee41c1",
+    "bytes": 133104
+  }
+]

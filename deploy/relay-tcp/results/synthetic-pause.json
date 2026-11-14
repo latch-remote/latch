@@ -1,0 +1,8 @@
+{
+  "verified_utc": "2026-11-14T10:49:41.499732+00:00",
+  "active_synthetic_probe_pids": [],
+  "bulk_state": "paused_by_parent",
+  "terminated_soak_runner_pid": 83536,
+  "terminated_probe_pid": 91100,
+  "last_probe_log_write_utc": "2026-11-14T10:43:48.799286+00:00"
+}

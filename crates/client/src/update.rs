@@ -1,10 +1,9 @@
 //! Keeping this app and every Latch Host it can see on the newest release.
 //!
-//! The Mac does the fetching for everyone (with a GitHub login if the
-//! repository is private; see `latch_core::update`). Every few hours it asks
-//! GitHub for the latest release. A newer app is downloaded, verified against
-//! GitHub's digest and its own code signature, and swapped into place once no
-//! stream is running; the app then relaunches itself. A newer host is
+//! The Mac fetches public, version-pinned release manifests for everyone.
+//! Every few hours it checks for a newer release. A newer app is downloaded,
+//! verified against the manifest digest and its own code signature, and
+//! swapped into place once no stream is running; the app then relaunches itself. A newer host is
 //! downloaded once, and `latch-host.exe` is sent to each PC whose host
 //! already speaks `/v1/update` (3.1+) and reports an older version, over
 //! the same Tailscale-authenticated control API that can put the PC to
@@ -17,7 +16,7 @@ use crate::config::ClientConfig;
 use crate::session::{Discovery, Live, Progress};
 use anyhow::{anyhow, bail, Context, Result};
 use latch_core::api::{Ack, Status, UPDATE_PATH, UPDATE_SHA256_HEADER, UPDATE_VERSION_HEADER};
-use latch_core::update::{self, Release, HOST_EXE, MAC_ASSET, WINDOWS_ASSET};
+use latch_core::update::{self, Release, HOST_EXE, MAC_ASSET};
 use latch_core::{http, legacy, CONTROL_PORT};
 use latch_ui::Tone;
 use parking_lot::Mutex;
@@ -90,7 +89,6 @@ pub fn spawn(
     std::thread::spawn(move || {
         let mut next = Instant::now() + FIRST_CHECK;
         let mut release: Option<Release> = None;
-        let mut token = None;
         // The last self-update that failed. It is not tried again on every
         // tick, and one that can only fail the same way not until the
         // release changes; the PCs get theirs meanwhile either way.
@@ -108,9 +106,8 @@ pub fn spawn(
             }
             let due = state.lock().check_now || Instant::now() >= next;
             if due {
-                token = update::token(cfg.github_token.as_deref());
                 state.lock().check_now = false;
-                match update::latest(token.as_deref()) {
+                match update::latest(None) {
                     Ok(r) => {
                         next = Instant::now() + CHECK_EVERY;
                         let mut st = state.lock();
@@ -142,7 +139,7 @@ pub fn spawn(
                 && state.lock().ready.is_none()
                 && self_update_due(self_failed.as_ref(), rel, Instant::now())
             {
-                match prepare_self(rel, token.as_deref()) {
+                match prepare_self(rel) {
                     Ok(Some(v)) => {
                         self_failed = None;
                         let mut st = state.lock();
@@ -186,7 +183,7 @@ pub fn spawn(
                 };
                 if idle {
                     let bundle = bundle_path();
-                    match (bundle, install_self(rel, token.as_deref())) {
+                    match (bundle, install_self(rel)) {
                         (Some(bundle), Ok(staged)) => {
                             if let Err(e) = relaunch(&bundle, &staged.parked, &staged.stage) {
                                 let mut st = state.lock();
@@ -283,7 +280,7 @@ pub fn spawn(
                         continue;
                     }
                 }
-                let outcome = push_host(rel, token.as_deref(), ip);
+                let outcome = push_host(rel, ip);
                 let mut st = state.lock();
                 st.pushed
                     .insert(pc.node_id.clone(), (rel.version.clone(), Instant::now()));
@@ -399,7 +396,7 @@ fn spawn_desktop(
 ) {
     std::thread::spawn(move || {
         let mut next = Instant::now() + FIRST_CHECK;
-        let mut pending: Option<(Release, Option<String>)> = None;
+        let mut pending: Option<Release> = None;
         loop {
             std::thread::sleep(TICK);
             let cfg = ClientConfig::load();
@@ -408,8 +405,7 @@ fn spawn_desktop(
             }
             if state.lock().check_now || Instant::now() >= next {
                 state.lock().check_now = false;
-                let token = update::token(cfg.github_token.as_deref());
-                match update::latest(token.as_deref()) {
+                match update::latest(None) {
                     Ok(rel) => {
                         next = Instant::now() + CHECK_EVERY;
                         let newer = rel.is_newer_than(&update::current());
@@ -420,7 +416,7 @@ fn spawn_desktop(
                         st.message = desktop_offer(&rel, cfg!(windows))
                             .unwrap_or_else(|| format!("Up to date (v{}).", update::current()));
                         st.notice = newer.then(|| (Tone::Info, st.message.clone()));
-                        pending = (newer && cfg!(windows)).then_some((rel, token));
+                        pending = (newer && cfg!(windows)).then_some(rel);
                     }
                     Err(e) => {
                         next = Instant::now() + RETRY_AFTER;
@@ -432,7 +428,7 @@ fn spawn_desktop(
                 }
                 ctx.request_repaint();
             }
-            if let Some((rel, token)) = pending.as_ref() {
+            if let Some(rel) = pending.as_ref() {
                 let idle = {
                     let live = live.lock();
                     let mut p = progress.lock();
@@ -447,7 +443,7 @@ fn spawn_desktop(
                     continue;
                 }
                 let result = (|| -> Result<()> {
-                    let path = fetch_asset(rel, HOST_EXE, token.as_deref())?;
+                    let path = fetch_asset(rel, HOST_EXE)?;
                     let bytes = std::fs::read(path)?;
                     update::verify_host(rel, &rel.version, &bytes)?;
                     // The service independently authenticates the same bytes and serializes
@@ -501,14 +497,14 @@ fn spawn_desktop(
 
 /// Recheck cached assets before using them: an interrupted download or a
 /// modified cache must never become an executable update.
-fn fetch_asset(rel: &Release, name: &str, token: Option<&str>) -> Result<PathBuf> {
+fn fetch_asset(rel: &Release, name: &str) -> Result<PathBuf> {
     let asset = rel
         .asset(name)
         .ok_or_else(|| anyhow!("release {} has no {name}", rel.tag))?;
     update::require_digest(asset)?;
     let dest = updates_dir(rel)?.join(name);
     if update::verify_asset(asset, &dest).is_err() {
-        update::download(asset, token, &dest)?;
+        update::download(asset, None, &dest)?;
     }
     Ok(dest)
 }
@@ -586,18 +582,18 @@ fn self_update_due(failed: Option<&SelfFailure>, rel: &Release, now: Instant) ->
 /// Download and verify the new app. `Ok(None)` when this copy is not in a
 /// bundle (a development build), which is left alone. A download that
 /// fails its checks is [`Unusable`]; a failed download is not.
-fn prepare_self(rel: &Release, token: Option<&str>) -> Result<Option<Version>> {
+fn prepare_self(rel: &Release) -> Result<Option<Version>> {
     if bundle_path().is_none() {
         return Ok(None);
     }
     if rel.asset(MAC_ASSET).is_none() {
         return Err(anyhow!("release {} has no {MAC_ASSET}", rel.tag).context(Unusable));
     }
-    let tarball = fetch_asset(rel, MAC_ASSET, token)?;
+    let tarball = fetch_asset(rel, MAC_ASSET)?;
     match prepare_in(&updates_dir(rel)?.join("unpacked"), &tarball, &rel.version) {
         Ok(v) => Ok(Some(v)),
         Err(e) => {
-            // It matched GitHub's digest, so fetching it again would bring
+            // It matched the manifest's digest, so fetching it again would bring
             // the same bytes.
             let _ = std::fs::remove_file(&tarball);
             Err(e.context(Unusable))
@@ -679,14 +675,14 @@ fn clean_old_stages() {
 }
 
 /// Move the new app over this one. The release's tarball is checked
-/// against GitHub's digest again (and fetched again if the asset changed
+/// against the manifest's digest again (and fetched again if the asset changed
 /// since it was prepared), unpacked straight into the staging folder beside
 /// this app and checked there: what was checked is exactly what goes in.
 /// macOS keeps the running executable alive across the rename, so the swap
 /// is safe while we are still up.
-fn install_self(rel: &Release, token: Option<&str>) -> Result<StagedUpdate> {
+fn install_self(rel: &Release) -> Result<StagedUpdate> {
     let bundle = bundle_path().ok_or_else(|| anyhow!("not running from an app bundle"))?;
-    let tarball = fetch_asset(rel, MAC_ASSET, token)?;
+    let tarball = fetch_asset(rel, MAC_ASSET)?;
     let staged = replace_bundle(&bundle, &tarball, |tarball, staged| {
         stage_from(tarball, staged, &rel.version)
     })?;
@@ -821,18 +817,14 @@ fn relaunch_command(
     command
 }
 
-/// Extract `latch-host.exe` from the verified Windows archive. An extracted
-/// cache has no published digest, so never trust one from an earlier run.
-pub(crate) fn host_exe(rel: &Release, token: Option<&str>) -> Result<Vec<u8>> {
-    let zip = fetch_asset(rel, WINDOWS_ASSET, token)?;
-    let out = std::process::Command::new("/usr/bin/unzip")
-        .args(["-p", &zip.display().to_string(), HOST_EXE])
-        .output()
-        .context("unzip")?;
-    if !out.status.success() || out.stdout.len() < 1024 * 1024 {
-        bail!("{} holds no {HOST_EXE}", WINDOWS_ASSET);
+/// Fetch the independently published host executable, checking its own digest.
+pub(crate) fn host_exe(rel: &Release) -> Result<Vec<u8>> {
+    let path = fetch_asset(rel, HOST_EXE)?;
+    let bytes = std::fs::read(path)?;
+    if bytes.len() < 1024 * 1024 {
+        bail!("the release holds no complete {HOST_EXE}");
     }
-    Ok(out.stdout)
+    Ok(bytes)
 }
 
 /// A host that already speaks `/v1/update`, and a release newer than it.
@@ -842,7 +834,7 @@ fn should_push(running: &Version, rel: &Release) -> bool {
 
 pub fn old_host_message(name: &str, version: &Version) -> String {
     format!(
-        "{name} runs Latch Host {version}, which cannot take an update over the network. Install the latest Latch release on that PC from https://github.com/MrBeldum/latch/releases/latest. After that, updates are automatic."
+        "{name} runs Latch Host {version}, which cannot take an update over the network. Install the latest Latch release on that PC from https://github.com/latch-remote/latch-releases/releases/latest. After that, updates are automatic."
     )
 }
 
@@ -880,20 +872,18 @@ fn is_transient(e: &anyhow::Error) -> bool {
 /// Use the same verified download and update push as the automatic updater
 /// before connecting to a host that speaks the old streaming protocol.
 pub fn upgrade_for_stream(ip: Ipv4Addr, running: &str) -> Result<()> {
-    let cfg = ClientConfig::load();
-    let token = update::token(cfg.github_token.as_deref());
-    let rel = update::latest(token.as_deref())?;
+    let rel = update::latest(None)?;
     let running = Version::parse(running)?;
     if rel.version.major < 5 || !should_push(&running, &rel) {
         bail!("no Latch 5 update is available. Install Latch 5 on that PC to connect.");
     }
-    push_host(&rel, token.as_deref(), ip)
+    push_host(&rel, ip)
 }
 
 /// Send the new host to the PC at `ip`. The host checks the digest, swaps
 /// the file in and restarts.
-fn push_host(rel: &Release, token: Option<&str>, ip: Ipv4Addr) -> Result<()> {
-    let exe = host_exe(rel, token)?;
+fn push_host(rel: &Release, ip: Ipv4Addr) -> Result<()> {
+    let exe = host_exe(rel)?;
     let sha = update::sha256_hex(&exe);
     let version = rel.version.to_string();
     let host = SocketAddr::from((ip, CONTROL_PORT));
@@ -1009,6 +999,18 @@ pub fn ago(at: Option<Instant>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_shared_token_config_loads_without_providing_download_credentials() {
+        let cfg: ClientConfig =
+            toml::from_str("github_token = \"legacy-secret\"\nauto_update = true\n").unwrap();
+        assert!(cfg.auto_update);
+        assert_eq!(cfg.github_token.as_deref(), Some("legacy-secret"));
+        assert_eq!(update::token(cfg.github_token.as_deref()), None);
+        let saved = toml::to_string(&cfg).unwrap();
+        let restored: ClientConfig = toml::from_str(&saved).unwrap();
+        assert_eq!(restored.github_token, cfg.github_token);
+    }
 
     #[test]
     fn desktop_updates_offer_windows_install_and_linux_manual_release_url() {

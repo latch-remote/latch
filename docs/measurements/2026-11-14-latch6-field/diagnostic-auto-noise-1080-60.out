@@ -1,0 +1,14 @@
+[2m2026-11-14T10:47:31.772600Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) [3msend_bytes[0m[2m=[0m8388608 [3mreceive_bytes[0m[2m=[0m8388608
+[2m2026-11-14T10:47:32.512305Z[0m [32m INFO[0m [2mlatch_stream::audio[0m[2m:[0m audio: playing on Speakers (Steam Streaming Speakers) at 48000 Hz, 2 channels (FL FR), WASAPI period 480 frames (10.00 ms; default 10.00, least 10.00)
+[2m2026-11-14T10:47:40.823461Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m using Latch TLS relay [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1
+[2m2026-11-14T10:48:42.569199Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m the decoder fell behind; restarting at a keyframe
+[2m2026-11-14T10:48:43.391831Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m the decoder fell behind; restarting at a keyframe
+[2m2026-11-14T10:48:43.659360Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m the decoder fell behind; restarting at a keyframe
+[2m2026-11-14T10:48:44.723701Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m the decoder fell behind; restarting at a keyframe
+[2m2026-11-14T10:48:45.033829Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m the decoder fell behind; restarting at a keyframe
+[2m2026-11-14T10:48:45.197809Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m the decoder fell behind; restarting at a keyframe
+[2m2026-11-14T10:48:45.341043Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m the decoder fell behind; restarting at a keyframe
+[2m2026-11-14T10:48:46.997105Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m the decoder fell behind; restarting at a keyframe
+[2m2026-11-14T10:48:52.069853Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m the decoder fell behind; restarting at a keyframe
+[2m2026-11-14T10:48:54.183265Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m the decoder fell behind; restarting at a keyframe
+[2m2026-11-14T10:49:06.798476Z[0m [32m INFO[0m [2mlatch_stream::audio::wasapi[0m[2m:[0m audio: WASAPI stream closed after 9427 wakes, 1 with nothing left to play

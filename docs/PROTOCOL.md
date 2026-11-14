@@ -1,17 +1,18 @@
 # Latch stream protocol, version 1
 
-Latch 5 streams a desktop with its own protocol. It replaces the
+Latch streams a desktop with its own protocol, introduced in version 5. It replaces the
 GameStream/Moonlight protocol that Sunshine and moonlight-common-c spoke
 until Latch 4. Every byte of it is implemented in Rust in `crates/proto`.
 
-The protocol only runs inside a Tailscale tailnet. WireGuard already
-encrypts and authenticates every packet between two machines, and the
-host's control service already decides which tailnet peers may use it
-(`tailscale whois`, see `crates/host/src/service.rs`). So the protocol has
-no encryption, no key exchange and no PIN pairing of its own. Whoever may
-call the control API may stream; nobody else gets a session token.
+Session authorization runs inside a Tailscale tailnet. The host's control
+service decides which peers may stream using `tailscale whois` and local
+control tokens. WireGuard protects the normal UDP path. Version 6 adds
+an optional public TCP/TLS relay with its own end-to-end encryption and
+keys exchanged over the existing authorized control connection. Both
+transports require that connection to stay open.
 
-All integers are little-endian. Times are microseconds.
+Protocol 1 control and datagram integers are little-endian. Times are
+microseconds. The relay's outer record framing uses big-endian lengths.
 
 ## Ports
 
@@ -19,6 +20,7 @@ All integers are little-endian. Times are microseconds.
 | --- | --- |
 | Session control (TCP) | the control port, 47850, upgraded from HTTP |
 | Media (UDP) | host UDP 47850; the viewer uses any local port |
+| Public relay (TCP/TLS) | outbound to the configured public hostname, normally 443, ALPN `latch-relay/1` |
 
 ## Session start
 
@@ -53,6 +55,7 @@ Content-Length: <n>
 | `audio_channels` | u32 | optional; most channels the viewer plays (6 for 5.1, 8 for 7.1). Absent, or below 3, means stereo |
 | `mic` | bool | optional, default false; the viewer offers its microphone (datagram kind 13) |
 | `probe_trains` | bool | optional, default false; the viewer times probe trains (datagram kind 16) and reports their rate |
+| `relay` | bool | optional, default false; the viewer supports the two-lane authenticated relay extension |
 
 A request is taken within 64 to 16384 pixels a side, 1 to 500 fps and
 500 kbps to 1 Gbps (`latch_proto::control::MAX_*`). The host then meets
@@ -87,12 +90,20 @@ type byte and the payload and is at most 65 536. Payloads are JSON objects.
 | 5 | `Report` | either | `{"fps", "loss_pct", "decode_ms", "rtt_ms"}`, every 50 ms (older viewers: 250 ms or once a second), for bitrate and FEC feedback |
 | 6 | `Cursor` | host → viewer | `{"visible": bool, "shape": null \| {"serial": u32, "width": u32, "height": u32, "hot_x": u32, "hot_y": u32, "rgba": "<base64>"}}`; only after an `Accept` with `cursor` true; sent when visibility or shape changes (`shape` null: unchanged); straight-alpha RGBA, at most 96×96 |
 | 7 | `DrawCursor` | viewer → host | `{"draw": bool}`; tells host whether to composite pointer into video |
+| 8 | `Relay` | either | `{"session": u32, "attempt": u64, "action": RelayAction}`; negotiated only when request and accept both set `relay` |
+
+`End` always uses the original control connection, including while relay is
+active. Codes 0 (intentional end), 1 (takeover), and 5 (host stopping) stop
+automatic reconnect. Code 6 is a recoverable transport failure, including
+priority backpressure or a full bounded control inbox. Every cursor update
+uses the original ordered connection, regardless of its serialized size.
 
 `Accept`:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `session` | u32 | session id, in every datagram |
+| `relay` | bool | optional, default false; host and viewer can negotiate the public relay |
 | `token` | string | 32 hex digits (16 random bytes); proves a datagram's sender is this viewer |
 | `codec` | string | one of the viewer's `codecs` |
 | `width`, `height`, `fps` | u32 | what will actually be sent |
@@ -264,12 +275,17 @@ carries every unacknowledged event, oldest first, as many as fit. The
 viewer sends one whenever it has a new event, and again every 20 ms while
 any event is unacknowledged. The host applies events in sequence order,
 ignores ones it has applied, and keeps a later event until the gap before
-it is filled.
+it is filled. An injection failure holds the acknowledgment and retries
+that event for up to two seconds. A persistently failing event is then
+dropped so later events can proceed. The viewer bounds pending input at
+4,096 events and ends a session after five seconds without acknowledgment
+progress. Teardown releases held keys and buttons.
 
 ### InputAck (5)
 
-`u32 next` at offset 8: every event before `next` has been applied. Sent at
-once for every `Input` datagram.
+`u32 next` at offset 8 acknowledges every earlier event as consumed, either
+applied or dropped after the bounded injection retry. Sent at once for every
+`Input` datagram.
 
 ### KeyframeRequest (6)
 
@@ -621,3 +637,118 @@ A viewer whose decoder cannot keep up notices it locally and says so; no
 message asks the host for a lower frame rate, so the accepted rate holds
 until the viewer reconnects. Recovery of a dropped decode queue uses the
 existing keyframe messages.
+
+## Public TCP/TLS relay
+
+`crates/relay` provides native TLS with ALPN `latch-relay/1`. Production
+clients validate the hostname against WebPKI roots and reject private,
+loopback and tailnet DNS results. Each endpoint opens separate outbound
+priority and video connections. Native TLS requires a compatible network.
+HTTP-only proxies and TLS inspection may reject this ALPN.
+
+### Authorization and negotiation
+
+Both `StreamRequest.relay` and `Accept.relay` must be true. An older peer
+omitting these fields continues over UDP. `Relay` control messages always
+use the original authorized Tailscale TCP connection. Session ID and a
+monotonically increasing nonzero attempt number scope each negotiation.
+Stale or mismatched attempts are ignored.
+
+The viewer sends `Request`. The host obtains a new grant and generates
+fresh session keys. `Offer` contains a bounded serialized payload with the
+session, attempt, endpoint, viewer attachment and session keys. The host
+keeps its own attachment. The viewer checks its locally configured endpoint
+against the offer. Each attachment has independent single-use tickets for
+its role's priority and video lanes. Each attempt needs fresh tickets and
+keys. Capability and key debug formatting is redacted.
+
+After both lanes complete end-to-end key confirmation, the viewer sends
+`Ready`. The host sends `Commit`, the viewer activates and replies
+`Committed`, and the host activates. `Abort` resets the current attempt.
+Negotiation has a six-second application deadline. Failed attempts cool
+down for two seconds, increasing to thirty seconds after repeated failures.
+A single cancellable grant worker prevents preparation work accumulating.
+
+The current switch-back implementation adds `UdpProbe { first, kbps }`,
+`UdpProbeResult { first, received, span_us }`, `Direct` and `DirectReady`.
+The host probes UDP after a relay dwell period while media stays on relay.
+A qualifying report triggers an authorized handover back to UDP. Route
+revisions invalidate queued frames from the previous path and restart video
+recovery. Loopback TLS integration tests cover recovered UDP, relay
+restart, and repeated lifetime/byte grant renewal. Reassessment uses at
+most 50 Mbps of padding, so requested rates above 40 Mbps currently stay
+on relay until it fails or the session ends. The AWS endpoint has public
+TLS; campus measurements are recorded separately from these tests.
+
+### Framing and cryptography
+
+Outer TLS application records use `u32 big-endian length | record`, with
+at most 16 KiB per record. The grant response contains a random rendezvous
+ID, four independent lane tickets, an attachment expiry and session limits.
+An attach request binds the rendezvous ID, role, lane and corresponding
+ticket. The daemon pairs sockets and forwards bounded opaque records.
+
+Four independent random 256-bit base keys cover both directions on both
+lanes. RFC 5869 HKDF-SHA256 derives traffic keys with the rendezvous ID as
+salt and authenticated context as expansion info. ChaCha20-Poly1305
+protects each application record. Protocol version, rendezvous ID,
+generation, lane, direction and a strict monotonically increasing counter
+bind records to their context. Nonces use a zero prefix and 64-bit counter.
+The first encrypted record confirms possession of the keys on each lane.
+TLS termination at the relay leaves the inner records encrypted.
+
+The video lane transfers complete encoded frames with frame number,
+keyframe/recovery flags and host delay. It bypasses UDP reassembly and FEC.
+A partially sent frame is completed or the attempt closes. Whole unsent
+frames may be discarded under backpressure. End-to-end frame acknowledgments
+bound stalls even after TCP accepts bytes.
+
+The priority lane carries the existing datagram payloads for sound,
+microphone, input, input acknowledgments, gamepads, feedback and timing.
+Authenticated serialized control shares that lane up to 16,359 bytes.
+Cursor and terminal messages keep the original authorized TCP path. Relay
+negotiation, clipboard and service requests retain Tailscale control.
+
+### Bounds, fallback and privacy
+
+Default client limits are an 8 MiB complete frame, one queued outgoing
+frame plus one in flight, 256 KiB queued priority bytes, and 9 MiB delivered
+event bytes. Setup defaults to ten seconds at the transport layer. Frame
+and send deadlines default to 750 ms. Video ACKs use that lane's measured
+RTT plus four times its variation, bounded between the stall deadline and
+five seconds. Peer idle defaults to thirty seconds. Priority queue exhaustion
+ends the session to release held input. A closed attempt invalidates queued events. Session media
+watchdogs remain independent of control keepalives.
+
+Missing decoded video for one second or sustained UDP damage for about
+two seconds can request relay recovery. Busy video with a wire budget
+below 60% of its requested rate for five seconds can also request recovery;
+video must fill at least 75% of its reduced encoder target. Quiet content
+does not allocate relay capacity for this reason. A failed relay returns routing to
+UDP. Continued media or input failure can end the session and trigger the
+viewer's reconnect policy. The original authorized control connection
+remains required throughout.
+
+Daemon defaults bound admission to four sessions globally and two per
+creator IP, with a 60-second attachment window, 900-second session lifetime
+and 512 MiB per session. The CLI defaults to a 10 GiB monthly encrypted TCP
+ingress-plus-egress reservation budget. Operators can override bounded
+limits. A locked persistent ledger reserves byte leases and fsyncs them
+before I/O. Missing or corrupt state fails closed. Cloud billing includes
+additional headers and retransmissions, so this ledger alone cannot
+establish the provider's billed transfer.
+
+The relay observes public IP addresses, timing, traffic volume and
+rendezvous metadata. Only the endpoints hold the inner session keys.
+Viewer opt-out is **Settings → Stream relay → Recover automatically through
+the Latch relay**. Host policy is `[relay] enabled = false` in `host.toml`,
+applied when the background service starts.
+
+Graviola requires AES, PCLMULQDQ, BMI1, ADX, AVX and AVX2 on x86-64, or
+NEON, AES, PMULL and SHA2 on AArch64. Configuration and cryptographic entry
+points check these features before enabling relay support. Direct UDP and
+codec hardware requirements remain separate constraints. Default endpoint
+`relay.latch.rune.foo:443` is deployed on AWS Lightsail with public TLS.
+Field and scale validation are distinct from protocol conformance.
+[Relay implementation](../crates/relay/README.md) ·
+[Deployment](../deploy/relay-tcp/README.md)

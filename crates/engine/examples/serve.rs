@@ -53,6 +53,7 @@ fn main() -> anyhow::Result<()> {
             }),
             log: Box::new(|line| eprintln!("{line}")),
             mic: mic_opener(),
+            ..Options::default()
         },
     )?;
     eprintln!("serving on {bind}:{port} (TCP and UDP)");

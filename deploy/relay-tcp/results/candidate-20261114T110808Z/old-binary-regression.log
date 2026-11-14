@@ -1,0 +1,10 @@
+PASS kit syntax, operator limits, privilege and persistent-ledger contract
+Traceback (most recent call last):
+  File "/home/ubuntu/latch6-build/deploy/relay-tcp/selftest.py", line 179, in <module>
+    main()
+  File "/home/ubuntu/latch6-build/deploy/relay-tcp/selftest.py", line 172, in main
+    check_binary(args.binary)
+  File "/home/ubuntu/latch6-build/deploy/relay-tcp/selftest.py", line 140, in check_binary
+    assert process.poll() is None, "admission exhaustion terminated the daemon"
+           ^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: admission exhaustion terminated the daemon

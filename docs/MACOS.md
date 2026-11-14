@@ -31,33 +31,41 @@ with `lpcm-rice`, and the picture is drawn in Latch's own window under a toolbar
 
 ## Install a prebuilt app
 
-The installer uses only tools every Mac has (`curl`, `sed`, `shasum`).
-Public releases download anonymously. If the repository is private, install
-the [GitHub CLI](https://cli.github.com) and sign in
-(`brew install gh && gh auth login`) so the script can fall back to `gh`.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MrBeldum/latch/main/scripts/install-macos-release.sh | bash
-```
-
-It checks the release SHA-256, verifies the ad-hoc signature, swaps the app
-into `/Applications` (the live copy is not deleted first) and opens it.
-
-By hand: download `latch-macos-arm64.tar.gz` from the
-[latest release](https://github.com/MrBeldum/latch/releases/latest), then
+Download `latch-macos-arm64.tar.gz` and `SHA256SUMS` from the public latest
+release. Downloads require no GitHub login. Quit Latch before replacing an
+existing app, then run these commands in the download folder.
+[Latest release](https://github.com/latch-remote/latch-releases/releases/latest)
 
 ```bash
 shasum -a 256 latch-macos-arm64.tar.gz
-# Compare with this asset's SHA-256 digest on the GitHub release before extracting.
+```
+
+Compare the result with this archive's line in `SHA256SUMS`, then extract
+and verify the bundle.
+
+```bash
 tar xzf latch-macos-arm64.tar.gz
 codesign --verify --deep --strict Latch.app
-mv Latch.app /Applications/
+```
+
+Move `Latch.app` into `/Applications` with Finder, replacing the old app if
+present. Then clear quarantine and open it.
+
+```bash
 xattr -dr com.apple.quarantine /Applications/Latch.app
 open /Applications/Latch.app
 ```
 
 The digest comes from GitHub alongside the artifact, not an independent
 publisher signature. Ad-hoc signature verification checks bundle consistency.
+
+The corresponding source snapshot on the release page also contains
+`scripts/install-macos-release.sh`. From the extracted source, run
+`bash scripts/install-macos-release.sh` for the manifest-verified installer.
+It uses macOS tools (`curl`, `sed`, `shasum`), checks digest, size and ad-hoc
+signature, swaps the app into `/Applications`, then opens it. The script
+needs no GitHub CLI or credentials. The development repository requires
+access, so its raw script URL is unsuitable for public installation.
 
 The `xattr` step is required for a browser download. The app is ad-hoc
 signed rather than signed with an Apple Developer ID, and macOS 15 reports
@@ -563,12 +571,18 @@ A Windows PC also updates itself while its window is open
 GitHub's digest for the release. A Linux host shows the new version;
 install the new tarball or rebuild the Docker node.
 
-Public releases need no GitHub login. If the repository is private, the
-app uses, in order: `github_token` in `client.toml`, `LATCH_GITHUB_TOKEN`
-in the environment, and the token git has stored for github.com (only if you previously stored one through a configured credential
-helper; the public installer uses anonymous downloads and stores none). Settings has the switch and a **Check now** button; the line under
+Version 6 fetches public `release.json` manifests with exact version-tagged
+URLs, SHA-256 digests and byte sizes. It ignores legacy `github_token`,
+`LATCH_GITHUB_TOKEN` and stored Git credentials for distribution. Settings
+has the switch and a **Check now** button. The line under
 it says what happened last. A copy that is not running from an app bundle
 (a development build) reports the new version but does not replace itself.
+
+Some 5.x apps still check the former repository and require a one-time
+installation from the public release page. Keep the existing settings
+folder. Older Windows hosts may need the same local installer migration
+before they can accept updates from this Mac.
+[Migration steps](USING.md#moving-from-5x-to-600)
 
 ## Staying reachable
 

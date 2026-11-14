@@ -4,13 +4,14 @@ use latch_engine::server::{Options, Server};
 use latch_proto::control::{self, Accept, Codec, End, Message, StreamRequest};
 use latch_stream::{Event, FrameSlot, Session, Settings};
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 fn request(name: &str) -> StreamRequest {
     StreamRequest {
+        relay: false,
         prefer_color: false,
         color: Default::default(),
         protocol: latch_proto::PROTOCOL,
@@ -134,6 +135,7 @@ fn post_accept_end_close_and_missing_media_are_reported_as_failures() {
             control::write_message(
                 &mut tcp,
                 &Message::Accept(Accept {
+                    relay: false,
                     color: Default::default(),
                     session: 123,
                     token: control::token_hex(&[7; 16]),
@@ -224,6 +226,241 @@ fn post_accept_end_close_and_missing_media_are_reported_as_failures() {
                 _ => {}
             }
         }
+        host.join().unwrap();
+        session.stop();
+    }
+}
+
+/// Keep control traffic healthy while selectively breaking the media or input
+/// path. The host finishes only when the viewer closes its control socket.
+fn impaired_host(mode: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+    let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = udp.local_addr().unwrap().port();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let worker = std::thread::spawn(move || {
+        let (mut tcp, peer) = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        let request: StreamRequest = http::read_request(&mut tcp)
+            .unwrap()
+            .unwrap()
+            .json()
+            .unwrap();
+        write!(
+            tcp,
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: {}\r\n\r\n",
+            control::UPGRADE
+        )
+        .unwrap();
+        control::write_message(
+            &mut tcp,
+            &Message::Accept(Accept {
+                relay: false,
+                color: Default::default(),
+                session: 123,
+                token: control::token_hex(&[7; 16]),
+                codec: Codec::H264Baseline,
+                width: 64,
+                height: 64,
+                fps: 60,
+                bitrate_kbps: 1000,
+                encoder: "impaired test host".into(),
+                audio: None,
+                audio_problem: String::new(),
+                cursor: false,
+                gamepads: 0,
+                gamepad_kinds: Vec::new(),
+                gamepad_problem: String::new(),
+                reference_invalidation: false,
+                mic: None,
+                mic_problem: String::new(),
+            }),
+        )
+        .unwrap();
+        let viewer = std::net::SocketAddr::new(peer.ip(), request.udp_port);
+        let mut encoder = latch_codec::h264::Encoder::new(latch_codec::h264::EncoderConfig {
+            width: 64,
+            height: 64,
+            fps: 60,
+            bitrate_kbps: 1000,
+            threads: 1,
+        })
+        .unwrap();
+        let mut picture = Vec::new();
+        encoder
+            .encode(&latch_codec::Yuv420::new(64, 64), true, &mut picture)
+            .unwrap();
+        let mut packetizer = latch_proto::video::Packetizer::new(123);
+        let mut send_frame = |data: &[u8], partial: bool| {
+            let mut sent = false;
+            packetizer
+                .packetize(
+                    &latch_proto::video::OutFrame {
+                        data,
+                        keyframe: true,
+                        host_delay: 0,
+                    },
+                    |dg| {
+                        if !partial || !sent {
+                            udp.send_to(dg, viewer).unwrap();
+                            sent = true;
+                        }
+                    },
+                )
+                .unwrap();
+        };
+        if mode == "partial" {
+            send_frame(&vec![0x55; 5000], true);
+        } else if mode == "startup decode starvation" {
+            send_frame(&[0x55; 100], false);
+        } else {
+            send_frame(&picture, false);
+        }
+        let mut next_frame = Instant::now() + Duration::from_millis(100);
+        while control::read_message(&mut tcp).is_ok() {
+            if control::write_message(&mut tcp, &Message::Keepalive).is_err() {
+                break;
+            }
+            if Instant::now() >= next_frame {
+                next_frame = Instant::now() + Duration::from_millis(100);
+                match mode {
+                    "ack blackhole" | "backlog" => send_frame(&picture, false),
+                    "decode starvation" | "startup decode starvation" => {
+                        send_frame(&[0x55; 100], false)
+                    }
+                    _ => {}
+                }
+                if mode == "ack blackhole" {
+                    // Duplicate acknowledgements are traffic, but no progress.
+                    let mut ack = Vec::new();
+                    latch_proto::wire::write_input_ack(&mut ack, 123, 0);
+                    udp.send_to(&ack, viewer).unwrap();
+                }
+            }
+        }
+    });
+    (port, worker)
+}
+
+fn impaired_session(port: u16) -> (Session, Arc<FrameSlot>, mpsc::Receiver<Event>) {
+    let frames = Arc::new(FrameSlot::default());
+    let (tx, rx) = mpsc::channel();
+    let session = Session::start(
+        latch_stream::Server {
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+        },
+        Settings {
+            prefer_color: false,
+            color: Default::default(),
+            width: 64,
+            height: 64,
+            fps: 60,
+            bitrate_kbps: 1000,
+            hevc: false,
+            av1: false,
+            audio: false,
+            name: "impaired viewer".into(),
+            cursor: false,
+            gamepads: false,
+            mic: false,
+        },
+        frames.clone(),
+        tx,
+        || {},
+    );
+    (session, frames, rx)
+}
+
+fn next_boundary(rx: &mpsc::Receiver<Event>) -> Event {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let event = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("session boundary deadline");
+        if matches!(
+            event,
+            Event::Connected | Event::Failed { .. } | Event::Terminated { .. }
+        ) {
+            return event;
+        }
+    }
+}
+
+#[test]
+fn a_partial_frame_and_tcp_keepalives_cannot_disable_startup_timeout() {
+    let (port, host) = impaired_host("partial");
+    let (session, frames, rx) = impaired_session(port);
+    let start = Instant::now();
+    assert!(
+        matches!(next_boundary(&rx), Event::Failed { stage, message }
+        if stage == "connecting" && message.contains("no picture arrived"))
+    );
+    assert!(start.elapsed() < Duration::from_secs(11));
+    assert_eq!(frames.seq(), 0);
+    assert!(!session.connected());
+    host.join().unwrap();
+    session.stop();
+}
+
+#[test]
+fn complete_frames_without_a_picture_report_decode_starvation() {
+    let (port, host) = impaired_host("startup decode starvation");
+    let (session, frames, rx) = impaired_session(port);
+    assert!(
+        matches!(next_boundary(&rx), Event::Failed { stage, message }
+        if stage == "decoding" && message.contains("complete video frames"))
+    );
+    assert_eq!(frames.seq(), 0);
+    assert!(!session.connected());
+    host.join().unwrap();
+    session.stop();
+}
+
+#[test]
+fn established_media_stalls_recover_despite_tcp_keepalives() {
+    for mode in ["capture idle", "decode starvation"] {
+        let (port, host) = impaired_host(mode);
+        let (session, frames, rx) = impaired_session(port);
+        assert_eq!(next_boundary(&rx), Event::Connected);
+        assert!(frames.seq() > 0, "connected requires a published picture");
+        let start = Instant::now();
+        let Event::Terminated { code, message } = next_boundary(&rx) else {
+            panic!("media stall must end recoverably");
+        };
+        assert_eq!(code, -1);
+        assert!(
+            message.contains(if mode == "capture idle" {
+                "including idle frames"
+            } else {
+                "decoding stopped"
+            }),
+            "{message}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(11));
+        host.join().unwrap();
+        session.stop();
+    }
+}
+
+#[test]
+fn input_ack_blackholes_and_backlogs_close_the_session() {
+    for mode in ["ack blackhole", "backlog"] {
+        let (port, host) = impaired_host(mode);
+        let (session, _, rx) = impaired_session(port);
+        assert_eq!(next_boundary(&rx), Event::Connected);
+        let input = session.input();
+        let start = Instant::now();
+        let count = if mode == "backlog" { 5000 } else { 1 };
+        for _ in 0..count {
+            input.key(65, true, 0);
+        }
+        input.key(65, false, 0);
+        let Event::Terminated { code, message } = next_boundary(&rx) else {
+            panic!("input failure must end recoverably");
+        };
+        assert_eq!(code, -1);
+        assert!(message.contains("acknowledging input"));
+        assert!(start.elapsed() < Duration::from_secs(if mode == "backlog" { 3 } else { 8 }));
         host.join().unwrap();
         session.stop();
     }

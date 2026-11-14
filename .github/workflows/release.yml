@@ -2,12 +2,20 @@ name: release
 
 # Two ways in:
 #   * workflow_dispatch: build the binaries and leave them on the run page.
-#   * a v* tag: the same binaries, published as a GitHub release. The tag has
-#     to be the workspace version (Cargo.toml) with a v in front.
+#   * a v* tag: verified assets published to latch-remote/latch-releases.
+#     The tag must match Cargo.toml and a nonempty CHANGELOG.md section.
 on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+
+permissions:
+  contents: read
+
+# Let an in-flight publication finish before another run for the same ref.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,8 +25,11 @@ jobs:
     permissions:
       contents: read
     runs-on: macos-15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-apple-darwin
@@ -28,6 +39,8 @@ jobs:
       # Never ship a binary whose tests were not run.
       - name: test
         run: cargo test --locked --workspace --all-targets
+      - name: public manifest installer checks
+        run: bash scripts/test-release-manifest.sh
       - name: build app
         run: cargo build --locked --release -p latch-host --target aarch64-apple-darwin
       # bundle-macos.sh ad-hoc signs and verifies the bundle itself.
@@ -60,17 +73,22 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: latch-macos-arm64
+          overwrite: true
           path: |
             dist.noindex/latch-macos-arm64.tar.gz
             dist.noindex/brolink-macos-arm64.tar.gz
           if-no-files-found: error
+          retention-days: 7
 
   windows:
     permissions:
       contents: read
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: test
@@ -100,11 +118,13 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: latch-windows-x64
+          overwrite: true
           path: |
             latch-windows-x64.zip
             brolink-windows-x64.zip
             latch-host.exe
           if-no-files-found: error
+          retention-days: 7
 
   # The Linux host, for VPS desktops: both production ones are arm64, x64 is
   # the other common kind. Built on Ubuntu 24.04 like CI, so it needs glibc
@@ -114,15 +134,24 @@ jobs:
     permissions:
       contents: read
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          # Match the verified Ubuntu 24.04 runners used by CI.
+          - runner: ${{ vars.LINUX_X64_RUNNER || 'ubuntu-24.04' }}
             arch: x64
-          - runner: ubuntu-24.04-arm
+            machine: x86_64
+          - runner: ${{ vars.LINUX_ARM64_RUNNER || 'ubuntu-24.04-arm' }}
             arch: arm64
+            machine: aarch64
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
+      - name: verify native architecture
+        run: test "$(uname -m)" = '${{ matrix.machine }}'
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: native deps
@@ -143,18 +172,22 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: latch-host-linux-${{ matrix.arch }}
+          overwrite: true
           path: |
             latch-host-linux-${{ matrix.arch }}.tar.gz
             latch-host-linux-${{ matrix.arch }}.tar.gz.sha256
           if-no-files-found: error
+          retention-days: 7
 
   codec-conformance:
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_X64_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: fetch the conformance bitstreams
@@ -162,71 +195,89 @@ jobs:
       - name: decode them
         run: cargo test --locked --release -p latch-codec --test conformance -- --nocapture
 
-  publish:
-    # Tags only: a manual run just leaves artifacts on the run page.
-    if: startsWith(github.ref, 'refs/tags/v')
+  assemble:
+    # Manual builds also retain a complete, validated private release bundle.
     needs: [macos, windows, linux, codec-conformance]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_X64_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 15
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
     steps:
-      # Checkout first: it empties the workspace, so artifacts downloaded
-      # before it would be deleted.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          sparse-checkout: |
-            CHANGELOG.md
-            Cargo.toml
-            scripts/release-notes.py
-          sparse-checkout-cone-mode: false
-      # The release is named after the tag and every program reports the
-      # workspace version: a tag pushed before the bump would publish a
-      # release no Mac can update to. Read the way bundle-macos.sh reads it.
-      - name: tag matches the workspace version
-        run: |
-          have="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-          [ "$have" = "${GITHUB_REF_NAME#v}" ] || { echo "::error::tag ${GITHUB_REF_NAME} but Cargo.toml says ${have}"; exit 1; }
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.11'
+      - name: publisher tests
+        run: python3 -m unittest discover -s scripts -p 'test_publish_release.py' -v
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          pattern: latch-*
           path: artifacts
-      - name: checksums for every release asset
+      - name: prepare bounded public asset set and corresponding source
+        env:
+          TAG_BUILD: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         run: |
-          mkdir release-assets
-          find artifacts -type f -exec cp {} release-assets/ \;
-          cd release-assets
-          sha256sum * > SHA256SUMS
+          tag=()
+          if [ "$TAG_BUILD" = true ]; then tag=(--tag "$GITHUB_REF_NAME"); fi
+          python3 scripts/publish-release.py prepare \
+            --artifacts artifacts --output release-assets --notes notes.md "${tag[@]}"
       - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        # Private-repository attestations require an eligible GitHub plan.
+        # Enabled failures block publication.
+        if: github.event.repository.private == false || vars.RELEASE_ATTESTATIONS_ENABLED == 'true'
         with:
           subject-path: |
             release-assets/*.tar.gz
             release-assets/*.zip
             release-assets/latch-host.exe
-      - name: release notes
-        # The CHANGELOG.md section whose heading is this version, up to
-        # the next heading, with wrapped lines joined (GitHub renders each
-        # newline in a release body as a break). A tag without a section
-        # gets GitHub's generated notes.
-        run: |
-          python3 scripts/release-notes.py "${GITHUB_REF_NAME}" CHANGELOG.md > notes.md
-          if [ -s notes.md ]; then
-            echo "NOTES=--notes-file notes.md" >> "$GITHUB_ENV"
-          else
-            echo "no CHANGELOG.md section for ${GITHUB_REF_NAME}; using generated notes"
-            echo "NOTES=--generate-notes" >> "$GITHUB_ENV"
-          fi
-      - name: publish release
+      - name: report unavailable provenance
+        if: github.event.repository.private && vars.RELEASE_ATTESTATIONS_ENABLED != 'true'
+        run: echo 'Provenance is disabled for this private repository. Set RELEASE_ATTESTATIONS_ENABLED=true after verifying plan entitlement. Asset checksums were generated.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-bundle
+          overwrite: true
+          path: |
+            release-assets/
+            notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: assemble
+    runs-on: ${{ vars.LINUX_X64_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-bundle
+          path: publication
+      # This App is installed only on the public distribution repository.
+      # It never receives source-repository or organization administration access.
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        id: release-token
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: latch-remote
+          repositories: latch-releases
+          permission-contents: write
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.11'
+      - name: verify draft assets and publish public release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
         run: |
-          case "${GITHUB_REF_NAME}" in
-            *-*) PRE=--prerelease ;;
-            *)   PRE= ;;
-          esac
-          gh release create "${GITHUB_REF_NAME}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "Latch ${GITHUB_REF_NAME}" \
-            $NOTES \
-            $PRE \
-            release-assets/*
+          python3 scripts/publish-release.py publish \
+            --assets publication/release-assets --notes publication/notes.md --tag "$GITHUB_REF_NAME"

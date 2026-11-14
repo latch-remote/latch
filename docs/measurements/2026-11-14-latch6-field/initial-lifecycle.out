@@ -1,0 +1,11 @@
+
+running 6 tests
+test a_partial_frame_and_tcp_keepalives_cannot_disable_startup_timeout ... ok
+test complete_frames_without_a_picture_report_decode_starvation ... ok
+test established_media_stalls_recover_despite_tcp_keepalives ... ok
+test input_ack_blackholes_and_backlogs_close_the_session ... ok
+test post_accept_end_close_and_missing_media_are_reported_as_failures ... ok
+test preparation_stays_reserved_until_run_or_drop_and_takeover_waits_for_slow_undo ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 52.48s
+

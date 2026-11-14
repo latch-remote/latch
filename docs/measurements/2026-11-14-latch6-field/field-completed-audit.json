@@ -1,0 +1,35 @@
+{
+    "utc":  "2026-11-14T12:06:57.4551893Z",
+    "checked":  928,
+    "mismatches":  [
+
+                   ],
+    "binaries":  [
+                     {
+                         "path":  "C:\\Users\\Daniel\\dev\\latch6-field-20261114\\target\\debug\\latch-field-viewer.exe",
+                         "bytes":  17362944,
+                         "sha256":  "8bbcde98718687cf5293bfb5085e38e33fe26855d2b0359933f15e1ee9eb1e2d"
+                     },
+                     {
+                         "path":  "C:\\Users\\Daniel\\dev\\latch6-field-20261114\\target\\debug\\examples\\serve.exe",
+                         "bytes":  7484416,
+                         "sha256":  "188cf061bf3c3621ce5c60fd8724903710568515f2f345888caa17369bbfff52"
+                     },
+                     {
+                         "path":  "C:\\Users\\Daniel\\dev\\latch6-field-20261114\\target\\debug\\examples\\view.exe",
+                         "bytes":  6836224,
+                         "sha256":  "e037f524b74221f470c63c413b5e033100066b34dbbb61cf51503a47b2993d22"
+                     }
+                 ],
+    "owned_rules":  [
+
+                    ],
+    "owned_processes":  [
+
+                        ],
+    "owned_task":  [
+
+                   ],
+    "os":  "Microsoft Windows NT 10.0.26300.0",
+    "rust":  "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+}

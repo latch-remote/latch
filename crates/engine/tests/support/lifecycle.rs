@@ -32,6 +32,7 @@ fn info() -> VideoInfo {
 
 fn session(addr: SocketAddr) -> Arc<Session> {
     Arc::new(Session {
+        relay: RelayRoute::new(7, latch_relay::Role::Host, None),
         id: 7,
         token: [0; 16],
         viewer: "test".into(),
@@ -137,6 +138,7 @@ fn a_viewer_that_does_not_read_cannot_block_the_control_writer() {
     }
     host.set_nonblocking(false).unwrap();
     let accept = Accept {
+        relay: false,
         color: Default::default(),
         cursor: false,
         gamepads: 0,
@@ -198,6 +200,26 @@ fn a_stuck_media_thread_is_left_behind_at_the_deadline() {
     drop(release);
     let done = std::thread::spawn(|| {});
     assert!(join_by(done, Instant::now() + Duration::from_secs(5)));
+}
+
+#[test]
+fn relay_control_backlog_ends_cleanly_at_its_bound() {
+    let session = session("127.0.0.1:9".parse().unwrap());
+    let mut inbox = VecDeque::new();
+    for _ in 0..128 {
+        assert!(session.queue_relay_control(&mut inbox, 1, Message::Keepalive));
+    }
+    assert!(!session.queue_relay_control(&mut inbox, 1, Message::Keepalive));
+    assert_eq!(inbox.len(), 128);
+    assert_eq!(
+        session.ended.lock().as_ref().unwrap().code,
+        end::TRANSPORT_FAILED
+    );
+    session.end(end::ENDED, "later cleanup preserves the first cause");
+    assert_eq!(
+        session.ended.lock().as_ref().unwrap().code,
+        end::TRANSPORT_FAILED
+    );
 }
 
 #[test]
@@ -466,6 +488,7 @@ fn audio_reports_failure_retries_with_backoff_clears_notice_and_fits_the_mtu() {
     };
     let (host, mut client) = sockets();
     let accept = Accept {
+        relay: false,
         color: Default::default(),
         cursor: false,
         gamepads: 0,

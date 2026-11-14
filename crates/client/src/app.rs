@@ -15,6 +15,7 @@ use crate::update;
 use eframe::egui;
 use latch_core::api::PowerAction;
 use latch_core::tailscale;
+use latch_proto::control::end;
 use latch_stream::Event;
 use latch_ui::{self as ui, column, space, Icon, Tone, PALETTE as P};
 use parking_lot::Mutex;
@@ -116,6 +117,19 @@ fn chord(key: &str) -> String {
     } else {
         format!("Ctrl+{key}")
     }
+}
+
+/// The pre-stream worker currently exposes its error as text. Recognize
+/// only its three local reachability failures. Refusals and update failures
+/// remain terminal until that worker carries a typed recovery reason.
+fn startup_unreachable(progress: &Progress) -> bool {
+    let Step::Ended { error: Some(error) } = &progress.step else {
+        return false;
+    };
+    let pc = &progress.pc;
+    error == &format!("{pc} isn't answering, and Latch doesn't know how to wake it yet. Turn it on once while Latch runs there, so this machine can learn how.")
+        || error == &format!("{pc} didn't wake up. A wake packet reaches it only from its own network, or through a router that forwards UDP port 9 to it. Its Sharing tab in Latch shows whether Wake-on-LAN is ready.")
+        || error == &format!("{pc} is on, but Latch isn't answering. Open Latch there and set up sharing on its Sharing tab.")
 }
 
 pub struct ClientApp {
@@ -356,6 +370,10 @@ impl ClientApp {
             return;
         };
         self.pending_hdr = None;
+        if !matches!(&self.view.interrupted, Some(stream::Interruption::Reconnecting(state)) if state.in_flight)
+        {
+            self.view.cancel_reconnect();
+        }
         self.ended_seen = false;
         self.offer_sleep = None;
         self.streamed = false;
@@ -690,12 +708,14 @@ impl ClientApp {
                             if cancelled { " after a stop" } else { "" }
                         );
                         self.stream_failed = !cancelled;
-                        // An HTTP refusal is an answer, not a broken path.
-                        if !cancelled && stage == "starting" {
-                            self.view.interrupted = Some(crate::stream::Interruption::Failed);
-                        }
-                        if !cancelled && live.frames.seq() > 0 && self.view.interrupted.is_none() {
-                            self.view.handle_interruption();
+                        if !cancelled {
+                            if stage == "connecting" {
+                                if self.view.interrupted.is_none() {
+                                    self.view.handle_interruption();
+                                }
+                            } else {
+                                self.view.interrupted = Some(crate::stream::Interruption::Failed);
+                            }
                         }
                         prog.step = Step::Ended {
                             error: (!cancelled).then(|| stream_failure(&message)),
@@ -703,19 +723,22 @@ impl ClientApp {
                     }
                     Event::Terminated { code, message } => {
                         let cancelled = prog.cancel || self.power_sent.load(Ordering::Relaxed);
-                        let error = code != 0 && code != 1 && !cancelled;
-                        if code == 1 && !cancelled {
+                        let error = code != end::ENDED as i32
+                            && code != end::TAKEN_OVER as i32
+                            && !cancelled;
+                        if code == end::TAKEN_OVER as i32 && !cancelled {
                             self.notice = Some((Tone::Info, message.clone(), Instant::now()));
                             self.view.interrupted =
                                 Some(crate::stream::Interruption::TakenOver(message.clone()));
                         } else if self.power_sent.load(Ordering::Relaxed) {
                             self.view.interrupted = Some(crate::stream::Interruption::HostSleeping);
-                        } else if !cancelled && matches!(code, 0 | 5) {
+                        } else if !cancelled
+                            && (code == end::ENDED as i32 || code == end::HOST_STOPPING as i32)
+                        {
                             // An explicit end or host-side Stop must never be
                             // answered by automatic takeover.
                             self.view.interrupted = Some(crate::stream::Interruption::Failed);
-                        } else if error && live.frames.seq() > 0 && self.view.interrupted.is_none()
-                        {
+                        } else if error && self.view.interrupted.is_none() {
                             self.view.handle_interruption();
                         }
                         if code != 0 {
@@ -748,7 +771,11 @@ impl ClientApp {
                 && matches!(prog.step, Step::Ended { .. })
                 && !prog.cancel
             {
-                self.view.handle_interruption();
+                if live.generation == prog.generation || startup_unreachable(&prog) {
+                    self.view.handle_interruption();
+                } else {
+                    self.view.interrupted = Some(stream::Interruption::Failed);
+                }
             }
             if self.view.interrupted.is_some() {
                 let interruption = self.view.interrupted.take();
@@ -1164,6 +1191,15 @@ impl eframe::App for ClientApp {
         }
         if let Step::Ended { .. } = &prog.step {
             if !self.ended_seen {
+                if !prog.cancel
+                    && !self.power_sent.load(Ordering::Relaxed)
+                    && startup_unreachable(&prog)
+                    && self.last_pc.is_some()
+                {
+                    self.view.handle_interruption();
+                } else {
+                    self.view.cancel_reconnect();
+                }
                 self.ended_seen = true;
                 // A reconnect that failed before its stream came back: the
                 // window leaves full screen as the stream's end would have.
@@ -1179,6 +1215,21 @@ impl eframe::App for ClientApp {
                         .iter()
                         .find(|p| p.node_id == prog.node_id && p.can_sleep())
                         .cloned();
+                }
+            }
+        }
+        if !prog.active() && !prog.cancel {
+            if let Some(stream::Interruption::Reconnecting(state)) = &mut self.view.interrupted {
+                if !state.in_flight {
+                    if state.is_due(Instant::now()) {
+                        state.in_flight = true;
+                        self.reconnect = self.last_pc.clone();
+                        ctx.request_repaint();
+                    } else {
+                        ctx.request_repaint_after(
+                            state.remaining(Instant::now()).min(Duration::from_secs(1)),
+                        );
+                    }
                 }
             }
         }
@@ -1764,12 +1815,9 @@ impl ClientApp {
                 return;
             }
         }
-        // The token is looked up on the handover's own thread: git's
-        // credential helper may wait on a Keychain prompt, and this thread
-        // draws the stream.
         self.handover = Some(Handover::start(
             release,
-            self.cfg.github_token.clone(),
+            None,
             mac_ip,
             ip,
             input,
@@ -1853,6 +1901,25 @@ impl ClientApp {
     fn ended_card(&mut self, ui: &mut egui::Ui, prog: &Progress, error: Option<&str>) {
         let pc = prog.pc.clone();
         if let Some(e) = error {
+            if let Some(stream::Interruption::Reconnecting(state)) = &self.view.interrupted {
+                let remaining = state.remaining_secs(Instant::now());
+                ui::banner(
+                    ui,
+                    Tone::Warning,
+                    &format!("Reconnecting to {pc}"),
+                    Some(&format!(
+                        "{e} Retrying in {remaining} s · attempt {}",
+                        state.attempt
+                    )),
+                    |ui| {
+                        if ui::ghost_button(ui, "Stop").clicked() {
+                            self.disconnect();
+                            self.progress.lock().step = Step::Idle;
+                        }
+                    },
+                );
+                return;
+            }
             let title = if self.streamed {
                 format!("{pc} disconnected")
             } else {
@@ -1976,6 +2043,31 @@ impl ClientApp {
             ) {
                 self.dirty = true;
             }
+        });
+        ui::section(ui, "Stream relay", |ui| {
+            if ui::toggle_row(
+                ui,
+                &mut self.cfg.stream.relay.enabled,
+                "Recover automatically through the Latch relay",
+                Some("Used when usable video cannot get through UDP."),
+            ) {
+                self.dirty = true;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Relay hostname");
+                if ui
+                    .text_edit_singleline(&mut self.cfg.stream.relay.host)
+                    .changed()
+                {
+                    self.dirty = true;
+                }
+                if ui
+                    .add(egui::DragValue::new(&mut self.cfg.stream.relay.port).range(1..=65535))
+                    .changed()
+                {
+                    self.dirty = true;
+                }
+            });
         });
         self.updates_section(ui);
         self.relay_section(ui, disc);
@@ -4344,6 +4436,7 @@ mod window_fit {
 #[cfg(test)]
 mod live_snapshot {
     use super::*;
+    use egui_kittest::kittest::Queryable;
 
     #[test]
     #[ignore = "needs a Latch 5 host on this machine, completed protocol/codec implementations and a GPU"]
@@ -4518,7 +4611,7 @@ mod live_snapshot {
                 "old Connected cannot finish a new attempt"
             );
             h.state().progress.lock().step = Step::Ended {
-                error: Some("worker failed before publishing live".into()),
+                error: Some(" is on, but Latch isn't answering. Open Latch there and set up sharing on its Sharing tab.".into()),
             };
             h.state_mut().poll_live(&ctx);
             let after = h.state().view.interrupted.clone();
@@ -4535,6 +4628,111 @@ mod live_snapshot {
         assert!(h.state().progress.lock().cancel);
         assert!(h.state().reconnect.is_none());
         assert!(h.state().view.interrupted.is_none());
+    }
+
+    #[test]
+    fn initial_stream_connection_failures_retry_without_a_frame() {
+        for (stage, cancelled, retry) in [
+            ("connecting", false, true),
+            ("starting", false, false),
+            ("decoding", false, false),
+            ("connecting", true, false),
+        ] {
+            let mut h = snapshots::build(
+                snapshots::Setup::new(Discovery::default()),
+                egui::vec2(800.0, 600.0),
+                1.0,
+                false,
+            );
+            let ctx = h.ctx.clone();
+            let mut live = crate::stream::tests::dummy_live(&ctx);
+            assert_eq!(live.frames.seq(), 0);
+            let (tx, rx) = std::sync::mpsc::channel();
+            live.events = rx;
+            *h.state().live.lock() = Some(live);
+            h.state().progress.lock().step = Step::Connecting;
+            h.state().progress.lock().cancel = cancelled;
+            tx.send(Event::Failed {
+                stage: stage.into(),
+                message: "initial failure".into(),
+            })
+            .unwrap();
+            h.state_mut().poll_live(&ctx);
+            assert_eq!(
+                matches!(&h.state().view.interrupted,
+                Some(stream::Interruption::Reconnecting(state)) if state.attempt == 1 && !state.in_flight),
+                retry
+            );
+        }
+    }
+
+    #[test]
+    fn initial_worker_outage_retains_retry_intent_and_stop_cancels() {
+        let mut h = snapshots::build(
+            snapshots::Setup::new(Discovery::default()),
+            egui::vec2(800.0, 600.0),
+            1.0,
+            false,
+        );
+        h.state_mut().last_pc = Some(Pc {
+            name: "Office".into(),
+            ..Default::default()
+        });
+        {
+            let mut progress = h.state().progress.lock();
+            progress.pc = "Office".into();
+            progress.step = Step::Ended { error: Some("Office is on, but Latch isn't answering. Open Latch there and set up sharing on its Sharing tab.".into()) };
+        }
+        h.state_mut().ended_seen = false;
+        h.run_steps(1);
+        assert!(matches!(&h.state().view.interrupted,
+            Some(stream::Interruption::Reconnecting(state)) if state.attempt == 1));
+        // Advance the retry state's clock by three days, then complete a
+        // failed worker. The retry stays bounded and the UI still offers Stop.
+        let start = Instant::now() - Duration::from_secs(72 * 60 * 60);
+        if let Some(stream::Interruption::Reconnecting(state)) = &mut h.state_mut().view.interrupted
+        {
+            state.started = start;
+            state.attempt = 1000;
+            state.in_flight = true;
+        }
+        h.state_mut().ended_seen = false;
+        h.run_steps(1);
+        let Some(stream::Interruption::Reconnecting(state)) = &h.state().view.interrupted else {
+            panic!("outage expired retry intent");
+        };
+        assert_eq!(state.started, start);
+        assert_eq!(state.attempt, 1001);
+        assert!(state.remaining(Instant::now()) <= Duration::from_secs(30));
+        h.get_by_label("Stop").simulate_click();
+        h.run_steps(2);
+        assert!(h.state().progress.lock().cancel);
+        assert!(h.state().view.interrupted.is_none());
+        assert!(h.state().reconnect.is_none());
+    }
+
+    #[test]
+    fn initial_worker_refusals_do_not_retry() {
+        for error in [
+            "HTTP 401",
+            "HTTP 403: access refused",
+            "Updating Latch on Office: HTTP 503",
+        ] {
+            let mut h = snapshots::build(
+                snapshots::Setup::new(Discovery::default()),
+                egui::vec2(800.0, 600.0),
+                1.0,
+                false,
+            );
+            h.state_mut().last_pc = Some(Pc::default());
+            h.state().progress.lock().step = Step::Ended {
+                error: Some(error.into()),
+            };
+            h.state_mut().ended_seen = false;
+            h.run_steps(2);
+            assert!(h.state().view.interrupted.is_none());
+            assert!(h.state().reconnect.is_none());
+        }
     }
 
     #[test]
@@ -4575,6 +4773,12 @@ mod live_snapshot {
     fn review_session_end_events_retry_only_unexpected_loss() {
         for (cancel, sleeping, code, retry) in [
             (false, false, 2, true),
+            (
+                false,
+                false,
+                latch_proto::control::end::TRANSPORT_FAILED as i32,
+                true,
+            ),
             (true, false, 2, false),
             (false, true, 2, false),
             (false, false, 1, false),

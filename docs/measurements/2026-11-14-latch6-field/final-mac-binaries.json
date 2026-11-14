@@ -1,0 +1,22 @@
+[
+  {
+    "path": "/Users/daniel/Desktop/T3_Projects/latch/target/debug/examples/serve",
+    "bytes": 8704856,
+    "sha256": "d7ca2424592cbd8371b1c183866e4a28774857fee9c95491d5aee93c0be75135"
+  },
+  {
+    "path": "/Users/daniel/Desktop/T3_Projects/latch/target/debug/examples/view",
+    "bytes": 8299864,
+    "sha256": "3a4626ec5caf6599af0579f2e47f1c73e1ebb80f0f3ee5d11a64aa14cd007424"
+  },
+  {
+    "path": "/Users/daniel/Desktop/T3_Projects/latch/target/debug/latch-field-viewer",
+    "bytes": 20580080,
+    "sha256": "cdd3e417f916936f1249304ab51064732db497af0b5ede41a84cd183c71e281c"
+  },
+  {
+    "path": "/Users/daniel/Desktop/T3_Projects/latch/target/debug/latch-field-headless",
+    "bytes": 8217576,
+    "sha256": "3f088356bf395e202c90edebcd79f3188172df9e8e1bb413b0f98058b738871b"
+  }
+]

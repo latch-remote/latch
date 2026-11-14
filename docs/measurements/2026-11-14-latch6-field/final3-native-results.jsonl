@@ -1,0 +1,8 @@
+{"label":"final3-foundation","exit":0,"elapsed_s":14.3154779,"command":"cargo test --locked -p latch-core -p latch-proto -p latch-relay --all-targets"}
+{"label":"final3-platform-libs","exit":0,"elapsed_s":36.3102631,"command":"cargo test --locked -p latch-engine -p latch-stream -p latch-client --lib"}
+{"label":"final3-lifecycle","exit":0,"elapsed_s":62.4599487,"command":"cargo test --locked -p latch-engine --test lifecycle -- --test-threads=1"}
+{"label":"final3-relay-runtime","exit":0,"elapsed_s":130.2656577,"command":"cargo test --locked -p latch-engine --test relay_runtime -- --test-threads=1"}
+{"label":"final3-windows-examples","exit":0,"elapsed_s":13.9621474,"command":"cargo build --locked -p latch-engine --example serve --example pipeline_bench -p latch-client --example present -p latch-stream --example view --example pads"}
+{"label":"final3-workspace-check","exit":0,"elapsed_s":4.7186337,"command":"cargo check --locked --workspace --all-targets"}
+{"label":"final3-codec","exit":0,"elapsed_s":5.4712100999999995,"command":"cargo test --locked -p latch-codec --lib"}
+{"label":"final-transport-sequential","exit":0,"elapsed_s":17.5739747,"command":"cargo test --locked -p latch-relay --test transport -- --test-threads=1"}

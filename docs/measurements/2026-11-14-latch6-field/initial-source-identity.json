@@ -1,0 +1,9 @@
+{
+  "utc": "2026-11-14T10:19:01Z",
+  "git_head": "103e72c51fa8e50bd8e8738189e29d95b06e8107",
+  "branch": "codex/latch-6-network",
+  "manifest_sha256": "95a30ad914b87e45177d8d0a1a26b6b4f26fd1ef64874266143d0445aa76f692",
+  "archive_sha256": "d9f627a2aaeb8500a1de309cbc9db7824ddef0664321a8b4f86d555b8b43591e",
+  "files": 920,
+  "bytes": 10591306
+}
