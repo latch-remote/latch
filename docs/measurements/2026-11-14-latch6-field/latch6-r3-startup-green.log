@@ -1,0 +1,31 @@
+   Compiling latch-stream v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/stream)
+    Finished `test` profile [optimized + debuginfo] target(s) in 2.02s
+     Running unittests src/lib.rs (/Users/daniel/Desktop/T3_Projects/latch/target/debug/deps/latch_stream-4c056a784707176b)
+
+running 23 tests
+test session::tests::loss_is_the_share_of_packets_fec_could_not_save ... ok
+test session::tests::arrivals_count_frames_and_how_unevenly_they_come ... ok
+test session::tests::media_deadline_tracks_pictures_even_while_complete_frames_arrive ... ok
+test session::tests::queue_budget_tracks_frame_interval_with_bounds ... ok
+test session::tests::refusals_read_the_hosts_sentence ... ok
+test session::tests::relay_can_help_busy_rate_limited_udp_even_when_fec_repairs_every_frame ... ok
+test session::tests::relay_close_before_direct_ready_is_a_healthy_handoff ... ok
+test session::tests::sustained_slow_decoder_is_detected_once_and_bursts_are_not ... ok
+test session::tests::terminal_and_cursor_controls_always_keep_original_ordered_connection ... ok
+test session::tests::relay_retry_has_monotonic_attempts_cooldown_and_a_circuit_breaker ... ok
+test session::tests::host_cooldown_defers_a_fresh_request_without_stranding_the_viewer ... ok
+test session::tests::video_health_distinguishes_missing_black_frozen_and_recovered_video ... ok
+test session::tests::udp_reassessment_requires_full_capacity_and_counts_loss_and_duplicates ... ok
+test session::tests::the_bitrate_is_encoded_video_and_received_counts_fec_and_audio ... ok
+test session::tests::host_transport_failure_before_publication_remains_retryable ... ok
+test session::tests::input_backlog_is_bounded_before_enqueue_and_large_text_is_rejected ... ok
+test session::tests::a_decoder_stuck_in_the_os_does_not_hold_the_session_open ... ok
+test session::tests::decoded_picture_updates_session_stats_dimensions ... ok
+test session::tests::a_failing_hardware_decoder_is_given_up_for_another_codec ... ok
+test session::tests::viewer_relay_backpressure_retries_unless_stopped_or_renegotiating ... ok
+test session::tests::hevc_is_offered_only_when_the_settings_allow_it ... ok
+test session::tests::stop_interrupts_blocked_upgrade ... ok
+test session::tests::slow_test_decoder_emits_capacity_notice_and_stats ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 36 filtered out; finished in 1.54s
+

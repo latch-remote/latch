@@ -1,0 +1,15 @@
+{
+  "head": "d0b1b54e3b3c0cbeeb560b9cc3f0aa0600ee133a",
+  "passed_checks": 10,
+  "evidence": "T3 PR watch completion notification",
+  "followup_patch": "/tmp/latch6-r3-reconnect-fixes.patch",
+  "followup_applied": false,
+  "merge_ready": false,
+  "remaining": [
+    "remaining round-2 review",
+    "integrate prepared reconnect fixes",
+    "fresh council review",
+    "CI on updated head",
+    "publication validation"
+  ]
+}

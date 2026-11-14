@@ -1,4 +1,10 @@
 use super::*;
+
+// Runtime-only operations in this shared fixture are used by relay_runtime.rs.
+#[allow(dead_code)]
+#[path = "relay_pilot.rs"]
+mod relay;
+
 use crate::video::EncodedVideo;
 use std::net::TcpListener;
 use std::sync::atomic::AtomicUsize;
@@ -270,6 +276,137 @@ fn relay_control_backlog_ends_cleanly_at_its_bound() {
         session.ended.lock().as_ref().unwrap().code,
         end::TRANSPORT_FAILED
     );
+}
+
+#[test]
+fn priority_failure_keeps_its_end_code_when_the_sender_is_preempted() {
+    let mut pilot = relay::Pilot::start();
+    pilot.config.limits.priority_queue_bytes = 1280;
+    for explicit_stop in [false, true] {
+        let server = Server::bind(0, Options::default()).unwrap();
+        let mut session = session("127.0.0.1:9".parse().unwrap());
+        Arc::get_mut(&mut session).unwrap().relay =
+            RelayRoute::new(7, latch_relay::Role::Host, Some(pilot.config.clone()));
+        let viewer = RelayRoute::new(7, latch_relay::Role::Viewer, Some(pilot.config.clone()));
+        let mut to_host = VecDeque::new();
+        let mut to_viewer = VecDeque::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.relay.active() || !viewer.active() {
+            assert!(Instant::now() < deadline, "relay setup deadline");
+            session.relay.poll();
+            viewer.poll();
+            assert!(session.relay.maintain(false, |m| {
+                to_viewer.push_back(m.clone());
+                true
+            }));
+            assert!(viewer.maintain(true, |m| {
+                to_host.push_back(m.clone());
+                true
+            }));
+            while let Some(Message::Relay(message)) = to_host.pop_front() {
+                assert!(session.relay.handle(message, |m| {
+                    to_viewer.push_back(m.clone());
+                    true
+                }));
+            }
+            while let Some(Message::Relay(message)) = to_viewer.pop_front() {
+                assert!(viewer.handle(message, |m| {
+                    to_host.push_back(m.clone());
+                    true
+                }));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let (failed, failure) = mpsc::channel();
+        let (resume, paused) = mpsc::channel();
+        let sending = {
+            let session = session.clone();
+            std::thread::spawn(move || {
+                let error = session
+                    .relay
+                    .send_control(&Message::Notice(Notice {
+                        kind: "audio".into(),
+                        message: "x".repeat(2000),
+                    }))
+                    .unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+                failed.send(()).unwrap();
+                // The transport has marked fatal, but the sending worker has
+                // not yet recorded the session's end reason.
+                let _ = paused.recv_timeout(Duration::from_secs(5));
+                session.end(end::TRANSPORT_FAILED, "late sending worker");
+            })
+        };
+        failure.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(session.ended.lock().is_none());
+        if explicit_stop {
+            session.end(end::HOST_STOPPING, "explicit Stop wins");
+        }
+        let (host, mut peer) = sockets();
+        let accept: Accept = serde_json::from_value(serde_json::json!({
+            "session": 7, "token": "00000000000000000000000000000000",
+            "codec": "h264-baseline", "width": 64, "height": 64, "fps": 30,
+            "bitrate_kbps": 2000, "encoder": "test", "audio": null, "relay": true
+        }))
+        .unwrap();
+        let controlling = {
+            let session = session.clone();
+            std::thread::spawn(move || {
+                server.control(&session, host, accept, None, || (None, None))
+            })
+        };
+        assert!(matches!(
+            control::read_message(&mut peer).unwrap(),
+            Message::Accept(_)
+        ));
+        let ended = control::read_message(&mut peer).unwrap();
+        let _ = resume.send(());
+        sending.join().unwrap();
+        let _ = peer.shutdown(Shutdown::Both);
+        controlling.join().unwrap();
+        viewer.shutdown();
+        let expected = if explicit_stop {
+            end::HOST_STOPPING
+        } else {
+            end::TRANSPORT_FAILED
+        };
+        assert!(
+            matches!(&ended, Message::End(e) if e.code == expected),
+            "{ended:?}"
+        );
+        assert_eq!(session.ended.lock().as_ref().unwrap().code, expected);
+    }
+}
+
+#[test]
+fn an_explicit_viewer_end_keeps_normal_completion() {
+    let server = Server::bind(0, Options::default()).unwrap();
+    let session = session("127.0.0.1:9".parse().unwrap());
+    let (host, mut peer) = sockets();
+    let accept: Accept = serde_json::from_value(serde_json::json!({
+        "session": 7, "token": "00000000000000000000000000000000",
+        "codec": "h264-baseline", "width": 64, "height": 64, "fps": 30,
+        "bitrate_kbps": 2000, "encoder": "test", "audio": null
+    }))
+    .unwrap();
+    let worker =
+        std::thread::spawn(move || server.control(&session, host, accept, None, || (None, None)));
+    assert!(matches!(
+        control::read_message(&mut peer).unwrap(),
+        Message::Accept(_)
+    ));
+    control::write_message(
+        &mut peer,
+        &Message::End(End {
+            code: end::ENDED,
+            message: "explicit viewer stop".into(),
+        }),
+    )
+    .unwrap();
+    let ended = control::read_message(&mut peer).unwrap();
+    let _ = peer.shutdown(Shutdown::Both);
+    worker.join().unwrap();
+    assert!(matches!(ended, Message::End(e) if e.code == end::ENDED));
 }
 
 #[test]

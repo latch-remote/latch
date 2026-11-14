@@ -2192,7 +2192,9 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 } else {
                     e.message
                 };
-                return if inner.connected.load(Ordering::Acquire) {
+                return if inner.connected.load(Ordering::Acquire)
+                    || e.code == control::end::TRANSPORT_FAILED
+                {
                     Outcome::Ended(e.code as i32, message)
                 } else {
                     Outcome::Failed("starting".into(), message)
@@ -3411,6 +3413,53 @@ mod tests {
                 } else {
                     assert!(viewer.events.try_recv().is_err(), "{action}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn host_transport_failure_before_publication_remains_retryable() {
+        let accept: Accept = serde_json::from_value(serde_json::json!({
+            "session": 7, "token": "00000000000000000000000000000000",
+            "codec": "h264-baseline", "width": 64, "height": 64, "fps": 30,
+            "bitrate_kbps": 2000, "encoder": "test", "audio": null, "relay": true
+        }))
+        .unwrap();
+        for code in [
+            control::end::TRANSPORT_FAILED,
+            control::end::ENDED,
+            control::end::TAKEN_OVER,
+            control::end::HOST_STOPPING,
+            control::end::ENCODER_FAILED,
+        ] {
+            let (tx, _events) = mpsc::channel();
+            let inner = Arc::new(Inner::new(
+                tx,
+                Arc::new(FrameSlot::default()),
+                Box::new(|| {}),
+            ));
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut host, _) = listener.accept().unwrap();
+            control::write_message(
+                &mut host,
+                &Message::End(control::End {
+                    code,
+                    message: "before the first frame".into(),
+                }),
+            )
+            .unwrap();
+            assert!(!inner.connected.load(Ordering::Acquire));
+            let event = control_loop(&inner, &mut tcp, &accept).event();
+            let _ = tcp.shutdown(Shutdown::Both);
+            if code == control::end::TRANSPORT_FAILED {
+                assert!(
+                    matches!(event, Some(Event::Terminated { code: actual, .. }) if actual == code as i32)
+                );
+            } else {
+                assert!(
+                    matches!(event, Some(Event::Failed { ref stage, .. }) if stage == "starting")
+                );
             }
         }
     }

@@ -804,11 +804,13 @@ impl Server {
                     }
                 }
                 Ok(Message::End(e)) => {
-                    break if e.message.is_empty() {
+                    let message = if e.message.is_empty() {
                         "the viewer disconnected".to_string()
                     } else {
                         e.message
-                    }
+                    };
+                    session.end(end::ENDED, &message);
+                    break message;
                 }
                 Ok(Message::DrawCursor(d)) if session.cursor_supported => {
                     session.heard(self.now_us());
@@ -982,7 +984,11 @@ impl Server {
                 break e.message;
             }
         };
-        session.end(end::ENDED, &reason);
+        // Only an explicit End establishes normal completion. In particular,
+        // a priority worker can mark the route fatal before it records code 6;
+        // cleanup must not win that race with a non-retrying End. Preserve any
+        // already-recorded Stop, takeover or media failure.
+        session.end(end::TRANSPORT_FAILED, &reason);
         // Terminal lifecycle messages must reach the original control socket
         // before shutdown discards queued relay traffic. Release every state
         // guard before sending or running cleanup.

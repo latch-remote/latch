@@ -1,0 +1,28 @@
+   Compiling latch-proto v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/proto)
+   Compiling latch-codec v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/codec)
+   Compiling latch-core v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/core)
+   Compiling latch-relay v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/relay)
+   Compiling latch-stream v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/stream)
+   Compiling latch-engine v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/engine)
+    Finished `test` profile [optimized + debuginfo] target(s) in 10.79s
+     Running unittests src/lib.rs (/Users/daniel/Desktop/T3_Projects/latch/target/debug/deps/latch_engine-1aaec34317e911cf)
+
+running 1 test
+test server::tests::priority_failure_keeps_its_end_code_when_the_sender_is_preempted ... FAILED
+
+failures:
+
+---- server::tests::priority_failure_keeps_its_end_code_when_the_sender_is_preempted stdout ----
+relay connection closed phase=attached role=host lane=priority category=peer_closed kind=UnexpectedEof
+
+thread 'server::tests::priority_failure_keeps_its_end_code_when_the_sender_is_preempted' (81161812) panicked at crates/engine/src/../tests/support/lifecycle.rs:373:9:
+assertion failed: matches!(ended, Message::End(e) if e.code == expected)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    server::tests::priority_failure_keeps_its_end_code_when_the_sender_is_preempted
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 133 filtered out; finished in 0.15s
+
+error: test failed, to rerun pass `-p latch-engine --lib`

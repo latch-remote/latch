@@ -4770,6 +4770,48 @@ mod live_snapshot {
     }
 
     #[test]
+    fn transport_end_before_first_picture_retains_initial_and_inflight_retry() {
+        for previous_attempt in [0, 1] {
+            let mut h = snapshots::build(
+                snapshots::Setup::new(Discovery::default()),
+                egui::vec2(800.0, 600.0),
+                1.0,
+                false,
+            );
+            let ctx = h.ctx.clone();
+            let mut live = crate::stream::tests::dummy_live(&ctx);
+            assert_eq!(live.frames.seq(), 0);
+            h.state().progress.lock().generation = live.generation;
+            let (tx, rx) = std::sync::mpsc::channel();
+            live.events = rx;
+            *h.state().live.lock() = Some(live);
+            h.state().progress.lock().step = Step::Streaming;
+            if previous_attempt > 0 {
+                h.state_mut().view.interrupted = Some(crate::stream::Interruption::Reconnecting(
+                    crate::stream::ReconnectState {
+                        started: Instant::now(),
+                        attempt: previous_attempt,
+                        deadline: Instant::now(),
+                        in_flight: true,
+                    },
+                ));
+            }
+            tx.send(Event::Terminated {
+                code: latch_proto::control::end::TRANSPORT_FAILED as i32,
+                message: "transport failed before video".into(),
+            })
+            .unwrap();
+            h.state_mut().poll_live(&ctx);
+            h.state_mut().poll_live(&ctx);
+            assert!(matches!(
+                &h.state().view.interrupted,
+                Some(crate::stream::Interruption::Reconnecting(state))
+                    if state.attempt == previous_attempt + 1 && !state.in_flight
+            ));
+        }
+    }
+
+    #[test]
     fn review_session_end_events_retry_only_unexpected_loss() {
         for (cancel, sleeping, code, retry) in [
             (false, false, 2, true),

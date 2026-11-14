@@ -1,0 +1,6 @@
+    Checking latch-engine v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/engine)
+    Checking latch-host v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/host)
+    Checking latch-client v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/client)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 1.92s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
