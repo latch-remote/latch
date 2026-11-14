@@ -1,0 +1,18 @@
+Socket::new => Ok(Socket { raw: 244, local_addr: None, peer_addr: None })
+set_nonblocking(true) => Ok(())
+connect => Err(Os { code: 10035, kind: WouldBlock, message: "A non-blocking socket operation could not be completed immediately." })
+take_error => Ok(None)
+peer_addr => Ok([::1]:1)
+first write => Err(Os { code: 10057, kind: NotConnected, message: "A request to send or receive data was disallowed because the socket is not connected and (when sending on a datagram socket using a sendto call) no address was supplied." })
+first read => Err(Os { code: 10057, kind: NotConnected, message: "A request to send or receive data was disallowed because the socket is not connected and (when sending on a datagram socket using a sendto call) no address was supplied." })
+set_nodelay(true) => Err(Os { code: 10022, kind: InvalidInput, message: "An invalid argument was supplied." })
+Error: Os { code: 10022, kind: InvalidInput, message: "An invalid argument was supplied." }
+Socket::new => Ok(Socket { raw: 244, local_addr: None, peer_addr: None })
+set_nonblocking(true) => Ok(())
+connect => Err(Os { code: 10035, kind: WouldBlock, message: "A non-blocking socket operation could not be completed immediately." })
+take_error => Ok(None)
+peer_addr => Ok(54.116.93.176:443)
+first write => Err(Os { code: 10057, kind: NotConnected, message: "A request to send or receive data was disallowed because the socket is not connected and (when sending on a datagram socket using a sendto call) no address was supplied." })
+first read => Err(Os { code: 10057, kind: NotConnected, message: "A request to send or receive data was disallowed because the socket is not connected and (when sending on a datagram socket using a sendto call) no address was supplied." })
+set_nodelay(true) => Err(Os { code: 10022, kind: InvalidInput, message: "An invalid argument was supplied." })
+Error: Os { code: 10022, kind: InvalidInput, message: "An invalid argument was supplied." }

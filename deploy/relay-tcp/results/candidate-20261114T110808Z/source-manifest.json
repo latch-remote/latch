@@ -1,0 +1,310 @@
+{
+  "candidate_id": "candidate-20261114T110808Z",
+  "captured_utc": "2026-11-14T11:12:36.732481+00:00",
+  "version": "6.0.0",
+  "git_base": "103e72c51fa8e50bd8e8738189e29d95b06e8107",
+  "source_sha256": "682ad11d20e4aa796e50a9ad60c53cfc6e7d419744b4049772f4f9b34e3a1f64",
+  "archive_sha256": "a5c5c68c1b518a1aa16d3c9aecc29d3eab15d7150de5e6d2597e19b954267513",
+  "source_digest_format": "sorted relative path, NUL, file bytes, NUL",
+  "files": [
+    {
+      "path": ".cargo/config.toml",
+      "sha256": "c2fb7054743bb57931056529ca81643f4bde2df00172af4bf61dcc4ffe055427",
+      "bytes": 651
+    },
+    {
+      "path": "Cargo.lock",
+      "sha256": "30489af800d6a7b34abc6b3140c8709069465c8ef2ea6e5e73396e7059ee41c1",
+      "bytes": 133104
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "c07c1a0e72e421621e3798d4f66c6737843749085727dbacea009e487f7c4787",
+      "bytes": 1681
+    },
+    {
+      "path": "crates/client/Cargo.toml",
+      "sha256": "5b0c20eb26c2c4b3bde1beb7af5c2bef14003264a4044a52d0a68165a2a8c543",
+      "bytes": 2277
+    },
+    {
+      "path": "crates/codec/Cargo.toml",
+      "sha256": "5eb4173633ac8f91a66fce90d953e34e7861920e55418b8aa42bab620107c39b",
+      "bytes": 289
+    },
+    {
+      "path": "crates/core/Cargo.toml",
+      "sha256": "346ee7e625b652177b7bd88d6f30a92ce8f60724edfc204a018f76420bc57ce2",
+      "bytes": 1129
+    },
+    {
+      "path": "crates/engine/Cargo.toml",
+      "sha256": "00838b1c7964463218d6c8c751455ccd2945329f058e3dc7a05322c9438c6037",
+      "bytes": 3429
+    },
+    {
+      "path": "crates/host/Cargo.toml",
+      "sha256": "e6765df5dfba6a14b1b85ca6282242ae04c29b34b054bf8470dfec2fb60d6cca",
+      "bytes": 1991
+    },
+    {
+      "path": "crates/proto/Cargo.toml",
+      "sha256": "e3fb366cf16e7220b796642eea73c6dbb18d26db9a4f5b8da4a59f935da316ac",
+      "bytes": 547
+    },
+    {
+      "path": "crates/proto/examples/transport.rs",
+      "sha256": "e9f226aa86542244fa376b01e7224618b2b171e433d37e13d35c4664bb464463",
+      "bytes": 7608
+    },
+    {
+      "path": "crates/proto/src/audio.rs",
+      "sha256": "3d223618dbca61edffe58846eabe5f9337b0f3c0cd6400c0f150cee94bebd59e",
+      "bytes": 9369
+    },
+    {
+      "path": "crates/proto/src/base64.rs",
+      "sha256": "93ffb17b367bf627a546a0e1f4c34e3436115931752cf1de50f65cb988c0fb69",
+      "bytes": 6740
+    },
+    {
+      "path": "crates/proto/src/color.rs",
+      "sha256": "ca26d4263a559b04c1d204911d233719a5d9e3f5a875d6aa80077b8cb586e6d3",
+      "bytes": 14740
+    },
+    {
+      "path": "crates/proto/src/control.rs",
+      "sha256": "72e2c36aaede219ff9fae42b7ff29762ca471796943de7a6e166339864152a3e",
+      "bytes": 23039
+    },
+    {
+      "path": "crates/proto/src/fec.rs",
+      "sha256": "be2a52020288ce452ab45d3a5e38bc9b62cfafed8837d33523037d9d8c4eec87",
+      "bytes": 35031
+    },
+    {
+      "path": "crates/proto/src/gamepad.rs",
+      "sha256": "41bd92f873996c260e9109588f71a94688b87ff3fc527e78dbd36f515ccd0b62",
+      "bytes": 27067
+    },
+    {
+      "path": "crates/proto/src/input.rs",
+      "sha256": "2e2f3169f27730a4558042b27c15c876d20ffcad3701528d4df30a2e40f63fe1",
+      "bytes": 14261
+    },
+    {
+      "path": "crates/proto/src/lib.rs",
+      "sha256": "94caad8112b0aaa0ac2606dec2f86f7a21c88a12eca6d2a1b1beb8d8c00ebef5",
+      "bytes": 1370
+    },
+    {
+      "path": "crates/proto/src/probe.rs",
+      "sha256": "60c848b00c1a44c9a7d7b37181ab05c6ace08724b9c9eca4e8fdfb7837dcb54a",
+      "bytes": 9976
+    },
+    {
+      "path": "crates/proto/src/rtt.rs",
+      "sha256": "25354bec37bd25f34b24f7faa8413de52e1af3b8eeb737bf8eed079d49d82a51",
+      "bytes": 807
+    },
+    {
+      "path": "crates/proto/src/sim.rs",
+      "sha256": "6dd334636eb516e253ae02d54ee1d7da80cf57954e031f492859af3d8fb44d7d",
+      "bytes": 4697
+    },
+    {
+      "path": "crates/proto/src/transport/linux.rs",
+      "sha256": "f1e47818f24548cf014797147dc6d92695dc61c9dea8f3b183e321517a477fc2",
+      "bytes": 3720
+    },
+    {
+      "path": "crates/proto/src/transport/windows.rs",
+      "sha256": "d56f46ab816eddcc7718d845a0df67cf7b9c42ee3bf562c1631d8e0df67744cd",
+      "bytes": 8392
+    },
+    {
+      "path": "crates/proto/src/transport.rs",
+      "sha256": "faf1d9c1f0d6bbb4431596648dc06f91a352de16ae349ed1cdfb1b000cabf234",
+      "bytes": 18302
+    },
+    {
+      "path": "crates/proto/src/video.rs",
+      "sha256": "7024abdafe8d22d601b786db8aa46ade935b16d8801cc74e52461538e61f2996",
+      "bytes": 50244
+    },
+    {
+      "path": "crates/proto/src/wire.rs",
+      "sha256": "e2b8267382247f00766246cb67a492f089a5946579ce269e35757f13a7e6f7f7",
+      "bytes": 22422
+    },
+    {
+      "path": "crates/proto/tests/keyframe_recovery.rs",
+      "sha256": "83b111f9da6c904e21f429542c4ea4b2489d30128c462abbe290ad0a38f57a67",
+      "bytes": 10074
+    },
+    {
+      "path": "crates/proto/tests/protocol.rs",
+      "sha256": "2753508410e30a066a1fa0c97a99c7a7fade61e5ca2d1d1d7c01f93c5c5684c6",
+      "bytes": 38574
+    },
+    {
+      "path": "crates/proto/tests/regressions.rs",
+      "sha256": "3f3e5641077cafe03f35acbd3d869e9037f976e05ca3fbeac9eebb9dc53d7cdb",
+      "bytes": 21780
+    },
+    {
+      "path": "crates/relay/Cargo.toml",
+      "sha256": "c340e77041efabd290d904e909a0e9b85003607bf8c78f6fa20f8fa58fe64eee",
+      "bytes": 504
+    },
+    {
+      "path": "crates/relay/README.md",
+      "sha256": "1b1e410e78cd3eb37528fcf28aa4c8196605c50e01bf0a74625e9a172fbf448d",
+      "bytes": 11653
+    },
+    {
+      "path": "crates/relay/examples/paired_probe.rs",
+      "sha256": "c611b834d65a6539cb3d56721ddecb676e813a4acb367519866bee480b635cee",
+      "bytes": 12419
+    },
+    {
+      "path": "crates/relay/src/client.rs",
+      "sha256": "e2fbc9d93f7bf8255c731efe49ecde7ec121bbee5cd1fc996963b9b03b14bd37",
+      "bytes": 37463
+    },
+    {
+      "path": "crates/relay/src/crypto.rs",
+      "sha256": "002ef1a45342b877d14cf993aa770e8212e84c55a97de2dcf84d2d7fab0a724f",
+      "bytes": 9308
+    },
+    {
+      "path": "crates/relay/src/daemon.rs",
+      "sha256": "67f7bb50eb9b922e22dbcf32e1499c9cc8cf2797336ab4984f1cf34659dfe52f",
+      "bytes": 30143
+    },
+    {
+      "path": "crates/relay/src/lib.rs",
+      "sha256": "9968d29b358802a6d9e400941d046153f0cef19201bb8442a26750070268b15f",
+      "bytes": 1476
+    },
+    {
+      "path": "crates/relay/src/main.rs",
+      "sha256": "2978f68e3f0cf4fc3735602e6d02bdc4184b52bb9b95f26ff7c16073c95fdcb2",
+      "bytes": 4179
+    },
+    {
+      "path": "crates/relay/src/quota.rs",
+      "sha256": "932d3bbe8986274e5ca71faab9f3b5221fbc7cd6f8b56d12f18c7e57b4589f65",
+      "bytes": 7377
+    },
+    {
+      "path": "crates/relay/src/wire.rs",
+      "sha256": "81c27161b5406ef1ad2e3651789440f82a125a29918021db48ca97969908afca",
+      "bytes": 17420
+    },
+    {
+      "path": "crates/relay/tests/certs/ca.pem",
+      "sha256": "3ba85c89957262653b4c32e44f011eaa16d08553b5ad270d6512dffd0a88dd65",
+      "bytes": 562
+    },
+    {
+      "path": "crates/relay/tests/certs/generate.sh",
+      "sha256": "fea7af0fa1cf4a5108f0aabbf4bfa349fd36bcf5b000990b8f071adf3afc003d",
+      "bytes": 767
+    },
+    {
+      "path": "crates/relay/tests/certs/server-key.pem",
+      "sha256": "63fefef4719b362c2a501a1a9baf734c8472db7fac3903ed16eca1db4b6104d8",
+      "bytes": 241
+    },
+    {
+      "path": "crates/relay/tests/certs/server.pem",
+      "sha256": "f337c365b6fef37b9f2c8465bc0f7f93043a9a5bdad09e1bb681127f970e9ee4",
+      "bytes": 583
+    },
+    {
+      "path": "crates/relay/tests/transport.rs",
+      "sha256": "cea4a945f47bc025cda86117a20a0a10349777fe3483dc290240bb519dc02295",
+      "bytes": 21573
+    },
+    {
+      "path": "crates/stream/Cargo.toml",
+      "sha256": "6972fe2f5e48d27ea7d15c94ec96f6491064fabcb3b6c8c21ecfd3f0a2aaa799",
+      "bytes": 2415
+    },
+    {
+      "path": "crates/ui/Cargo.toml",
+      "sha256": "cd86b511a80c31bc49832424ebb2d07d5c7f2768e4a848f7b32c2b584b9e984c",
+      "bytes": 574
+    },
+    {
+      "path": "deploy/relay-tcp/DEPLOYED.md",
+      "sha256": "b2434ecaaf494c5ed43381c398384219a37e69362a34be133375673ca9ac8f96",
+      "bytes": 12644
+    },
+    {
+      "path": "deploy/relay-tcp/INSPECTION.md",
+      "sha256": "e9849689b43878a4743aacd1a7f3dc0d99704dfde76a078a9239bb992964d67e",
+      "bytes": 8063
+    },
+    {
+      "path": "deploy/relay-tcp/LIGHTSAIL.md",
+      "sha256": "003390f93660ed8ed237a02c875c68c168c4a7f4122c16f3712a813ee096641a",
+      "bytes": 10165
+    },
+    {
+      "path": "deploy/relay-tcp/README.md",
+      "sha256": "92bd61e86c99a173faace8dd54e355749855af6e66264588f59c1df1ef65c476",
+      "bytes": 14638
+    },
+    {
+      "path": "deploy/relay-tcp/certbot-deploy.sh",
+      "sha256": "de0c38f952d6e0bdc98c6a034665a835a910c7cd667f5ac1fab05c28eb143259",
+      "bytes": 2030
+    },
+    {
+      "path": "deploy/relay-tcp/inspect.sh",
+      "sha256": "115c1e39a6d9f3b70fe8a214dad6f365f756cb4474b4cb84c41149713d3a3615",
+      "bytes": 2620
+    },
+    {
+      "path": "deploy/relay-tcp/install.sh",
+      "sha256": "c3e65cecb444f9d32b4b75a0fb030e8e549f3caf1122e65e176e5e59ec37a639",
+      "bytes": 4357
+    },
+    {
+      "path": "deploy/relay-tcp/latch-relay.service",
+      "sha256": "b82954b66e7179df95042f9e57ee9b4869b2bca0bb71b401466334817aa47dab",
+      "bytes": 1285
+    },
+    {
+      "path": "deploy/relay-tcp/limits.json",
+      "sha256": "1f038572819969d3a2e24952f93aec87b59b6800a069388b1ed208644d6f5c46",
+      "bytes": 469
+    },
+    {
+      "path": "deploy/relay-tcp/network.sh",
+      "sha256": "046fd815761846640f9ee07ccb692fa8ecdee404c2d6bec447721ca94b12afee",
+      "bytes": 1156
+    },
+    {
+      "path": "deploy/relay-tcp/sample-capacity.py",
+      "sha256": "a776789bd5e02112bc74508a313d712212bc002004403b03ee67aef16972d8a2",
+      "bytes": 2252
+    },
+    {
+      "path": "deploy/relay-tcp/selftest.py",
+      "sha256": "ee088f255174d35d9a4aa9e6fe2be26b4299d0be731696db2f3137d5d39f9923",
+      "bytes": 7764
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "sha256": "e5cc0545f232bde807bd9394c2433322d1cd2cf42b060ceab2ac7329bc9cdaa2",
+      "bytes": 31
+    }
+  ],
+  "candidate_remote_directory": "/home/ubuntu/latch6-candidates/candidate-20261114T110808Z",
+  "build_workspace": "/home/ubuntu/latch6-build",
+  "intended_state": "inactive candidate pending parent restart coordination",
+  "validation_note": "Initial zero-mtime archive reused stale Cargo outputs. Recaptured with current mtimes, strengthened quota liveness selftest and require 16 library tests plus 12 transport tests."
+}

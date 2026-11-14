@@ -1,0 +1,17 @@
+   Compiling naga v24.0.0
+   Compiling latch-proto v6.0.0 (/private/tmp/latch6-field-mac-final-20261114/crates/proto)
+   Compiling latch-codec v6.0.0 (/private/tmp/latch6-field-mac-final-20261114/crates/codec)
+   Compiling latch-core v6.0.0 (/private/tmp/latch6-field-mac-final-20261114/crates/core)
+   Compiling latch-relay v6.0.0 (/private/tmp/latch6-field-mac-final-20261114/crates/relay)
+   Compiling latch-ui v6.0.0 (/private/tmp/latch6-field-mac-final-20261114/crates/ui)
+   Compiling latch-stream v6.0.0 (/private/tmp/latch6-field-mac-final-20261114/crates/stream)
+   Compiling wgpu-hal v24.0.4
+   Compiling wgpu-core v24.0.5
+   Compiling wgpu v24.0.5
+   Compiling egui-wgpu v0.31.1
+   Compiling eframe v0.31.1
+   Compiling latch-client v6.0.0 (/private/tmp/latch6-field-mac-final-20261114/crates/client)
+   Compiling latch-field-viewer v0.0.0 (/tmp/latch6-field-viewer-final-20261114)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 21.23s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

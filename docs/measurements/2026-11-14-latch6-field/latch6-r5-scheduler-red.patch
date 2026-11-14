@@ -1,0 +1,34 @@
+diff --git a/crates/relay/tests/transport.rs b/crates/relay/tests/transport.rs
+index 823839e..3fa56f0 100644
+--- a/crates/relay/tests/transport.rs
++++ b/crates/relay/tests/transport.rs
+@@ -374,7 +374,7 @@ impl ReturnGate {
+                                 {
+                                     break;
+                                 }
+-                                thread::sleep(Duration::from_millis(1));
++                                thread::sleep(Duration::from_millis(200));
+                             }
+                         }));
+                     }
+@@ -479,10 +479,19 @@ fn delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole() {
+         let deadline = Instant::now() + Duration::from_secs(1);
+         loop {
+             if let Some(elapsed) = host.take_frame_ack_elapsed() {
++                eprintln!("frame={number} hold={delay}ms ack={elapsed:?}");
+                 assert!(elapsed >= Duration::from_millis(delay));
+                 break;
+             }
+-            assert!(Instant::now() < deadline, "authenticated ACK never arrived");
++            let event = host.recv_timeout(Duration::ZERO);
++            assert!(
++                event.is_none(),
++                "after return-path release: frame={number}, hold={delay}ms, event={event:?}"
++            );
++            assert!(
++                Instant::now() < deadline,
++                "authenticated ACK never arrived: frame={number}, hold={delay}ms"
++            );
+             thread::sleep(Duration::from_millis(2));
+         }
+     }

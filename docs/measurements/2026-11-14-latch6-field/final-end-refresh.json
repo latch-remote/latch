@@ -1,0 +1,51 @@
+{
+  "utc": "2026-11-14T12:07:14Z",
+  "files": [
+    {
+      "path": "crates/engine/src/server.rs",
+      "bytes": 89220,
+      "sha256": "fca8b723506db7580b19d089dee94e22e47419209f7cfe7e2b260a8f9b53a597"
+    },
+    {
+      "path": "crates/engine/src/software.rs",
+      "bytes": 44210,
+      "sha256": "d1451b4a7f78efbcf1148ff7fd724559a00ac463489d5736a641565134520176"
+    },
+    {
+      "path": "crates/proto/src/control.rs",
+      "bytes": 23080,
+      "sha256": "9e184644d3efa15031c1f0dc3e4be9275fd391c64f03caa15d12210e8c89e7cc"
+    },
+    {
+      "path": "crates/client/src/app.rs",
+      "bytes": 188934,
+      "sha256": "01e77a5c272638705befb6b8ab16b479849461a5551e423568e99f0c40a64c50"
+    },
+    {
+      "path": "crates/stream/src/session.rs",
+      "bytes": 153524,
+      "sha256": "d7958fdd138b26769ec2d8ab27901af7d7aa9b5f5b60e5f0a9c2abaecde5c22b"
+    },
+    {
+      "path": "crates/relay/src/client.rs",
+      "bytes": 44505,
+      "sha256": "899b0d9cb278f706d483cd717a8b3416087d42e5500c77f9e484247113275301"
+    },
+    {
+      "path": "crates/relay/tests/transport.rs",
+      "bytes": 23735,
+      "sha256": "97a9304f9a6062c965cd5a89c80f5f3509540e4496a5981a2a02208ee314875f"
+    },
+    {
+      "path": "crates/engine/tests/support/lifecycle.rs",
+      "bytes": 38103,
+      "sha256": "48f856f49299d8ddc6631637d7a86be9010569f221da1b765a38a9471c518b96"
+    },
+    {
+      "path": "crates/engine/tests/relay_runtime.rs",
+      "bytes": 32403,
+      "sha256": "90a1e44d1caac1eb7ec4423d4a14057b684f0d611c50e204ded0aec5733e67cd"
+    }
+  ],
+  "archive_sha256": "64442abb296ba0f2c71bd63322a4b508e27fd1de5c99a686392fc86bff47e14a"
+}

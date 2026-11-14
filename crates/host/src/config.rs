@@ -7,6 +7,7 @@ pub const FILE: &str = "host.toml";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct HostConfig {
+    pub relay: latch_proto::control::RelaySettings,
     /// Let a Mac on the tailnet sleep, restart, or shut this PC down.
     pub power_allowed: bool,
     /// Explicit consent to the same-user elevated input route (Windows setup).
@@ -35,6 +36,7 @@ pub struct HostConfig {
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
+            relay: Default::default(),
             power_allowed: true,
             elevated_input: false,
             clipboard_sharing: true,
@@ -109,6 +111,7 @@ impl HostConfig {
     /// Update the window's settings, preserving prep commands edited on disk.
     pub fn save(&self) -> anyhow::Result<()> {
         latch_core::config::update(FILE, |disk: &mut Self| {
+            disk.relay = self.relay.clone();
             disk.power_allowed = self.power_allowed;
             disk.elevated_input = self.elevated_input;
             disk.clipboard_sharing = self.clipboard_sharing;

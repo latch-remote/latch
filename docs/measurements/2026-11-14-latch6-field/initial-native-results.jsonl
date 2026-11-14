@@ -1,0 +1,4 @@
+{"label":"lifecycle","exit":0,"elapsed_s":182.2723763,"command":"cargo test --locked -p latch-engine --test lifecycle -- --test-threads=1"}
+{"label":"relay-runtime","exit":101,"elapsed_s":33.3569309,"command":"cargo test --locked -p latch-engine --test relay_runtime -- --test-threads=1"}
+{"label":"windows-examples","exit":0,"elapsed_s":17.906082599999998,"command":"cargo build --locked -p latch-engine --example serve --example pipeline_bench -p latch-client --example present -p latch-stream --example view --example pads"}
+{"label":"workspace-check","exit":0,"elapsed_s":80.1677644,"command":"cargo check --locked --workspace --all-targets"}

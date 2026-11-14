@@ -10,6 +10,8 @@
 | [../deploy/native/README.md](../deploy/native/README.md) | A Linux server sharing a virtual desktop, under systemd |
 | [../deploy/node/NODE.md](../deploy/node/NODE.md) | The same in a Docker container |
 | [../deploy/relay/RELAY.md](../deploy/relay/RELAY.md) | Your own Tailscale peer relay, for networks that cannot connect directly |
+| [USING.md#stream-relay](USING.md#stream-relay) | Version 6 public TCP/TLS relay, privacy opt-out, CPU constraints and limits |
+| [../deploy/relay-tcp/README.md](../deploy/relay-tcp/README.md) | Operating the native TLS relay |
 
 ## How it works
 

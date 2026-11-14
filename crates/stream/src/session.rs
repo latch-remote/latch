@@ -29,10 +29,818 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Builds the configured production relay with standard certificate validation.
+pub fn relay_config(settings: &control::RelaySettings) -> Option<latch_relay::ClientConfig> {
+    if !settings.enabled {
+        return None;
+    }
+    latch_relay::Endpoint::new(settings.host.clone(), settings.port)
+        .and_then(latch_relay::ClientConfig::production)
+        .map_err(|error| tracing::warn!(%error, "relay unavailable"))
+        .ok()
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RelayOffer {
+    session: u32,
+    attempt: u64,
+    endpoint: latch_relay::Endpoint,
+    viewer: latch_relay::Attachment,
+    keys: latch_relay::SessionKeys,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelayPhase {
+    Idle,
+    Preparing,
+    Offered,
+    CommitSent,
+    Active,
+}
+struct PreparedRelay {
+    grant_deadline: Instant,
+    grant_bytes: u64,
+    transport: Arc<latch_relay::Transport>,
+    offer: control::RelayPayload,
+}
+const UDP_REASSESS_DWELL: Duration = Duration::from_secs(60);
+const UDP_REASSESS_MAX_BACKOFF: Duration = Duration::from_secs(600);
+const UDP_PROBE_SETTLE: Duration = Duration::from_millis(100);
+const UDP_PROBE_REPORT: Duration = Duration::from_secs(2);
+
+struct UdpProbe {
+    first: u16,
+    kbps: u32,
+    started: Instant,
+    sent: u32,
+    seen: Vec<u16>,
+    first_received: Option<Instant>,
+    last_received: Option<Instant>,
+}
+impl UdpProbe {
+    fn new(first: u16, kbps: u32) -> Self {
+        Self {
+            first,
+            kbps,
+            started: Instant::now(),
+            sent: 0,
+            seen: vec![
+                0;
+                (kbps as usize * 1000 / 8 / (latch_proto::MAX_DATAGRAM + 80) / 16).max(1)
+            ],
+            first_received: None,
+            last_received: None,
+        }
+    }
+    fn packets(&self) -> u32 {
+        self.seen.len() as u32 * 16
+    }
+    fn healthy(&self, received: u32, span_us: u32) -> bool {
+        // Count every missing position, including lost tails. Duplicates never
+        // count, and a short burst or a backed-up queue cannot prove capacity.
+        self.sent == self.packets()
+            && received <= self.packets()
+            && received * 1000 >= self.packets() * 995
+            && (800_000..=1_200_000).contains(&span_us)
+            && u64::from(received) * (latch_proto::MAX_DATAGRAM + 80) as u64 * 8 * 1000
+                >= u64::from(self.kbps) * u64::from(span_us) * 9 / 10
+    }
+}
+
+struct RelayAttempt {
+    number: u64,
+    phase: RelayPhase,
+    transport: Option<Arc<latch_relay::Transport>>,
+    ready: bool,
+    peer_ready: bool,
+    started: Instant,
+    retry_at: Instant,
+    failures: u32,
+    next_probe: Instant,
+    probe_delay: Duration,
+    probe_serial: u16,
+    udp_probe: Option<UdpProbe>,
+    returning_direct: bool,
+    grant_deadline: Option<Instant>,
+    grant_bytes: u64,
+    traffic_bytes: u64,
+    media_delivered: bool,
+    cancel: latch_relay::Cancel,
+    preparing: Option<(
+        mpsc::Receiver<std::io::Result<PreparedRelay>>,
+        std::thread::JoinHandle<()>,
+    )>,
+}
+
+/// Session-scoped routing shared by the host and viewer. Exactly one receive loop
+/// calls `poll`. Negotiation always uses the original authorized TCP connection.
+pub struct RelayRoute {
+    session: u32,
+    role: latch_relay::Role,
+    config: Option<latch_relay::ClientConfig>,
+    state: Mutex<RelayAttempt>,
+    active: AtomicBool,
+    failed: AtomicBool,
+    fatal: AtomicBool,
+    revision: AtomicU64,
+}
+impl RelayRoute {
+    pub fn new(
+        session: u32,
+        role: latch_relay::Role,
+        config: Option<latch_relay::ClientConfig>,
+    ) -> Self {
+        let now = Instant::now();
+        Self {
+            session,
+            role,
+            config,
+            state: Mutex::new(RelayAttempt {
+                number: 0,
+                phase: RelayPhase::Idle,
+                transport: None,
+                ready: false,
+                peer_ready: false,
+                started: now,
+                retry_at: now,
+                failures: 0,
+                next_probe: now + UDP_REASSESS_DWELL,
+                probe_delay: UDP_REASSESS_DWELL,
+                probe_serial: 0,
+                udp_probe: None,
+                returning_direct: false,
+                grant_deadline: None,
+                grant_bytes: 0,
+                traffic_bytes: 0,
+                media_delivered: false,
+                cancel: latch_relay::Cancel::new(),
+                preparing: None,
+            }),
+            active: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            fatal: AtomicBool::new(false),
+            revision: AtomicU64::new(0),
+        }
+    }
+    pub(crate) fn fail(&self) {
+        self.fatal.store(true, Ordering::Release);
+    }
+    pub fn active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+    pub fn pending(&self) -> bool {
+        self.state.lock().phase != RelayPhase::Idle
+    }
+    pub fn number(&self) -> u64 {
+        self.state.lock().number
+    }
+    fn message(&self, attempt: u64, action: control::RelayAction) -> Message {
+        Message::Relay(control::RelayControl {
+            session: self.session,
+            attempt,
+            action,
+        })
+    }
+    fn activate(&self, state: &mut RelayAttempt) {
+        tracing::info!(role = ?self.role, attempt = state.number, "using Latch TLS relay");
+        state.phase = RelayPhase::Active;
+        state.started = Instant::now();
+        state.next_probe = state.next_probe.max(state.started + UDP_REASSESS_DWELL);
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        self.active.store(true, Ordering::Release);
+    }
+    fn reset(&self, state: &mut RelayAttempt) {
+        // A close polled just before a TCP handoff/Abort belongs to this reset.
+        // Leaving it pending would reset Idle again and move its retry deadline.
+        self.failed.store(false, Ordering::Release);
+        self.active.store(false, Ordering::Release);
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        state.cancel.cancel();
+        if let Some(transport) = state.transport.take() {
+            transport.shutdown();
+        }
+        // Keep the one cancellable grant worker until it has joined. A new
+        // attempt cannot allocate another worker while this one is unwinding.
+        let grant_spent = state
+            .grant_deadline
+            .is_some_and(|deadline| Instant::now() + Duration::from_millis(250) >= deadline)
+            || (state.grant_bytes > 0
+                && state.traffic_bytes >= state.grant_bytes - state.grant_bytes / 10);
+        if state.phase == RelayPhase::Active
+            && (state.started.elapsed() >= Duration::from_secs(30) || grant_spent)
+        {
+            // A finite grant ending normally earns a fresh grant, even when a
+            // small byte allowance runs out sooner than the healthy dwell.
+            state.failures = 0;
+        }
+        state.grant_deadline = None;
+        state.grant_bytes = 0;
+        state.traffic_bytes = 0;
+        state.media_delivered = false;
+        state.phase = RelayPhase::Idle;
+        state.udp_probe = None;
+        state.returning_direct = false;
+        state.ready = false;
+        state.peer_ready = false;
+        state.failures = state.failures.saturating_add(1);
+        let cooldown = if state.failures >= 3 { 30 } else { 2 };
+        state.retry_at = Instant::now() + Duration::from_secs(cooldown);
+    }
+    /// Called by the host control owner. Padding is bounded to one second,
+    /// 50 Mbps, and 64 packets per turn. Media stays exclusively on the relay.
+    pub fn reassess_udp(
+        &self,
+        udp: &UdpSocket,
+        addr: SocketAddr,
+        requested_kbps: u32,
+        mut send: impl FnMut(&Message) -> bool,
+    ) -> bool {
+        let mut state = self.state.lock();
+        if self.role != latch_relay::Role::Host || state.phase != RelayPhase::Active {
+            return true;
+        }
+        let now = Instant::now();
+        // 25% headroom covers packet/FEC overhead. Higher requested rates
+        // keep the relay until a correspondingly larger check is supported.
+        let kbps = requested_kbps.saturating_mul(5).div_ceil(4).max(2000);
+        if state.udp_probe.is_none()
+            && !state.returning_direct
+            && now >= state.next_probe
+            && kbps <= 50_000
+        {
+            state.probe_serial = state.probe_serial.wrapping_add(512);
+            let first = state.probe_serial;
+            state.udp_probe = Some(UdpProbe::new(first, kbps));
+            state.next_probe = now + state.probe_delay;
+            state.probe_delay = (state.probe_delay * 2).min(UDP_REASSESS_MAX_BACKOFF);
+            if !send(&self.message(state.number, control::RelayAction::UdpProbe { first, kbps })) {
+                return false;
+            }
+        }
+        let Some(probe) = state.udp_probe.as_mut() else {
+            return true;
+        };
+        let elapsed = now.saturating_duration_since(probe.started + UDP_PROBE_SETTLE);
+        if elapsed > Duration::from_millis(1250) {
+            return true;
+        }
+        let due = (elapsed.as_secs_f64() * f64::from(probe.kbps) * 1000.0
+            / 8.0
+            / (latch_proto::MAX_DATAGRAM + 80) as f64) as u32;
+        let end = due.min(probe.packets()).min(probe.sent + 64);
+        let mut bytes = Vec::with_capacity(latch_proto::MAX_DATAGRAM);
+        while probe.sent < end {
+            wire::write_probe(
+                &mut bytes,
+                self.session,
+                probe.first.wrapping_add((probe.sent / 16) as u16),
+                (probe.sent % 16) as u8,
+                16,
+                latch_proto::MAX_DATAGRAM,
+            );
+            // A failed send remains a missing position in the result.
+            let _ = udp.send_to(&bytes, addr);
+            probe.sent += 1;
+        }
+        true
+    }
+
+    /// Only direct UDP enters this meter, separately from relay media reports.
+    pub fn observe_udp_probe(&self, datagram: &Datagram<'_>, now: Instant) {
+        let Datagram::Probe {
+            train,
+            index,
+            count: 16,
+            len,
+            ..
+        } = datagram
+        else {
+            return;
+        };
+        if *len != latch_proto::MAX_DATAGRAM || *index >= 16 {
+            return;
+        }
+        let mut state = self.state.lock();
+        if self.role != latch_relay::Role::Viewer || state.phase != RelayPhase::Active {
+            return;
+        }
+        let Some(probe) = state.udp_probe.as_mut() else {
+            return;
+        };
+        if now.duration_since(probe.started) >= UDP_PROBE_REPORT {
+            return;
+        }
+        let train = usize::from(train.wrapping_sub(probe.first));
+        if let Some(seen) = probe.seen.get_mut(train) {
+            let bit = 1 << index;
+            if *seen & bit == 0 {
+                *seen |= bit;
+                probe.first_received.get_or_insert(now);
+                probe.last_received = Some(now);
+            }
+        }
+    }
+
+    pub fn shutdown(&self) {
+        let mut state = self.state.lock();
+        self.reset(&mut state);
+        if let Some((_, worker)) = state.preparing.take() {
+            let _ = worker.join();
+        }
+    }
+    /// Priority failure terminates the session so held input is released.
+    pub fn send_datagram(&self, bytes: &[u8]) -> std::io::Result<bool> {
+        let mut state = self.state.lock();
+        if state.phase != RelayPhase::Active {
+            return Ok(false);
+        }
+        match state
+            .transport
+            .as_ref()
+            .ok_or(std::io::ErrorKind::NotConnected)?
+            .try_send_datagram(bytes)
+        {
+            Ok(()) => {
+                state.traffic_bytes = state.traffic_bytes.saturating_add((bytes.len() * 2) as u64);
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                self.fail();
+                Err(error)
+            }
+            Err(_) => {
+                self.failed.store(true, Ordering::Release);
+                Ok(false)
+            }
+        }
+    }
+    pub fn send_control(&self, message: &Message) -> std::io::Result<bool> {
+        // Lifecycle must survive relay teardown. Keep every cursor update on
+        // one ordered connection, regardless of serialized shape size.
+        if matches!(message, Message::End(_) | Message::Cursor(_)) {
+            return Ok(false);
+        }
+        let mut state = self.state.lock();
+        if state.phase != RelayPhase::Active {
+            return Ok(false);
+        }
+        let mut bytes = Vec::new();
+        control::write_message(&mut bytes, message)?;
+        // Oversized controls retain the existing authorized TCP path.
+        if bytes.len() > 16_359 {
+            return Ok(false);
+        }
+        match state
+            .transport
+            .as_ref()
+            .ok_or(std::io::ErrorKind::NotConnected)?
+            .try_send_control(&bytes)
+        {
+            Ok(()) => {
+                state.traffic_bytes = state.traffic_bytes.saturating_add((bytes.len() * 2) as u64);
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                self.fail();
+                Err(error)
+            }
+            Err(_) => {
+                self.failed.store(true, Ordering::Release);
+                Ok(false)
+            }
+        }
+    }
+    pub fn queued_frame_age(&self) -> Duration {
+        self.state
+            .lock()
+            .transport
+            .as_ref()
+            .map_or(Duration::ZERO, |transport| transport.queued_frame_age())
+    }
+
+    pub fn take_frame_ack_elapsed(&self) -> Option<Duration> {
+        let mut state = self.state.lock();
+        let elapsed = state.transport.as_ref()?.take_frame_ack_elapsed();
+        state.media_delivered |= elapsed.is_some();
+        elapsed
+    }
+
+    pub fn send_frame(&self, frame: &InFrame) -> std::io::Result<bool> {
+        let mut state = self.state.lock();
+        if state.phase != RelayPhase::Active {
+            return Ok(false);
+        }
+        match state
+            .transport
+            .as_ref()
+            .ok_or(std::io::ErrorKind::NotConnected)?
+            .try_send_frame(frame)
+        {
+            Ok(()) => {
+                state.traffic_bytes = state
+                    .traffic_bytes
+                    .saturating_add((frame.data.len() * 2) as u64);
+                Ok(true)
+            }
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::WouldBlock {
+                    self.failed.store(true, Ordering::Release);
+                }
+                Err(error)
+            }
+        }
+    }
+    /// Consumes transport events in one place. Readiness is E2E on both lanes.
+    pub fn poll(&self) -> Option<(u64, latch_relay::Event)> {
+        let mut state = self.state.lock();
+        let event = state.transport.as_ref()?.recv_timeout(Duration::ZERO)?;
+        let received = match &event {
+            latch_relay::Event::Frame(frame) => frame.data.len(),
+            latch_relay::Event::Datagram(bytes) | latch_relay::Event::Control(bytes) => bytes.len(),
+            _ => 0,
+        };
+        state.traffic_bytes = state.traffic_bytes.saturating_add((received * 2) as u64);
+        state.media_delivered |= matches!(event, latch_relay::Event::Frame(_));
+        match event {
+            latch_relay::Event::Ready => {
+                state.ready = true;
+                None
+            }
+            latch_relay::Event::Closed { kind, message } => {
+                tracing::warn!(role = ?self.role, ?kind, %message, "relay closed, falling back to UDP");
+                self.failed.store(true, Ordering::Release);
+                None
+            }
+            event if state.phase == RelayPhase::Active || state.phase == RelayPhase::CommitSent => {
+                Some((self.revision(), event))
+            }
+            _ => None,
+        }
+    }
+    /// Runs on the TCP control owner. Return false for an authority write failure.
+    pub fn maintain(&self, wanted: bool, mut send: impl FnMut(&Message) -> bool) -> bool {
+        use control::RelayAction as A;
+        if self.fatal.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut state = self.state.lock();
+        let renewing = self.role == latch_relay::Role::Host
+            && state.phase == RelayPhase::Active
+            && (state
+                .grant_deadline
+                .is_some_and(|deadline| Instant::now() + Duration::from_millis(250) >= deadline)
+                || (state.media_delivered
+                    && state.grant_bytes > 0
+                    && state.traffic_bytes >= state.grant_bytes - state.grant_bytes / 4));
+        if renewing {
+            // Application bytes omit TLS overhead. Leave a quarter of the
+            // advertised combined allowance for records and in-flight media.
+            let number = state.number;
+            self.reset(&mut state);
+            state.failures = 1;
+            state.retry_at = Instant::now() + Duration::from_secs(2);
+            if !send(&self.message(number, A::Renew)) {
+                return false;
+            }
+        }
+        if state.phase == RelayPhase::Active
+            && state.udp_probe.as_ref().is_some_and(|p| {
+                p.started.elapsed()
+                    >= UDP_PROBE_REPORT
+                        + if self.role == latch_relay::Role::Host {
+                            Duration::from_secs(1)
+                        } else {
+                            Duration::ZERO
+                        }
+            })
+        {
+            let probe = state.udp_probe.take().unwrap();
+            if self.role == latch_relay::Role::Viewer {
+                let received = probe.seen.iter().map(|bits| bits.count_ones()).sum();
+                let span_us = probe
+                    .first_received
+                    .zip(probe.last_received)
+                    .map_or(0, |(first, last)| {
+                        last.duration_since(first).as_micros() as u32
+                    });
+                if !send(&self.message(
+                    state.number,
+                    A::UdpProbeResult {
+                        first: probe.first,
+                        received,
+                        span_us,
+                    },
+                )) {
+                    return false;
+                }
+            }
+        }
+        let failed = self.failed.swap(false, Ordering::AcqRel);
+        if failed
+            || (state.returning_direct && state.started.elapsed() >= Duration::from_secs(6))
+            || (state.phase != RelayPhase::Idle
+                && state.phase != RelayPhase::Active
+                && state.started.elapsed() >= Duration::from_secs(6))
+        {
+            let number = state.number;
+            let healthy_handoff = failed && state.returning_direct;
+            self.reset(&mut state);
+            if healthy_handoff {
+                state.failures = 0;
+                state.retry_at = Instant::now() + Duration::from_secs(2);
+            }
+            if !send(&self.message(number, A::Abort)) {
+                return false;
+            }
+        }
+        if state
+            .preparing
+            .as_ref()
+            .is_some_and(|(_, worker)| worker.is_finished())
+        {
+            let (result, worker) = state.preparing.take().unwrap();
+            let _ = worker.join();
+            if state.phase == RelayPhase::Preparing {
+                let prepared = result
+                    .try_recv()
+                    .map_err(std::io::Error::other)
+                    .and_then(|prepared| prepared);
+                match prepared {
+                    Ok(prepared) => {
+                        state.grant_deadline = Some(prepared.grant_deadline);
+                        state.grant_bytes = prepared.grant_bytes;
+                        state.transport = Some(prepared.transport);
+                        state.phase = RelayPhase::Offered;
+                        if !send(&self.message(state.number, A::Offer(prepared.offer))) {
+                            return false;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "relay preparation failed");
+                        let number = state.number;
+                        self.reset(&mut state);
+                        if !send(&self.message(number, A::Abort)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        if self.role == latch_relay::Role::Viewer
+            && wanted
+            && self.config.is_some()
+            && state.phase == RelayPhase::Idle
+            && state.preparing.is_none()
+            && Instant::now() >= state.retry_at
+        {
+            let Some(number) = state.number.checked_add(1) else {
+                return true;
+            };
+            state.number = number;
+            state.phase = RelayPhase::Preparing;
+            state.started = Instant::now();
+            state.cancel = latch_relay::Cancel::new();
+            if !send(&self.message(number, A::Request)) {
+                return false;
+            }
+        }
+        if state.ready && state.phase == RelayPhase::Offered {
+            if self.role == latch_relay::Role::Viewer && !state.peer_ready {
+                state.peer_ready = true;
+                if !send(&self.message(state.number, A::Ready)) {
+                    return false;
+                }
+            } else if self.role == latch_relay::Role::Host && state.peer_ready {
+                state.phase = RelayPhase::CommitSent;
+                if !send(&self.message(state.number, A::Commit)) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    pub fn handle(
+        &self,
+        message: control::RelayControl,
+        mut send: impl FnMut(&Message) -> bool,
+    ) -> bool {
+        use control::RelayAction as A;
+        if message.session != self.session || message.attempt == 0 {
+            return true;
+        }
+        tracing::debug!(role = ?self.role, attempt = message.attempt, action = ?message.action, "relay negotiation");
+        let mut state = self.state.lock();
+        if self.role == latch_relay::Role::Host && matches!(message.action, A::Request) {
+            if self.config.is_none()
+                || state.phase != RelayPhase::Idle
+                || state.preparing.is_some()
+                || message.attempt <= state.number
+            {
+                return true;
+            }
+            if let Some(remaining) = state.retry_at.checked_duration_since(Instant::now()) {
+                // Never silently discard a valid request at the cooldown edge.
+                // The viewer otherwise waits six seconds for an offer while
+                // its media watchdog is already counting the same outage.
+                return send(&self.message(
+                    message.attempt,
+                    A::RetryAfter {
+                        millis: remaining.as_millis().clamp(250, 30_000) as u32,
+                    },
+                ));
+            }
+            let config = self.config.as_ref().unwrap().clone();
+            state.number = message.attempt;
+            state.phase = RelayPhase::Preparing;
+            state.started = Instant::now();
+            state.cancel = latch_relay::Cancel::new();
+            let cancel = state.cancel.clone();
+            let session = self.session;
+            let attempt = state.number;
+            let (tx, rx) = mpsc::sync_channel(1);
+            match std::thread::Builder::new()
+                .name("relay-grant".into())
+                .spawn(move || {
+                    let prepared = (|| {
+                        let granted = Instant::now();
+                        let grant = latch_relay::create_grant(&config, &cancel)?;
+                        let grant_deadline =
+                            granted + Duration::from_secs(u64::from(grant.host.session_seconds));
+                        let grant_bytes = grant.host.session_bytes;
+                        if cancel.is_cancelled() {
+                            return Err(std::io::ErrorKind::Interrupted.into());
+                        }
+                        let keys = latch_relay::SessionKeys::generate()?;
+                        let offer = RelayOffer {
+                            session,
+                            attempt,
+                            endpoint: config.endpoint.clone(),
+                            viewer: grant.viewer,
+                            keys: keys.clone(),
+                        };
+                        let offer = control::RelayPayload::new(serde_json::to_string(&offer)?)?;
+                        let transport =
+                            Arc::new(latch_relay::Transport::connect(config, grant.host, keys)?);
+                        if cancel.is_cancelled() {
+                            transport.shutdown();
+                            return Err(std::io::ErrorKind::Interrupted.into());
+                        }
+                        Ok(PreparedRelay {
+                            transport,
+                            offer,
+                            grant_deadline,
+                            grant_bytes,
+                        })
+                    })();
+                    let _ = tx.send(prepared);
+                }) {
+                Ok(worker) => state.preparing = Some((rx, worker)),
+                Err(_) => self.reset(&mut state),
+            }
+            return true;
+        }
+        if message.attempt != state.number {
+            return true;
+        }
+        match message.action {
+            A::Offer(payload)
+                if self.role == latch_relay::Role::Viewer
+                    && state.phase == RelayPhase::Preparing =>
+            {
+                let offer: Result<RelayOffer, _> = serde_json::from_str(payload.as_str());
+                let config = self.config.as_ref();
+                if let (Ok(offer), Some(config)) = (offer, config) {
+                    if offer.session == self.session
+                        && offer.attempt == state.number
+                        && offer.viewer.role() == latch_relay::Role::Viewer
+                        && offer.endpoint.host() == config.endpoint.host()
+                        && offer.endpoint.port() == config.endpoint.port()
+                    {
+                        state.grant_deadline = Some(
+                            state.started
+                                + Duration::from_secs(u64::from(offer.viewer.session_seconds)),
+                        );
+                        state.grant_bytes = offer.viewer.session_bytes;
+                        if let Ok(transport) = latch_relay::Transport::connect(
+                            config.clone(),
+                            offer.viewer,
+                            offer.keys,
+                        ) {
+                            state.transport = Some(Arc::new(transport));
+                            state.phase = RelayPhase::Offered;
+                            return true;
+                        }
+                    }
+                }
+                self.reset(&mut state);
+                return send(&self.message(message.attempt, A::Abort));
+            }
+            A::Ready
+                if self.role == latch_relay::Role::Host && state.phase == RelayPhase::Offered =>
+            {
+                state.peer_ready = true
+            }
+            A::Commit
+                if self.role == latch_relay::Role::Viewer
+                    && state.phase == RelayPhase::Offered
+                    && state.ready =>
+            {
+                self.activate(&mut state);
+                return send(&self.message(message.attempt, A::Committed));
+            }
+            A::Committed
+                if self.role == latch_relay::Role::Host
+                    && state.phase == RelayPhase::CommitSent
+                    && state.ready
+                    && state.peer_ready =>
+            {
+                self.activate(&mut state)
+            }
+            A::UdpProbe { first, kbps }
+                if self.role == latch_relay::Role::Viewer
+                    && state.phase == RelayPhase::Active
+                    && state.udp_probe.is_none()
+                    && (2000..=50_000).contains(&kbps) =>
+            {
+                state.udp_probe = Some(UdpProbe::new(first, kbps));
+            }
+            A::UdpProbeResult {
+                first,
+                received,
+                span_us,
+            } if self.role == latch_relay::Role::Host && state.phase == RelayPhase::Active => {
+                if let Some(probe) = state.udp_probe.take() {
+                    if probe.first != first {
+                        state.udp_probe = Some(probe);
+                    } else if probe.healthy(received, span_us) {
+                        state.returning_direct = true;
+                        state.started = Instant::now();
+                        return send(&self.message(message.attempt, A::Direct));
+                    }
+                }
+            }
+            A::Direct
+                if self.role == latch_relay::Role::Viewer && state.phase == RelayPhase::Active =>
+            {
+                self.reset(&mut state);
+                // A measured, healthy handoff is not a failed relay attempt.
+                state.failures = 0;
+                state.retry_at = Instant::now() + Duration::from_secs(2);
+                return send(&self.message(message.attempt, A::DirectReady));
+            }
+            A::DirectReady if self.role == latch_relay::Role::Host && state.returning_direct => {
+                self.reset(&mut state);
+                state.failures = 0;
+                state.retry_at = Instant::now() + Duration::from_secs(2);
+            }
+            A::RetryAfter { millis }
+                if self.role == latch_relay::Role::Viewer
+                    && state.phase == RelayPhase::Preparing =>
+            {
+                let failures = state.failures;
+                self.reset(&mut state);
+                // Waiting for the host's cooldown did not test the relay path.
+                state.failures = failures;
+                state.retry_at =
+                    Instant::now() + Duration::from_millis(u64::from(millis.clamp(250, 30_000)));
+            }
+            A::Renew
+                if self.role == latch_relay::Role::Viewer
+                    && (state.phase == RelayPhase::Active || state.phase == RelayPhase::Idle) =>
+            {
+                if state.phase == RelayPhase::Active {
+                    self.reset(&mut state);
+                }
+                state.failures = 1;
+                state.retry_at = Instant::now() + Duration::from_secs(2);
+            }
+            A::Abort if state.phase != RelayPhase::Idle => self.reset(&mut state),
+            _ => {}
+        }
+        true
+    }
+}
+impl Drop for RelayRoute {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// Includes takeover (up to 30 s), this viewer's prep (15 s), and capture open.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
-/// After the host accepts, its first frame must arrive within this.
+/// After the host accepts, its first decoded picture must arrive within this.
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(8);
+/// Still desktops produce idle frames every 100 ms. Give loss recovery and
+/// decoder recovery eight seconds, independently of TCP keepalives.
+const MEDIA_STALL_TIMEOUT: Duration = Duration::from_secs(8);
+/// Four seconds of 1 kHz input, or roughly 256 KiB of pasted text. Beyond
+/// this, end the session so its cleanup releases held keys and buttons.
+const MAX_PENDING_INPUT: usize = 4096;
+/// Allows the host's two-second injection retry grace plus network recovery.
+const INPUT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// A host heard from neither over TCP nor UDP for this long is gone.
 const SILENT: Duration = Duration::from_secs(10);
 const KEEPALIVE: Duration = Duration::from_secs(1);
@@ -77,7 +885,9 @@ pub enum Event {
     /// A connection stage is starting.
     Stage(String),
     Connected,
-    /// Setup failed before the stream started.
+    /// Setup failed before the stream started. The `connecting` stage
+    /// denotes a recoverable connection/media failure. Other stages need
+    /// the user to resolve a refusal or local setup failure before retrying.
     Failed {
         stage: String,
         message: String,
@@ -146,8 +956,8 @@ pub struct Stats {
     /// Encoded video in the frames that came together, in Mbps: what the
     /// bitrate setting caps. FEC parity, headers and audio are not in it.
     pub mbps: f32,
-    /// Every video and audio datagram the host's media brought, FEC parity
-    /// and Latch headers included, in Mbps: what the network delivered.
+    /// Received media in Mbps: UDP includes FEC and Latch headers; relay
+    /// includes complete video and priority payloads, excluding TLS/TCP headers.
     pub received_mbps: f32,
     pub rtt_ms: u32,
     pub rtt_var_ms: u32,
@@ -339,6 +1149,7 @@ fn recovery_wanted() -> bool {
 struct VideoHealth {
     connected_at: Option<Instant>,
     last_frame: Option<Instant>,
+    last_encoded: Option<Instant>,
     black_since: Option<Instant>,
     last_error: Option<String>,
 }
@@ -354,14 +1165,26 @@ impl VideoHealth {
         }
     }
 
+    fn stalled(&self, now: Instant) -> bool {
+        self.last_frame
+            .is_some_and(|last| now.saturating_duration_since(last) >= MEDIA_STALL_TIMEOUT)
+    }
+
+    fn stall_message(&self) -> &'static str {
+        if self.last_encoded > self.last_frame {
+            "Video is arriving, but decoding stopped producing pictures. Reconnecting…"
+        } else {
+            "Video stopped arriving from the PC, including idle frames. Reconnecting…"
+        }
+    }
+
     fn problem(&self, now: Instant) -> Option<String> {
         let connected = self.connected_at?;
         if now.duration_since(self.last_frame.unwrap_or(connected)) >= Duration::from_secs(5) {
             return Some(if let Some(error) = &self.last_error {
                 format!("Video cannot be decoded: {error}. Try restarting the stream or selecting H.264 in Settings.")
             } else if self.last_frame.is_some() {
-                "Video stopped arriving from the PC. Try restarting the stream or lowering Quality."
-                    .into()
+                self.stall_message().into()
             } else {
                 "Connected, but no video has arrived from the PC. Check its display, or restart the stream.".into()
             });
@@ -391,18 +1214,34 @@ struct DecodeWindow {
 struct Link {
     udp: UdpSocket,
     host: SocketAddr,
+    relay: Arc<RelayRoute>,
     sender: InputSender,
+    input_progress: Option<Instant>,
+    input_failed: bool,
     pads: PadSender,
     buf: Vec<u8>,
 }
 
 impl Link {
     fn flush(&mut self, now: Instant) {
-        if self.sender.poll(now, &mut self.buf) {
-            let _ = self.udp.send_to(&self.buf, self.host);
+        if self
+            .input_progress
+            .is_some_and(|since| now.saturating_duration_since(since) >= INPUT_ACK_TIMEOUT)
+        {
+            self.input_failed = true;
         }
-        if self.pads.poll(now, &mut self.buf) {
-            let _ = self.udp.send_to(&self.buf, self.host);
+        if self.input_failed {
+            return;
+        }
+        if self.sender.poll(now, &mut self.buf)
+            && routed_datagram(&self.relay, &self.udp, &self.buf, self.host).is_err()
+        {
+            self.input_failed = true;
+        }
+        if self.pads.poll(now, &mut self.buf)
+            && routed_datagram(&self.relay, &self.udp, &self.buf, self.host).is_err()
+        {
+            self.input_failed = true;
         }
     }
 
@@ -416,6 +1255,9 @@ impl Link {
 }
 
 struct Inner {
+    configured_relay: Mutex<Option<latch_relay::ClientConfig>>,
+    relay: Mutex<Arc<RelayRoute>>,
+    relay_messages: Mutex<VecDeque<(u64, Message)>>,
     /// This machine's microphone, while it is being sent.
     mic: Mutex<Option<crate::mic::Mic>>,
     events: Sender<Event>,
@@ -470,7 +1312,7 @@ struct Inner {
     pad_slots: AtomicU32,
     pad_problem: Mutex<String>,
     pad_feedback: Mutex<Option<FeedbackFn>>,
-    /// Pads' newest states from before the host accepted, sent once it has.
+    /// Pads' newest physical states, retained across connection/route changes.
     /// Locked after `link`, never before.
     pending_pads: Mutex<[Option<(PadKind, PadState)>; latch_proto::gamepad::MAX_PADS]>,
 }
@@ -500,6 +1342,7 @@ impl DecodeLoad {
 
 #[derive(Default)]
 struct DecodeQueue {
+    route_revision: u64,
     frames: VecDeque<(InFrame, Instant)>,
     want_keyframe: bool,
 }
@@ -511,6 +1354,13 @@ impl Inner {
         wake: Box<dyn Fn() + Send + Sync>,
     ) -> Self {
         Self {
+            configured_relay: Mutex::new(None),
+            relay: Mutex::new(Arc::new(RelayRoute::new(
+                0,
+                latch_relay::Role::Viewer,
+                None,
+            ))),
+            relay_messages: Mutex::new(VecDeque::new()),
             events,
             wake,
             frames,
@@ -596,8 +1446,23 @@ impl Input {
             return;
         }
         if let Some(link) = self.inner.link.lock().as_mut() {
+            if link.input_failed || self.inner.stopping() {
+                return;
+            }
+            // UTF-8 splitting can leave up to three bytes unused in each
+            // MAX_TEXT chunk. Reserve that upper bound before allocating.
+            let count = match &event {
+                InputEvent::Text(text) => text.len().div_ceil(latch_proto::input::MAX_TEXT - 3),
+                _ => 1,
+            };
+            if count > MAX_PENDING_INPUT.saturating_sub(link.sender.unacked()) {
+                link.input_failed = true;
+                return;
+            }
+            let now = Instant::now();
+            link.input_progress.get_or_insert(now);
             link.sender.push(event);
-            link.flush(Instant::now());
+            link.flush(now);
         }
     }
 
@@ -674,10 +1539,10 @@ impl Input {
 
     fn set_pad(&self, slot: u8, pad: Option<(PadKind, PadState)>) {
         let mut link = self.inner.link.lock();
+        if let Some(p) = self.inner.pending_pads.lock().get_mut(slot as usize) {
+            *p = pad;
+        }
         let Some(link) = link.as_mut() else {
-            if let Some(p) = self.inner.pending_pads.lock().get_mut(slot as usize) {
-                *p = pad;
-            }
             return;
         };
         if slot >= self.pad_slots() {
@@ -699,7 +1564,26 @@ impl Session {
         events: Sender<Event>,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Self {
+        Self::start_with_relay(
+            server,
+            settings,
+            frames,
+            events,
+            wake,
+            relay_config(&control::RelaySettings::default()),
+        )
+    }
+
+    pub fn start_with_relay(
+        server: Server,
+        settings: Settings,
+        frames: Arc<FrameSlot>,
+        events: Sender<Event>,
+        wake: impl Fn() + Send + Sync + 'static,
+        relay: Option<latch_relay::ClientConfig>,
+    ) -> Self {
         let inner = Arc::new(Inner::new(events, frames, Box::new(wake)));
+        *inner.configured_relay.lock() = relay;
         let worker = inner.clone();
         let spawned = std::thread::Builder::new()
             .name("stream".into())
@@ -742,12 +1626,10 @@ impl Session {
 
     /// Tell the host whether to draw the cursor into its video stream.
     pub fn draw_cursor(&self, draw: bool) {
-        if let Some(w) = self.inner.control_writer.lock().as_mut() {
-            let _ = control::write_message(
-                w,
-                &Message::DrawCursor(latch_proto::control::DrawCursor { draw }),
-            );
-        }
+        let _ = send_control(
+            &self.inner,
+            &Message::DrawCursor(latch_proto::control::DrawCursor { draw }),
+        );
     }
 
     /// Ends the session; returns at once. [`Session::finished`] says when
@@ -758,6 +1640,10 @@ impl Session {
             let _ = tcp.shutdown(Shutdown::Both);
         }
         self.inner.queue_cv.notify_all();
+    }
+
+    pub fn relay_active(&self) -> bool {
+        self.inner.relay.lock().active()
     }
 
     pub fn stats(&self) -> Stats {
@@ -900,6 +1786,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         })
         .collect();
     let request = StreamRequest {
+        relay: inner.configured_relay.lock().is_some(),
         prefer_color: settings.prefer_color,
         color: settings.color,
         protocol: latch_proto::PROTOCOL,
@@ -940,7 +1827,11 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         Ok(Ok(tcp)) => tcp,
         Ok(Err(reply)) => {
             return fail(
-                "starting",
+                if matches!(reply.status, 408 | 429 | 500..=599) {
+                    "connecting"
+                } else {
+                    "starting"
+                },
                 if reply.status == 404 {
                     "the host runs a Latch older than 5.0 and needs updating".into()
                 } else {
@@ -970,11 +1861,24 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         Ok(other) => return fail("starting", format!("the host said {other:?} first")),
         Err(e) => {
             return fail(
-                "starting",
+                if e.kind() == std::io::ErrorKind::InvalidData {
+                    "starting"
+                } else {
+                    "connecting"
+                },
                 format!("the host did not start the stream: {e}"),
             )
         }
     };
+    *inner.relay.lock() = Arc::new(RelayRoute::new(
+        accept.session,
+        latch_relay::Role::Viewer,
+        accept
+            .relay
+            .then(|| inner.configured_relay.lock().clone())
+            .flatten(),
+    ));
+    inner.relay_messages.lock().clear();
     inner
         .cursor_supported
         .store(accept.cursor, Ordering::Release);
@@ -1003,7 +1907,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         || (accept.color.bit_depth == 10 && !settings.color.ten_bit)
         || (accept.color.is_hdr() && (!settings.color.hdr || settings.color.peak_nits == 0))
     {
-        return fail("connecting", "host selected unoffered colour format".into());
+        return fail("starting", "host selected unoffered colour format".into());
     }
     let decoder =
         match video::new_decoder_for_color(accept.codec, accept.width, accept.height, accept.color)
@@ -1057,16 +1961,16 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         let mut link = Link {
             udp: send_udp,
             host: media,
+            relay: inner.relay.lock().clone(),
             sender: InputSender::new(accept.session),
+            input_progress: None,
+            input_failed: false,
             pads: PadSender::new(accept.session),
             buf: Vec::with_capacity(latch_proto::MAX_DATAGRAM),
         };
         let taken = inner.pad_slots.load(Ordering::Acquire);
         let mut guard = inner.link.lock();
-        let pending = std::mem::replace(
-            &mut *inner.pending_pads.lock(),
-            [None; latch_proto::gamepad::MAX_PADS],
-        );
+        let pending = *inner.pending_pads.lock();
         for (slot, pad) in pending.into_iter().enumerate() {
             if let Some((kind, state)) = pad.filter(|_| (slot as u32) < taken) {
                 link.pads.update(slot as u8, kind, state);
@@ -1077,8 +1981,14 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
     }
     if settings.mic {
         let started = match (&accept.mic, udp.try_clone()) {
-            (Some(format), Ok(udp)) => crate::mic::Mic::start(format, accept.session, udp, media)
-                .map_err(|e| format!("{e:#}")),
+            (Some(format), Ok(udp)) => crate::mic::Mic::start_routed(
+                format,
+                accept.session,
+                udp,
+                media,
+                inner.relay.lock().clone(),
+            )
+            .map_err(|e| format!("{e:#}")),
             (Some(_), Err(e)) => Err(e.to_string()),
             (None, _) if accept.mic_problem.is_empty() => {
                 Err("the host does not take a microphone".into())
@@ -1107,6 +2017,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
     };
     let outcome = control_loop(inner, &mut tcp, &accept);
     inner.mic.lock().take();
+    inner.relay.lock().shutdown();
     inner.attempt_over.store(true, Ordering::Release);
     inner.connected.store(false, Ordering::Release);
     inner.queue_cv.notify_all();
@@ -1129,10 +2040,8 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         }
     }
     *inner.link.lock() = None;
-    match outcome {
-        Outcome::Stopped => {}
-        Outcome::Failed(stage, message) => inner.emit(Event::Failed { stage, message }),
-        Outcome::Ended(code, message) => inner.emit(Event::Terminated { code, message }),
+    if let Some(event) = outcome.event() {
+        inner.emit(event);
     }
 }
 
@@ -1175,16 +2084,51 @@ enum Outcome {
     Ended(i32, String),
 }
 
+impl Outcome {
+    fn event(self) -> Option<Event> {
+        match self {
+            Self::Stopped => None,
+            Self::Failed(stage, message) => Some(Event::Failed { stage, message }),
+            Self::Ended(code, message) => Some(Event::Terminated { code, message }),
+        }
+    }
+}
+
 /// The control connection: keepalives and reports out, notices and the end
 /// in; and the clock that gives up on a silent host.
 fn send_control(inner: &Inner, message: &Message) -> bool {
+    let relay = inner.relay.lock().clone();
+    match relay.send_control(message) {
+        Ok(true) => return true,
+        Err(_) => {
+            relay.fail();
+            return false;
+        }
+        Ok(false) => {}
+    }
+    send_tcp(inner, message)
+}
+fn send_tcp(inner: &Inner, message: &Message) -> bool {
     inner.control_writer.lock().as_mut().is_some_and(|writer| {
         control::write_message(writer, message).is_ok() && writer.flush().is_ok()
     })
 }
 
+fn relay_bandwidth_limited(stats: &Stats) -> bool {
+    // FEC can conceal every missing frame while a UDP policer still forces
+    // poor picture quality. Compare useful video with the encoder's reduced
+    // target: a quiet desktop must not allocate a relay just for being small.
+    stats.requested_bitrate_kbps >= 4000
+        && stats.wire_budget_kbps > 0
+        && stats.wire_budget_kbps.saturating_mul(5) < stats.requested_bitrate_kbps.saturating_mul(3)
+        && stats.applied_bitrate_kbps > 0
+        && stats.received_fps > 0.0
+        && stats.mbps.is_finite()
+        && stats.mbps * 1000.0 >= stats.applied_bitrate_kbps as f32 * 0.75
+}
+
 fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Outcome {
-    let (messages, inbox) = mpsc::channel();
+    let (messages, inbox) = mpsc::sync_channel(128);
     if let Ok(mut reader) = tcp.try_clone() {
         let _ = reader.set_read_timeout(None);
         let _ = std::thread::Builder::new()
@@ -1203,6 +2147,8 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
     let accepted = Instant::now();
     let mut last_report = Instant::now();
     let mut last_keepalive = Instant::now();
+    let mut damage_since: Option<Instant> = None;
+    let mut bandwidth_since: Option<Instant> = None;
     loop {
         if inner.stopping() {
             if let Some(w) = inner.control_writer.lock().as_mut() {
@@ -1217,14 +2163,38 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
             *inner.control_writer.lock() = None;
             return Outcome::Stopped;
         }
-        match inbox.recv_timeout(Duration::from_millis(25)) {
+        let incoming = match inbox.try_recv() {
+            Ok(message) => Ok(message),
+            Err(mpsc::TryRecvError::Disconnected) => Err(mpsc::RecvTimeoutError::Disconnected),
+            Err(mpsc::TryRecvError::Empty) => {
+                let message = inner.relay_messages.lock().pop_front();
+                message
+                    .and_then(|(revision, message)| {
+                        (revision == inner.relay.lock().revision()).then_some(message)
+                    })
+                    .map(Ok)
+                    .unwrap_or_else(|| inbox.recv_timeout(Duration::from_millis(5)))
+            }
+        };
+        match incoming {
+            Ok(Message::Relay(message)) if accept.relay => {
+                if !inner
+                    .relay
+                    .lock()
+                    .handle(message, |message| send_tcp(inner, message))
+                {
+                    return Outcome::Ended(-1, "The authorized control connection broke.".into());
+                }
+            }
             Ok(Message::End(e)) => {
                 let message = if e.message.is_empty() {
                     "The host ended the stream.".to_string()
                 } else {
                     e.message
                 };
-                return if inner.connected.load(Ordering::Acquire) {
+                return if inner.connected.load(Ordering::Acquire)
+                    || e.code == control::end::TRANSPORT_FAILED
+                {
                     Outcome::Ended(e.code as i32, message)
                 } else {
                     Outcome::Failed("starting".into(), message)
@@ -1279,25 +2249,89 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 return if inner.connected.load(Ordering::Acquire) {
                     Outcome::Ended(-1, "The connection to the host closed.".into())
                 } else {
-                    Outcome::Failed("starting".into(), "the host closed the connection".into())
+                    Outcome::Failed("connecting".into(), "the host closed the connection".into())
                 };
             }
         }
         let now = Instant::now();
+        let published = inner.published_us.load(Ordering::Relaxed);
+        let missing = if published == 0 {
+            accepted.elapsed() >= Duration::from_secs(1)
+        } else {
+            inner.now_us().saturating_sub(published) >= 1_000_000
+        };
+        let report = inner.feedback.lock().clone();
+        if report.frames_lost > 0 || report.unrecovered_loss_pct.unwrap_or(0.0) > 1.0 {
+            damage_since.get_or_insert(now);
+        } else if report.fps > 0.0 {
+            damage_since = None;
+        }
+        let damaged = damage_since.is_some_and(|since| since.elapsed() >= Duration::from_secs(2));
+        if !inner.relay.lock().active() && relay_bandwidth_limited(&inner.stats.lock()) {
+            bandwidth_since.get_or_insert(now);
+        } else {
+            bandwidth_since = None;
+        }
+        let limited =
+            bandwidth_since.is_some_and(|since| since.elapsed() >= Duration::from_secs(5));
+        if !inner
+            .relay
+            .lock()
+            .maintain(missing || damaged || limited, |message| {
+                send_tcp(inner, message)
+            })
+        {
+            return Outcome::Ended(
+                control::end::TRANSPORT_FAILED as i32,
+                "The stream transport failed. Reconnecting…".into(),
+            );
+        }
         if now - last_keepalive >= KEEPALIVE {
             last_keepalive = now;
-            if !send_control(inner, &Message::Keepalive) && !inner.stopping() {
-                return Outcome::Ended(-1, "The connection to the host broke.".into());
+            if (!send_control(inner, &Message::Keepalive) || !send_tcp(inner, &Message::Keepalive))
+                && !inner.stopping()
+            {
+                return Outcome::Ended(
+                    control::end::TRANSPORT_FAILED as i32,
+                    "The connection to the host broke.".into(),
+                );
             }
         }
         if now - last_report >= REPORT_EVERY {
             last_report = now;
             let report = inner.feedback.lock().clone();
             if !send_control(inner, &Message::Report(report)) && !inner.stopping() {
-                return Outcome::Ended(-1, "The connection to the host broke.".into());
+                return Outcome::Ended(
+                    control::end::TRANSPORT_FAILED as i32,
+                    "The connection to the host broke.".into(),
+                );
             }
         }
+        {
+            let mut link = inner.link.lock();
+            if let Some(link) = link.as_mut() {
+                if link.input_failed
+                    || link.input_progress.is_some_and(|since| {
+                        now.saturating_duration_since(since) >= INPUT_ACK_TIMEOUT
+                    })
+                {
+                    link.input_failed = true;
+                    return Outcome::Ended(-1, "The PC stopped acknowledging input. Reconnecting to release held keys and buttons.".into());
+                }
+            }
+        }
+        let health = inner.video_health.lock();
+        if health.stalled(now) {
+            return Outcome::Ended(-1, health.stall_message().into());
+        }
+        drop(health);
         if !inner.connected.load(Ordering::Acquire) && accepted.elapsed() >= MEDIA_TIMEOUT {
+            if inner.video_health.lock().last_encoded.is_some() {
+                return Outcome::Failed(
+                    "decoding".into(),
+                    "The host is sending complete video frames, but this machine has not decoded a picture. Try H.264 or restart the stream.".into(),
+                );
+            }
             return Outcome::Failed(
                 "connecting".into(),
                 format!(
@@ -1316,6 +2350,28 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 "The host stopped answering.".into(),
             );
         }
+    }
+}
+
+fn receive_relay_control(inner: &Inner, revision: u64, bytes: &[u8]) {
+    let relay = inner.relay.lock().clone();
+    let mut source = bytes;
+    match control::read_message(&mut source) {
+        Ok(
+            message @ (Message::Report(_)
+            | Message::Keepalive
+            | Message::Notice(_)
+            | Message::Cursor(_)
+            | Message::End(_)),
+        ) if source.is_empty() => {
+            let mut messages = inner.relay_messages.lock();
+            if messages.len() >= 128 {
+                relay.fail();
+            } else {
+                messages.push_back((revision, message));
+            }
+        }
+        _ => relay.fail(),
     }
 }
 
@@ -1381,8 +2437,96 @@ fn receive(
     let mut good_windows = 0u32;
     // The socket ran dry on the last pass, after which everything that had
     // arrived was handled: wait for the next datagram or timer.
+    let relay = inner.relay.lock().clone();
+    let mut route_revision = relay.revision();
+    let mut relay_frames = 0u64;
+    let mut relay_report_frames = 0u64;
+    let mut last_relay_frame = None;
     let mut drained = false;
     while !inner.stopping() {
+        if route_revision != relay.revision() {
+            route_revision = relay.revision();
+            reassembler = Reassembler::new(session);
+            rtt = RttEstimator::new();
+            keyframes = KeyframeRequests::new();
+            recovery = accept.reference_invalidation.then(Recovery::new);
+            window_base = reassembler.stats();
+            report_base = window_base;
+            throughput = Throughput::default();
+            relay_report_frames = relay_frames;
+            last_relay_frame = None;
+            if let Some(link) = inner.link.lock().as_mut() {
+                for (slot, pad) in inner.pending_pads.lock().iter().enumerate() {
+                    if let Some((kind, state)) = pad.filter(|_| slot < accept.gamepads as usize) {
+                        // A fallback unplugs the host's devices. Advance the
+                        // snapshot sequence so even a stationary pad plugs in
+                        // again, without accepting an old route's ACK.
+                        link.pads.remove(slot as u8);
+                        link.pads.update(slot as u8, kind, state);
+                    }
+                }
+                link.flush(Instant::now());
+            }
+            let mut queue = inner.queue.lock();
+            queue.frames.clear();
+            queue.route_revision = route_revision;
+            queue.want_keyframe = true;
+        }
+        for _ in 0..64 {
+            match relay.poll() {
+                Some((revision, latch_relay::Event::Frame(frame))) => {
+                    if revision != relay.revision() {
+                        continue;
+                    }
+                    inner.heard();
+                    media_seen = true;
+                    throughput.received += frame.data.len() as u64;
+                    throughput.feedback_received += frame.data.len() as u64;
+                    relay_frames += 1;
+                    last_relay_frame = Some(frame.frame);
+                    deliver_frame(
+                        inner,
+                        frame,
+                        &mut throughput,
+                        &mut arrivals,
+                        &mut losses,
+                        Instant::now(),
+                    );
+                }
+                Some((revision, latch_relay::Event::Datagram(bytes))) => {
+                    if revision != relay.revision() {
+                        continue;
+                    }
+                    if let Ok(datagram) = wire::parse(&bytes) {
+                        if datagram.session() == session {
+                            inner.heard();
+                            handle(
+                                inner,
+                                &datagram,
+                                &udp,
+                                host,
+                                &mut out,
+                                &mut reassembler,
+                                &mut audio_rx,
+                                &mut feedback,
+                                &mut rtt,
+                                &mut media_seen,
+                                &mut throughput,
+                                bytes.len(),
+                            );
+                        }
+                    }
+                }
+                Some((revision, latch_relay::Event::Control(bytes))) => {
+                    if revision != relay.revision() {
+                        continue;
+                    }
+                    receive_relay_control(inner, revision, &bytes);
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
         if drained {
             let now = Instant::now();
             let deadline = reassembler
@@ -1394,7 +2538,7 @@ fn receive(
                 .unwrap_or(now + Duration::from_millis(20));
             let wait = deadline
                 .saturating_duration_since(now)
-                .min(Duration::from_millis(20));
+                .min(Duration::from_millis(if relay.active() { 2 } else { 20 }));
             let _ = poll.poll(&mut events, Some(wait));
             drained = false;
         }
@@ -1407,7 +2551,7 @@ fn receive(
         }
         if media_seen && now - last_ping >= PING_EVERY {
             wire::write_ping(&mut out, session, inner.now_us());
-            let _ = udp.send_to(&out, host);
+            let _ = routed_datagram(&relay, &udp, &out, host);
             last_ping = now;
         }
         if let Some(link) = inner.link.lock().as_mut() {
@@ -1418,6 +2562,14 @@ fn receive(
             if from.ip() == host.ip() {
                 if let Ok(datagram) = wire::parse(bytes) {
                     if datagram.session() == session {
+                        if relay.active() {
+                            relay.observe_udp_probe(&datagram, Instant::now());
+                            if let Datagram::Ping { time, .. } = datagram {
+                                wire::write_pong(&mut out, session, time);
+                                let _ = udp.send_to(&out, host);
+                            }
+                            return;
+                        }
                         if matches!(datagram, Datagram::Video { .. })
                             && test_loss.as_mut().is_some_and(TestLoss::drops)
                         {
@@ -1466,6 +2618,14 @@ fn receive(
                 Ok((n, from)) if from.ip() == host.ip() => {
                     if let Ok(datagram) = wire::parse(&buf[..n]) {
                         if datagram.session() == session {
+                            if relay.active() {
+                                relay.observe_udp_probe(&datagram, Instant::now());
+                                if let Datagram::Ping { time, .. } = datagram {
+                                    wire::write_pong(&mut out, session, time);
+                                    let _ = udp.send_to(&out, host);
+                                }
+                                continue;
+                            }
                             if let (Datagram::RecoveryAck { ack, .. }, Some(r)) =
                                 (&datagram, recovery.as_mut())
                             {
@@ -1510,6 +2670,9 @@ fn receive(
                 }
             }
         }
+        if route_revision != relay.revision() {
+            continue;
+        }
         hand_off_video(
             inner,
             &mut reassembler,
@@ -1520,7 +2683,7 @@ fn receive(
             now,
         );
         let lost = reassembler.waiting_for_keyframe();
-        if let Some(r) = recovery.as_mut() {
+        if let Some(r) = recovery.as_mut().filter(|_| !relay.active()) {
             if let Some(request) = r.due(
                 lost,
                 reassembler.last_delivered(),
@@ -1530,12 +2693,13 @@ fn receive(
                 rtt.srtt(),
             ) {
                 wire::write_recovery_request(&mut out, session, &request);
-                let _ = udp.send_to(&out, host);
+                let _ = routed_datagram(&relay, &udp, &out, host);
             }
         }
         // With recovery frames, a loss asks for a keyframe only once the
         // host could not recover it.
-        let waiting = (reassembler.needs_keyframe(accepted, now)
+        let waiting = (!relay.active()
+            && reassembler.needs_keyframe(accepted, now)
             && recovery
                 .as_ref()
                 .is_none_or(|r| r.wants_keyframe() || reassembler.last_delivered().is_none()))
@@ -1544,16 +2708,24 @@ fn receive(
             wire::write_keyframe_request(
                 &mut out,
                 session,
-                reassembler.last_delivered().unwrap_or(0),
+                if relay.active() {
+                    last_relay_frame.unwrap_or(0)
+                } else {
+                    reassembler.last_delivered().unwrap_or(0)
+                },
             );
-            let _ = udp.send_to(&out, host);
+            let _ = routed_datagram(&relay, &udp, &out, host);
         }
         if now - report_start >= REPORT_EVERY {
             let stats = reassembler.stats();
             let (loss, _, raw_loss) = loss_in_window(&report_base, &stats);
             let secs = (now - report_start).as_secs_f32();
             *inner.feedback.lock() = Report {
-                fps: (stats.frames_delivered - report_base.frames_delivered) as f32 / secs,
+                fps: if relay.active() {
+                    (relay_frames - relay_report_frames) as f32 / secs
+                } else {
+                    (stats.frames_delivered - report_base.frames_delivered) as f32 / secs
+                },
                 loss_pct: raw_loss,
                 decode_ms: inner.stats.lock().decode_ms,
                 rtt_ms: rtt.srtt().map_or(0.0, |d| d.as_secs_f32() * 1000.0),
@@ -1565,10 +2737,17 @@ fn receive(
                 loss_burst_packets: reassembler.take_loss_burst(),
                 probe_kbps: throughput.probes.take_kbps(now),
                 window_ms: (secs * 1000.0) as u32,
+                queue_ms: inner
+                    .queue
+                    .lock()
+                    .frames
+                    .front()
+                    .map_or(0.0, |(_, at)| at.elapsed().as_secs_f32() * 1000.0),
                 ..Default::default()
             };
             report_start = now;
             report_base = stats;
+            relay_report_frames = relay_frames;
         }
         if now - window_start >= STATS_EVERY {
             let stats = reassembler.stats();
@@ -1653,27 +2832,7 @@ fn hand_off_video(
     while let Some(event) = reassembler.poll(now) {
         match event {
             Reassembled::Frame(frame) => {
-                losses.delivered(&inner.recovery, &frame, now);
-                throughput.frame(&frame);
-                arrivals.frame(now);
-                let max_age =
-                    decode_max_age((1000.0 / inner.stats.lock().frame_budget_ms.max(1.0)) as u32);
-                let mut q = inner.queue.lock();
-                if q.frames.len() >= DECODE_QUEUE
-                    || q.frames
-                        .front()
-                        .is_some_and(|(_, at)| now.saturating_duration_since(*at) >= max_age)
-                {
-                    tracing::warn!("the decoder fell behind; restarting at a keyframe");
-                    inner
-                        .dropped
-                        .fetch_add(q.frames.len() as u64, Ordering::Relaxed);
-                    q.frames.clear();
-                    q.want_keyframe = true;
-                }
-                q.frames.push_back((frame, now));
-                drop(q);
-                inner.queue_cv.notify_one();
+                deliver_frame(inner, frame, throughput, arrivals, losses, now);
             }
             Reassembled::Lost { frame } => {
                 losses.lost(now);
@@ -1681,6 +2840,59 @@ fn hand_off_video(
                 // Perhaps the keyframe asked for: ask again.
                 keyframes.lost();
             }
+        }
+    }
+}
+
+fn deliver_frame(
+    inner: &Arc<Inner>,
+    frame: InFrame,
+    throughput: &mut Throughput,
+    arrivals: &mut Arrivals,
+    losses: &mut Losses,
+    now: Instant,
+) {
+    losses.delivered(&inner.recovery, &frame, now);
+    throughput.frame(&frame);
+    arrivals.frame(now);
+    let max_age = decode_max_age((1000.0 / inner.stats.lock().frame_budget_ms.max(1.0)) as u32);
+    let mut q = inner.queue.lock();
+    if q.frames.len() >= DECODE_QUEUE
+        || q.frames
+            .front()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) >= max_age)
+    {
+        tracing::warn!("the decoder fell behind; restarting at a keyframe");
+        inner
+            .dropped
+            .fetch_add(q.frames.len() as u64, Ordering::Relaxed);
+        q.frames.clear();
+        q.want_keyframe = true;
+    }
+    inner.video_health.lock().last_encoded = Some(now);
+    if q.route_revision != inner.relay.lock().revision() {
+        return;
+    }
+    q.frames.push_back((frame, now));
+    drop(q);
+    inner.queue_cv.notify_one();
+}
+
+pub(crate) fn routed_datagram(
+    relay: &RelayRoute,
+    udp: &UdpSocket,
+    bytes: &[u8],
+    host: SocketAddr,
+) -> std::io::Result<()> {
+    match relay.send_datagram(bytes) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            let _ = udp.send_to(bytes, host);
+            Ok(())
+        }
+        Err(error) => {
+            relay.fail();
+            Err(error)
         }
     }
 }
@@ -1728,7 +2940,8 @@ impl Arrivals {
 /// Media bytes in the current statistics window.
 #[derive(Default)]
 struct Throughput {
-    /// Video and audio datagrams as received.
+    /// Received media payload: UDP video/audio packets or complete relay frames.
+    /// IP, TCP and TLS framing are outside this application counter.
     received: u64,
     feedback_received: u64,
     /// Encoded video in the frames put back together.
@@ -1804,22 +3017,17 @@ fn handle(
     match datagram {
         Datagram::Hello { .. } => {}
         Datagram::Video { shard, .. } => {
-            if !*media_seen {
-                *media_seen = true;
-                let mut health = inner.video_health.lock();
-                health.connected_at = Some(now);
-                drop(health);
-                inner.connected.store(true, Ordering::Release);
-                if !inner.announced.swap(true, Ordering::AcqRel) {
-                    inner.emit(Event::Connected);
-                }
-            }
+            *media_seen = true;
             reassembler.push(shard, now);
         }
         Datagram::Audio { packet, .. } => audio_rx.push(packet, now),
         Datagram::InputAck { next, .. } => {
             if let Some(link) = inner.link.lock().as_mut() {
+                let before = link.sender.unacked();
                 link.sender.ack(*next);
+                if link.sender.unacked() < before {
+                    link.input_progress = (link.sender.unacked() > 0).then_some(now);
+                }
             }
         }
         Datagram::PadAck { acks, .. } => {
@@ -1843,12 +3051,12 @@ fn handle(
             drop(deliver);
             if !acks.is_empty() {
                 wire::write_pad_feedback_ack(out, session, &acks);
-                let _ = udp.send_to(out, from);
+                let _ = routed_datagram(&inner.relay.lock(), udp, out, from);
             }
         }
         Datagram::Ping { time, .. } => {
             wire::write_pong(out, session, *time);
-            let _ = udp.send_to(out, from);
+            let _ = routed_datagram(&inner.relay.lock(), udp, out, from);
         }
         Datagram::Pong { time, .. } => {
             let sample = inner.now_us().saturating_sub(*time);
@@ -1885,7 +3093,7 @@ fn decode(
     let max_age = decode_max_age((1000.0 / budget_ms) as u32);
     let mut load = DecodeLoad::default();
     loop {
-        let (frame, ready) = {
+        let ((frame, ready), route_revision) = {
             let mut q = inner.queue.lock();
             loop {
                 if over() {
@@ -1909,7 +3117,7 @@ fn decode(
                     if next.0.keyframe {
                         q.want_keyframe = false;
                     }
-                    break next;
+                    break (next, q.route_revision);
                 }
                 inner.queue_cv.wait_for(&mut q, Duration::from_millis(100));
             }
@@ -1920,6 +3128,9 @@ fn decode(
         if over() {
             // The session may have finished without waiting for this.
             return;
+        }
+        if inner.relay.lock().revision() != route_revision {
+            continue;
         }
         let service = start.elapsed();
         if let Some(fps) = load.sample(service, Duration::from_secs_f32(budget_ms / 1000.0)) {
@@ -1950,6 +3161,11 @@ fn decode(
         }
         match decoded {
             Ok(Some(mut picture)) => {
+                // Serialize publication with the TCP owner's route commit.
+                let route = inner.relay.lock();
+                if route.revision() != route_revision {
+                    continue;
+                }
                 if picture.color.bit_depth != color.bit_depth {
                     // Pictures at another depth would be drawn wrongly;
                     // the stream starts again without this codec.
@@ -1985,7 +3201,15 @@ fn decode(
                     .published_us
                     .store(inner.now_us().max(1), Ordering::Relaxed);
                 (inner.wake)();
-                inner.video_health.lock().frame(decoded, black);
+                {
+                    let mut health = inner.video_health.lock();
+                    health.connected_at.get_or_insert(decoded);
+                    health.frame(decoded, black);
+                }
+                inner.connected.store(true, Ordering::Release);
+                if !inner.announced.swap(true, Ordering::AcqRel) {
+                    inner.emit(Event::Connected);
+                }
                 let mut w = inner.decode.lock();
                 w.frames += 1;
                 w.decode_us += (decoded - start).as_micros() as u64;
@@ -2019,6 +3243,567 @@ fn receive_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ViewerRelay {
+        inner: Arc<Inner>,
+        events: mpsc::Receiver<Event>,
+        tcp: TcpStream,
+        _control_peer: TcpStream,
+        peer: latch_relay::Transport,
+        cancel: latch_relay::Cancel,
+        daemon: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+        quota: std::path::PathBuf,
+    }
+
+    impl ViewerRelay {
+        fn new() -> Self {
+            use latch_relay::daemon::{Daemon, DaemonConfig};
+            use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+
+            let quota = std::env::temp_dir().join(format!(
+                "latch-viewer-failure-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            let mut config = DaemonConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                vec![CertificateDer::from_pem_slice(include_bytes!(
+                    "../../relay/tests/certs/server.pem"
+                ))
+                .unwrap()],
+                PrivateKeyDer::from_pem_slice(include_bytes!(
+                    "../../relay/tests/certs/server-key.pem"
+                ))
+                .unwrap(),
+                quota.clone(),
+                32 * 1024 * 1024,
+            )
+            .unwrap();
+            config.initialize_quota = true;
+            let daemon = Daemon::bind(config).unwrap();
+            let endpoint =
+                latch_relay::Endpoint::new("localhost", daemon.local_addr().unwrap().port())
+                    .unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots
+                .add(
+                    CertificateDer::from_pem_slice(include_bytes!(
+                        "../../relay/tests/certs/ca.pem"
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+            let mut config = latch_relay::ClientConfig::with_roots(endpoint, roots).unwrap();
+            config.limits.priority_queue_bytes = 1280;
+            let cancel = latch_relay::Cancel::new();
+            let run_cancel = cancel.clone();
+            let worker = std::thread::spawn(move || daemon.run(&run_cancel));
+            let grant = latch_relay::create_grant(&config, &cancel).unwrap();
+            let keys = latch_relay::SessionKeys::generate().unwrap();
+            let peer =
+                latch_relay::Transport::connect(config.clone(), grant.host, keys.clone()).unwrap();
+            let viewer =
+                Arc::new(latch_relay::Transport::connect(config, grant.viewer, keys).unwrap());
+            for transport in [&peer, viewer.as_ref()] {
+                assert!(matches!(
+                    transport.recv_timeout(Duration::from_secs(5)),
+                    Some(latch_relay::Event::Ready)
+                ));
+            }
+            let (tx, events) = mpsc::channel();
+            let inner = Arc::new(Inner::new(
+                tx,
+                Arc::new(FrameSlot::default()),
+                Box::new(|| {}),
+            ));
+            let route = Arc::new(RelayRoute::new(7, latch_relay::Role::Viewer, None));
+            route.state.lock().transport = Some(viewer);
+            route.activate(&mut route.state.lock());
+            *inner.relay.lock() = route;
+            // Start at the established-session boundary, after first publication.
+            inner.connected.store(true, Ordering::Release);
+            inner.announced.store(true, Ordering::Release);
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (control_peer, _) = listener.accept().unwrap();
+            *inner.control_writer.lock() = Some(tcp.try_clone().unwrap());
+            *inner.tcp.lock() = Some(tcp.try_clone().unwrap());
+            Self {
+                inner,
+                events,
+                tcp,
+                _control_peer: control_peer,
+                peer,
+                cancel,
+                daemon: Some(worker),
+                quota,
+            }
+        }
+    }
+
+    impl Drop for ViewerRelay {
+        fn drop(&mut self) {
+            let _ = self.tcp.shutdown(Shutdown::Both);
+            self.inner.relay.lock().shutdown();
+            self.peer.shutdown();
+            self.cancel.cancel();
+            let _ = self.daemon.take().unwrap().join();
+            let _ = std::fs::remove_file(&self.quota);
+        }
+    }
+
+    #[test]
+    fn viewer_relay_backpressure_retries_unless_stopped_or_renegotiating() {
+        let accept: Accept = serde_json::from_value(serde_json::json!({
+            "session": 7, "token": "00000000000000000000000000000000",
+            "codec": "h264-baseline", "width": 64, "height": 64, "fps": 30,
+            "bitrate_kbps": 2000, "encoder": "test", "audio": null, "relay": true
+        }))
+        .unwrap();
+        for inbox_overflow in [false, true] {
+            for action in ["recover", "stop", "codec fallback"] {
+                let mut viewer = ViewerRelay::new();
+                let route = viewer.inner.relay.lock().clone();
+                if inbox_overflow {
+                    let mut bytes = Vec::new();
+                    control::write_message(&mut bytes, &Message::Keepalive).unwrap();
+                    for _ in 0..=128 {
+                        receive_relay_control(&viewer.inner, route.revision(), &bytes);
+                    }
+                    assert_eq!(viewer.inner.relay_messages.lock().len(), 128);
+                } else {
+                    // A single record exceeds this fixture's queue, so the
+                    // actual TLS writer cannot race away the capacity failure.
+                    let message = Message::Notice(control::Notice {
+                        kind: "video".into(),
+                        message: "x".repeat(2000),
+                    });
+                    assert!(!send_control(&viewer.inner, &message));
+                }
+                match action {
+                    "stop" => Session {
+                        inner: viewer.inner.clone(),
+                    }
+                    .stop(),
+                    "codec fallback" => {
+                        *viewer.inner.renegotiate.lock() = Some((
+                            Codec::Hevc,
+                            "test decoder failure".into(),
+                            video::FailureKind::Decode,
+                        ));
+                        viewer.inner.attempt_over.store(true, Ordering::Release);
+                    }
+                    _ => {}
+                }
+                let started = Instant::now();
+                let outcome = control_loop(&viewer.inner, &mut viewer.tcp, &accept);
+                if let Some(event) = outcome.event() {
+                    viewer.inner.emit(event);
+                }
+                assert!(started.elapsed() < Duration::from_secs(1));
+                if action == "recover" {
+                    assert!(
+                        matches!(
+                            viewer.events.try_recv(),
+                            Ok(Event::Terminated { code, .. })
+                                if code == control::end::TRANSPORT_FAILED as i32
+                        ),
+                        "inbox overflow: {inbox_overflow}"
+                    );
+                } else {
+                    assert!(viewer.events.try_recv().is_err(), "{action}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn host_transport_failure_before_publication_remains_retryable() {
+        let accept: Accept = serde_json::from_value(serde_json::json!({
+            "session": 7, "token": "00000000000000000000000000000000",
+            "codec": "h264-baseline", "width": 64, "height": 64, "fps": 30,
+            "bitrate_kbps": 2000, "encoder": "test", "audio": null, "relay": true
+        }))
+        .unwrap();
+        for code in [
+            control::end::TRANSPORT_FAILED,
+            control::end::ENDED,
+            control::end::TAKEN_OVER,
+            control::end::HOST_STOPPING,
+            control::end::ENCODER_FAILED,
+        ] {
+            let (tx, _events) = mpsc::channel();
+            let inner = Arc::new(Inner::new(
+                tx,
+                Arc::new(FrameSlot::default()),
+                Box::new(|| {}),
+            ));
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut host, _) = listener.accept().unwrap();
+            control::write_message(
+                &mut host,
+                &Message::End(control::End {
+                    code,
+                    message: "before the first frame".into(),
+                }),
+            )
+            .unwrap();
+            assert!(!inner.connected.load(Ordering::Acquire));
+            let event = control_loop(&inner, &mut tcp, &accept).event();
+            let _ = tcp.shutdown(Shutdown::Both);
+            if code == control::end::TRANSPORT_FAILED {
+                assert!(
+                    matches!(event, Some(Event::Terminated { code: actual, .. }) if actual == code as i32)
+                );
+            } else {
+                assert!(
+                    matches!(event, Some(Event::Failed { ref stage, .. }) if stage == "starting")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_and_cursor_controls_always_keep_original_ordered_connection() {
+        let route = RelayRoute::new(7, latch_relay::Role::Host, None);
+        route.activate(&mut route.state.lock());
+        for message in [
+            Message::End(control::End {
+                code: control::end::HOST_STOPPING,
+                message: "stop".into(),
+            }),
+            Message::Cursor(control::Cursor {
+                visible: true,
+                shape: None,
+            }),
+        ] {
+            assert!(!route.send_control(&message).unwrap());
+        }
+    }
+
+    #[test]
+    fn relay_close_before_direct_ready_is_a_healthy_handoff() {
+        use control::{RelayAction as A, RelayControl};
+        let host = RelayRoute::new(7, latch_relay::Role::Host, None);
+        {
+            let mut state = host.state.lock();
+            state.number = 1;
+            host.activate(&mut state);
+            state.returning_direct = true;
+            state.failures = 2;
+        }
+        host.failed.store(true, Ordering::Release);
+        assert!(host.maintain(false, |_| true));
+        assert!(!host.active());
+        assert_eq!(host.state.lock().failures, 0);
+        assert!(host.handle(
+            RelayControl {
+                session: 7,
+                attempt: 1,
+                action: A::DirectReady
+            },
+            |_| true
+        ));
+        assert_eq!(host.state.lock().failures, 0);
+        assert!(
+            host.state
+                .lock()
+                .retry_at
+                .saturating_duration_since(Instant::now())
+                <= Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn udp_reassessment_requires_full_capacity_and_counts_loss_and_duplicates() {
+        use control::{RelayAction as A, RelayControl};
+        for loss_pct in [0, 15, 18] {
+            let host = RelayRoute::new(7, latch_relay::Role::Host, None);
+            let viewer = RelayRoute::new(7, latch_relay::Role::Viewer, None);
+            for route in [&host, &viewer] {
+                let mut state = route.state.lock();
+                state.number = 1;
+                route.activate(&mut state);
+            }
+            let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let addr = sink.local_addr().unwrap();
+            assert!(host.reassess_udp(&udp, addr, 2000, |_| panic!("minimum dwell")));
+            host.state.lock().next_probe = Instant::now();
+            assert!(host.reassess_udp(&udp, addr, 2000, |message| {
+                let Message::Relay(message) = message else {
+                    panic!("control")
+                };
+                viewer.handle(message.clone(), |_| true)
+            }));
+            let mut bytes = Vec::new();
+            let mut state = host.state.lock();
+            let probe = state.udp_probe.as_mut().unwrap();
+            let first = probe.first;
+            let packets = probe.packets();
+            probe.sent = packets;
+            drop(state);
+            let start = viewer.state.lock().udp_probe.as_ref().unwrap().started;
+            for packet in 0..packets {
+                if packet * 37 % 100 < loss_pct {
+                    continue;
+                }
+                wire::write_probe(
+                    &mut bytes,
+                    7,
+                    first.wrapping_add((packet / 16) as u16),
+                    (packet % 16) as u8,
+                    16,
+                    latch_proto::MAX_DATAGRAM,
+                );
+                let datagram = wire::parse(&bytes).unwrap();
+                let now = start + Duration::from_secs_f64(f64::from(packet) / f64::from(packets));
+                // Duplicate traffic cannot hide the 15–18% erased positions.
+                viewer.observe_udp_probe(&datagram, now);
+                viewer.observe_udp_probe(&datagram, now);
+            }
+            viewer.state.lock().udp_probe.as_mut().unwrap().started -= UDP_PROBE_REPORT;
+            let mut messages = Vec::new();
+            assert!(viewer.maintain(false, |message| {
+                messages.push(message.clone());
+                true
+            }));
+            let Message::Relay(result) = messages.pop().unwrap() else {
+                panic!("result")
+            };
+            let mut direct = false;
+            assert!(host.handle(result, |message| {
+                direct = matches!(
+                    message,
+                    Message::Relay(RelayControl {
+                        action: A::Direct,
+                        ..
+                    })
+                );
+                true
+            }));
+            assert_eq!(direct, loss_pct == 0);
+            assert!(
+                host.active(),
+                "host waits for the direct handoff acknowledgement"
+            );
+            assert!(host.state.lock().probe_delay >= Duration::from_secs(120));
+            assert!(host.reassess_udp(&udp, addr, 2000, |_| panic!("backoff")));
+            if direct {
+                host.handle(
+                    RelayControl {
+                        session: 7,
+                        attempt: 0,
+                        action: A::DirectReady,
+                    },
+                    |_| true,
+                );
+                assert!(host.active(), "stale epoch ended relay");
+                host.failed.store(true, Ordering::Release);
+                host.handle(
+                    RelayControl {
+                        session: 7,
+                        attempt: 1,
+                        action: A::DirectReady,
+                    },
+                    |_| true,
+                );
+                assert!(!host.active());
+                assert_eq!(host.state.lock().failures, 0, "healthy handoff failed");
+                assert!(host.maintain(false, |_| panic!("consumed close reset Idle twice")));
+            }
+        }
+        let mut probe = UdpProbe::new(0, 25_000);
+        probe.sent = probe.packets();
+        assert!(probe.healthy(probe.packets(), 1_000_000));
+        for span in [0, 20_000, 2_000_000, u32::MAX] {
+            assert!(
+                !probe.healthy(probe.packets(), span),
+                "unvalidated capacity {span}"
+            );
+        }
+        assert!(!probe.healthy(probe.packets() + 1, 1_000_000));
+        probe.sent -= 1;
+        assert!(
+            !probe.healthy(probe.packets(), 1_000_000),
+            "incomplete local send"
+        );
+    }
+
+    #[test]
+    fn host_cooldown_defers_a_fresh_request_without_stranding_the_viewer() {
+        let config = relay_config(&control::RelaySettings::default()).unwrap();
+        let host = RelayRoute::new(7, latch_relay::Role::Host, Some(config.clone()));
+        let viewer = RelayRoute::new(7, latch_relay::Role::Viewer, Some(config));
+        host.state.lock().retry_at = Instant::now() + Duration::from_secs(2);
+        let mut responses = Vec::new();
+        assert!(viewer.maintain(true, |request| {
+            let Message::Relay(request) = request else {
+                panic!("request")
+            };
+            host.handle(request.clone(), |response| {
+                responses.push(response.clone());
+                true
+            })
+        }));
+        let Message::Relay(response) = responses.pop().expect("bounded deferral") else {
+            panic!("response")
+        };
+        assert!(matches!(
+            response.action,
+            control::RelayAction::RetryAfter { millis: 250..=2000 }
+        ));
+        assert!(viewer.handle(response, |_| true));
+        assert_eq!(
+            viewer.state.lock().failures,
+            0,
+            "deferral counted as failure"
+        );
+        assert!(!viewer.pending());
+        assert!(viewer.maintain(true, |_| panic!("hot retry")));
+        assert!(!host.pending());
+    }
+
+    #[test]
+    fn relay_retry_has_monotonic_attempts_cooldown_and_a_circuit_breaker() {
+        let config = relay_config(&control::RelaySettings::default()).unwrap();
+        let route = RelayRoute::new(7, latch_relay::Role::Viewer, Some(config));
+        for attempt in 1..=3 {
+            route.state.lock().retry_at = Instant::now();
+            let mut requested = None;
+            assert!(route.maintain(true, |message| {
+                if let Message::Relay(control::RelayControl {
+                    attempt,
+                    action: control::RelayAction::Request,
+                    ..
+                }) = message
+                {
+                    requested = Some(*attempt);
+                }
+                true
+            }));
+            assert_eq!(requested, Some(attempt));
+            if attempt > 1 {
+                route.handle(
+                    control::RelayControl {
+                        session: 7,
+                        attempt: attempt - 1,
+                        action: control::RelayAction::Abort,
+                    },
+                    |_| true,
+                );
+                assert!(route.pending(), "stale Abort canceled the current attempt");
+            }
+            route.failed.store(true, Ordering::Release);
+            assert!(route.maintain(false, |_| true));
+            assert!(!route.pending());
+            assert!(route.maintain(true, |_| panic!("cooldown was bypassed")));
+        }
+        assert!(
+            route
+                .state
+                .lock()
+                .retry_at
+                .saturating_duration_since(Instant::now())
+                > Duration::from_secs(29)
+        );
+        route.state.lock().retry_at = Instant::now();
+        assert!(route.maintain(false, |_| panic!(
+            "healthy UDP must cancel the need to retry"
+        )));
+        assert_eq!(route.number(), 3);
+    }
+
+    #[test]
+    fn relay_can_help_busy_rate_limited_udp_even_when_fec_repairs_every_frame() {
+        let mut stats = Stats {
+            requested_bitrate_kbps: 20_000,
+            wire_budget_kbps: 6000,
+            applied_bitrate_kbps: 4000,
+            mbps: 3.5,
+            received_fps: 60.0,
+            ..Stats::default()
+        };
+        assert!(relay_bandwidth_limited(&stats));
+        stats.mbps = 0.1;
+        assert!(!relay_bandwidth_limited(&stats), "quiet desktop");
+        stats.mbps = 3.5;
+        stats.wire_budget_kbps = 15_000;
+        assert!(!relay_bandwidth_limited(&stats), "healthy path");
+        stats.wire_budget_kbps = 0;
+        assert!(!relay_bandwidth_limited(&stats), "no host telemetry yet");
+        stats.requested_bitrate_kbps = 2000;
+        stats.wire_budget_kbps = 1000;
+        assert!(!relay_bandwidth_limited(&stats), "intentionally low rate");
+    }
+
+    #[test]
+    fn input_backlog_is_bounded_before_enqueue_and_large_text_is_rejected() {
+        let (tx, _) = mpsc::channel();
+        let inner = Arc::new(Inner::new(tx, Arc::default(), Box::new(|| {})));
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let host = udp.local_addr().unwrap();
+        *inner.link.lock() = Some(Link {
+            udp,
+            host,
+            relay: inner.relay.lock().clone(),
+            sender: InputSender::new(1),
+            input_progress: None,
+            input_failed: false,
+            pads: PadSender::new(1),
+            buf: Vec::new(),
+        });
+        inner.connected.store(true, Ordering::Release);
+        let input = Input {
+            inner: inner.clone(),
+        };
+        for _ in 0..MAX_PENDING_INPUT {
+            input.key(65, true, 0);
+        }
+        assert_eq!(
+            inner.link.lock().as_ref().unwrap().sender.unacked(),
+            MAX_PENDING_INPUT
+        );
+        input.key(65, false, 0);
+        input.release_all();
+        {
+            let mut guard = inner.link.lock();
+            let link = guard.as_mut().unwrap();
+            assert!(
+                link.input_failed,
+                "a key-up beyond the bound ends the session"
+            );
+            assert_eq!(link.sender.unacked(), MAX_PENDING_INPUT);
+            link.sender = InputSender::new(1);
+            link.input_progress = None;
+            link.input_failed = false;
+        }
+        input.text(&"🎮".repeat(MAX_PENDING_INPUT * latch_proto::input::MAX_TEXT / 4 + 1));
+        let guard = inner.link.lock();
+        let link = guard.as_ref().unwrap();
+        assert!(link.input_failed);
+        assert_eq!(
+            link.sender.unacked(),
+            0,
+            "oversized paste is rejected before splitting"
+        );
+    }
+
+    #[test]
+    fn media_deadline_tracks_pictures_even_while_complete_frames_arrive() {
+        let start = Instant::now();
+        let mut health = VideoHealth::default();
+        health.frame(start, false);
+        let before = start + MEDIA_STALL_TIMEOUT - Duration::from_millis(1);
+        health.last_encoded = Some(before);
+        assert!(!health.stalled(before));
+        assert!(health.stalled(start + MEDIA_STALL_TIMEOUT));
+        assert!(health.stall_message().contains("decoding stopped"));
+        health.frame(start + MEDIA_STALL_TIMEOUT, false);
+        assert!(!health.stalled(start + MEDIA_STALL_TIMEOUT));
+        assert!(health.stall_message().contains("including idle frames"));
+    }
 
     #[test]
     fn queue_budget_tracks_frame_interval_with_bounds() {

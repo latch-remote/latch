@@ -11,7 +11,7 @@ It is not the packet relay. The relay kit stays in `deploy/relay/`.
 ## What runs inside
 
 - Xvfb + XFCE (a virtual 1920×1080 desktop)
-- Latch 5 streaming engine (pure-Rust, in-process inside `latch-host`)
+- Latch streaming engine (pure-Rust, in-process inside `latch-host`)
 - Latch's control service on TCP 47850 and streaming on UDP 47850
 - Optional Tailscale (`TS_AUTHKEY`), with kernel networking: the compose
   file gives the container `/dev/net/tun` and `NET_ADMIN`. Latch Host
@@ -29,10 +29,15 @@ need explicit `/dev/uinput` access; Compose does not provision it.
 ## One node
 
 Install Docker Engine and its Compose plugin on a Linux host with
-`/dev/net/tun`, install Git, and clone the repository:
+`/dev/net/tun`. Download `latch-<version>-source.tar.gz` and `SHA256SUMS`
+from the public release, verify the archive's SHA-256 and extract it.
+The source archive includes this container kit and its build inputs.
+[Public releases](https://github.com/latch-remote/latch-releases/releases/latest)
+
+Developers with private repository access can also clone it.
 
 ```bash
-git clone https://github.com/MrBeldum/latch.git
+git clone https://github.com/latch-remote/latch.git
 cd latch
 ```
 

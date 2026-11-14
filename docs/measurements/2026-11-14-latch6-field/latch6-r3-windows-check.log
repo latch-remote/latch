@@ -1,0 +1,10 @@
+    Checking latch-codec v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/codec)
+    Checking latch-proto v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/proto)
+   Compiling latch-host v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/host)
+    Checking latch-relay v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/relay)
+    Checking latch-core v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/core)
+    Checking latch-stream v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/stream)
+    Checking latch-ui v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/ui)
+    Checking latch-engine v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/engine)
+    Checking latch-client v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/client)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 8.71s

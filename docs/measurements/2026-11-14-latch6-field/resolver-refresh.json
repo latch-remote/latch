@@ -1,0 +1,11 @@
+{
+  "utc": "2026-11-14T11:43:07Z",
+  "files": [
+    {
+      "path": "crates/relay/src/client.rs",
+      "bytes": 43923,
+      "sha256": "537d2dd2b3d03dbfe31afe3ea0bb2b10d745112381b7603ed73257e3e87cc5c0"
+    }
+  ],
+  "archive_sha256": "72379e326fb1c1ac41d5af596ad7194bc6c36eaaf47cfb632781fa476874b44a"
+}

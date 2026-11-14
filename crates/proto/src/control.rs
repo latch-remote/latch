@@ -99,6 +99,9 @@ impl Codec {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamRequest {
+    /// Both peers support authenticated, two-lane relay attempts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relay: bool,
     /// Rank colour before codec order; send only to hosts advertising support.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prefer_color: bool,
@@ -168,6 +171,8 @@ pub struct AudioFormat {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Accept {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relay: bool,
     #[serde(default)]
     pub color: crate::color::ColorDescription,
     pub session: u32,
@@ -219,6 +224,7 @@ pub mod end {
     pub const ENCODER_FAILED: u32 = 3;
     pub const VIEWER_SILENT: u32 = 4;
     pub const HOST_STOPPING: u32 = 5;
+    pub const TRANSPORT_FAILED: u32 = 6;
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -318,8 +324,96 @@ pub struct DrawCursor {
     pub draw: bool,
 }
 
+/// Change this single default when the production relay is provisioned.
+pub const DEFAULT_RELAY_HOST: &str = "relay.latch.rune.foo";
+
+/// Local policy. A peer cannot supply an endpoint outside this configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RelaySettings {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+}
+impl Default for RelaySettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            host: DEFAULT_RELAY_HOST.into(),
+            port: 443,
+        }
+    }
+}
+
+/// Opaque relay-owned DTO, bounded before deserialization and redacted in logs.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct RelayPayload(String);
+impl RelayPayload {
+    pub fn new(payload: String) -> std::io::Result<Self> {
+        if payload.len() > 8192 || payload.is_empty() {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        Ok(Self(payload))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl TryFrom<String> for RelayPayload {
+    type Error = std::io::Error;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+impl From<RelayPayload> for String {
+    fn from(value: RelayPayload) -> String {
+        value.0
+    }
+}
+impl std::fmt::Debug for RelayPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayControl {
+    pub session: u32,
+    pub attempt: u64,
+    pub action: RelayAction,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelayAction {
+    Request,
+    Offer(RelayPayload),
+    Ready,
+    Commit,
+    Committed,
+    /// One second of full-size UDP padding at the candidate wire rate.
+    UdpProbe {
+        first: u16,
+        kbps: u32,
+    },
+    UdpProbeResult {
+        first: u16,
+        received: u32,
+        span_us: u32,
+    },
+    Direct,
+    DirectReady,
+    /// The authority's retry clock can lag the viewer's after a transition.
+    RetryAfter {
+        millis: u32,
+    },
+    /// The authority is replacing a finite grant before its budget runs out.
+    Renew,
+    Abort,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
+    Relay(RelayControl),
     Accept(Accept),
     End(End),
     Keepalive,
@@ -334,6 +428,7 @@ pub enum Message {
 /// Writes one message (`u32 length | u8 type | JSON`).
 pub fn write_message(w: &mut impl Write, message: &Message) -> std::io::Result<()> {
     let (kind, payload) = match message {
+        Message::Relay(v) => (8, serde_json::to_vec(v)),
         Message::Accept(v) => (1, serde_json::to_vec(v)),
         Message::End(v) => (2, serde_json::to_vec(v)),
         Message::Keepalive => (3, Ok(b"{}".to_vec())),
@@ -376,6 +471,7 @@ pub fn read_message(r: &mut impl Read) -> std::io::Result<Message> {
         5 => Message::Report(serde_json::from_slice(&bytes[1..]).map_err(invalid)?),
         6 => Message::Cursor(serde_json::from_slice(&bytes[1..]).map_err(invalid)?),
         7 => Message::DrawCursor(serde_json::from_slice(&bytes[1..]).map_err(invalid)?),
+        8 => Message::Relay(serde_json::from_slice(&bytes[1..]).map_err(invalid)?),
         t => Message::Unknown(t),
     })
 }

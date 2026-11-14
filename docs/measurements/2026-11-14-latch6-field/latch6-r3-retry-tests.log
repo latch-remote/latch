@@ -1,0 +1,17 @@
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.42s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (/Users/daniel/Desktop/T3_Projects/latch/target/debug/deps/latch_client-eae8832f56b3372a)
+
+running 8 tests
+test stream::tests::reconnect_state_takeover_does_not_retry ... ok
+test app::live_snapshot::initial_worker_outage_retains_retry_intent_and_stop_cancels ... ok
+test app::snapshots::a_failure_offers_a_retry_and_a_lighter_profile_only_for_stream_failures ... ok
+test app::live_snapshot::review_retry_flow_ignores_old_events_and_counts_worker_failures_once ... ok
+test app::live_snapshot::initial_worker_refusals_do_not_retry ... ok
+test app::live_snapshot::transport_end_before_first_picture_retains_initial_and_inflight_retry ... ok
+test app::live_snapshot::initial_stream_connection_failures_retry_without_a_frame ... ok
+test app::live_snapshot::review_session_end_events_retry_only_unexpected_loss ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 229 filtered out; finished in 1.01s
+

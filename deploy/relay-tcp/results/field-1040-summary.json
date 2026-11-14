@@ -1,0 +1,79 @@
+{
+  "window": "2026-11-14T10:40:15Z through 2026-11-14T10:40:50Z",
+  "capacity_sample_interval_seconds": 30,
+  "nearby_capacity_samples": [
+    {
+      "utc": "2026-11-14T10:39:01.378928+00:00",
+      "pid": 3142,
+      "rss_kib": 4300,
+      "cgroup_memory_bytes": 1351680,
+      "cgroup_memory_peak_bytes": 2818048,
+      "cpu_usage_usec": 18465255,
+      "quota_reserved_bytes": 1103626240,
+      "elapsed_s": 630.1816995250001,
+      "service_cpu_one_core_percent": 1.7265726365121172
+    },
+    {
+      "utc": "2026-11-14T10:39:31.386825+00:00",
+      "pid": 3142,
+      "rss_kib": 4300,
+      "cgroup_memory_bytes": 1310720,
+      "cgroup_memory_peak_bytes": 2818048,
+      "cpu_usage_usec": 19227939,
+      "quota_reserved_bytes": 1167458304,
+      "elapsed_s": 660.1896384219999,
+      "service_cpu_one_core_percent": 2.5416074146840297
+    },
+    {
+      "utc": "2026-11-14T10:40:01.400922+00:00",
+      "pid": 3142,
+      "rss_kib": 4300,
+      "cgroup_memory_bytes": 1363968,
+      "cgroup_memory_peak_bytes": 2818048,
+      "cpu_usage_usec": 19766611,
+      "quota_reserved_bytes": 1199767552,
+      "elapsed_s": 690.2037545400001,
+      "service_cpu_one_core_percent": 1.7947288465274702
+    },
+    {
+      "utc": "2026-11-14T10:40:31.409201+00:00",
+      "pid": 3142,
+      "rss_kib": 4360,
+      "cgroup_memory_bytes": 1183744,
+      "cgroup_memory_peak_bytes": 2818048,
+      "cpu_usage_usec": 20651660,
+      "quota_reserved_bytes": 1238630400,
+      "elapsed_s": 720.2119950700001,
+      "service_cpu_one_core_percent": 2.9493531922179677
+    },
+    {
+      "utc": "2026-11-14T10:41:01.416872+00:00",
+      "pid": 3142,
+      "rss_kib": 4360,
+      "cgroup_memory_bytes": 1204224,
+      "cgroup_memory_peak_bytes": 2818048,
+      "cpu_usage_usec": 21190850,
+      "quota_reserved_bytes": 1249902592,
+      "elapsed_s": 750.219653114,
+      "service_cpu_one_core_percent": 1.7968413236694118
+    },
+    {
+      "utc": "2026-11-14T10:41:31.424485+00:00",
+      "pid": 3142,
+      "rss_kib": 4360,
+      "cgroup_memory_bytes": 1495040,
+      "cgroup_memory_peak_bytes": 2818048,
+      "cpu_usage_usec": 21861021,
+      "quota_reserved_bytes": 1285816320,
+      "elapsed_s": 780.2272970260001,
+      "service_cpu_one_core_percent": 2.2333342863082923
+    }
+  ],
+  "daemon_per_connection_close_reason": "not recorded by installed version",
+  "synthetic_overlap": "attempt 6 began 10:39:51.976744Z, quarter-rate 2.5 Mbps for 30 s, then target 10 Mbps until about 10:40:28.878Z; attempt 7 began 10:40:38.885446Z",
+  "monthly_limit_bytes": 500000000000,
+  "session_limit_bytes": 17179869184,
+  "session_limit_seconds": 3600,
+  "synthetic_traffic": "stopped at parent request",
+  "evidence_prepared_utc": "2026-11-14T10:47:20.909830+00:00"
+}

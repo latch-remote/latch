@@ -59,12 +59,11 @@ pub struct Handover {
 impl Handover {
     /// Serve `release`'s host (fetching it first) and type the install
     /// command on the PC at `pc_ip` through `input`. `mac_ip` is this Mac's
-    /// Tailscale address, the only one the PC can reach. `configured_token`
-    /// is the one in Settings; without it, git's is asked for here, off
-    /// the window's thread.
+    /// Tailscale address, the only one the PC can reach. The legacy token
+    /// argument is ignored because release downloads are public.
     pub fn start(
         release: Option<Release>,
-        configured_token: Option<String>,
+        _configured_token: Option<String>,
         mac_ip: Ipv4Addr,
         pc_ip: Ipv4Addr,
         input: Input,
@@ -82,17 +81,7 @@ impl Handover {
             std::thread::Builder::new()
                 .name("handover".into())
                 .spawn(move || {
-                    let token = update::token(configured_token.as_deref());
-                    let outcome = run(
-                        release,
-                        token.as_deref(),
-                        mac_ip,
-                        pc_ip,
-                        &input,
-                        &progress,
-                        &stop,
-                        &ctx,
-                    );
+                    let outcome = run(release, mac_ip, pc_ip, &input, &progress, &stop, &ctx);
                     let mut p = progress.lock();
                     match outcome {
                         Ok(()) if p.phase == Phase::Fetched => {}
@@ -216,7 +205,6 @@ pub fn usable(rel: &Release, running: &Version) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn run(
     release: Option<Release>,
-    token: Option<&str>,
     mac_ip: Ipv4Addr,
     pc_ip: Ipv4Addr,
     input: &Input,
@@ -226,11 +214,11 @@ fn run(
 ) -> Result<()> {
     let rel = match release {
         Some(r) => r,
-        None => update::latest(token).context("look up the latest release")?,
+        None => update::latest(None).context("look up the latest release")?,
     };
     progress.lock().version = Some(rel.version.clone());
     ctx.request_repaint();
-    let exe = crate::update::host_exe(&rel, token).context("fetch latch-host.exe")?;
+    let exe = crate::update::host_exe(&rel).context("fetch latch-host.exe")?;
     let sha = update::sha256_hex(&exe);
     let script = script(mac_ip, &rel.version, &sha);
     let listener = TcpListener::bind(SocketAddr::from((mac_ip, HANDOVER_PORT)))

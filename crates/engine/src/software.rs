@@ -273,6 +273,8 @@ pub struct SoftwarePipeline<C: CpuCapture> {
     encoder: Option<Box<dyn PictureEncoder>>,
     /// The size `encoder` was opened for.
     encoder_size: (u32, u32),
+    /// Learned encodable pixel budget and the bitrate at which it was learned.
+    bitrate_size: Option<(u64, u32)>,
     source_size: (u32, u32),
     scaler: Option<latch_codec::color::scale::Scaler>,
     cursor: Option<crate::video::CursorUpdate>,
@@ -313,6 +315,7 @@ impl<C: CpuCapture> SoftwarePipeline<C> {
             picture: Yuv420::default(),
             encoder: None,
             encoder_size: (0, 0),
+            bitrate_size: None,
             source_size: (0, 0),
             scaler: None,
             cursor: None,
@@ -380,6 +383,26 @@ impl<C: CpuCapture> SoftwarePipeline<C> {
 
     pub fn timings(&self) -> SoftwareTimings {
         self.timings
+    }
+
+    fn output_size(&self) -> (u32, u32) {
+        let requested = (self.config.width, self.config.height);
+        let Some((pixels, kbps)) = self.bitrate_size else {
+            return requested;
+        };
+        let budget = pixels * u64::from(self.config.bitrate_kbps) / u64::from(kbps);
+        let full = u64::from(requested.0) * u64::from(requested.1);
+        if budget >= full {
+            return requested;
+        }
+        let active = u64::from(self.encoder_size.0) * u64::from(self.encoder_size.1);
+        // Grow by substantial steps so small congestion probes do not keep reopening the encoder.
+        if budget > active && budget < active * 2 {
+            return self.encoder_size;
+        }
+        let scale = (budget as f64 / full as f64).sqrt();
+        let even = |side: u32| ((f64::from(side) * scale) as u32 / 2 * 2).max(side.min(64));
+        (even(requested.0), even(requested.1))
     }
 
     fn acquire(&mut self, keyframe: bool, idle: Duration) -> anyhow::Result<bool> {
@@ -553,7 +576,11 @@ fn validate_frame(frame: &Bgra) -> anyhow::Result<()> {
 
 impl<C: CpuCapture> VideoPipeline for SoftwarePipeline<C> {
     fn info(&self) -> VideoInfo {
-        let (width, height) = (self.config.width, self.config.height);
+        let (width, height) = if self.encoder_size == (0, 0) {
+            self.output_size()
+        } else {
+            self.encoder_size
+        };
         let (name, hardware, codec, _) = &self.describe;
         VideoInfo {
             color: Default::default(),
@@ -569,130 +596,153 @@ impl<C: CpuCapture> VideoPipeline for SoftwarePipeline<C> {
     fn next(&mut self, keyframe: bool, idle: Duration) -> anyhow::Result<EncodedVideo> {
         let changed = self.acquire(keyframe || self.recovering, idle)?;
         self.recovering = false;
-        let size = (self.config.width, self.config.height);
-        let source = (self.frame.width, self.frame.height);
-        let resized =
-            (self.picture.width, self.picture.height) != size || self.source_size != source;
-        if self.encoder.is_none()
-            || self.encoder_size != size
-            || (self.source_size != (0, 0) && self.source_size != source)
-        {
-            self.encoder = None;
-            // A new encoder holds none of the old one's pictures.
-            self.picture_base = self.last_picture;
-            let encoder = (self.open)(size.0, size.1, &self.config)?;
-            // At another size the encoder may be another (software where
-            // hardware does not take it).
-            self.describe = (
-                encoder.name(),
-                encoder.hardware(),
-                encoder.codec(),
-                encoder.recovers(),
-            );
-            self.encoder = Some(encoder);
-            self.encoder_size = size;
-        }
-        if resized {
-            self.picture = Yuv420::new(size.0, size.1);
-            self.source_size = source;
-            self.cursor_dirty = true;
-            self.scaler = if source == size {
-                None
-            } else {
-                let fit = DisplayRect {
-                    width: source.0,
-                    height: source.1,
-                    ..Default::default()
-                }
-                .fitted(size.0, size.1);
-                Some(latch_codec::color::scale::Scaler::new(
-                    source,
-                    size,
-                    Rect {
-                        x: fit.x as u32,
-                        y: fit.y as u32,
-                        width: fit.width,
-                        height: fit.height,
-                    },
-                ))
-            };
-        }
-        let started = Instant::now();
-        // What differs from the picture encoded last: a repeat changes
-        // nothing.
-        let mut damage = Some(Vec::new());
-        if changed || resized {
-            let whole = [Rect {
-                x: 0,
-                y: 0,
-                width: self.frame.width,
-                height: self.frame.height,
-            }];
-            damage = if resized { None } else { self.capture.damage() };
-            if let Some(scaler) = &self.scaler {
-                damage = damage.map(|rects| scaler.damage(&rects));
+        self.timings.convert = Duration::ZERO;
+        self.timings.encode = Duration::ZERO;
+        loop {
+            let size = self.output_size();
+            let source = (self.frame.width, self.frame.height);
+            let resized =
+                (self.picture.width, self.picture.height) != size || self.source_size != source;
+            if self.encoder.is_none()
+                || self.encoder_size != size
+                || (self.source_size != (0, 0) && self.source_size != source)
+            {
+                self.encoder = None;
+                // A new encoder holds none of the old one's pictures.
+                self.picture_base = self.last_picture;
+                let encoder = (self.open)(size.0, size.1, &self.config)?;
+                // At another size the encoder may be another (software where
+                // hardware does not take it).
+                self.describe = (
+                    encoder.name(),
+                    encoder.hardware(),
+                    encoder.codec(),
+                    encoder.recovers(),
+                );
+                self.encoder = Some(encoder);
+                self.encoder_size = size;
+            }
+            if resized {
+                self.picture = Yuv420::new(size.0, size.1);
+                self.source_size = source;
+                self.cursor_dirty = true;
+                self.scaler = if source == size {
+                    None
+                } else {
+                    let fit = DisplayRect {
+                        width: source.0,
+                        height: source.1,
+                        ..Default::default()
+                    }
+                    .fitted(size.0, size.1);
+                    Some(latch_codec::color::scale::Scaler::new(
+                        source,
+                        size,
+                        Rect {
+                            x: fit.x as u32,
+                            y: fit.y as u32,
+                            width: fit.width,
+                            height: fit.height,
+                        },
+                    ))
+                };
+            }
+            let started = Instant::now();
+            // What differs from the picture encoded last: a repeat changes
+            // nothing.
+            let mut damage = Some(Vec::new());
+            if changed || resized {
                 let whole = [Rect {
                     x: 0,
                     y: 0,
-                    width: size.0,
-                    height: size.1,
+                    width: self.frame.width,
+                    height: self.frame.height,
                 }];
-                scaler.convert(
-                    &self.frame.data,
-                    self.frame.stride,
-                    damage.as_deref().unwrap_or(&whole),
-                    self.threads,
-                    &mut self.picture,
-                );
-            } else {
-                latch_codec::color::bgra_to_yuv420_rects(
-                    &self.frame.data,
-                    self.frame.width,
-                    self.frame.height,
-                    self.frame.stride,
-                    damage.as_deref().unwrap_or(&whole),
-                    self.threads,
-                    &mut self.picture,
-                );
+                damage = if resized { None } else { self.capture.damage() };
+                if let Some(scaler) = &self.scaler {
+                    damage = damage.map(|rects| scaler.damage(&rects));
+                    let whole = [Rect {
+                        x: 0,
+                        y: 0,
+                        width: size.0,
+                        height: size.1,
+                    }];
+                    scaler.convert(
+                        &self.frame.data,
+                        self.frame.stride,
+                        damage.as_deref().unwrap_or(&whole),
+                        self.threads,
+                        &mut self.picture,
+                    );
+                } else {
+                    latch_codec::color::bgra_to_yuv420_rects(
+                        &self.frame.data,
+                        self.frame.width,
+                        self.frame.height,
+                        self.frame.stride,
+                        damage.as_deref().unwrap_or(&whole),
+                        self.threads,
+                        &mut self.picture,
+                    );
+                }
             }
+            self.timings.convert += started.elapsed();
+            // A repeat shows the old picture, but it was taken up now: what the
+            // viewer learns about the host's delay is about this frame.
+            if !changed && !resized {
+                self.captured = started;
+            }
+            let mut data = Vec::new();
+            let started = Instant::now();
+            let encoded = self
+                .encoder
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("encoder unavailable"))?
+                .encode_changed(
+                    &self.picture,
+                    damage.as_deref(),
+                    keyframe || resized,
+                    &mut data,
+                );
+            self.timings.encode += started.elapsed();
+            let sent_keyframe = match encoded {
+                Ok(keyframe) => keyframe,
+                Err(error)
+                    if error.downcast_ref::<latch_codec::h264::CodecError>()
+                        == Some(&latch_codec::h264::CodecError::FrameTooLarge)
+                        && (size.0 > self.config.width.min(64)
+                            || size.1 > self.config.height.min(64)) =>
+                {
+                    self.bitrate_size = Some((
+                        u64::from(size.0) * u64::from(size.1) / 4,
+                        self.config.bitrate_kbps,
+                    ));
+                    if self.output_size() == size {
+                        return Err(error);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            self.last_sent = Some(self.captured);
+            let (picture, recovery) = self
+                .encoder
+                .as_ref()
+                .map_or((0, None), |e| e.last_picture());
+            let base = self.picture_base;
+            let picture = if picture > 0 { base + picture } else { 0 };
+            self.last_picture = self.last_picture.max(picture);
+            return Ok(EncodedVideo {
+                generation: 0,
+                data,
+                keyframe: sent_keyframe,
+                captured: self.captured,
+                picture,
+                recovery: recovery
+                    .filter(|_| !sent_keyframe)
+                    .map(|local| base + local),
+            });
         }
-        self.timings.convert = started.elapsed();
-        // A repeat shows the old picture, but it was taken up now: what the
-        // viewer learns about the host's delay is about this frame.
-        if !changed && !resized {
-            self.captured = started;
-        }
-        let mut data = Vec::new();
-        let started = Instant::now();
-        let sent_keyframe = self
-            .encoder
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("encoder unavailable"))?
-            .encode_changed(
-                &self.picture,
-                damage.as_deref(),
-                keyframe || resized,
-                &mut data,
-            )?;
-        self.timings.encode = started.elapsed();
-        self.last_sent = Some(self.captured);
-        let (picture, recovery) = self
-            .encoder
-            .as_ref()
-            .map_or((0, None), |e| e.last_picture());
-        let base = self.picture_base;
-        let picture = if picture > 0 { base + picture } else { 0 };
-        self.last_picture = self.last_picture.max(picture);
-        Ok(EncodedVideo {
-            generation: 0,
-            data,
-            keyframe: sent_keyframe,
-            captured: self.captured,
-            picture,
-            recovery: recovery
-                .filter(|_| !sent_keyframe)
-                .map(|local| base + local),
-        })
     }
 
     fn recovers(&self) -> bool {
@@ -735,12 +785,17 @@ impl<C: CpuCapture> VideoPipeline for SoftwarePipeline<C> {
         let mut update = self.cursor.clone()?;
         if let Some(shape) = update.shape.as_mut() {
             let source = self.capture.size();
+            let size = if self.encoder_size == (0, 0) {
+                (self.config.width, self.config.height)
+            } else {
+                self.encoder_size
+            };
             let fit = DisplayRect {
                 width: source.0,
                 height: source.1,
                 ..Default::default()
             }
-            .fitted(self.config.width, self.config.height);
+            .fitted(size.0, size.1);
             if (fit.width, fit.height) != source {
                 scale_cursor(shape, source, (fit.width, fit.height));
             }
@@ -797,6 +852,7 @@ mod tests {
     use super::*;
 
     struct Fake {
+        shade: u8,
         changed: bool,
         size: (u32, u32),
         waits: Vec<Duration>,
@@ -814,7 +870,7 @@ mod tests {
                 width: self.size.0,
                 height: self.size.1,
                 stride: self.size.0 as usize * 4,
-                data: vec![128; (self.size.0 * self.size.1 * 4) as usize],
+                data: vec![self.shade; (self.size.0 * self.size.1 * 4) as usize],
             };
             Ok(true)
         }
@@ -832,6 +888,7 @@ mod tests {
     fn pipeline() -> SoftwarePipeline<Fake> {
         SoftwarePipeline::new(
             Fake {
+                shade: 128,
                 changed: true,
                 size: (16, 16),
                 waits: Vec::new(),
@@ -847,6 +904,71 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn low_bitrate_resizes_visible_input_and_recovers_requested_size() {
+        let mut base = pipeline();
+        base.capture.size = (1280, 720);
+        base.config.width = 1280;
+        base.config.height = 720;
+        base.config.fps = 60;
+        base.config.bitrate_kbps = 10_000;
+        let mut p = SoftwarePipeline::with_workers(base.capture, &base.config, 1).unwrap();
+        let mut decoder = latch_codec::h264::Decoder::new();
+        let first = p.next(true, Duration::ZERO).unwrap();
+        let dark = decoder.decode(&first.data).unwrap().unwrap().y[0];
+        assert_eq!((p.info().width, p.info().height), (1280, 720));
+
+        p.set_bitrate(94);
+        p.capture.shade = 255;
+        p.capture.changed = true;
+        let low = p.next(false, Duration::ZERO).unwrap();
+        assert!(low.keyframe);
+        assert!(low.data.len() as u64 * 60 <= 94_000);
+        assert!(p.info().width < 1280 && p.info().height < 720);
+        let decoded = decoder.decode(&low.data).unwrap().unwrap();
+        assert_eq!(
+            (decoded.width, decoded.height),
+            (p.info().width, p.info().height)
+        );
+        assert!(
+            decoded.y[0] > dark + 50,
+            "synthetic input reached the decoded picture"
+        );
+        let small = p.encoder_size;
+        p.set_bitrate(99);
+        let probe = p.next(false, Duration::ZERO).unwrap();
+        decoder.decode(&probe.data).unwrap().unwrap();
+        assert_eq!(
+            p.encoder_size, small,
+            "small probes retain the active encoder size"
+        );
+
+        p.set_bitrate(10_000);
+        p.capture.shade = 128;
+        p.capture.changed = true;
+        let restored = p.next(false, Duration::ZERO).unwrap();
+        assert!(restored.keyframe);
+        let decoded = decoder.decode(&restored.data).unwrap().unwrap();
+        assert_eq!((decoded.width, decoded.height), (1280, 720));
+        assert!(decoded.y[0].abs_diff(dark) < 5);
+        assert_eq!(p.config.width, 1280);
+        assert_eq!(p.config.height, 720);
+    }
+
+    #[test]
+    fn an_impossible_minimum_size_retains_the_explicit_codec_error() {
+        let mut p = pipeline();
+        p.config.width = 64;
+        p.config.height = 64;
+        p.set_bitrate(1);
+        let error = p.next(true, Duration::ZERO).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<latch_codec::h264::CodecError>(),
+            Some(&latch_codec::h264::CodecError::FrameTooLarge)
+        );
+        assert_eq!(p.encoder_size, (64, 64));
+    }
+
     /// Pictures are numbered across encoders: after a resize the old
     /// numbers name nothing, so a stale request cannot reach a picture
     /// of the new encoder that happens to share its number.

@@ -1,0 +1,30 @@
+{
+  "baseline": "fb9b4f0dc5338106eecfc66bd5ea95caa50729e1",
+  "scratch": "/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0",
+  "patch": "/tmp/latch6-viewer-failure-fix.patch",
+  "patch_sha256": "de2c91a4ebf8da1e072ae7ddb211f2a2030218429326a34c4d8aacfda281cdd0",
+  "files": [
+    {
+      "path": "crates/stream/src/session.rs",
+      "sha256": "d4610cd2aa3000df5c732bbb3ad1bf20a2ed248d0ce1b3a2d9f0c560952202e7"
+    },
+    {
+      "path": "crates/stream/Cargo.toml",
+      "sha256": "b22ded769e5205bb8641a886bf65ed5f0317df0b5116517cda6a4ad23110930a"
+    },
+    {
+      "path": "Cargo.lock",
+      "sha256": "54f6ec1c4fdbf907d1d9fde0eca9d11db6133efc3708267892be1da3ac31ded0"
+    },
+    {
+      "path": "crates/client/src/app.rs",
+      "sha256": "e45e1b8c7e87b987c4ac4ff973fc1afc60fcabc4762555d10c1e0cd14102dd80"
+    }
+  ],
+  "baseline_regression": "failed without a reconnectable termination event",
+  "fixed_session_tests": 22,
+  "ui_retry_test": "passed including cancelled transport failure",
+  "clippy": "strict stream/client all targets passed",
+  "windows_msvc": "stream all-target check passed",
+  "native_windows_execution": "pending hosted CI after integration"
+}

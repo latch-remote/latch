@@ -1,0 +1,47 @@
+{
+  "candidate_id": "candidate-20261114T110808Z",
+  "candidate_path": "/home/ubuntu/latch6-candidates/candidate-20261114T110808Z/latch-relay.candidate",
+  "candidate_sha256": "0b2b3f500cf5c9a42b49fd361dc443be309b9f92b9b7049c99e41781302c02a7",
+  "candidate_bytes": 2936704,
+  "source_sha256": "682ad11d20e4aa796e50a9ad60c53cfc6e7d419744b4049772f4f9b34e3a1f64",
+  "source_archive_sha256": "a5c5c68c1b518a1aa16d3c9aecc29d3eab15d7150de5e6d2597e19b954267513",
+  "version": "6.0.0",
+  "target": "x86_64-unknown-linux-gnu",
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "validation": {
+    "library_tests": 16,
+    "transport_tests": 12,
+    "probe_example_tests": 1,
+    "strict_clippy": "passed",
+    "deployment_selftest": "passed",
+    "former_binary_failed_new_quota_liveness_check": true,
+    "fresh_rebuild_after_stale_cache_detection": true,
+    "diagnostic_marker_present": true
+  },
+  "build_priority": {
+    "nice": 19,
+    "ionice_class": 3,
+    "cargo_jobs": 1
+  },
+  "deployment_state": "inactive, awaiting parent-coordinated restart",
+  "live_state": {
+    "verified_utc": "2026-11-14T11:18:37.527262+00:00",
+    "live_file_sha256": {
+      "/usr/local/bin/latch-relay": "9d3a309ac7d3e58bb188d244e0818c92c9cc0042896d0636c8a131fef918f1b5",
+      "/etc/latch-relay/limits.json": "1f038572819969d3a2e24952f93aec87b59b6800a069388b1ed208644d6f5c46",
+      "/etc/latch-relay/budget.conf": "86a30ba76f6a72d72766b7fad71c63155a8c5a1a633bddb4f849015c88d1cc9b",
+      "/etc/systemd/system/latch-relay.service": "b82954b66e7179df95042f9e57ee9b4869b2bca0bb71b401466334817aa47dab"
+    },
+    "ledger": {
+      "inode": 532979,
+      "device": 66305,
+      "uid": 999,
+      "gid": 988,
+      "mode": "0o600",
+      "bytes": 32,
+      "month": 24322,
+      "reserved": 3166961664
+    },
+    "service": "MainPID=3142\nNRestarts=0\nActiveState=active\nActiveEnterTimestamp=Sat 2026-11-14 10:17:54 UTC\n"
+  }
+}

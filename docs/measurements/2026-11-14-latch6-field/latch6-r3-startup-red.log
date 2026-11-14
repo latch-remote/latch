@@ -1,0 +1,23 @@
+   Compiling latch-stream v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/stream)
+    Finished `test` profile [optimized + debuginfo] target(s) in 4.22s
+     Running unittests src/lib.rs (/Users/daniel/Desktop/T3_Projects/latch/target/debug/deps/latch_stream-4c056a784707176b)
+
+running 1 test
+test session::tests::host_transport_failure_before_publication_remains_retryable ... FAILED
+
+failures:
+
+---- session::tests::host_transport_failure_before_publication_remains_retryable stdout ----
+
+thread 'session::tests::host_transport_failure_before_publication_remains_retryable' (81168671) panicked at crates/stream/src/session.rs:3454:17:
+assertion failed: matches!(event, Some(Event::Terminated { code: actual, .. }) if actual == code
+    as i32)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    session::tests::host_transport_failure_before_publication_remains_retryable
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p latch-stream --lib`

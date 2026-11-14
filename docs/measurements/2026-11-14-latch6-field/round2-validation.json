@@ -1,0 +1,48 @@
+{
+  "parent": "fb9b4f0dc5338106eecfc66bd5ea95caa50729e1",
+  "files": [
+    {
+      "path": "crates/stream/src/session.rs",
+      "sha256": "634e80a121d380b88df719729c5a00baeab8225b3f999ec001b485b112c41114"
+    },
+    {
+      "path": "crates/stream/Cargo.toml",
+      "sha256": "b22ded769e5205bb8641a886bf65ed5f0317df0b5116517cda6a4ad23110930a"
+    },
+    {
+      "path": "Cargo.lock",
+      "sha256": "54f6ec1c4fdbf907d1d9fde0eca9d11db6133efc3708267892be1da3ac31ded0"
+    },
+    {
+      "path": "crates/client/src/app.rs",
+      "sha256": "e45e1b8c7e87b987c4ac4ff973fc1afc60fcabc4762555d10c1e0cd14102dd80"
+    },
+    {
+      "path": "crates/engine/src/server.rs",
+      "sha256": "e9c34cc39056d16963fe7eca968c925779d771fc4dfa6e2f3ccefb061f39cb35"
+    },
+    {
+      "path": "crates/engine/tests/relay_runtime.rs",
+      "sha256": "f788683d21b69cecec7ca60873069da0fb2fcaaaa0ccc3cbd3d3b512f41a4d86"
+    },
+    {
+      "path": "crates/engine/tests/support/lifecycle.rs",
+      "sha256": "3d8e0886c664d4f983909fd6a71ee5a4536326fd4c82047d800ae26e0c183c4c"
+    },
+    {
+      "path": "docs/USING.md",
+      "sha256": "be64e9b39e6a192d514ac5c02dcfe28edee28c7308eef978aa0219abab816471"
+    }
+  ],
+  "full_mac_workspace": {
+    "test_targets": 57,
+    "reported_passes": 954,
+    "failed": 0,
+    "ignored": 40
+  },
+  "full_mac_command": "cargo test --locked --offline --workspace --all-targets",
+  "strict_workspace_clippy": "passed",
+  "windows_workspace_all_targets_compile": "passed",
+  "windows_native_followup_execution": "pending hosted CI; previous 641-pass field run remains attributed to its recorded source manifest",
+  "new_wan_or_field_traffic": false
+}

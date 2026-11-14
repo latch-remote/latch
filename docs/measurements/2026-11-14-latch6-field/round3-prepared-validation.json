@@ -1,0 +1,51 @@
+{
+  "baseline": "d0b1b54e3b3c0cbeeb560b9cc3f0aa0600ee133a",
+  "scratch": "/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0",
+  "patch": "/tmp/latch6-r3-reconnect-fixes.patch",
+  "patch_sha256": "69e14bd70b00db7ffad4f1fb8485d127363c9f04e563b2794e7542ba7a96b8b8",
+  "files": [
+    {
+      "path": "crates/engine/src/server.rs",
+      "sha256": "c10d8944d4d847380ee4aab034768baa9370317e58a43543058fea7b27f76fee"
+    },
+    {
+      "path": "crates/engine/tests/relay_runtime.rs",
+      "sha256": "80b92a1f16a5e95f76baf7259d5f6b0b886284ad8ca350e366e596d0cdd4a7ea"
+    },
+    {
+      "path": "crates/engine/tests/support/lifecycle.rs",
+      "sha256": "014e3be86fed328d4e1bc3b6150bb64fdc41e3ef84fd03cd4cd1c9dcb7f2ef04"
+    },
+    {
+      "path": "crates/engine/tests/support/relay_pilot.rs",
+      "sha256": "143909159d877dcccacc5edabb5ec7ca59785e8c08c4194a3fa4c788f3680a05"
+    },
+    {
+      "path": "crates/stream/src/session.rs",
+      "sha256": "74682daa3285c240e123155c3b5308686ccb49cba4146ff363f18a0ae5d83e80"
+    },
+    {
+      "path": "crates/client/src/app.rs",
+      "sha256": "6c9e223299c329bf3a1bfee78c955b01ab56b2d6ead2553082e88a692d649210"
+    }
+  ],
+  "regressions_reproduced": [
+    "host priority sender preempted before recording termination",
+    "host code 6 before first decoded picture"
+  ],
+  "validation": {
+    "host_lifecycle": {
+      "passed": 19,
+      "ignored": 1
+    },
+    "session_tests": 23,
+    "ui_retry_tests": 8,
+    "relay_runtime_tests": 9,
+    "relay_runtime_seconds": 118.26,
+    "strict_workspace_clippy": "passed",
+    "windows_workspace_all_targets_compile": "passed"
+  },
+  "native_windows_followup_execution": "pending CI after integration",
+  "review_candidate_unchanged": true,
+  "new_wan_traffic": false
+}

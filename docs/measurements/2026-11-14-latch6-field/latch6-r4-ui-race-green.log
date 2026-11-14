@@ -1,0 +1,11 @@
+   Compiling latch-client v6.0.0 (/private/tmp/latch6-r4-ui-race-0fcf0f1b/latch-6.0.0/crates/client)
+    Finished `test` profile [optimized + debuginfo] target(s) in 5.42s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (/Users/daniel/Desktop/T3_Projects/latch/target/debug/deps/latch_client-eae8832f56b3372a)
+
+running 1 test
+test app::live_snapshot::completion_after_event_drain_preserves_retry_unless_cancelled ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 237 filtered out; finished in 0.73s
+

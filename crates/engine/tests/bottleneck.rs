@@ -7,6 +7,9 @@
 #[allow(dead_code)]
 #[path = "../src/congestion.rs"]
 mod congestion;
+#[allow(dead_code)]
+#[path = "../src/pacing.rs"]
+mod pacing;
 #[path = "support/relay.rs"]
 mod relay;
 
@@ -15,9 +18,41 @@ use latch_engine::server::{Options, Server};
 use latch_proto::control::{self, StreamRequest};
 use latch_proto::sim::{Impairment, Link};
 use latch_stream::{Event, FrameSlot, Session, Settings};
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
+
+#[test]
+fn clean_frame_trains_fit_a_shallow_relay_queue() {
+    let start = Instant::now();
+    let controller = congestion::Controller::new(40_000, start);
+    let mut pacer = pacing::Pacer::new(start);
+    let mut link = Link::new(Impairment::NONE, 11);
+    link.set_bandwidth(50_000, Duration::from_millis(4));
+    // 90 KB frames at 30 fps average only 22 Mbps, but an unpaced
+    // frame overflows this 50 Mbps path before the controller sees loss.
+    let packets = vec![vec![0; 1200]; 72];
+    for frame in 0..60 {
+        let mut now = start + Duration::from_micros(frame * 33_333);
+        let mut sent = 0;
+        while sent < packets.len() {
+            let (count, wait) = pacer.batch(now, &packets[sent..], controller.pace_kbps());
+            for packet in &packets[sent..sent + count] {
+                link.send(now, packet);
+            }
+            sent += count;
+            now += wait;
+        }
+        link.receive(now + Duration::from_millis(10));
+        assert!(now < start + Duration::from_micros((frame + 1) * 33_333));
+    }
+    assert_eq!(
+        link.counts().1,
+        0,
+        "frame bursts must not cause recovery loops"
+    );
+}
 
 fn host() -> u16 {
     for _ in 0..50 {
@@ -208,8 +243,8 @@ fn saturated_ten_megabit_fifo_converges_and_recovers_with_fake_clock() {
         // Generate the full wire budget, including Link's 80 byte overhead,
         // without an encoder or scheduler limiting the offered load.
         let packet = [0u8; 1200];
-        let spacing =
-            Duration::from_secs_f64(1280.0 * 8.0 / (f64::from(controller.budget()) * 1000.0));
+        let offered = controller.budget();
+        let spacing = Duration::from_secs_f64(1280.0 * 8.0 / (f64::from(offered) * 1000.0));
         let before = link.counts();
         let mut at = now;
         while at < now + Duration::from_millis(250) {
@@ -229,7 +264,9 @@ fn saturated_ten_megabit_fifo_converges_and_recovers_with_fake_clock() {
         if limited && loss > 3.0 {
             pressured += 1;
         }
-        if limited && loss == 0.0 && controller.budget() <= 10_000 {
+        // Judge delivery at the rate that produced this window, before
+        // feedback changes the next window's offer.
+        if limited && loss == 0.0 && offered <= 10_000 {
             clean += 1;
         }
         // Probes deliberately cross capacity: judge convergence over the
@@ -251,6 +288,183 @@ fn saturated_ten_megabit_fifo_converges_and_recovers_with_fake_clock() {
         50_000,
         "must recover to requested rate"
     );
+}
+
+#[test]
+fn campus_rtt_fifo_reduces_the_offer_and_recovers_with_delayed_feedback() {
+    let start = Instant::now();
+    let mut controller = congestion::Controller::new(40_000, start);
+    let mut link = Link::new(
+        Impairment {
+            delay: Duration::from_millis(85),
+            ..Impairment::NONE
+        },
+        11,
+    );
+    let mut feedback = VecDeque::new();
+    let mut sequence = 0u64;
+    let mut expected = 0;
+    let mut settled = Vec::new();
+    let mut queues = Vec::new();
+    let mut clean = 0;
+    // Keep packet timing across windows so rounding cannot add a packet
+    // to every 50 ms offer and manufacture a standing queue.
+    let mut next_packet = start;
+    for tick in 0..800 {
+        let limited = (40..400).contains(&tick);
+        let now = start + Duration::from_millis(tick * 50);
+        let end = now + Duration::from_millis(50);
+        link.set_bandwidth(
+            if limited { 10_000 } else { 50_000 },
+            Duration::from_millis(40),
+        );
+        let spacing =
+            Duration::from_secs_f64(1280.0 * 8.0 / (f64::from(controller.pace_kbps()) * 1000.0));
+        let mut sent = 0;
+        let mut at = next_packet;
+        let mut queue = f32::MAX;
+        while at < end {
+            let mut packet = [0u8; 1200];
+            packet[..8].copy_from_slice(&sequence.to_le_bytes());
+            link.send(at, &packet);
+            sequence += 1;
+            sent += 1;
+            queue = queue.min(link.queue_delay(at).as_secs_f32() * 1000.0);
+            at += spacing;
+        }
+        next_packet = at;
+        let packets = link.receive(end);
+        let mut missing = 0;
+        for packet in &packets {
+            let number = u64::from_le_bytes(packet[..8].try_into().unwrap());
+            missing += number - expected;
+            expected = number + 1;
+        }
+        let loss = missing as f32 * 100.0 / (packets.len() as u64 + missing).max(1) as f32;
+        let report = control::Report {
+            rtt_ms: 170.0 + queue,
+            received_kbps: (packets.len() * 1280 * 8 / 50) as u32,
+            loss_pct: loss,
+            unrecovered_loss_pct: Some(loss),
+            window_ms: 50,
+            ..Default::default()
+        };
+        // The report returns over the other 85 ms leg. The server compares
+        // it to its current send window, as in the production control loop.
+        feedback.push_back((end + Duration::from_millis(85), report));
+        while feedback.front().is_some_and(|(due, _)| *due <= end) {
+            let (_, report) = feedback.pop_front().unwrap();
+            controller.observe_sent(sent * 1280 * 8 / 50);
+            controller.update(end, &report, report.rtt_ms, 0.0);
+        }
+        if (200..400).contains(&tick) {
+            settled.push(controller.budget());
+            queues.push(queue);
+            clean += usize::from(loss == 0.0);
+        }
+    }
+    let mean = settled.iter().sum::<u32>() / settled.len() as u32;
+    queues.sort_by(f32::total_cmp);
+    let p95 = queues[queues.len() * 95 / 100];
+    assert!((8500..=11_000).contains(&mean), "mean budget {mean}");
+    assert!(p95 < 20.0, "standing queue p95 {p95} ms");
+    assert!(clean >= 150, "only {clean} clean constrained windows");
+    assert_eq!(
+        controller.budget(),
+        40_000,
+        "must regain the requested rate"
+    );
+}
+
+#[test]
+fn campus_random_loss_and_a_token_bucket_are_distinguished_with_delayed_feedback() {
+    for random_loss in [0.15, 0.18] {
+        for policed in [false, true] {
+            let start = Instant::now();
+            let mut controller = congestion::Controller::new(40_000, start);
+            let mut link = Link::new(
+                Impairment {
+                    loss: random_loss,
+                    delay: Duration::from_millis(85),
+                    ..Impairment::NONE
+                },
+                17,
+            );
+            let mut feedback = VecDeque::new();
+            let mut sequence = 0u64;
+            let mut expected = 0;
+            let mut tokens = 5120.0f64;
+            let mut minimum = controller.budget();
+            let mut settled = Vec::new();
+            let mut recovered = Vec::new();
+            let mut next_packet = start;
+            for tick in 0..1600 {
+                let now = start + Duration::from_millis(tick * 50);
+                let end = now + Duration::from_millis(50);
+                let spacing = Duration::from_secs_f64(
+                    1280.0 * 8.0 / (f64::from(controller.pace_kbps()) * 1000.0),
+                );
+                let limited = policed && (40..800).contains(&tick);
+                let mut at = next_packet;
+                let mut sent = 0;
+                while at < end {
+                    let mut packet = [0u8; 1200];
+                    packet[..8].copy_from_slice(&sequence.to_le_bytes());
+                    sequence += 1;
+                    sent += 1;
+                    tokens = (tokens + spacing.as_secs_f64() * 25_000_000.0 / 8.0).min(5120.0);
+                    if !limited || tokens >= 1280.0 {
+                        tokens = (tokens - 1280.0).max(0.0);
+                        link.send(at, &packet);
+                    }
+                    at += spacing;
+                }
+                next_packet = at;
+                let packets = link.receive(end);
+                let mut missing = 0;
+                for packet in &packets {
+                    let number = u64::from_le_bytes(packet[..8].try_into().unwrap());
+                    missing += number - expected;
+                    expected = number + 1;
+                }
+                let loss = missing as f32 * 100.0 / (packets.len() as u64 + missing).max(1) as f32;
+                let report = control::Report {
+                    rtt_ms: 170.0,
+                    received_kbps: (packets.len() * 1280 * 8 / 50) as u32,
+                    loss_pct: loss,
+                    unrecovered_loss_pct: Some(loss),
+                    frames_lost: u64::from(loss > 3.0),
+                    window_ms: 50,
+                    ..Default::default()
+                };
+                feedback.push_back((end + Duration::from_millis(85), report));
+                while feedback.front().is_some_and(|(due, _)| *due <= end) {
+                    let (_, report) = feedback.pop_front().unwrap();
+                    controller.observe_sent(sent * 1280 * 8 / 50);
+                    controller.update(end, &report, report.rtt_ms, 0.0);
+                }
+                minimum = minimum.min(controller.budget());
+                if (200..800).contains(&tick) {
+                    settled.push(controller.budget());
+                }
+                if tick >= 1000 {
+                    recovered.push(controller.budget());
+                }
+            }
+            let mean = settled.iter().sum::<u32>() / settled.len() as u32;
+            eprintln!("campus loss={random_loss} policed={policed} minimum={minimum} mean={mean}");
+            if policed {
+                assert!((22_000..=25_500).contains(&mean), "policer mean {mean}");
+                // Rate tests briefly spend 80% of a noisy capacity estimate.
+                assert!(minimum >= 19_000, "policer minimum {minimum}");
+            } else {
+                assert!(minimum >= 32_000, "random loss minimum {minimum}");
+                assert!(mean >= 36_000, "random loss mean {mean}");
+            }
+            let recovered_mean = recovered.iter().sum::<u32>() / recovered.len() as u32;
+            assert!(recovered_mean >= 36_000, "recovery mean {recovered_mean}");
+        }
+    }
 }
 
 /// The actual software noise-pattern codec and viewer, separate from the

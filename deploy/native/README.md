@@ -55,7 +55,7 @@ use software H.264 decode.
 
 ## Download and verify
 
-Choose a published tag from [Releases](https://github.com/MrBeldum/latch/releases).
+Choose a published tag from [Releases](https://github.com/latch-remote/latch-releases/releases).
 Replace `vX.Y.Z` below. The archive includes the binary and this native kit.
 
 ```sh
@@ -65,7 +65,7 @@ case "$(uname -m)" in
   aarch64) arch=arm64 ;;
   *) echo 'Unsupported architecture'; exit 1 ;;
 esac
-base="https://github.com/MrBeldum/latch/releases/download/$tag"
+base="https://github.com/latch-remote/latch-releases/releases/download/$tag"
 name="latch-host-linux-$arch"
 curl -fLO "$base/$name.tar.gz"
 curl -fLO "$base/$name.tar.gz.sha256"

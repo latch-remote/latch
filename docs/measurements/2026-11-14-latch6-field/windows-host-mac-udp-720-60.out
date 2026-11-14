@@ -1,0 +1,1 @@
+2026-11-14T10:57:15.046787Z  INFO latch_stream::session: viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) send_bytes=8388608 receive_bytes=8388608

@@ -1,0 +1,32 @@
+   Compiling latch-relay v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/relay)
+    Finished `test` profile [optimized + debuginfo] target(s) in 1.68s
+     Running tests/transport.rs (target/debug/deps/transport-121c865364ef8b37)
+
+running 1 test
+frame=0 hold=20ms ack=415.967666ms
+frame=1 hold=20ms ack=405.762917ms
+frame=2 hold=20ms ack=406.726791ms
+frame=3 hold=20ms ack=414.490458ms
+frame=4 hold=20ms ack=413.568958ms
+frame=5 hold=20ms ack=405.692083ms
+frame=6 hold=20ms ack=415.979833ms
+frame=7 hold=20ms ack=412.954917ms
+frame=8 hold=20ms ack=408.917083ms
+frame=9 hold=20ms ack=409.540667ms
+frame=10 hold=20ms ack=408.621417ms
+frame=11 hold=20ms ack=403.03875ms
+
+thread 'delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole' (81409319) panicked at crates/relay/tests/transport.rs:487:13:
+after return-path release: frame=12, hold=650ms, event=Some(Closed { kind: TimedOut, message: "relay Video: video acknowledgment deadline expired" })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+relay connection closed phase=attached role=viewer lane=priority category=peer_closed kind=UnexpectedEof
+test delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole ... FAILED
+
+failures:
+
+failures:
+    delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 6.85s
+
+error: test failed, to rerun pass `-p latch-relay --test transport`

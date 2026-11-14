@@ -1,0 +1,19 @@
+{
+  "verified_utc": "2026-11-14T11:32:57.217633+00:00",
+  "running_binary_sha256": "0b2b3f500cf5c9a42b49fd361dc443be309b9f92b9b7049c99e41781302c02a7",
+  "service": {
+    "MainPID": "6541",
+    "NRestarts": "0",
+    "MemoryCurrent": "1163264",
+    "MemoryPeak": "1826816",
+    "User": "latch-relay",
+    "Group": "latch-relay",
+    "ActiveState": "active"
+  },
+  "ledger_inode": 532979,
+  "ledger_device": 66305,
+  "quota_reserved_bytes": 4092133376,
+  "safe_peer_close_diagnostic": true,
+  "safe_partial_record_timeout_diagnostic": true,
+  "wan_bulk_state": "paused"
+}

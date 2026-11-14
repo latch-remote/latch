@@ -1,0 +1,3 @@
+{"files":928,"mismatches":0,"paths":[]}
+{"label":"foundation","exit":0,"elapsed_s":22.5083271,"command":"cargo test --locked -p latch-core -p latch-proto -p latch-relay --all-targets"}
+{"label":"platform-libs","exit":0,"elapsed_s":51.438285,"command":"cargo test --locked -p latch-engine -p latch-stream -p latch-client --lib"}

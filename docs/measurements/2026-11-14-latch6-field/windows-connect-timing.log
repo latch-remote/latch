@@ -1,0 +1,18 @@
+address=[::1]:64075 connect=Err(Os { code: 10035, kind: WouldBlock, message: "A non-blocking socket operation could not be completed immediately." }) elapsed_ms=0.367
+early_peer=Ok([::1]:64075)
+address=[::1]:64075 readiness=Err(Os { code: 10061, kind: ConnectionRefused, message: "No connection could be made because the target machine actively refused it." }) elapsed_ms=2048.423
+address=127.0.0.1:64075 connect=Err(Os { code: 10035, kind: WouldBlock, message: "A non-blocking socket operation could not be completed immediately." }) elapsed_ms=0.386
+early_peer=Ok(127.0.0.1:64075)
+address=127.0.0.1:64075 readiness=Ok(true) elapsed_ms=0.424
+address=[::1]:53189 connect=Err(Os { code: 10035, kind: WouldBlock, message: "A non-blocking socket operation could not be completed immediately." }) elapsed_ms=0.307
+early_peer=Ok([::1]:53189)
+address=[::1]:53189 readiness=Err(Os { code: 10061, kind: ConnectionRefused, message: "No connection could be made because the target machine actively refused it." }) elapsed_ms=2024.576
+address=127.0.0.1:53189 connect=Err(Os { code: 10035, kind: WouldBlock, message: "A non-blocking socket operation could not be completed immediately." }) elapsed_ms=0.433
+early_peer=Ok(127.0.0.1:53189)
+address=127.0.0.1:53189 readiness=Ok(true) elapsed_ms=0.467
+address=[::1]:53193 connect=Err(Os { code: 10035, kind: WouldBlock, message: "A non-blocking socket operation could not be completed immediately." }) elapsed_ms=0.292
+early_peer=Ok([::1]:53193)
+address=[::1]:53193 readiness=Err(Os { code: 10061, kind: ConnectionRefused, message: "No connection could be made because the target machine actively refused it." }) elapsed_ms=2029.900
+address=127.0.0.1:53193 connect=Err(Os { code: 10035, kind: WouldBlock, message: "A non-blocking socket operation could not be completed immediately." }) elapsed_ms=0.451
+early_peer=Ok(127.0.0.1:53193)
+address=127.0.0.1:53193 readiness=Ok(true) elapsed_ms=0.481

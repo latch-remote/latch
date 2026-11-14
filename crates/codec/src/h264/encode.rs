@@ -559,9 +559,7 @@ impl Encoder {
                 self.spare_reconstruction = Some(next);
                 self.hints_hold = false;
                 self.last_dirty = None;
-                return Err(CodecError::Config(
-                    "frame exceeds eight bitrate intervals at the allowed QP",
-                ));
+                return Err(CodecError::FrameTooLarge);
             }
             break (data, mbs, skipped, qp_sum);
         };
@@ -690,9 +688,7 @@ impl Encoder {
         }
         let budget = self.config.bitrate_kbps as f64 * 1000. / self.config.fps as f64;
         if data.len() as f64 * 8. > budget * 8. {
-            return Err(CodecError::Config(
-                "skip headers exceed eight bitrate intervals",
-            ));
+            return Err(CodecError::FrameTooLarge);
         }
         self.frame_num = (self.frame_num + 1) & 65535;
         self.window.push_back(data.len());

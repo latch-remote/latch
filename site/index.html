@@ -10,10 +10,8 @@
     />
     <meta name="color-scheme" content="dark" />
     <meta name="theme-color" content="#000000" />
-    <link rel="canonical" href="https://runefoo.github.io/latch/" />
     <meta property="og:site_name" content="Latch" />
     <meta property="og:type" content="website" />
-    <meta property="og:url" content="https://runefoo.github.io/latch/" />
     <meta
       property="og:title"
       content="Latch — Remote desktop over Tailscale"
@@ -24,7 +22,7 @@
     />
     <meta
       property="og:image"
-      content="https://runefoo.github.io/latch/img/og.png?v=20261104"
+      content="img/og.png?v=20261104"
     />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
@@ -43,7 +41,7 @@
     />
     <meta
       name="twitter:image"
-      content="https://runefoo.github.io/latch/img/og.png?v=20261104"
+      content="img/og.png?v=20261104"
     />
     <link rel="icon" href="favicon.ico?v=20261104" sizes="48x48" />
     <link rel="icon" href="favicon.svg?v=20261104" type="image/svg+xml" />
@@ -73,8 +71,8 @@
           <a href="#network">Network</a>
           <a href="#specs">Specs</a>
           <a href="#platforms">Platforms</a>
-          <a href="https://github.com/runefoo/latch"
-            >GitHub <span class="arr" aria-hidden="true">↗</span></a
+          <a href="https://github.com/latch-remote/latch"
+            >Development (private) <span class="arr" aria-hidden="true">↗</span></a
           >
         </nav>
         <a class="btn btn-primary btn-small" href="#download"
@@ -87,9 +85,9 @@
       <section class="hero" aria-labelledby="hero-title">
         <div class="wrap">
           <p class="hero-meta">
-            <span>Latch 5.3.0</span>
+            <span>Latch 6.0.0</span>
             <span class="hero-meta-kind">Remote desktop over Tailscale</span>
-            <a href="https://github.com/runefoo/latch/releases/latest"
+            <a href="https://github.com/latch-remote/latch-releases/releases/latest"
               >Release notes <span class="arr" aria-hidden="true">↗</span></a
             >
           </p>
@@ -103,10 +101,10 @@
             </p>
             <div class="actions">
               <a class="btn btn-primary" href="#download"
-                >Download 5.3.0 <span class="arr" aria-hidden="true">↓</span></a
+                >Download 6.0.0 <span class="arr" aria-hidden="true">↓</span></a
               >
-              <a class="btn btn-ghost" href="https://github.com/runefoo/latch"
-                >Source on GitHub <span class="arr" aria-hidden="true">↗</span></a
+              <a class="btn btn-ghost" href="https://github.com/latch-remote/latch-releases/releases/latest"
+                >Source snapshot <span class="arr" aria-hidden="true">↗</span></a
               >
             </div>
           </div>
@@ -441,10 +439,10 @@
             <div>
               <dt>Stream</dt>
               <dd>
-                Latch’s own stream protocol over UDP, inside WireGuard, with
-                Reed-Solomon forward error correction. A lost packet is rebuilt,
-                not waited for, and a frame that cannot be rebuilt costs a small
-                recovery frame where the encoder can make one, not a keyframe.
+                UDP inside WireGuard uses Reed-Solomon forward error correction.
+                The optional native TLS relay sends complete video frames and
+                end-to-end encrypted sound and input on separate lanes.
+                Tailscale-authenticated control remains required.
               </dd>
             </div>
             <div>
@@ -480,7 +478,7 @@
           <p class="section-link">
             <a
               class="link"
-              href="https://github.com/runefoo/latch/blob/main/deploy/relay/RELAY.md"
+              href="https://github.com/latch-remote/latch/blob/main/deploy/relay/RELAY.md"
               >Run your own peer relay <span class="arr" aria-hidden="true">↗</span></a
             >
           </p>
@@ -494,7 +492,7 @@
             <div class="section-title">
               <h2 id="specs-title">What Latch asks the other machine&nbsp;for.</h2>
               <p class="intro">
-                These are the settings Latch 5.3.0 offers, not benchmarks. What
+                These are the settings Latch 6.0.0 offers, not benchmarks. What
                 you get depends on both machines and the path between them.
               </p>
             </div>
@@ -689,10 +687,15 @@
                 <dt>Transport</dt>
                 <dd>
                   <p>
-                    Tailscale (WireGuard): direct, your own peer relay, or DERP.
+                    Tailscale UDP, with an optional native TCP/TLS relay for
+                    unusable video. The relay uses ALPN latch-relay/1.
                   </p>
                   <p class="sub">
-                    1200-byte datagrams, sized for the tunnel’s 1280-byte MTU.
+                    The relay sees public IPs, timing and volume. Opt out in
+                    Settings → Stream relay. HTTP-only proxies may block it.
+                    Supported CPU features and finite admission and transfer
+                    limits apply. The dedicated AWS relay uses public TLS. See the source
+                    snapshot documentation for validation and capacity limits.
                   </p>
                 </dd>
               </div>
@@ -764,7 +767,7 @@
               </dl>
               <a
                 class="link"
-                href="https://github.com/runefoo/latch/blob/main/docs/MACOS.md"
+                href="https://github.com/latch-remote/latch/blob/main/docs/MACOS.md"
                 >Mac guide <span class="arr" aria-hidden="true">↗</span></a
               >
             </article>
@@ -795,7 +798,7 @@
               </dl>
               <a
                 class="link"
-                href="https://github.com/runefoo/latch/blob/main/docs/WINDOWS.md"
+                href="https://github.com/latch-remote/latch/blob/main/docs/WINDOWS.md"
                 >Windows guide <span class="arr" aria-hidden="true">↗</span></a
               >
             </article>
@@ -821,7 +824,7 @@
               </dl>
               <a
                 class="link"
-                href="https://github.com/runefoo/latch/blob/main/deploy/native/README.md"
+                href="https://github.com/latch-remote/latch/blob/main/deploy/native/README.md"
                 >Linux guide <span class="arr" aria-hidden="true">↗</span></a
               >
             </article>
@@ -850,7 +853,7 @@
               </dl>
               <a
                 class="link"
-                href="https://github.com/runefoo/latch/blob/main/deploy/node/NODE.md"
+                href="https://github.com/latch-remote/latch/blob/main/deploy/node/NODE.md"
                 >Container guide <span class="arr" aria-hidden="true">↗</span></a
               >
             </article>
@@ -863,30 +866,33 @@
           <header class="section-head">
             <p class="label"><span class="label-no">05</span>Download</p>
             <div class="section-title">
-              <h2 id="download-title">Latch 5.3.0</h2>
+              <h2 id="download-title">Latch 6.0.0</h2>
               <p class="intro">
-                Released 9 November 2026. First install
+                Version 6.0.0. Public release publication is pending. First install
                 <a class="link-inline" href="https://tailscale.com/download"
                   >Tailscale</a
                 >
                 on each machine and sign in with the same account. On Mac and
                 Windows an installed copy updates itself and keeps its
                 settings; on Linux it tells you when there is a new one.
+                Older 5.x copies may need a one-time installation from the
+                public release page. Public releases include corresponding
+                GPL source. Development repository access is restricted.
               </p>
               <p class="head-links">
                 <a
                   class="link"
-                  href="https://github.com/runefoo/latch/releases/latest"
+                  href="https://github.com/latch-remote/latch-releases/releases/latest"
                   >Release notes <span class="arr" aria-hidden="true">↗</span></a
                 >
                 <a
                   class="link"
-                  href="https://github.com/runefoo/latch/releases/latest"
+                  href="https://github.com/latch-remote/latch-releases/releases/latest"
                   >Latest release <span class="arr" aria-hidden="true">↗</span></a
                 >
                 <a
                   class="link"
-                  href="https://github.com/runefoo/latch/releases"
+                  href="https://github.com/latch-remote/latch-releases/releases"
                   >All releases <span class="arr" aria-hidden="true">↗</span></a
                 >
               </p>
@@ -901,8 +907,9 @@
               </div>
               <div class="dl-body">
                 <p>
-                  In Terminal. Downloads the latest release, checks its SHA-256
-                  and signature, installs it in Applications and opens it.
+                  Download the archive and SHA256SUMS from the same public
+                  release. In Terminal, compare its SHA-256 before extracting.
+                  Quit Latch before replacing an existing app.
                 </p>
                 <div class="code">
                   <div class="code-bar">
@@ -917,19 +924,22 @@
                       Copy
                     </button>
                   </div>
-                  <pre><code id="cmd-mac"><span class="cmd">curl -fsSL https://raw.githubusercontent.com/<wbr>runefoo/<wbr>latch/<wbr>main/<wbr>scripts/<wbr>install-macos-release.sh | bash</span></code></pre>
+                  <pre><code id="cmd-mac"><span class="cmd">shasum -a 256 latch-macos-arm64.tar.gz</span></code></pre>
                 </div>
                 <p class="copy-status" id="status-mac" role="status"></p>
                 <p class="note">
-                  Downloaded the archive in a browser instead? The app is ad-hoc
-                  signed, so unpack it and clear the quarantine flag first:
-                  <code class="note-cmd">xattr -dr com.apple.quarantine Latch.app</code>
+                  Once the hash matches SHA256SUMS, extract the archive and run
+                  <code class="note-cmd">codesign --verify --deep --strict Latch.app</code>.
+                  Move the verified app into Applications with Finder. Run
+                  <code class="note-cmd">xattr -dr com.apple.quarantine /Applications/Latch.app</code>,
+                  then open it. The app is ad-hoc signed. Older 5.x copies may
+                  need this one-time installation. Keep your settings.
                 </p>
               </div>
               <div class="dl-action">
                 <a
                   class="btn-file"
-                  href="https://github.com/runefoo/latch/releases/latest/download/latch-macos-arm64.tar.gz"
+                  href="https://github.com/latch-remote/latch-releases/releases/latest/download/latch-macos-arm64.tar.gz"
                 >
                   <span class="file-label">Download<span class="file-for"> for macOS</span></span>
                   <span class="arr" aria-hidden="true">↓</span>
@@ -960,7 +970,7 @@
               <div class="dl-action">
                 <a
                   class="btn-file"
-                  href="https://github.com/runefoo/latch/releases/latest/download/latch-windows-x64.zip"
+                  href="https://github.com/latch-remote/latch-releases/releases/latest/download/latch-windows-x64.zip"
                 >
                   <span class="file-label">Download<span class="file-for"> for Windows</span></span>
                   <span class="arr" aria-hidden="true">↓</span>
@@ -992,8 +1002,9 @@
                       Copy
                     </button>
                   </div>
-                  <pre><code id="cmd-docker"><span class="cmd">git clone https://github.com/<wbr>runefoo/<wbr>latch
-</span><span class="cmd">cd latch
+                  <pre><code id="cmd-docker"><span class="cmd"># Download and verify latch-6.0.0-source.tar.gz from the release.
+tar xzf latch-6.0.0-source.tar.gz
+</span><span class="cmd">cd latch-6.0.0
 </span><span class="cmd">cp deploy/<wbr>node/<wbr>env.example deploy/<wbr>node/<wbr>.env
 </span><span class="cmd-note"># paste a Tailscale auth key, pick TS_HOSTNAME
 </span><span class="cmd">docker compose -f deploy/<wbr>node/<wbr>docker-compose.yml up -d --build</span></code></pre>
@@ -1003,7 +1014,7 @@
               <div class="dl-action">
                 <a
                   class="btn btn-ghost btn-block"
-                  href="https://github.com/runefoo/latch/blob/main/deploy/node/NODE.md"
+                  href="https://github.com/latch-remote/latch/blob/main/deploy/node/NODE.md"
                   >Container guide <span class="arr" aria-hidden="true">↗</span></a
                 >
               </div>
@@ -1024,7 +1035,7 @@
               <div class="dl-action">
                 <a
                   class="btn btn-ghost btn-block"
-                  href="https://github.com/runefoo/latch/blob/main/deploy/native/README.md"
+                  href="https://github.com/latch-remote/latch/blob/main/deploy/native/README.md"
                   >Linux guide <span class="arr" aria-hidden="true">↗</span></a
                 >
               </div>
@@ -1048,44 +1059,44 @@
         </div>
         <nav class="foot-nav" aria-label="Project">
           <p class="foot-head">Project</p>
-          <a href="https://github.com/runefoo/latch">Source</a>
-          <a href="https://github.com/runefoo/latch/releases">Releases</a>
-          <a href="https://github.com/runefoo/latch/blob/main/CHANGELOG.md"
+          <a href="https://github.com/latch-remote/latch-releases/releases/latest">Source snapshots</a>
+          <a href="https://github.com/latch-remote/latch-releases/releases">Releases</a>
+          <a href="https://github.com/latch-remote/latch-releases/releases/latest"
             >Changelog</a
           >
-          <a href="https://github.com/runefoo/latch/blob/main/LICENSE"
+          <a href="https://github.com/latch-remote/latch-releases/releases/latest/download/LICENSE"
             >License</a
           >
         </nav>
         <nav class="foot-nav" aria-label="Guides">
-          <p class="foot-head">Guides</p>
-          <a href="https://github.com/runefoo/latch/blob/main/docs/MACOS.md"
+          <p class="foot-head">Guides (source access)</p>
+          <a href="https://github.com/latch-remote/latch/blob/main/docs/MACOS.md"
             >macOS</a
           >
-          <a href="https://github.com/runefoo/latch/blob/main/docs/WINDOWS.md"
+          <a href="https://github.com/latch-remote/latch/blob/main/docs/WINDOWS.md"
             >Windows</a
           >
           <a
-            href="https://github.com/runefoo/latch/blob/main/deploy/node/NODE.md"
+            href="https://github.com/latch-remote/latch/blob/main/deploy/node/NODE.md"
             >Docker node</a
           >
           <a
-            href="https://github.com/runefoo/latch/blob/main/deploy/relay/RELAY.md"
+            href="https://github.com/latch-remote/latch/blob/main/deploy/relay/RELAY.md"
             >Peer relay</a
           >
         </nav>
         <nav class="foot-nav" aria-label="Help">
           <p class="foot-head">Help</p>
-          <a href="https://github.com/runefoo/latch/issues">Report an issue</a>
-          <a href="https://github.com/runefoo/latch/blob/main/CONTRIBUTING.md"
+          <a href="https://github.com/latch-remote/latch/issues">Issues (source access)</a>
+          <a href="https://github.com/latch-remote/latch/blob/main/CONTRIBUTING.md"
             >Contributing</a
           >
         </nav>
       </div>
       <div class="wrap foot-base">
-        <span>Latch 5.3.0</span>
-        <a href="https://github.com/runefoo/latch"
-          >Source on GitHub
+        <span>Latch 6.0.0</span>
+        <a href="https://github.com/latch-remote/latch"
+          >Development (private)
           <span class="arr" aria-hidden="true">↗</span></a
         >
       </div>

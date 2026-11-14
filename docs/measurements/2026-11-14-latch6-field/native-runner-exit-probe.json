@@ -1,0 +1,12 @@
+[
+    {
+        "mode":  "fail",
+        "expected":  1,
+        "actual":  1
+    },
+    {
+        "mode":  "pass",
+        "expected":  0,
+        "actual":  0
+    }
+]

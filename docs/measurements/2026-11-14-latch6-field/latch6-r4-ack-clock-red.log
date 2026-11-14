@@ -1,0 +1,20 @@
+   Compiling latch-relay v6.0.0 (/private/tmp/latch6-r4-ui-race-0fcf0f1b/latch-6.0.0/crates/relay)
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.68s
+     Running tests/transport.rs (/Users/daniel/Desktop/T3_Projects/latch/target/debug/deps/transport-121c865364ef8b37)
+
+running 1 test
+relay connection closed phase=attached role=host lane=video category=peer_closed kind=UnexpectedEof
+
+thread 'delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole' (81322707) panicked at crates/relay/tests/transport.rs:472:9:
+return-path delay closed video: frame=12, hold=650ms, event=Some(Closed { kind: TimedOut, message: "relay Video: video acknowledgment deadline expired" })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole ... FAILED
+
+failures:
+
+failures:
+    delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 1.48s
+
+error: test failed, to rerun pass `-p latch-relay --test transport`

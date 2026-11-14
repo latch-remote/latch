@@ -6,10 +6,18 @@ report with the stats overlay's numbers, or a measurement from a GPU the
 project has never run on (any NVIDIA or Intel GPU on Windows, any GPU at
 all on Linux, an HDR monitor), moves it further than most patches.
 
-- **Questions and ideas:** [Discussions](https://github.com/MrBeldum/latch/discussions).
-- **Bugs:** an [issue](https://github.com/MrBeldum/latch/issues/new/choose).
+- **Questions and ideas:** [Discussions](https://github.com/latch-remote/latch/discussions).
+- **Bugs:** an [issue](https://github.com/latch-remote/latch/issues/new/choose).
 - **Security problems:** privately, as [SECURITY.md](SECURITY.md) says.
 - **Code:** read on.
+
+Development issues, discussions and pull requests require access to the
+private source repository. Public releases contain the corresponding GPL
+source snapshot `latch-<version>-source.tar.gz`, including build inputs and
+license notices. Private measurement dumps and account-specific deployment
+records are excluded; deployment scripts remain included. Download and extract that archive to build without source
+repository access. The public distribution repository holds releases.
+[Public releases](https://github.com/latch-remote/latch-releases/releases)
 
 Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
@@ -49,7 +57,8 @@ there.
 
 | Crate | What is in it |
 |-------|---------------|
-| `crates/proto` | The wire format: datagram kinds, Reed–Solomon FEC, packetizer and reassembler, input reliability, control framing. No I/O. |
+| `crates/proto` | The wire format, Reed–Solomon FEC, packetizer and reassembler, input reliability, control framing, and shared socket helpers. |
+| `crates/relay` | Public native TLS transport, end-to-end record encryption, lane capabilities, bounded admission and durable transfer quota. |
 | `crates/codec` | The software H.264 encoder and decoder and the `lpcm-rice` audio codec. |
 | `crates/engine` | The sharing side: capture, hardware and software encode, display sizing, audio capture, input injection, congestion control, and the session server. One directory per OS (`mac/`, `windows/`, `linux/`). |
 | `crates/stream` | The viewing side: session, receive loop, decoders (VideoToolbox, Media Foundation, `latch-codec`), audio playback, gamepads. |
@@ -154,8 +163,38 @@ GPL-3.0-or-later, like the rest of Latch.
 
 ## Releases
 
-Maintainers cut a release by bumping `version` in `Cargo.toml`, dating the
-changelog section, and pushing a `v*` tag. `.github/workflows/release.yml`
-tests, builds and publishes the macOS, Windows and Linux archives with
-their SHA-256 digests. Installed Mac and Windows copies update themselves
-from there; Linux hosts show a notice.
+Maintainers align the workspace version, local path package requirements
+and `latch-*` package entries in `Cargo.lock`, then date the matching
+changelog section. `cargo metadata --locked` verifies the manifest and lock
+before a `v*` tag is pushed. The release workflow tests and builds macOS,
+Windows and Linux assets, exports corresponding source from the tag, and
+prepares an allowlisted public asset set. A distribution-scoped App token
+creates a draft, verifies uploaded bytes, and publishes it only after the
+asset set passes validation. The public distribution tag belongs to that
+repository's history.
+
+Every release includes `release.json`, `SHA256SUMS`, `LICENSE`, `NOTICE`
+and `latch-<version>-source.tar.gz`. The manifest binds exact version-tagged
+URLs, byte sizes and SHA-256 digests. Source exports preserve workspace
+build inputs, the release packaging workflow, and third-party notices while
+excluding other repository automation, site assets and private operational
+records. Consumer update requests are
+anonymous. Installed Mac and Windows copies update from this manifest.
+Linux hosts show a notice.
+
+The publisher uses `vars.RELEASE_APP_ID` and
+`secrets.RELEASE_APP_PRIVATE_KEY`, with the App installed only on
+`latch-remote/latch-releases`. Keep that installation scoped to distribution.
+Linux jobs default to GitHub-hosted runners. Optional `LINUX_X64_RUNNER`
+and `LINUX_ARM64_RUNNER` variables select verified alternative runners.
+Blacksmith dashboard verification and capacity remain unconfirmed.
+`PAGES_ENABLED` and `RELEASE_ATTESTATIONS_ENABLED` are opt-in after plan
+entitlement and configuration are verified. Private attestations are
+unavailable by default. Release signing and notarization remain open work.
+
+```bash
+python3 -m unittest discover -s scripts -p 'test_publish_release.py' -v
+bash scripts/test-release-manifest.sh
+python3 scripts/release-notes.py 6.0.0
+cargo metadata --locked --format-version 1 --no-deps
+```

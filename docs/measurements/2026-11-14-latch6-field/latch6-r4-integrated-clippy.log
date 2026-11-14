@@ -1,0 +1,6 @@
+    Checking latch-client v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/client)
+    Checking latch-relay v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/relay)
+    Checking latch-host v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/host)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 2.40s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

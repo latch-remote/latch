@@ -1,0 +1,26 @@
+{
+  "utc": "2026-11-14T11:26:21Z",
+  "files": [
+    {
+      "path": "crates/stream/src/session.rs",
+      "bytes": 151327,
+      "sha256": "82121cdf29a50235b48fe657fac89b537d7097dfe9792568537ff0ed978c17e4"
+    },
+    {
+      "path": "crates/codec/src/h264/encode.rs",
+      "bytes": 44779,
+      "sha256": "1b81f5884de656c3917229c3c681e932d28ca6a5d85b1a77c90812b4b45b20bf"
+    },
+    {
+      "path": "crates/codec/src/h264/mod.rs",
+      "bytes": 1867,
+      "sha256": "64735b984c85f8d637ba4390597ff4ddf91999bab704150a96d2b524d13bc16b"
+    },
+    {
+      "path": "crates/engine/src/software.rs",
+      "bytes": 44093,
+      "sha256": "d0b65617b078a2218875d9b124b881a8e301a7fe0e2a77a69bc8bc51e3a56f53"
+    }
+  ],
+  "archive_sha256": "05619c99d2e9d53ff6e2eecf5ad413bfe2a7de2f60b8080eb4de316a3db1802c"
+}

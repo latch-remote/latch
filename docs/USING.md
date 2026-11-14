@@ -36,7 +36,7 @@ is sitting at it. Platform details are in [MACOS.md](MACOS.md) and
 ## When the connection drops
 
 If a stream loses its connection, leave the window open. Latch tries again
-after 2, 5 and 10 seconds, then every 20 to 30 seconds for five minutes,
+after 2, 5 and 10 seconds, then every 20 to 30 seconds until you stop it,
 and at once when the machine shows as online again or this one wakes from
 sleep. The overlay shows the countdown; **Reconnect now** skips the wait
 and **Stop** goes back to the machine list. Each attempt is a new session,
@@ -46,9 +46,88 @@ Latch does not keep retrying when the other side said no: a refusal,
 another viewer taking the machine over, or the stream being ended there.
 **Try again** starts over when you are ready.
 
+## Stream relay
+
+Latch first tries UDP over Tailscale. If both machines support the version
+6 relay, missing video for about a second or sustained damaged video for
+about two seconds can start a relay attempt. Busy video held below 60% of
+the requested rate for five seconds can also trigger recovery, even when
+error correction repairs the lost packets. Quiet desktops do not trigger
+this bandwidth check. This can help when UDP media
+is unusable and the authorized Tailscale control connection still works.
+The toolbar shows **Latch TLS relay** when that route is active.
+
+Open **Settings → Stream relay** to change **Recover automatically through
+the Latch relay** or **Relay hostname** and its port. The default is
+`relay.latch.rune.foo`, port `443`, with recovery enabled. The dedicated
+AWS Lightsail relay has public TLS, four concurrent session slots, and a
+monthly transfer budget. If it is unavailable or full, Latch keeps trying
+the original path within its recovery limits.
+
+Turning off recovery opts this viewer out. For a sharing machine, edit the
+existing `host.toml` in Latch's settings folder and restart its background
+service to apply the policy. A custom endpoint must match on both machines.
+The equivalent viewer configuration is in `client.toml`.
+
+```toml
+# host.toml
+[relay]
+enabled = false
+host = "relay.latch.rune.foo"
+port = 443
+```
+
+```toml
+# client.toml
+[stream.relay]
+enabled = false
+host = "relay.latch.rune.foo"
+port = 443
+```
+
+Edit existing tables in place to avoid duplicate TOML sections. Restart
+Latch after editing its files. Host endpoint and policy changes currently
+take effect only when the background service starts.
+
+The relay carries complete video frames on one TLS lane, and sound,
+microphone, keyboard, mouse, gamepads and small control messages on another.
+Fresh session keys and attachment tickets are exchanged through authorized
+Tailscale control. Media and input remain end-to-end encrypted. The relay
+operator sees public IP addresses, connection timing and traffic volume.
+
+Relay use has finite capacity. The daemon's pilot defaults allow four
+sessions globally, two per creator IP, a 60-second attachment window,
+15-minute sessions and 512 MiB per session. The CLI's default monthly
+ingress-plus-egress reservation budget is 10 GiB. Operators can configure
+different bounded limits. These are implementation defaults, with deployed
+limits set by the operator. Quota exhaustion or admission rejection prevents
+a new relay route. The monthly ledger survives daemon restarts.
+
+Relay setup and frame stalls have deadlines and retries have cooldowns.
+A failed relay attempt leaves or returns routing to UDP. If that path
+still cannot deliver usable video, the media watchdog ends the session and
+the reconnect overlay appears. After a minute on relay, a bounded UDP load
+probe can return the stream to a healthy direct path. This probe currently
+covers requests up to 40 Mbps. At the relay's time or traffic limit, Latch
+returns briefly to UDP and starts a fresh relay connection. On a network
+where UDP is blocked, video can pause for several seconds during renewal.
+Priority queue exhaustion ends the
+session to release held keys and buttons. Local acceptance of a packet
+into a queue does not guarantee remote delivery.
+
+The network must allow native TLS with ALPN `latch-relay/1`. HTTP-only
+proxies, TLS inspection and captive portals may prevent it. This path
+requires AES, PCLMULQDQ, BMI1, ADX, AVX and AVX2 on x86-64, or NEON, AES,
+PMULL and SHA2 on AArch64. Unsupported CPUs disable relay support. Codec,
+GPU, capture and display limits still determine picture size and speed.
+Synthetic campus sessions exercise this path; see the
+[performance notes](PERFORMANCE.md#latch-6-network-recovery) for their limits.
+Large-concurrency qualification remains outstanding.
+[Protocol and security details](PROTOCOL.md#public-tcptls-relay)
+
 ## Updates
 
-Every few hours Latch asks GitHub for the latest release. Settings has the
+Every few hours Latch fetches the public `release.json` manifest. Settings has the
 switch and a **Check now** button.
 
 - **macOS.** A newer app is downloaded, checked against the digest GitHub
@@ -59,21 +138,45 @@ switch and a **Check now** button.
   sleep. A PC that is asleep gets it the next time the Mac sees it.
 - **Windows.** With the window open, Latch downloads a newer
   `latch-host.exe` itself and installs it when no stream is running.
-  Whether an update is pulled or pushed from a Mac, the PC looks the
-  release up on GitHub and installs the file only if it matches the
-  SHA-256 published there; what the sender says about it is not enough. A
-  PC that cannot reach GitHub refuses the update.
+  Whether an update is pulled or pushed from a Mac, the PC fetches the
+  version-specific public manifest and installs the file only if its exact
+  version, URL, size and SHA-256 match. A PC that cannot reach GitHub refuses
+  the update.
 - **Linux.** Latch says a newer version exists and links to it. Install the
   tarball as in [deploy/native/README.md](../deploy/native/README.md), or
   rebuild the Docker node.
 
-Public releases need no GitHub login. For a private fork, Latch uses the
-GitHub token git has stored for github.com, `LATCH_GITHUB_TOKEN`, or
-`github_token` in `client.toml`. Hosts installed before 3.1 need a local or
+Version 6 downloads and update checks need no GitHub login. Legacy
+`github_token` and `LATCH_GITHUB_TOKEN` settings are ignored by this public
+distribution path. Development source requires repository access, or you
+can build the corresponding source snapshot attached to each public release.
+Hosts installed before 3.1 need a local or
 SSH installation of a current release: a Latch 5 viewer cannot stream the
 retired protocol to upgrade them. Mac builds are ad-hoc signed, so macOS may
 ask for Screen Recording and Accessibility again after an update
 ([why](ROADMAP.md#signing-and-notarization)).
+
+### Moving from 5.x to 6.0.0
+
+1. Download the matching archive and `SHA256SUMS` from the public releases
+   page and compare the archive's SHA-256 with its listed value.
+2. On Windows, extract the zip and run `install-host.ps1` from that folder.
+   Open **Sharing** and run **Set up as administrator** if setup is needed.
+   On macOS, quit Latch and replace `/Applications/Latch.app` using the
+   [Mac installation steps](MACOS.md#install-a-prebuilt-app).
+   On Linux, replace the binary and restart the service using the
+   [native guide](../deploy/native/README.md#download-and-verify).
+3. Keep your existing settings folder. Open Latch and check the version
+   in **Settings**. Use **Check now** for subsequent release checks.
+4. Update both ends to use the new relay path. Older protocol 1 peers keep
+   UDP streaming and do not negotiate this extension.
+
+Some compiled 5.x versions check the former private release endpoint, so
+they may never offer 6.0.0 automatically. They can also reject an update
+pushed by a new Mac because their independent verification still uses the
+old endpoint. A one-time installer or local/SSH handover gets those machines
+onto the public manifest updater.
+[Public releases](https://github.com/latch-remote/latch-releases/releases/latest)
 
 ## Staying reachable
 
@@ -110,10 +213,11 @@ Ethernet is strongly preferred; most Wi-Fi adapters cannot wake a PC.
 
 ## Upgrading from Latch 4 or BroLink
 
-An older install updates to Latch 5 and keeps its settings. Latch 5
-machines stream only with Latch 5 machines: a Latch 5 viewer that finds an
-older host sends it the update (or says which machine to update), and an
-older viewer finds no stream on a Latch 5 host and offers its own update.
+Install the current release locally or over SSH and keep your settings.
+Version 5 introduced protocol 1, shared by versions 5 and 6. Versions 4
+and earlier used the retired GameStream protocol and require an upgrade
+before streaming with current peers. An update pushed to an older Windows
+host can still fail verification against its compiled release endpoint.
 Setup removes the old engine, its pairing data and its services.
 
 - **Mac:** a BroLink app moves to `Latch.app` the first time it runs, and
@@ -126,5 +230,5 @@ Setup removes the old engine, its pairing data and its services.
 - **Linux:** the first start registers `latch.service` and retires the old
   service. For a native desktop, see [deploy/native/README.md](../deploy/native/README.md).
 
-Use `LATCH_DATA_DIR` and `LATCH_GITHUB_TOKEN` for environment overrides.
-The equivalent names from versions before 4.1.0 still work.
+Use `LATCH_DATA_DIR` to override the settings directory. Version 6 public
+updates ignore the legacy GitHub token settings.

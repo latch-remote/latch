@@ -243,6 +243,7 @@ impl Service {
         *self.server.lock() = Some(Server::bind(
             CONTROL_PORT,
             Options {
+                relay: latch_stream::session::relay_config(&self.cfg.lock().relay),
                 prepare: Some(Box::new(move |req| {
                     let service = owner.upgrade().context("the host is stopping")?;
                     let cfg = service.cfg.lock().clone();
@@ -289,7 +290,17 @@ impl Service {
         http::serve_with_auth(
             listener,
             move |peer| authorizer.authorized(peer.ip()),
-            move |peer, _path, _headers, _len| body_authorizer.caller(peer).allowed(),
+            move |peer, path, headers, len| {
+                let caller = body_authorizer.caller(peer);
+                caller.allowed()
+                    && local_body_authorized(
+                        caller == Caller::Local || body_authorizer.own_address(peer.ip()),
+                        body_authorizer.local_secret.as_deref(),
+                        path,
+                        headers,
+                        len,
+                    )
+            },
             move |peer, req| handler.handle(peer, req),
         );
         Ok(())
@@ -1167,6 +1178,24 @@ fn media_peer(peer: SocketAddr, who: Option<tailscale::WhoIs>) -> SocketAddr {
 /// (`TUN` false) can it be a tailnet peer; then `whois` of the connection's
 /// address says which, and an address Tailscale knows nothing about is a
 /// process on this machine. A lookup that fails admits nobody.
+// Check before collecting an upload: the update allowance is much larger
+// than an ordinary control request, including on platforms that reject it.
+fn local_body_authorized(
+    local: bool,
+    secret: Option<&str>,
+    path: &str,
+    headers: &[(String, String)],
+    len: u64,
+) -> bool {
+    !local
+        || (path == "/v1/status" && len == 0)
+        || secret.is_some_and(|secret| {
+            headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case(crate::local_control::HEADER) && value == secret
+            })
+        })
+}
+
 fn loopback_caller(
     tun: Option<bool>,
     owner: Option<&Owner>,
@@ -1490,6 +1519,65 @@ pub fn mic_opener() -> Option<latch_engine::mic::MicOpener> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_uploads_require_the_secret_before_reading_the_body() {
+        let headers = vec![(
+            crate::local_control::HEADER.to_owned(),
+            "owner-secret".to_owned(),
+        )];
+        for path in ["/v1/update", "/v1/status", "/v1/stream"] {
+            assert!(!super::local_body_authorized(
+                true,
+                Some("owner-secret"),
+                path,
+                &[],
+                128 << 20
+            ));
+            assert!(!super::local_body_authorized(
+                true,
+                Some("different"),
+                path,
+                &headers,
+                128 << 20
+            ));
+            assert!(!super::local_body_authorized(
+                true,
+                None,
+                path,
+                &headers,
+                128 << 20
+            ));
+            assert!(super::local_body_authorized(
+                true,
+                Some("owner-secret"),
+                path,
+                &headers,
+                128 << 20
+            ));
+            assert!(super::local_body_authorized(
+                false,
+                None,
+                path,
+                &[],
+                128 << 20
+            ));
+        }
+        assert!(super::local_body_authorized(
+            true,
+            None,
+            "/v1/status",
+            &[],
+            0
+        ));
+        assert!(!super::local_body_authorized(
+            true,
+            None,
+            "/v1/quit",
+            &[],
+            0
+        ));
+    }
+
     use super::*;
 
     #[test]

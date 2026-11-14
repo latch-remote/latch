@@ -1,0 +1,512 @@
+//! A headless Latch viewer for measurements: connects, decodes, prints a
+//! line a second and a JSON summary at the end. Against a host streaming
+//! the test pattern, `--keys N` times N key presses to the decoded picture
+//! (the pattern's top-left square flips on each press) on this machine's
+//! own clock.
+//!
+//!     view HOST [--port 47860] [--width 1280] [--height 720] [--fps 60]
+//!          [--kbps 10000] [--seconds 30] [--sample-ms 1000] [--keys 0] [--hevc] [--audio]
+//!          [--point X,Y]   (one absolute pointer position, in picture pixels)
+//!          [--moves N]     (N relative moves of +10,+5, one every 16 ms)
+//!          [--dump PREFIX] (PREFIX-before.pgm and PREFIX-after.pgm: the
+//!                           picture's luma either side of the moves)
+//!          [--pads N]      (N gamepads for the whole run: south/A toggles
+//!                           every --pad-toggle-ms (500), the left stick
+//!                           sweeps, the right trigger ramps; each state
+//!                           change is logged with the wall clock to the
+//!                           microsecond, and so is every rumble the host
+//!                           sends back)
+//!          [--pad-kind xbox|playstation] [--pad-hz 250]
+//!          [--mute]        (play sound at zero volume)
+//!
+//! With `LATCH_AUDIO_PROBE=1` against a host run with
+//! `LATCH_TEST_AUDIO=clicks`, the summary's `audio_click_ms` is how long
+//! after the host made each click it reached this machine's speaker (both
+//! wall clocks; on two machines, their offset is in it).
+
+use latch_proto::gamepad::{button, PadKind, PadState};
+use latch_stream::{Event, Frame, FrameSlot, Session, Settings};
+use std::net::IpAddr;
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
+
+fn cpu_seconds() -> f64 {
+    // getrusage through std is not available; /proc is Linux only. `ps`
+    // works on every Unix this runs on.
+    let out = std::process::Command::new("ps")
+        .args(["-o", "cputime=", "-p", &std::process::id().to_string()])
+        .output();
+    let Ok(out) = out else { return f64::NAN };
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut total = 0.0;
+    for part in s.trim().split(':') {
+        total = total * 60.0 + part.parse::<f64>().unwrap_or(0.0);
+    }
+    total
+}
+
+fn rss_mb() -> f64 {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output();
+    out.ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<f64>()
+                .ok()
+        })
+        .map_or(f64::NAN, |kb| kb / 1024.0)
+}
+
+fn square_is_white(f: &Frame, source_width: u32, source_height: u32) -> bool {
+    f.with_planes(|y, y_stride, _, _| {
+        let mut sum = 0u64;
+        let mut samples = 0u64;
+        for y_pos in (16 * f.height / source_height) as usize..(48 * f.height / source_height) as usize {
+            for x_pos in (16 * f.width / source_width) as usize..(48 * f.width / source_width) as usize {
+                let idx = y_pos * y_stride + x_pos * if f.color.bit_depth == 10 { 2 } else { 1 };
+                if idx < y.len() {
+                    samples += 1;
+                    sum += if f.color.bit_depth == 10 {
+                        u64::from(u16::from_le_bytes([y[idx], y[idx + 1]]) >> 8)
+                    } else {
+                        y[idx] as u64
+                    };
+                }
+            }
+        }
+        sum / samples.max(1) > 128
+    })
+}
+
+/// The next decoded picture's luma as a binary PGM.
+fn dump(frames: &FrameSlot, path: &str) -> anyhow::Result<()> {
+    let start = Instant::now();
+    let frame = loop {
+        if let Some(f) = frames.take() {
+            break f;
+        }
+        anyhow::ensure!(
+            start.elapsed() < Duration::from_secs(5),
+            "no picture to dump"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    let ten = frame.color.bit_depth == 10;
+    let max = if ten { 1023 } else { 255 };
+    let mut out = format!("P5\n{w} {h}\n{max}\n").into_bytes();
+    frame.with_planes(|y, stride, _, _| {
+        for row in 0..h {
+            if ten {
+                for v in y[row * stride..row * stride + w * 2].as_chunks::<2>().0 {
+                    out.extend_from_slice(&(u16::from_le_bytes(*v) >> 6).to_be_bytes());
+                }
+            } else {
+                out.extend_from_slice(&y[row * stride..row * stride + w]);
+            }
+        }
+    });
+    std::fs::write(path, out)?;
+    eprintln!("wrote {path}");
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    // Warnings only, unless RUST_LOG asks (`latch_stream::audio=info`
+    // names the output device, its speakers and its period).
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+    let args: Vec<String> = std::env::args().collect();
+    let host: IpAddr = args
+        .get(1)
+        .map(|s| s.parse())
+        .transpose()?
+        .unwrap_or("127.0.0.1".parse()?);
+    let arg = |name: &str, default: &str| {
+        args.windows(2)
+            .find(|w| w[0] == name)
+            .map_or(default.to_string(), |w| w[1].clone())
+    };
+    let flag = |name: &str| args.iter().any(|a| a == name);
+    let port: u16 = arg("--port", "47860").parse()?;
+    let width: u32 = arg("--width", "1280").parse()?;
+    let height: u32 = arg("--height", "720").parse()?;
+    let fps: u32 = arg("--fps", "60").parse()?;
+    let kbps: u32 = arg("--kbps", "10000").parse()?;
+    let seconds: u64 = arg("--seconds", "30").parse()?;
+    let sample_ms: u64 = arg("--sample-ms", "1000").parse()?;
+    anyhow::ensure!(
+        sample_ms > 0 && sample_ms <= 1000,
+        "sample-ms must be 1..=1000"
+    );
+    let keys: usize = arg("--keys", "0").parse()?;
+    let pads: u8 = arg("--pads", "0").parse()?;
+    let pad_kind = match arg("--pad-kind", "xbox").as_str() {
+        "playstation" => PadKind::PlayStation,
+        "generic" => PadKind::Generic,
+        _ => PadKind::Xbox,
+    };
+    let pad_hz: u64 = arg("--pad-hz", "250").parse()?;
+    let pad_toggle_ms: u64 = arg("--pad-toggle-ms", "500").parse()?;
+
+    let frames = Arc::new(FrameSlot::default());
+    let (tx, rx) = mpsc::channel();
+    let session = Session::start_with_relay(
+        latch_stream::Server {
+            address: host,
+            port,
+        },
+        Settings {
+            prefer_color: false,
+            color: latch_proto::color::ColorCapabilities {
+                ten_bit: flag("--ten-bit"),
+                hdr: flag("--hdr"),
+                peak_nits: if flag("--hdr") { 1000 } else { 0 },
+            },
+            width,
+            height,
+            fps,
+            bitrate_kbps: kbps,
+            hevc: flag("--hevc"),
+            av1: flag("--av1"),
+            audio: flag("--audio"),
+            name: "view example".into(),
+            cursor: false,
+            gamepads: pads > 0,
+            mic: flag("--mic"),
+        },
+        frames.clone(),
+        tx,
+        || {},
+        if std::env::var_os("LATCH_FIELD_UDP_ONLY").is_some() { None } else { latch_stream::session::relay_config(&Default::default()) },
+    );
+    let asked = Instant::now();
+    loop {
+        match rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(Event::Connected) => {
+                eprintln!("negotiated color: {:?}", session.stats().color);
+                break;
+            }
+            Ok(Event::Failed { stage, message }) => anyhow::bail!("failed at {stage}: {message}"),
+            Ok(other) => eprintln!("{other:?}"),
+            Err(_) => anyhow::bail!("no stream after 20 s"),
+        }
+    }
+    eprintln!("connected in {:?}", asked.elapsed());
+    // Microseconds since the epoch, comparable with another program's
+    // log on the same machine.
+    fn wall_us() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros())
+    }
+    let pad_log = Arc::new(parking_lot::Mutex::new(Vec::<serde_json::Value>::new()));
+    let pads_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pad_thread = (pads > 0).then(|| {
+        let log = pad_log.clone();
+        session.on_pad_feedback(move |slot, f| {
+            eprintln!(
+                "pad {slot} feedback large {} small {} triggers {}/{} led {:?} player {} at {}",
+                f.large,
+                f.small,
+                f.left_trigger,
+                f.right_trigger,
+                f.led,
+                f.player,
+                wall_us()
+            );
+            log.lock().push(serde_json::json!({
+                "feedback": slot, "large": f.large, "small": f.small, "led": f.led,
+                "player": f.player, "wall_us": wall_us().to_string(),
+            }));
+        });
+        let input = session.input();
+        let done = pads_done.clone();
+        let log = pad_log.clone();
+        std::thread::spawn(move || {
+            let slots = pads.min(input.pad_slots());
+            if slots < pads {
+                eprintln!("the host takes {} gamepads", input.pad_slots());
+            }
+            let start = Instant::now();
+            let period = Duration::from_micros(1_000_000 / pad_hz.max(1));
+            let mut south = false;
+            let mut tick = 0u64;
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let ms = start.elapsed().as_millis() as u64;
+                let toggled = (ms / pad_toggle_ms.max(1)) % 2 == 1;
+                let phase = (tick % 1000) as f32 / 1000.0 * std::f32::consts::TAU;
+                let state = PadState {
+                    buttons: if toggled { button::SOUTH } else { 0 },
+                    left_x: (phase.sin() * 30_000.0) as i16,
+                    left_y: (phase.cos() * 30_000.0) as i16,
+                    right_trigger: ((tick % 256) * 256) as u16,
+                    ..Default::default()
+                };
+                // Stamped before sending, so the log never trails the pad.
+                let sent_us = wall_us();
+                for slot in 0..slots {
+                    input.pad(slot, pad_kind, state);
+                }
+                if toggled != south {
+                    south = toggled;
+                    log.lock().push(serde_json::json!({
+                        "south": south, "wall_us": sent_us.to_string(),
+                    }));
+                }
+                tick += 1;
+                std::thread::sleep(period);
+            }
+            for slot in 0..slots {
+                input.pad_gone(slot);
+            }
+        })
+    });
+    if flag("--mute") {
+        session.set_volume(0.0);
+    }
+    let mut clicks: Vec<f64> = Vec::new();
+    let cpu0 = cpu_seconds();
+    let t0 = Instant::now();
+
+    // Smoothness: when each decoded frame appears, polled every 250 µs.
+    let timing_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let arrivals = {
+        let done = timing_done.clone();
+        let frames = frames.clone();
+        std::thread::spawn(move || {
+            let mut times = Vec::new();
+            let mut seq = frames.seq();
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let now = frames.seq();
+                if now != seq {
+                    seq = now;
+                    times.push(Instant::now());
+                }
+                std::thread::sleep(Duration::from_micros(250));
+            }
+            times
+        })
+    };
+
+    if let Some((x, y)) = arg("--point", "")
+        .split_once(',')
+        .and_then(|(x, y)| Some((x.parse::<i16>().ok()?, y.parse::<i16>().ok()?)))
+    {
+        std::thread::sleep(Duration::from_millis(500));
+        session
+            .input()
+            .mouse_position(x, y, width as i16, height as i16);
+        eprintln!("pointer sent to {x},{y} of {width}x{height}");
+    }
+
+    let moves: u32 = arg("--moves", "0").parse()?;
+    let dump_to = arg("--dump", "");
+    if moves > 0 {
+        std::thread::sleep(Duration::from_millis(500));
+        if !dump_to.is_empty() {
+            dump(&frames, &format!("{dump_to}-before.pgm"))?;
+        }
+        let input = session.input();
+        for _ in 0..moves {
+            input.mouse_move(10, 5);
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        eprintln!("{moves} relative moves sent");
+        if !dump_to.is_empty() {
+            std::thread::sleep(Duration::from_millis(500));
+            dump(&frames, &format!("{dump_to}-after.pgm"))?;
+        }
+    }
+
+    let mut presses = Vec::new();
+    if keys > 0 {
+        let input = session.input();
+        let mut seq = frames.seq();
+        let start = Instant::now();
+        while frames.seq() == 0 && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut white = frames.take().map(|f| {
+            let w = square_is_white(&f, width, height);
+            frames.recycle(f);
+            w
+        });
+        for _ in 0..keys {
+            std::thread::sleep(Duration::from_millis(100));
+            seq = seq.max(frames.seq());
+            let pressed = Instant::now();
+            input.key(0x41, true, 0);
+            loop {
+                if pressed.elapsed() > Duration::from_secs(2) {
+                    eprintln!("a press never showed up");
+                    break;
+                }
+                if frames.seq() > seq {
+                    seq = frames.seq();
+                    if let Some(f) = frames.take() {
+                        let now = square_is_white(&f, width, height);
+                        frames.recycle(f);
+                        if white.is_some_and(|w| w != now) {
+                            presses.push(pressed.elapsed().as_secs_f64() * 1000.0);
+                            white = Some(now);
+                            break;
+                        }
+                        white = Some(now);
+                    }
+                }
+                std::thread::sleep(Duration::from_micros(500));
+            }
+            input.key(0x41, false, 0);
+        }
+    }
+
+    let mut lines = Vec::new();
+    let sample_start = Instant::now();
+    while sample_start.elapsed() < Duration::from_secs(seconds) {
+        std::thread::sleep(Duration::from_millis(sample_ms));
+        let second = t0.elapsed().as_secs_f64();
+        while let Ok(e) = rx.try_recv() {
+            eprintln!("elapsed_ms={} {e:?}", t0.elapsed().as_millis());
+        }
+        let s = session.stats();
+        let probe = latch_stream::audio::take_probe();
+        let a = s.audio_latency;
+        if !probe.is_empty() || a.queued_ms > 0.0 {
+            let mean = probe.iter().sum::<f32>() / probe.len().max(1) as f32;
+            eprintln!(
+                "        audio: queued {:.1} ms, device {:.1} ms, jitter {:.1} ms, {} underruns; {} clicks at {mean:.1} ms",
+                a.queued_ms, a.device_ms, a.jitter_ms, a.underruns, probe.len()
+            );
+        }
+        if !s.mic.is_empty() {
+            eprintln!("        {}", s.mic);
+        }
+        clicks.extend(probe.iter().map(|&ms| f64::from(ms)));
+        eprintln!(
+            "{second:>6.2}s {:5.1} fps {:6.2} Mbps rtt {:3} ms decode {:5.2} ms host {:5.2} ms assembly {:5.2} ms queue {:5.2} ms loss {:4.1}% fec {:3} {}x{} {} | {}",
+            s.fps, s.mbps, s.rtt_ms, s.decode_ms, s.host_ms, s.assembly_ms, s.queue_ms, s.loss_pct,
+            s.fec_recovered, s.width, s.height, s.decoder, s.audio
+        );
+        lines.push(serde_json::json!({
+            "fps": s.fps, "mbps": s.mbps, "rtt_ms": s.rtt_ms, "decode_ms": s.decode_ms,
+            "host_ms": s.host_ms, "assembly_ms": s.assembly_ms, "queue_ms": s.queue_ms,
+            "loss_pct": s.loss_pct, "fec_recovered": s.fec_recovered,
+            "elapsed_ms": t0.elapsed().as_millis(), "window_ms": s.window_ms,
+            "width": s.width, "height": s.height, "decoded_seq": frames.seq(),
+            "received_mbps": s.received_mbps, "frames_lost": s.frames_lost,
+            "video_problem": s.video_problem, "rtt_var_ms": s.rtt_var_ms,
+            "requested_bitrate_kbps": s.requested_bitrate_kbps,
+            "wire_budget_kbps": s.wire_budget_kbps,
+            "application_limited": s.application_limited,
+            "applied_bitrate_kbps": s.applied_bitrate_kbps, "pacing_queue_ms": s.pacing_queue_ms,
+            "send_errors": s.send_errors, "send_retries": s.send_retries,
+            "socket_send_bytes": s.socket_send_bytes, "socket_receive_bytes": s.socket_receive_bytes,
+            "host_socket_send_bytes": s.host_socket_send_bytes,
+            "host_socket_receive_bytes": s.host_socket_receive_bytes,
+            // Sparse luma samples confirm changing decoded content without saving pictures.
+            "luma_sample": frames.take().map(|f| {
+                let sample: Vec<u8> = f.with_planes(|y, stride, _, _| (0..16).map(|i| {
+                    y[(f.height as usize * (2 * i + 1) / 32) * stride + f.width as usize / 2]
+                }).collect());
+                frames.recycle(f);
+                sample
+            }),
+        }));
+    }
+    pads_done.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(t) = pad_thread {
+        let _ = t.join();
+        // Let the unplug reach the host before the session ends it anyway.
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+    let cpu = (cpu_seconds() - cpu0) / elapsed * 100.0;
+    let stats = session.stats();
+    presses.sort_by(f64::total_cmp);
+    timing_done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let times = arrivals.join().unwrap_or_default();
+    let mut gaps: Vec<f64> = times
+        .windows(2)
+        .map(|w| (w[1] - w[0]).as_secs_f64() * 1000.0)
+        .collect();
+    let mean_gap = gaps.iter().sum::<f64>() / gaps.len().max(1) as f64;
+    let stdev_gap = (gaps.iter().map(|g| (g - mean_gap).powi(2)).sum::<f64>()
+        / gaps.len().max(1) as f64)
+        .sqrt();
+    gaps.sort_by(f64::total_cmp);
+    let gap = |p: f64| {
+        gaps.get(((gaps.len() as f64 - 1.0) * p).round() as usize)
+            .copied()
+    };
+    let span = times
+        .last()
+        .zip(times.first())
+        .map_or(0.0, |(l, f)| (*l - *f).as_secs_f64());
+    let pct = |p: f64| {
+        presses
+            .get(((presses.len() as f64 - 1.0) * p).round() as usize)
+            .copied()
+    };
+    clicks.sort_by(f64::total_cmp);
+    let click = |p: f64| {
+        clicks
+            .get(((clicks.len() as f64 - 1.0) * p).round() as usize)
+            .copied()
+    };
+    let summary = serde_json::json!({
+        "host": host.to_string(), "asked": [width, height, fps, kbps],
+        "sample_ms": sample_ms,
+        "decoder": stats.decoder, "encoder": stats.encoder, "codec": stats.codec,
+        "viewer_cpu_pct_one_core": cpu, "viewer_rss_mb": rss_mb(),
+        "key_to_picture_ms": { "n": presses.len(), "min": presses.first(), "p50": pct(0.5), "p95": pct(0.95), "max": presses.last() },
+        "audio_click_ms": { "n": clicks.len(), "min": clicks.first(), "p50": click(0.5), "p95": click(0.95), "max": clicks.last() },
+        "frame_interval_ms": { "n": gaps.len(), "fps": if span > 0.0 { gaps.len() as f64 / span } else { 0.0 }, "mean": mean_gap, "stdev": stdev_gap, "p50": gap(0.5), "p95": gap(0.95), "p99": gap(0.99), "max": gaps.last() },
+        "seconds": lines,
+        "pads": { "asked": pads, "host_slots": session.input().pad_slots(),
+                  "problem": session.pad_problem(), "log": pad_log.lock().clone() },
+        "recovery": recovery_summary(&session.recovery_log(), elapsed),
+    });
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    session.stop();
+    let start = Instant::now();
+    while !session.finished() && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    anyhow::ensure!(
+        session.finished(),
+        "stream did not stop within five seconds"
+    );
+    eprintln!("stream stopped in {:?}", start.elapsed());
+    Ok(())
+}
+
+/// Losses and how they ended: keyframes and recovery frames a minute,
+/// their sizes, and how long each loss held the picture.
+fn recovery_summary(log: &latch_stream::RecoveryLog, seconds: f64) -> serde_json::Value {
+    let pct = |mut v: Vec<f32>, p: f64| {
+        v.sort_by(f32::total_cmp);
+        v.get(((v.len() as f64 - 1.0) * p).round() as usize)
+            .copied()
+    };
+    let resume: Vec<f32> = log.losses.iter().map(|l| l.resume_ms).collect();
+    let freeze: Vec<f32> = log.losses.iter().map(|l| l.freeze_ms).collect();
+    let minutes = seconds / 60.0;
+    serde_json::json!({
+        "losses": log.losses.len(),
+        "ended_by_keyframe": log.losses.iter().filter(|l| l.keyframe).count(),
+        "keyframes_per_min": log.keyframes as f64 / minutes,
+        "recovery_frames_per_min": log.recovery_frames as f64 / minutes,
+        "keyframe_bytes_mean": log.keyframe_bytes.checked_div(log.keyframes),
+        "recovery_bytes_mean": log.recovery_bytes.checked_div(log.recovery_frames),
+        "resume_ms": { "p50": pct(resume.clone(), 0.5), "p95": pct(resume, 0.95) },
+        "freeze_ms": { "p50": pct(freeze.clone(), 0.5), "p95": pct(freeze, 0.95) },
+    })
+}

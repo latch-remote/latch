@@ -1,0 +1,6 @@
+{"label":"final2-foundation","exit":0,"elapsed_s":9.409172,"command":"cargo test --locked -p latch-core -p latch-proto -p latch-relay --all-targets"}
+{"label":"final2-platform-libs","exit":0,"elapsed_s":38.3621614,"command":"cargo test --locked -p latch-engine -p latch-stream -p latch-client --lib"}
+{"label":"final2-lifecycle","exit":0,"elapsed_s":54.455711199999996,"command":"cargo test --locked -p latch-engine --test lifecycle -- --test-threads=1"}
+{"label":"final2-relay-runtime","exit":0,"elapsed_s":124.935811,"command":"cargo test --locked -p latch-engine --test relay_runtime -- --test-threads=1"}
+{"label":"final2-windows-examples","exit":0,"elapsed_s":15.125100399999999,"command":"cargo build --locked -p latch-engine --example serve --example pipeline_bench -p latch-client --example present -p latch-stream --example view --example pads"}
+{"label":"final2-workspace-check","exit":0,"elapsed_s":4.9396283,"command":"cargo check --locked --workspace --all-targets"}

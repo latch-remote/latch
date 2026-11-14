@@ -7,51 +7,111 @@
 #   bash scripts/install-macos-release.sh
 #
 set -euo pipefail
-REPO="${LATCH_REPO:-MrBeldum/latch}"
-URL="https://github.com/$REPO/releases/latest/download/latch-macos-arm64.tar.gz"
-API="https://api.github.com/repos/$REPO/releases/latest"
+# These helpers also run in the focused manifest checks when this file is sourced.
+manifest_value() {
+  /usr/bin/plutil -extract "$2" raw -expect "$3" -o - "$1"
+}
+
+approved_download_url() {
+  case "$1" in
+    https://github.com/*|https://release-assets.githubusercontent.com/*|https://objects.githubusercontent.com/*|https://github-releases.githubusercontent.com/*) ;;
+    *) return 1 ;;
+  esac
+  [[ "$1" != *[$'\r\n\t ']* && "$1" != *'#'* && "$1" != *\\* ]]
+}
+
+# Follow redirects explicitly so every destination uses an approved HTTPS
+# origin. --disable comes first to ignore curlrc credentials and options.
+download_public() {
+  local url="$1" dest="$2" limit="$3" status location hop
+  for ((hop=0; hop<5; hop++)); do
+    approved_download_url "$url" || { echo "unapproved release download origin" >&2; return 1; }
+    status=$(/usr/bin/curl --disable --silent --show-error --proto '=https' \
+      --connect-timeout 30 --max-time 120 --max-filesize "$limit" \
+      --dump-header "$dest.headers" --output "$dest" --write-out '%{http_code}' "$url") || return 1
+    case "$status" in
+      200) rm -f "$dest.headers"; return 0 ;;
+      301|302|303|307|308)
+        location=$(awk 'tolower($0) ~ /^location:/ {
+          sub(/^[^:]*:[ \t]*/, ""); sub(/\r$/, ""); value=$0; count++
+        } END { if (count != 1) exit 1; print value }' "$dest.headers") || return 1
+        case "$location" in
+          https://*) url="$location" ;;
+          //*) return 1 ;;
+          /*) url="${url#https://}"; url="https://${url%%/*}$location" ;;
+          *) return 1 ;;
+        esac
+        ;;
+      *) echo "release download returned HTTP $status" >&2; return 1 ;;
+    esac
+  done
+  echo "too many release redirects" >&2
+  return 1
+}
+
+# Read typed values from the same asset object. A missing hash can never
+# borrow the following asset's hash, even if the JSON uses one line.
+read_manifest() {
+  local file="$1" version tag count i name url size digest prerelease seen='|' found=0
+  local selected_url='' selected_size='' selected_digest=''
+  version=$(manifest_value "$file" version string) || return 1
+  tag=$(manifest_value "$file" tag_name string) || return 1
+  prerelease=$(manifest_value "$file" prerelease bool) || return 1
+  [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ && "$tag" == "v$version" && "$prerelease" == false ]] || return 1
+  if /usr/bin/plutil -type draft "$file" >/dev/null 2>&1; then
+    [[ "$(manifest_value "$file" draft bool)" == false ]] || return 1
+  fi
+  count=$(manifest_value "$file" assets array) || return 1
+  [[ "$count" -gt 0 ]] || return 1
+  for ((i=0; i<count; i++)); do
+    name=$(manifest_value "$file" "assets.$i.name" string) || return 1
+    url=$(manifest_value "$file" "assets.$i.url" string) || return 1
+    size=$(manifest_value "$file" "assets.$i.size" integer) || return 1
+    digest=$(manifest_value "$file" "assets.$i.digest" string) || return 1
+    [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ && "$seen" != *"|$name|"* ]] || return 1
+    seen="$seen$name|"
+    [[ "$url" == "https://github.com/latch-remote/latch-releases/releases/download/$tag/$name" ]] || return 1
+    [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 && "$size" -le 536870912 ]] || return 1
+    [[ "$digest" =~ ^sha256:[a-fA-F0-9]{64}$ ]] || return 1
+    if [[ "$name" == latch-macos-arm64.tar.gz ]]; then
+      found=$((found+1))
+      selected_url="$url" selected_size="$size" selected_digest="${digest#sha256:}"
+    fi
+  done
+  [[ "$found" == 1 ]] || return 1
+  printf '%s\n%s\n%s\n' "$selected_url" "$selected_size" "$selected_digest"
+}
+
+verify_download() {
+  local file="$1" size="$2" digest="$3" got
+  [[ "$(stat -f %z "$file")" == "$size" ]] || return 1
+  got=$(shasum -a 256 "$file" | awk '{print $1}') || return 1
+  [[ "$(printf '%s' "$got" | tr 'A-F' 'a-f')" == "$(printf '%s' "$digest" | tr 'A-F' 'a-f')" ]]
+}
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
+
+MANIFEST="https://github.com/latch-remote/latch-releases/releases/latest/download/release.json"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-echo "downloading $URL"
-if ! curl -fsSL -o "$TMP/latch-macos-arm64.tar.gz" "$URL"; then
-  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-    echo "anonymous download failed; downloading with gh"
-    gh release download --repo "$REPO" --pattern latch-macos-arm64.tar.gz --dir "$TMP" --clobber
-  else
-    echo "download failed; a private repository requires gh auth login" >&2
-    exit 1
-  fi
-fi
-
-echo "checking SHA-256"
-# The release API lists each asset's name and, after it, the digest GitHub
-# computed for it. Read with tools every Mac has: no Python, no gh.
-DIGEST=""
-if JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" "$API" 2>/dev/null); then
-  DIGEST=$(printf '%s' "$JSON" | tr -d '\n\r' \
-    | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"latch-macos-arm64\.tar\.gz"\(.*\)/\1/p' \
-    | grep -o '"digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-fA-F]\{64\}"' | head -1 \
-    | sed 's/.*sha256:\([0-9a-fA-F]*\)".*/\1/' || true)
-fi
-if [[ -z "$DIGEST" ]] && command -v gh >/dev/null 2>&1; then
-  DIGEST=$(gh api "repos/$REPO/releases/latest" --jq '
-    .assets[] | select(.name=="latch-macos-arm64.tar.gz") | .digest // ""
-  ' 2>/dev/null | sed 's/^[Ss][Hh][Aa]256://' || true)
-fi
-if [[ ! "$DIGEST" =~ ^[0-9a-fA-F]{64}$ ]]; then
-  echo "could not read the published SHA-256 for latch-macos-arm64.tar.gz from" >&2
-  echo "  $API" >&2
-  echo "(GitHub may be rate-limiting this address; try again in a few minutes)." >&2
-  echo "Refusing to install an unchecked download." >&2
+echo "checking the public release manifest"
+download_public "$MANIFEST" "$TMP/release.json" 1048576
+if ! read_manifest "$TMP/release.json" > "$TMP/asset"; then
+  echo "release manifest has invalid version, URL, size, or SHA-256; refusing to install" >&2
   exit 1
 fi
-GOT=$(shasum -a 256 "$TMP/latch-macos-arm64.tar.gz" | awk '{print $1}')
-lc() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
-if [[ "$(lc "$GOT")" != "$(lc "$DIGEST")" ]]; then
-  echo "download does not match the published SHA-256" >&2
-  echo "  expected $DIGEST" >&2
-  echo "  got      $GOT" >&2
+{
+  IFS= read -r URL
+  IFS= read -r SIZE
+  IFS= read -r DIGEST
+} < "$TMP/asset"
+echo "downloading $URL"
+download_public "$URL" "$TMP/latch-macos-arm64.tar.gz" "$SIZE"
+if ! verify_download "$TMP/latch-macos-arm64.tar.gz" "$SIZE" "$DIGEST"; then
+  echo "download does not match the manifest size and SHA-256; refusing to install" >&2
   exit 1
 fi
 

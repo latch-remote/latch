@@ -23,6 +23,8 @@ pub enum CodecError {
     /// A P slice refers to a picture the decoder does not have (after loss,
     /// or a stream joined mid-way). Wait for an IDR.
     MissingReference,
+    /// The picture cannot fit the bounded access-unit budget, even at maximum compression.
+    FrameTooLarge,
     /// The encoder was asked for something it cannot do.
     Config(&'static str),
 }
@@ -33,6 +35,10 @@ impl std::fmt::Display for CodecError {
             CodecError::Unsupported(what) => write!(f, "unsupported H.264 feature: {what}"),
             CodecError::Invalid(what) => write!(f, "invalid H.264 stream: {what}"),
             CodecError::MissingReference => write!(f, "H.264 reference picture missing"),
+            CodecError::FrameTooLarge => write!(
+                f,
+                "H.264 frame exceeds eight bitrate intervals at the allowed QP"
+            ),
             CodecError::Config(what) => write!(f, "H.264 encoder setting: {what}"),
         }
     }

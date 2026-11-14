@@ -2,7 +2,7 @@
 
 ## Now
 
-Latch 5 shares and views a desktop over Tailscale with one Rust app per
+Latch 6 shares and views a desktop over Tailscale with one Rust app per
 machine. Mac and Windows viewers probe hardware decode for AV1, HEVC and
 H.264; Linux viewers use software H.264. Mac hosts encode H.264/HEVC;
 Windows and Linux can offer AV1 where the encoder supports it. HEVC
@@ -12,6 +12,14 @@ gamepads work from all three viewer platforms into Windows and Linux hosts.
 Linux capture is X11-only. Request ceilings are 16384 pixels a side,
 500 fps and 1 Gbps, above what current hardware delivers; each session is
 fitted to the encoders, decoders and displays both machines report.
+
+Version 6 adds a native TCP/TLS relay for unusable UDP media, with
+end-to-end encryption, independent video and priority lanes, and bounded
+admission and durable transfer quota. A dedicated AWS Lightsail endpoint
+serves public TLS. Runtime tests cover recovered-UDP switch-back, relay
+restart and finite grant renewal. Synthetic campus sessions exercise the
+actual relay; see the field report for measured behavior. Large-concurrency
+capacity remains unmeasured.
 
 ## Next
 
@@ -26,9 +34,10 @@ date, and none of it is a tested capability until it leaves this list.
 - **Display-paced presentation.** The viewer shows each frame as soon as it
   is decoded. A vsync-locked mode, a smoothing mode, and feeding the
   viewer's display phase back to the host's capture clock are not built.
-- **Changing size and frame rate during a session.** Only bitrate adapts
-  while a stream runs; resolution and frame rate are fixed at connect. A
-  governor that trades them under encoder or network pressure is open.
+- **Changing size and frame rate during a session.** The software H.264
+  pipeline can shrink an otherwise unencodable picture under a tiny bitrate
+  budget, then restore it as bandwidth returns. Broader hardware resolution
+  and frame-rate adaptation remains open.
 - **A shared audio and video clock.** Sound and picture are each played as
   early as possible instead of against one timeline.
 - **Choosing the display.** A host with several monitors shares one that
@@ -114,6 +123,7 @@ game catalogue or application launch/resume API.
 | 3.x (retired) | Embedded GameStream viewer, wake and updates |
 | 4.x (retired) | Unified sharing/viewing app and Linux deployment kits |
 | 5.x | In-process Rust engine, protocol 1, platform codecs and colour negotiation |
+| 6.x | Public native TLS relay extension, private development and public credential-free release distribution |
 
 The [changelog](../CHANGELOG.md) records individual releases.
 

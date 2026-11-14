@@ -1,0 +1,9 @@
+{
+  "verified_utc": "2026-11-14T11:30:26.744596+00:00",
+  "hostname": "relay.latch.rune.foo",
+  "tls": "TLSv1.3",
+  "alpn": "latch-relay/1",
+  "leaf_sha256": "04ada3521f448256d484c5f3383d8bc1045e9105e2e8eff46926f70d35900b1c",
+  "expires": "Feb 12 09:03:48 2027 GMT",
+  "partial_record_closed_seconds": 1.0376542080193758
+}

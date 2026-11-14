@@ -1,0 +1,167 @@
+PASS updated deployment selftest rejects the former daemon using only disposable loopback state
+2026-11-14T11:13:39Z
+     Removed 1310 files, 545.1MiB total
+warning: unused field `description` in `workspace.package`
+  --> Cargo.toml:20:1
+   |
+20 | description = "Your machines, on any of your machines"
+   | ^^^^^^^^^^^
+   |
+   = note: `cargo::unused_workspace_package_fields` is set to `warn` by default
+help: consider removing the field `workspace.package.description`
+warning: unused field `repository` in `workspace.package`
+  --> Cargo.toml:21:1
+   |
+21 | repository = "https://github.com/latch-remote/latch"
+   | ^^^^^^^^^^
+   |
+help: consider removing the field `workspace.package.repository`
+warning: unused field `homepage` in `workspace.package`
+  --> Cargo.toml:22:1
+   |
+22 | homepage = "https://github.com/latch-remote/latch"
+   | ^^^^^^^^
+   |
+help: consider removing the field `workspace.package.homepage`
+warning: unused field `readme` in `workspace.package`
+  --> Cargo.toml:23:1
+   |
+23 | readme = "README.md"
+   | ^^^^^^
+   |
+help: consider removing the field `workspace.package.readme`
+warning: workspace (manifest) generated 4 warnings
+   Compiling latch-proto v6.0.0 (/home/ubuntu/latch6-build/crates/proto)
+   Compiling latch-relay v6.0.0 (/home/ubuntu/latch6-build/crates/relay)
+    Finished `release` profile [optimized] target(s) in 21.63s
+warning: unused field `description` in `workspace.package`
+  --> Cargo.toml:20:1
+   |
+20 | description = "Your machines, on any of your machines"
+   | ^^^^^^^^^^^
+   |
+   = note: `cargo::unused_workspace_package_fields` is set to `warn` by default
+help: consider removing the field `workspace.package.description`
+warning: unused field `repository` in `workspace.package`
+  --> Cargo.toml:21:1
+   |
+21 | repository = "https://github.com/latch-remote/latch"
+   | ^^^^^^^^^^
+   |
+help: consider removing the field `workspace.package.repository`
+warning: unused field `homepage` in `workspace.package`
+  --> Cargo.toml:22:1
+   |
+22 | homepage = "https://github.com/latch-remote/latch"
+   | ^^^^^^^^
+   |
+help: consider removing the field `workspace.package.homepage`
+warning: unused field `readme` in `workspace.package`
+  --> Cargo.toml:23:1
+   |
+23 | readme = "README.md"
+   | ^^^^^^
+   |
+help: consider removing the field `workspace.package.readme`
+warning: workspace (manifest) generated 4 warnings
+   Compiling latch-proto v6.0.0 (/home/ubuntu/latch6-build/crates/proto)
+   Compiling latch-relay v6.0.0 (/home/ubuntu/latch6-build/crates/relay)
+    Finished `test` profile [optimized + debuginfo] target(s) in 23.18s
+     Running unittests src/lib.rs (target/debug/build/latch-relay/db992728169422bf/out/latch_relay-db992728169422bf)
+
+running 16 tests
+test client::tests::incomplete_oversized_and_wrong_lane_frames_never_deliver ... ok
+test client::tests::priority_backpressure_and_whole_unsent_frame_discard ... ok
+test client::tests::production_resolution_rejects_tailnet_and_private_addresses ... ok
+test crypto::tests::authentication_binds_counter_lane_direction_session_and_generation ... ok
+test crypto::tests::key_derivation_matches_rfc5869_case_one ... ok
+test daemon::tests::diagnostics_classify_deadlines_without_exposing_error_text ... ok
+
+running 1 test
+test crypto::tests::cpu_rejection_is_a_result ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+test crypto::tests::cpu_rejection_is_a_result ... ok
+test daemon::tests::pairing_role_capabilities_are_single_use_per_lane ... ok
+test quota::tests::failed_persistence_is_sticky ... ok
+test quota::tests::month_rollover_invalidates_live_socket_credit ... ok
+test daemon::tests::exhausted_admission_preserves_existing_credit_and_keeps_running ... ok
+test quota::tests::restart_and_backwards_month_do_not_reset_budget ... ok
+test wire::tests::records_reject_oversize_and_truncation ... ok
+test wire::tests::stalled_and_closed_tls_peers_fail_on_bounded_deadlines ... ok
+test wire::tests::tls_hostname_verification_remains_enabled ... ok
+test wire::tests::partial_tls_writes_preserve_record_framing ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running unittests src/main.rs (target/debug/build/latch-relay/f7ad6b7ea6ce6387/out/latch_relay-f7ad6b7ea6ce6387)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/transport.rs (target/debug/build/latch-relay/07de8a11a0cf0801/out/transport-07de8a11a0cf0801)
+
+running 12 tests
+test daemon_restart_preserves_spent_transfer_reservations ... ok
+test cancelling_silent_tls_handshake_and_drop_are_bounded ... ok
+test exhausted_receive_queue_closes_attempt_and_propagates_failure ... ok
+test frame_ack_elapsed_is_authenticated_and_consumed_on_the_callers_cadence ... ok
+test pilot_admission_bounds_outstanding_grants_per_creator_ip ... ok
+test pre_cancelled_dns_and_connect_stop_without_waiting ... ok
+test public_roots_reject_test_certificate ... ok
+test real_tls_two_lanes_complete_frame_and_authenticated_control ... ok
+test repeated_frames_advance_the_bounded_authenticated_ack_window ... ok
+test replayed_attachment_cannot_rejoin ... ok
+test wrong_keys_never_reach_ready ... ok
+test delayed_ack_path_does_not_limit_video_to_eight_frames_per_round_trip ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.17s
+
+     Running unittests examples/paired_probe.rs (target/debug/build/latch-relay/af4d5dc6b85295c4/out/paired_probe-af4d5dc6b85295c4)
+
+running 1 test
+test tests::bounded_percentiles ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+warning: unused field `description` in `workspace.package`
+  --> Cargo.toml:20:1
+   |
+20 | description = "Your machines, on any of your machines"
+   | ^^^^^^^^^^^
+   |
+   = note: `cargo::unused_workspace_package_fields` is set to `warn` by default
+help: consider removing the field `workspace.package.description`
+warning: unused field `repository` in `workspace.package`
+  --> Cargo.toml:21:1
+   |
+21 | repository = "https://github.com/latch-remote/latch"
+   | ^^^^^^^^^^
+   |
+help: consider removing the field `workspace.package.repository`
+warning: unused field `homepage` in `workspace.package`
+  --> Cargo.toml:22:1
+   |
+22 | homepage = "https://github.com/latch-remote/latch"
+   | ^^^^^^^^
+   |
+help: consider removing the field `workspace.package.homepage`
+warning: unused field `readme` in `workspace.package`
+  --> Cargo.toml:23:1
+   |
+23 | readme = "README.md"
+   | ^^^^^^
+   |
+help: consider removing the field `workspace.package.readme`
+warning: workspace (manifest) generated 4 warnings
+    Checking latch-proto v6.0.0 (/home/ubuntu/latch6-build/crates/proto)
+    Checking latch-relay v6.0.0 (/home/ubuntu/latch6-build/crates/relay)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 2.64s
+PASS kit syntax, operator limits, privilege and persistent-ledger contract
+PASS real daemon TLS/ALPN, pilot JSON, private ledger, lock, restart, exhaustion and corruption
+PASS source snapshot remained stable through the forced fresh build
+0b2b3f500cf5c9a42b49fd361dc443be309b9f92b9b7049c99e41781302c02a7  /home/ubuntu/latch6-candidates/candidate-20261114T110808Z/latch-relay.candidate
+path+file:///home/ubuntu/latch6-build/crates/relay#latch-relay@6.0.0
+2026-11-14T11:14:31Z

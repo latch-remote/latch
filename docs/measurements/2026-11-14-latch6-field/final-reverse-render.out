@@ -1,0 +1,2 @@
+2026-11-14T11:56:56.828075Z  INFO latch_stream::session: viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) send_bytes=8388608 receive_bytes=8388608
+2026-11-14T11:56:57.174971Z  INFO latch_stream::audio: audio: playing on MacBook Pro Speakers at 48000 Hz, 2 channels (FL FR), 120-frame buffer

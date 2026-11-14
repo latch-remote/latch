@@ -1,0 +1,3 @@
+2026-11-14T10:39:54.413809+00:00 ip-172-26-14-232 latch-relay[3142]: network_bytes=1017070292 quota_reserved_bytes=1195311104 accepted=73 rejected=0 grants=10 connections=4 sessions=1
+2026-11-14T10:40:24.413895+00:00 ip-172-26-14-232 latch-relay[3142]: network_bytes=1045441996 quota_reserved_bytes=1224081408 accepted=78 rejected=0 grants=11 connections=8 sessions=2
+2026-11-14T10:40:54.414075+00:00 ip-172-26-14-232 latch-relay[3142]: network_bytes=1065470199 quota_reserved_bytes=1245446144 accepted=98 rejected=0 grants=15 connections=4 sessions=1

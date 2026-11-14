@@ -1,0 +1,110 @@
+{
+  "parent": "423dc294440c96584830456a59cbac3734f795fa",
+  "files": [
+    {
+      "path": "crates/relay/tests/transport.rs",
+      "sha256": "c8154187d83fe005a839aed97ca030a5816e35208bfb0628490bc19c7a796be2"
+    }
+  ],
+  "unchanged_review_files": 386,
+  "production_source_changed": false,
+  "production_timeouts_changed": false,
+  "validation": {
+    "relay_unit": 19,
+    "relay_transport_parallel": 13,
+    "transport_parallel_repeat": 13,
+    "transport_sequential_repeat": 13,
+    "strict_workspace_all_targets_clippy": "passed",
+    "windows_workspace_all_targets_compile": "passed",
+    "format_and_whitespace": "passed"
+  },
+  "scheduling_probe": {
+    "gate_poll_ms": 200,
+    "final_gate_poll_ms": 1,
+    "before_exit": 101,
+    "before_close": "relay Video: video acknowledgment deadline expired after gate release at frame12/650ms",
+    "after_exit": 0,
+    "after_last_ack_seconds": 2.275214625,
+    "after_duration_seconds": 16.78,
+    "probe_patches_in_logs": true
+  },
+  "fixture": {
+    "floor_ms": 2000,
+    "post_receipt_pause_ms": 750,
+    "warmup_samples": 12,
+    "warmup_hold_ms": 20,
+    "jitter_hold_ms": [
+      1400,
+      1400,
+      1400
+    ],
+    "above_floor_hold_ms": 2100,
+    "blackhole_timeout_retained": true,
+    "proxy_nodelay": true
+  },
+  "reported_ci": {
+    "url": "https://github.com/latch-remote/latch/actions/runs/43604271932/job/132475427437",
+    "transport_pass": 12,
+    "transport_fail": 1,
+    "failure": "authenticated ACK never arrived",
+    "exact_hosted_close_reason": "not available in old diagnostic"
+  },
+  "logs": [
+    {
+      "path": "latch6-423dc29-macos-job.log",
+      "sha256": "bf69c6bbd30505d46a86de7cc8a0d0b42db8ca7e68615aa1b700f72eba273b5b"
+    },
+    {
+      "path": "latch6-r5-ack-diagnostic.log",
+      "sha256": "0a859be3e443b3b08b869dd16d6f77835e91d66ba826365056fb3ef2f574a481"
+    },
+    {
+      "path": "latch6-r5-ack-scheduler-red.log",
+      "sha256": "543580cbaf9767a1054b2df283ea828d7366142ad334165e36441025bde44b1e"
+    },
+    {
+      "path": "latch6-r5-ack-scheduler-green.log",
+      "sha256": "6f6645640c8bed5ad85506113213da087c395f9a0ea88d456d9e8be09bffb9a5"
+    },
+    {
+      "path": "latch6-r5-scheduler-red.patch",
+      "sha256": "ac1b10aec42396ab2a22e2dd9f9f6918ad95175df2718cd9d41cb8a826075ee0"
+    },
+    {
+      "path": "latch6-r5-scheduler-green.patch",
+      "sha256": "a776a8f1eb72b150e78f9d7adc4b30c6222fa615b49a85ebd62a963ade008baa"
+    },
+    {
+      "path": "latch6-r5-integrated-relay.log",
+      "sha256": "cf271a339100a1c98a51a956532088fbd3b0515528ce1fad9560240c4b65e3bc"
+    },
+    {
+      "path": "latch6-r5-clippy.log",
+      "sha256": "dd796a475e60adf51295578eb4c7410311375318fa69e148df8544359e4e67a2"
+    },
+    {
+      "path": "latch6-r5-windows-check.log",
+      "sha256": "ca37683c3cedf44e9ef7b3d44a57db323c7244d6f8a189907c2015381b3d5ddb"
+    },
+    {
+      "path": "latch6-r5-transport-parallel-repeat.log",
+      "sha256": "aa0a7dfc3bffcb187c7b96118dc9bea7218301f45b5f764339481bc7f8219ca4"
+    },
+    {
+      "path": "latch6-r5-transport-sequential.log",
+      "sha256": "32ab637b3850cfc3fbb58bb1784e968a71d59a0b1875eb6ebf6df6dc62db4726"
+    }
+  ],
+  "commands": [
+    "cargo test --locked --offline -p latch-relay",
+    "cargo clippy --locked --offline --workspace --all-targets -- -D warnings",
+    "cargo check --locked --offline --workspace --all-targets --target x86_64-pc-windows-msvc",
+    "cargo fmt --all -- --check",
+    "git diff --check"
+  ],
+  "transport_repeat_executable_sha256": "f49a34224f2c14234e724d5dec1ee6e9364a80e4e5d1552427f0cadc9f6a1b02",
+  "new_native_windows_execution": false,
+  "new_hosted_ci": "required after push",
+  "new_wan_traffic": false,
+  "new_gpu_field_work": false
+}

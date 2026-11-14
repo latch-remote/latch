@@ -1,0 +1,66 @@
+{
+  "deployment_state": "deployed and Linux public TLS verified",
+  "binary_sha256": "0b2b3f500cf5c9a42b49fd361dc443be309b9f92b9b7049c99e41781302c02a7",
+  "backup_path": "/usr/local/lib/latch-relay/backups/latch-relay-9d3a309ac7d3e58bb188d244e0818c92c9cc0042896d0636c8a131fef918f1b5",
+  "source_manifest_sha256": "682ad11d20e4aa796e50a9ad60c53cfc6e7d419744b4049772f4f9b34e3a1f64",
+  "restart_and_health_seconds": 0.2218273139997109,
+  "linux_public_tls": {
+    "version": "TLSv1.3",
+    "alpn": "latch-relay/1",
+    "certificate_sha256": "04ada3521f448256d484c5f3383d8bc1045e9105e2e8eff46926f70d35900b1c"
+  },
+  "before": {
+    "utc": "2026-11-14T11:29:55.377642+00:00",
+    "service": {
+      "MainPID": "3142",
+      "NRestarts": "0",
+      "ActiveState": "active",
+      "ActiveEnterTimestamp": "Sat 2026-11-14 10:17:54 UTC"
+    },
+    "ledger": {
+      "inode": 532979,
+      "device": 66305,
+      "uid": 999,
+      "gid": 988,
+      "mode": "0o600",
+      "bytes": 32,
+      "month": 24322,
+      "reserved": 4092002304
+    },
+    "binary_sha256": "9d3a309ac7d3e58bb188d244e0818c92c9cc0042896d0636c8a131fef918f1b5",
+    "config_sha256": {
+      "/etc/latch-relay/limits.json": "1f038572819969d3a2e24952f93aec87b59b6800a069388b1ed208644d6f5c46",
+      "/etc/latch-relay/budget.conf": "86a30ba76f6a72d72766b7fad71c63155a8c5a1a633bddb4f849015c88d1cc9b",
+      "/etc/systemd/system/latch-relay.service": "b82954b66e7179df95042f9e57ee9b4869b2bca0bb71b401466334817aa47dab",
+      "/etc/letsencrypt/renewal-hooks/deploy/50-latch-relay": "de0c38f952d6e0bdc98c6a034665a835a910c7cd667f5ac1fab05c28eb143259",
+      "/etc/latch-relay/fullchain.pem": "049ed69a6d967b031631b6c1a87de8dc40f86ed5a41c7263b0602665221925cd"
+    }
+  },
+  "after": {
+    "utc": "2026-11-14T11:29:55.591873+00:00",
+    "service": {
+      "MainPID": "6541",
+      "NRestarts": "0",
+      "ActiveState": "active",
+      "ActiveEnterTimestamp": "Sat 2026-11-14 11:29:55 UTC"
+    },
+    "ledger": {
+      "inode": 532979,
+      "device": 66305,
+      "uid": 999,
+      "gid": 988,
+      "mode": "0o600",
+      "bytes": 32,
+      "month": 24322,
+      "reserved": 4092067840
+    },
+    "binary_sha256": "0b2b3f500cf5c9a42b49fd361dc443be309b9f92b9b7049c99e41781302c02a7",
+    "config_sha256": {
+      "/etc/latch-relay/limits.json": "1f038572819969d3a2e24952f93aec87b59b6800a069388b1ed208644d6f5c46",
+      "/etc/latch-relay/budget.conf": "86a30ba76f6a72d72766b7fad71c63155a8c5a1a633bddb4f849015c88d1cc9b",
+      "/etc/systemd/system/latch-relay.service": "b82954b66e7179df95042f9e57ee9b4869b2bca0bb71b401466334817aa47dab",
+      "/etc/letsencrypt/renewal-hooks/deploy/50-latch-relay": "de0c38f952d6e0bdc98c6a034665a835a910c7cd667f5ac1fab05c28eb143259",
+      "/etc/latch-relay/fullchain.pem": "049ed69a6d967b031631b6c1a87de8dc40f86ed5a41c7263b0602665221925cd"
+    }
+  }
+}

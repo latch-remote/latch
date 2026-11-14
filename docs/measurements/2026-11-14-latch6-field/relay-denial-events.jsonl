@@ -1,0 +1,4 @@
+{"utc":"2026-11-14T11:38:10.0885170Z","event":"test viewer public TCP denied","seconds":8}
+{"utc":"2026-11-14T11:38:18.6966183Z","event":"test viewer public TCP restored"}
+{"utc":"2026-11-14T11:40:56.7209397Z","event":"test viewer public TCP denied","seconds":8}
+{"utc":"2026-11-14T11:41:05.3464799Z","event":"test viewer public TCP restored"}

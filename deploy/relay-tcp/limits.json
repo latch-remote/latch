@@ -1,0 +1,15 @@
+{
+  "max_connections": 24,
+  "max_sessions": 4,
+  "connections_per_ip": 8,
+  "sessions_per_ip": 2,
+  "accepts_per_ip_per_minute": 30,
+  "accepts_per_minute": 120,
+  "max_rate_entries": 256,
+  "grant_ttl": { "secs": 60, "nanos": 0 },
+  "session_lifetime": { "secs": 3600, "nanos": 0 },
+  "session_bytes": 17179869184,
+  "handshake_timeout": { "secs": 10, "nanos": 0 },
+  "stall_timeout": { "secs": 0, "nanos": 750000000 },
+  "idle_timeout": { "secs": 30, "nanos": 0 }
+}

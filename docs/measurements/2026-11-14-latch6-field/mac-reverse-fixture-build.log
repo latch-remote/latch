@@ -1,0 +1,7 @@
+   Compiling latch-relay v6.0.0 (/private/tmp/latch6-field-mac-final-20261114/crates/relay)
+   Compiling latch-stream v6.0.0 (/private/tmp/latch6-field-mac-final-20261114/crates/stream)
+   Compiling latch-client v6.0.0 (/private/tmp/latch6-field-mac-final-20261114/crates/client)
+   Compiling latch-field-viewer v0.0.0 (/tmp/latch6-field-viewer-final-20261114)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 6.69s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

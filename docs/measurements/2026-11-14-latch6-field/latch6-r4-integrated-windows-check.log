@@ -1,0 +1,4 @@
+    Checking latch-client v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/client)
+    Checking latch-relay v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/relay)
+    Checking latch-host v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/host)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 2.93s

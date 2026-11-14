@@ -1,0 +1,37 @@
+[
+  {
+    "path": "fixtures/mac-Cargo.lock",
+    "sha256": "5cee60bbad69b006ba13f9952143f15bdb94a213df1d44a7eef2a836a561c82e",
+    "bytes": 124452
+  },
+  {
+    "path": "fixtures/mac-Cargo.toml",
+    "sha256": "62981813841f0598e99f78f6767c7014ecd8fc5861e467ed07efbfd0a97f2971",
+    "bytes": 823
+  },
+  {
+    "path": "fixtures/mac-headless.rs",
+    "sha256": "86bb09cddf0d972a8c7bdd3eb840af79a42744672de177517ec2e5547b149768",
+    "bytes": 21565
+  },
+  {
+    "path": "fixtures/mac-main.rs",
+    "sha256": "3941c77241712a00e60377a1f50dce562df713fa40aab5b04ac4e68ddf67d074",
+    "bytes": 12128
+  },
+  {
+    "path": "fixtures/windows-Cargo.lock",
+    "sha256": "1fd213f68756008499820bd6e053824a7b52257f6fd4e7dd1353b56d14e98ae1",
+    "bytes": 124405
+  },
+  {
+    "path": "fixtures/windows-Cargo.toml",
+    "sha256": "c287b44e2282d1d0461e7a03e031553e2ea37caa435e7721b46a06551a013ca9",
+    "bytes": 647
+  },
+  {
+    "path": "fixtures/windows-main.rs",
+    "sha256": "3941c77241712a00e60377a1f50dce562df713fa40aab5b04ac4e68ddf67d074",
+    "bytes": 12128
+  }
+]

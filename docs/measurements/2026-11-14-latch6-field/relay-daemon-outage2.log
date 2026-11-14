@@ -1,0 +1,6 @@
+2026-11-14T11:40:55+00:00 ip-172-26-14-232 latch-relay[6541]: network_bytes=60956145 quota_reserved_bytes=4154195968 accepted=19 rejected=0 grants=3 connections=4 sessions=1
+2026-11-14T11:40:57+00:00 ip-172-26-14-232 latch-relay[6541]: relay connection closed phase=attached role=host lane=priority category=peer_closed kind=UnexpectedEof
+2026-11-14T11:41:16+00:00 ip-172-26-14-232 latch-relay[6541]: relay connection closed phase=request role=none lane=none category=invalid_protocol kind=InvalidData
+2026-11-14T11:41:25+00:00 ip-172-26-14-232 latch-relay[6541]: network_bytes=106896552 quota_reserved_bytes=4200398848 accepted=25 rejected=0 grants=4 connections=4 sessions=1
+2026-11-14T11:41:49+00:00 ip-172-26-14-232 latch-relay[6541]: relay connection closed phase=attached role=host lane=video category=connection_reset kind=ConnectionReset
+2026-11-14T11:41:55+00:00 ip-172-26-14-232 latch-relay[6541]: network_bytes=188519913 quota_reserved_bytes=4282056704 accepted=25 rejected=0 grants=4 connections=0 sessions=0

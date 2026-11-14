@@ -2002,7 +2002,7 @@ dependencies = [
 
 [[package]]
 name = "latch-client"
-version = "5.3.0"
+version = "6.0.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -2035,16 +2035,17 @@ dependencies = [
 
 [[package]]
 name = "latch-codec"
-version = "5.3.0"
+version = "6.0.0"
 
 [[package]]
 name = "latch-core"
-version = "5.3.0"
+version = "6.0.0"
 dependencies = [
  "anyhow",
  "directories",
  "if-addrs",
  "image",
+ "latch-proto",
  "libc",
  "rustls",
  "rustls-graviola",
@@ -2061,7 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "latch-engine"
-version = "5.3.0"
+version = "6.0.0"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
@@ -2071,6 +2072,7 @@ dependencies = [
  "latch-codec",
  "latch-core",
  "latch-proto",
+ "latch-relay",
  "latch-stream",
  "libc",
  "libloading",
@@ -2083,6 +2085,7 @@ dependencies = [
  "parking_lot",
  "pulseaudio",
  "rand",
+ "rustls",
  "serde",
  "serde_json",
  "socket2",
@@ -2095,7 +2098,7 @@ dependencies = [
 
 [[package]]
 name = "latch-host"
-version = "5.3.0"
+version = "6.0.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2124,7 +2127,7 @@ dependencies = [
 
 [[package]]
 name = "latch-proto"
-version = "5.3.0"
+version = "6.0.0"
 dependencies = [
  "libc",
  "serde",
@@ -2134,8 +2137,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "latch-relay"
+version = "6.0.0"
+dependencies = [
+ "graviola",
+ "latch-proto",
+ "rustls",
+ "rustls-graviola",
+ "serde",
+ "serde_json",
+ "socket2",
+ "webpki-roots",
+ "zeroize",
+]
+
+[[package]]
 name = "latch-stream"
-version = "5.3.0"
+version = "6.0.0"
 dependencies = [
  "alsa",
  "anyhow",
@@ -2146,6 +2164,7 @@ dependencies = [
  "latch-codec",
  "latch-core",
  "latch-proto",
+ "latch-relay",
  "mio",
  "objc2 0.6.4",
  "objc2-core-haptics",
@@ -2153,6 +2172,8 @@ dependencies = [
  "objc2-game-controller",
  "parking_lot",
  "rand",
+ "rustls",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -2161,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "latch-ui"
-version = "5.3.0"
+version = "6.0.0"
 dependencies = [
  "ab_glyph",
  "egui",

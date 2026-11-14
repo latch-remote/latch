@@ -199,6 +199,7 @@ const SETTINGS_VERSION: u32 = 2;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StreamSettings {
+    pub relay: latch_proto::control::RelaySettings,
     pub quality: Quality,
     pub resolution: Resolution,
     pub fps: u32,
@@ -223,6 +224,7 @@ pub struct StreamSettings {
 impl Default for StreamSettings {
     fn default() -> Self {
         Self {
+            relay: Default::default(),
             quality: Quality::Auto,
             resolution: Resolution::Native,
             fps: 60,
@@ -431,6 +433,12 @@ impl ClientConfig {
         changed!(stream.custom_fps);
         changed!(stream.custom_bitrate_kbps);
         changed!(stream.version);
+        changed!(stream.mic);
+        changed!(stream.relay.enabled);
+        changed!(stream.relay.port);
+        if after.stream.relay.host != before.stream.relay.host {
+            self.stream.relay.host = after.stream.relay.host.clone();
+        }
         changed!(sleep_prompt);
         changed!(cmd_is_ctrl);
         changed!(capture_mouse);
@@ -476,6 +484,47 @@ mod tests {
         assert_eq!(disk.stream.fps, 120);
         assert!(!disk.auto_update);
         assert_eq!(disk.github_token.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn microphone_preference_delta_is_saved_and_preserves_concurrent_changes() {
+        let before = ClientConfig::default();
+        let mut after = before.clone();
+        after.stream.mic = true;
+        let mut disk = before.clone();
+        disk.stream.fps = 120;
+        disk.apply_changes(&before, &after);
+        let saved: ClientConfig = toml::from_str(&toml::to_string(&disk).unwrap()).unwrap();
+        assert!(saved.stream.mic);
+        assert_eq!(saved.stream.fps, 120);
+
+        disk.apply_changes(&after, &before);
+        assert!(!disk.stream.mic);
+        disk.stream.mic = true;
+        disk.apply_changes(&before, &before);
+        assert!(
+            disk.stream.mic,
+            "an unchanged window preserves the disk setting"
+        );
+    }
+
+    #[test]
+    fn relay_settings_persist_and_unchanged_fields_preserve_disk_edits() {
+        let before = ClientConfig::default();
+        let mut after = before.clone();
+        after.stream.relay.enabled = false;
+        let mut disk = before.clone();
+        disk.stream.relay.host = "custom.example".into();
+        disk.apply_changes(&before, &after);
+        assert!(!disk.stream.relay.enabled);
+        assert_eq!(disk.stream.relay.host, "custom.example");
+        after.stream.relay.host = "another.example".into();
+        after.stream.relay.port = 8443;
+        disk.apply_changes(&before, &after);
+        let again: ClientConfig = toml::from_str(&toml::to_string(&disk).unwrap()).unwrap();
+        assert_eq!(again.stream.relay, after.stream.relay);
+        let old: StreamSettings = toml::from_str("mic = true").unwrap();
+        assert_eq!(old.relay, latch_proto::control::RelaySettings::default());
     }
 
     #[test]

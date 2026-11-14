@@ -1,0 +1,200 @@
+   Compiling latch-engine v6.0.0 (/private/tmp/latch6-r3-fixes-d0b1b54e/latch-6.0.0/crates/engine)
+    Finished `test` profile [optimized + debuginfo] target(s) in 2.61s
+     Running tests/relay_runtime.rs (/Users/daniel/Desktop/T3_Projects/latch/target/debug/deps/relay_runtime-c9c1a0371214983e)
+
+running 9 tests
+test actual_relay_audio_and_microphone_reach_pcm_sinks ... ok
+test automatic_blackhole_recovery_real_tls_input_and_udp_fallback ... 2026-11-14T13:33:44.555991Z  INFO latch_stream::session: viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) send_bytes=8388608 receive_bytes=8388608
+2026-11-14T13:33:45.264030Z  INFO latch_engine::server: host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+2026-11-14T13:33:45.264056Z  INFO latch_engine::server: relay runtime test is watching: 128×128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+2026-11-14T13:33:46.265743Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Request
+2026-11-14T13:33:46.310479Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Offer([REDACTED])
+2026-11-14T13:33:46.365431Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Ready
+2026-11-14T13:33:46.365490Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Commit
+2026-11-14T13:33:46.365497Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=1
+2026-11-14T13:33:46.365527Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Committed
+2026-11-14T13:33:46.365531Z  INFO latch_stream::session: using Latch TLS relay role=Host attempt=1
+2026-11-14T13:34:46.371839Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=UdpProbe { first: 512, kbps: 2500 }
+2026-11-14T13:34:48.373628Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=UdpProbeResult { first: 512, received: 240, span_us: 982792 }
+2026-11-14T13:34:48.373820Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Direct
+2026-11-14T13:34:48.376017Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=DirectReady
+2026-11-14T13:34:50.378450Z DEBUG latch_stream::session: relay negotiation role=Host attempt=2 action=Request
+2026-11-14T13:34:50.417293Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=2 action=Offer([REDACTED])
+2026-11-14T13:34:50.476673Z DEBUG latch_stream::session: relay negotiation role=Host attempt=2 action=Ready
+2026-11-14T13:34:50.476894Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=2 action=Commit
+2026-11-14T13:34:50.476958Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=2
+2026-11-14T13:34:50.477081Z DEBUG latch_stream::session: relay negotiation role=Host attempt=2 action=Committed
+2026-11-14T13:34:50.477120Z  INFO latch_stream::session: using Latch TLS relay role=Host attempt=2
+2026-11-14T13:34:50.483990Z  WARN latch_stream::session: relay closed, falling back to UDP role=Host kind=UnexpectedEof relay Priority: relay socket closed
+2026-11-14T13:34:50.484134Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=2 action=Abort
+2026-11-14T13:34:52.490829Z DEBUG latch_stream::session: relay negotiation role=Host attempt=3 action=Request
+2026-11-14T13:34:52.528692Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=3 action=Offer([REDACTED])
+2026-11-14T13:34:52.592907Z DEBUG latch_stream::session: relay negotiation role=Host attempt=3 action=Ready
+2026-11-14T13:34:52.593136Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=3 action=Commit
+2026-11-14T13:34:52.593192Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=3
+2026-11-14T13:34:52.593291Z DEBUG latch_stream::session: relay negotiation role=Host attempt=3 action=Committed
+2026-11-14T13:34:52.593337Z  INFO latch_stream::session: using Latch TLS relay role=Host attempt=3
+2026-11-14T13:34:53.034675Z  INFO latch_engine::server: relay runtime test stopped watching after 1 min: the viewer disconnected
+2026-11-14T13:34:53.045129Z  INFO latch_stream::session: viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) send_bytes=8388608 receive_bytes=8388608
+2026-11-14T13:34:53.046158Z  INFO latch_engine::server: host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+2026-11-14T13:34:53.046242Z  INFO latch_engine::server: relay runtime test is watching: 128×128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+2026-11-14T13:34:55.064414Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Request
+2026-11-14T13:34:55.104057Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Offer([REDACTED])
+2026-11-14T13:34:55.164029Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Ready
+2026-11-14T13:34:55.164099Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Commit
+2026-11-14T13:34:55.164113Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=1
+2026-11-14T13:34:55.164160Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Committed
+2026-11-14T13:34:55.164171Z  INFO latch_stream::session: using Latch TLS relay role=Host attempt=1
+2026-11-14T13:34:55.717711Z  INFO latch_engine::server: relay runtime test stopped watching after 2 s: the viewer disconnected
+ok
+test cancelled_prepare_joins_its_worker_and_rejects_endpoint_role_and_generation ... 2026-11-14T13:34:55.733189Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Request
+2026-11-14T13:34:55.739611Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Ready
+2026-11-14T13:34:55.776185Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Offer([REDACTED])
+2026-11-14T13:34:55.776429Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Offer([REDACTED])
+2026-11-14T13:34:55.776551Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Offer([REDACTED])
+2026-11-14T13:34:55.776652Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Offer([REDACTED])
+ok
+test finite_byte_grants_renew_after_actual_video_transfer ... 2026-11-14T13:34:55.791665Z  INFO latch_stream::session: viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) send_bytes=8388608 receive_bytes=8388608
+2026-11-14T13:34:55.792647Z  INFO latch_engine::server: host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+2026-11-14T13:34:55.792744Z  INFO latch_engine::server: relay runtime test is watching: 128×128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+2026-11-14T13:34:56.796173Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Request
+2026-11-14T13:34:56.832115Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Offer([REDACTED])
+2026-11-14T13:34:56.893013Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Ready
+2026-11-14T13:34:56.893138Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Commit
+2026-11-14T13:34:56.893154Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=1
+2026-11-14T13:34:56.893197Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Committed
+2026-11-14T13:34:56.893210Z  INFO latch_stream::session: using Latch TLS relay role=Host attempt=1
+2026-11-14T13:34:59.976492Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Renew
+2026-11-14T13:35:01.980904Z DEBUG latch_stream::session: relay negotiation role=Host attempt=2 action=Request
+2026-11-14T13:35:02.012042Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=2 action=Offer([REDACTED])
+2026-11-14T13:35:02.070404Z DEBUG latch_stream::session: relay negotiation role=Host attempt=2 action=Ready
+2026-11-14T13:35:02.070852Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=2 action=Commit
+2026-11-14T13:35:02.070913Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=2
+2026-11-14T13:35:02.071047Z DEBUG latch_stream::session: relay negotiation role=Host attempt=2 action=Committed
+2026-11-14T13:35:02.071085Z  INFO latch_stream::session: using Latch TLS relay role=Host attempt=2
+2026-11-14T13:35:05.169064Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=2 action=Renew
+2026-11-14T13:35:07.171342Z DEBUG latch_stream::session: relay negotiation role=Host attempt=3 action=Request
+2026-11-14T13:35:07.210045Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=3 action=Offer([REDACTED])
+2026-11-14T13:35:07.266546Z DEBUG latch_stream::session: relay negotiation role=Host attempt=3 action=Ready
+2026-11-14T13:35:07.266725Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=3 action=Commit
+2026-11-14T13:35:07.266774Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=3
+2026-11-14T13:35:07.266870Z DEBUG latch_stream::session: relay negotiation role=Host attempt=3 action=Committed
+2026-11-14T13:35:07.266908Z  INFO latch_stream::session: using Latch TLS relay role=Host attempt=3
+2026-11-14T13:35:10.363250Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=3 action=Renew
+2026-11-14T13:35:12.369719Z DEBUG latch_stream::session: relay negotiation role=Host attempt=4 action=Request
+2026-11-14T13:35:12.404014Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=4 action=Offer([REDACTED])
+2026-11-14T13:35:12.461201Z DEBUG latch_stream::session: relay negotiation role=Host attempt=4 action=Ready
+2026-11-14T13:35:12.461302Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=4 action=Commit
+2026-11-14T13:35:12.461328Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=4
+2026-11-14T13:35:12.461408Z DEBUG latch_stream::session: relay negotiation role=Host attempt=4 action=Committed
+2026-11-14T13:35:12.461423Z  INFO latch_stream::session: using Latch TLS relay role=Host attempt=4
+2026-11-14T13:35:12.597279Z  INFO latch_engine::server: relay runtime test stopped watching after 16 s: the viewer disconnected
+ok
+test finite_grants_get_fresh_authorization_without_stranding_media ... 2026-11-14T13:35:12.604818Z  INFO latch_stream::session: viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) send_bytes=8388608 receive_bytes=8388608
+2026-11-14T13:35:12.605243Z  INFO latch_engine::server: host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+2026-11-14T13:35:12.605256Z  INFO latch_engine::server: relay runtime test is watching: 128×128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+2026-11-14T13:35:13.605837Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Request
+2026-11-14T13:35:13.643601Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Offer([REDACTED])
+2026-11-14T13:35:13.701013Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Ready
+2026-11-14T13:35:13.701101Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Commit
+2026-11-14T13:35:13.701113Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=1
+2026-11-14T13:35:13.701163Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Committed
+2026-11-14T13:35:13.701172Z  INFO latch_stream::session: using Latch TLS relay role=Host attempt=1
+2026-11-14T13:35:16.361975Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Renew
+2026-11-14T13:35:18.366891Z DEBUG latch_stream::session: relay negotiation role=Host attempt=2 action=Request
+2026-11-14T13:35:18.410438Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=2 action=Offer([REDACTED])
+2026-11-14T13:35:18.476325Z DEBUG latch_stream::session: relay negotiation role=Host attempt=2 action=Ready
+2026-11-14T13:35:18.476503Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=2 action=Commit
+2026-11-14T13:35:18.476517Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=2
+2026-11-14T13:35:18.476556Z DEBUG latch_stream::session: relay negotiation role=Host attempt=2 action=Committed
+2026-11-14T13:35:18.476566Z  INFO latch_stream::session: using Latch TLS relay role=Host attempt=2
+2026-11-14T13:35:21.122450Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=2 action=Renew
+2026-11-14T13:35:23.131946Z DEBUG latch_stream::session: relay negotiation role=Host attempt=3 action=Request
+2026-11-14T13:35:23.173410Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=3 action=Offer([REDACTED])
+2026-11-14T13:35:23.234310Z DEBUG latch_stream::session: relay negotiation role=Host attempt=3 action=Ready
+2026-11-14T13:35:23.234590Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=3 action=Commit
+2026-11-14T13:35:23.234666Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=3
+2026-11-14T13:35:23.234802Z DEBUG latch_stream::session: relay negotiation role=Host attempt=3 action=Committed
+2026-11-14T13:35:23.234841Z  INFO latch_stream::session: using Latch TLS relay role=Host attempt=3
+2026-11-14T13:35:25.885441Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=3 action=Renew
+2026-11-14T13:35:27.891392Z DEBUG latch_stream::session: relay negotiation role=Host attempt=4 action=Request
+2026-11-14T13:35:27.937818Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=4 action=Offer([REDACTED])
+2026-11-14T13:35:28.000207Z DEBUG latch_stream::session: relay negotiation role=Host attempt=4 action=Ready
+2026-11-14T13:35:28.000333Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=4 action=Commit
+2026-11-14T13:35:28.000352Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=4
+2026-11-14T13:35:28.000421Z DEBUG latch_stream::session: relay negotiation role=Host attempt=4 action=Committed
+2026-11-14T13:35:28.000439Z  INFO latch_stream::session: using Latch TLS relay role=Host attempt=4
+2026-11-14T13:35:28.540914Z  INFO latch_engine::server: relay runtime test stopped watching after 15 s: the viewer disconnected
+ok
+test monthly_cap_fails_closed_with_bounded_retry_and_direct_recovery ... 2026-11-14T13:35:28.550814Z  INFO latch_stream::session: viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) send_bytes=8388608 receive_bytes=8388608
+2026-11-14T13:35:28.551938Z  INFO latch_engine::server: host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+2026-11-14T13:35:28.552017Z  INFO latch_engine::server: relay runtime test is watching: 128×128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+2026-11-14T13:35:29.557432Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Request
+2026-11-14T13:35:29.594738Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Offer([REDACTED])
+2026-11-14T13:35:29.601053Z  WARN latch_stream::session: relay closed, falling back to UDP role=Host kind=UnexpectedEof relay Video: relay socket closed
+2026-11-14T13:35:29.601412Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Abort
+2026-11-14T13:35:31.608484Z DEBUG latch_stream::session: relay negotiation role=Host attempt=2 action=Request
+2026-11-14T13:35:31.621274Z  WARN latch_stream::session: relay preparation failed error=relay socket closed
+2026-11-14T13:35:31.621558Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=2 action=Abort
+2026-11-14T13:35:33.626913Z DEBUG latch_stream::session: relay negotiation role=Host attempt=3 action=Request
+2026-11-14T13:35:33.640441Z  WARN latch_stream::session: relay preparation failed error=relay socket closed
+2026-11-14T13:35:33.640581Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=3 action=Abort
+2026-11-14T13:35:35.010998Z  INFO latch_engine::server: relay runtime test stopped watching after 6 s: the viewer disconnected
+ok
+test negotiation_rejects_stale_malformed_and_unconfigured_offers ... 2026-11-14T13:35:35.021919Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=2 action=Offer([REDACTED])
+2026-11-14T13:35:35.021981Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Commit
+2026-11-14T13:35:35.021997Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Offer([REDACTED])
+ok
+test relay_preserves_explicit_stop_takeover_and_recoverable_end_codes ... 2026-11-14T13:35:35.031533Z  INFO latch_stream::session: viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) send_bytes=8388608 receive_bytes=8388608
+2026-11-14T13:35:35.032750Z  INFO latch_engine::server: host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+2026-11-14T13:35:35.032806Z  INFO latch_engine::server: relay runtime test is watching: 128×128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+2026-11-14T13:35:36.038261Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Request
+2026-11-14T13:35:36.071182Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Offer([REDACTED])
+2026-11-14T13:35:36.131851Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Ready
+2026-11-14T13:35:36.131933Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Commit
+2026-11-14T13:35:36.131952Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=1
+2026-11-14T13:35:36.132024Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Committed
+2026-11-14T13:35:36.132039Z  INFO latch_stream::session: using Latch TLS relay role=Host attempt=1
+2026-11-14T13:35:36.283782Z  INFO latch_engine::server: relay runtime test stopped watching after 1 s: test termination
+2026-11-14T13:35:36.287942Z  INFO latch_stream::session: viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) send_bytes=8388608 receive_bytes=8388608
+2026-11-14T13:35:36.288733Z  INFO latch_engine::server: host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+2026-11-14T13:35:36.288815Z  INFO latch_engine::server: relay runtime test is watching: 128×128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+2026-11-14T13:35:37.293979Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Request
+2026-11-14T13:35:37.330445Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Offer([REDACTED])
+2026-11-14T13:35:37.394827Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Ready
+2026-11-14T13:35:37.395120Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Commit
+2026-11-14T13:35:37.395175Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=1
+2026-11-14T13:35:37.395299Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Committed
+2026-11-14T13:35:37.395333Z  INFO latch_stream::session: using Latch TLS relay role=Host attempt=1
+2026-11-14T13:35:37.565241Z  INFO latch_engine::server: second viewer takes the stream over from relay runtime test
+2026-11-14T13:35:37.637915Z  INFO latch_engine::server: relay runtime test stopped watching after 1 s: Another device took this stream over.
+2026-11-14T13:35:37.650991Z  INFO latch_stream::session: viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) send_bytes=8388608 receive_bytes=8388608
+2026-11-14T13:35:37.652742Z  INFO latch_engine::server: host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+2026-11-14T13:35:37.652882Z  INFO latch_engine::server: relay runtime test is watching: 128×128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+2026-11-14T13:35:38.653774Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Request
+2026-11-14T13:35:38.687766Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Offer([REDACTED])
+2026-11-14T13:35:38.756626Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Ready
+2026-11-14T13:35:38.756687Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Commit
+2026-11-14T13:35:38.756700Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=1
+2026-11-14T13:35:38.756766Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Committed
+2026-11-14T13:35:38.756775Z  INFO latch_stream::session: using Latch TLS relay role=Host attempt=1
+2026-11-14T13:35:38.902973Z  INFO latch_engine::server: relay runtime test stopped watching after 1 s: test termination
+ok
+test resource_rejection_retries_after_the_occupied_grant_expires ... 2026-11-14T13:35:38.953585Z  INFO latch_stream::session: viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) send_bytes=8388608 receive_bytes=8388608
+2026-11-14T13:35:38.953929Z  INFO latch_engine::server: host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+2026-11-14T13:35:38.953945Z  INFO latch_engine::server: relay runtime test is watching: 128×128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+2026-11-14T13:35:39.959343Z DEBUG latch_stream::session: relay negotiation role=Host attempt=1 action=Request
+2026-11-14T13:35:39.992882Z  WARN latch_stream::session: relay preparation failed error=relay socket closed
+2026-11-14T13:35:39.992968Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=1 action=Abort
+2026-11-14T13:35:41.998061Z DEBUG latch_stream::session: relay negotiation role=Host attempt=2 action=Request
+2026-11-14T13:35:42.040157Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=2 action=Offer([REDACTED])
+2026-11-14T13:35:42.112355Z DEBUG latch_stream::session: relay negotiation role=Host attempt=2 action=Ready
+2026-11-14T13:35:42.112479Z DEBUG latch_stream::session: relay negotiation role=Viewer attempt=2 action=Commit
+2026-11-14T13:35:42.112501Z  INFO latch_stream::session: using Latch TLS relay role=Viewer attempt=2
+2026-11-14T13:35:42.112564Z DEBUG latch_stream::session: relay negotiation role=Host attempt=2 action=Committed
+2026-11-14T13:35:42.112584Z  INFO latch_stream::session: using Latch TLS relay role=Host attempt=2
+2026-11-14T13:35:42.541642Z  INFO latch_engine::server: relay runtime test stopped watching after 3 s: the viewer disconnected
+ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 118.26s
+

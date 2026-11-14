@@ -1,0 +1,29 @@
+   Compiling latch-stream v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/stream)
+   Compiling latch-engine v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/engine)
+    Finished `test` profile [optimized + debuginfo] target(s) in 8.05s
+     Running unittests src/lib.rs (target/debug/deps/latch_engine-1aaec34317e911cf)
+
+running 20 tests
+test server::tests::paced_socket_measurement ... ignored
+test server::tests::audio_packets_split_the_frame_evenly_and_always_fit ... ok
+test server::tests::relay_control_backlog_ends_cleanly_at_its_bound ... ok
+test server::tests::ending_revokes_and_releases_input_immediately ... ok
+test server::tests::fallback_refits_geometry_and_prepares_the_final_mode ... ok
+test server::tests::a_codec_that_cannot_go_on_ends_the_session_for_a_new_negotiation ... ok
+test server::tests::requested_idrs_cannot_exceed_one_per_rtt_even_when_last_delivered_advances ... ok
+test server::tests::surround_keeps_more_of_the_wire_for_sound_and_stereo_no_more_than_before ... ok
+test server::tests::repeated_video_errors_release_exclusive_capture_and_have_a_retry_budget ... ok
+test server::tests::idle_probes_share_sender_accounting_and_stop_under_pressure ... ok
+test server::tests::reopen_refuses_an_old_picture_held_in_the_send_queue ... ok
+test server::tests::an_opening_reservation_is_busy_before_a_viewer_is_installed ... ok
+test server::tests::route_changes_finish_before_new_udp_pad_updates_are_acknowledged ... ok
+test server::tests::a_stuck_media_thread_is_left_behind_at_the_deadline ... ok
+test server::tests::an_explicit_viewer_end_keeps_normal_completion ... ok
+test server::tests::video_reopen_failure_uses_remaining_budget ... ok
+test server::tests::idle_requests_are_prompt_and_each_encoded_frame_updates_mapping_and_is_sent ... ok
+test server::tests::priority_failure_keeps_its_end_code_when_the_sender_is_preempted ... ok
+test server::tests::audio_reports_failure_retries_with_backoff_clears_notice_and_fits_the_mtu ... ok
+test server::tests::a_viewer_that_does_not_read_cannot_block_the_control_writer ... ok
+
+test result: ok. 19 passed; 0 failed; 1 ignored; 0 measured; 115 filtered out; finished in 2.20s
+

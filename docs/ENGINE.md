@@ -1,7 +1,7 @@
-# The Latch 5 streaming engine
+# The Latch streaming engine
 
 Latch 4 shared a desktop through Sunshine (C++) and viewed it through
-moonlight-common-c (C), OpenH264 (C++) and libopus (C). Latch 5 does both
+moonlight-common-c (C), OpenH264 (C++) and libopus (C). Since version 5, Latch does both
 in Rust, inside the one `latch-host` executable that already runs the
 control service and the window.
 
@@ -19,7 +19,8 @@ that line, because they are the platform rather than a library we chose:
   Quick Sync, Apple's media engine);
 * the Windows virtual display driver, which is a driver;
 * Rust crates from crates.io that compile no C, C++ or assembler files.
-  One of them, `graviola` (the TLS provider for update downloads), holds
+  One of them, `graviola` (the cryptography provider for update TLS and the
+  public relay), holds
   formally verified assembly written as Rust inline `asm!`: `rustc`
   compiles it, no external assembler runs, and it is the only assembly in
   the build.
@@ -51,6 +52,7 @@ KeyframeRequest (fallback, older hosts) ────▶ next frame is IDR
 | Crate | What | Platform code |
 | --- | --- | --- |
 | `latch-proto` | wire format, Reed–Solomon FEC, packetizer and reassembler, input reliability, control framing, an impairment simulator for tests | socket helpers in `transport` |
+| `latch-relay` | native two-lane TLS transport, end-to-end record encryption, capabilities and daemon quotas | bounded outbound TLS connections and relay daemon sockets |
 | `latch-codec` | H.264 Constrained Baseline encoder and decoder, BGRA→YUV conversion, the `lpcm-rice` audio codec | none |
 | `latch-engine` | the host side: capture, encode, audio capture, input injection, display sizing, and the session server | `mac/`, `windows/`, `linux/` |
 | `latch-stream` | the viewer side: session, decoders (VideoToolbox, Media Foundation, `latch-codec`), audio playback | `video/` |
@@ -418,7 +420,8 @@ refresh; GPU completion, compositor, panel response and scanout are unmeasured.
 
 ## Compatibility
 
-Latch 5 viewers speak only protocol 1; Latch 5 hosts speak only protocol 1.
+Latch 5 and 6 viewers and hosts speak protocol 1. The version 6 public
+relay extension is negotiated only between peers that advertise support.
 A Latch 5 viewer that finds a Latch 4 host (no `streamer.protocol` in
 `/v1/status`) sends it the update it already knows how to send
 (`/v1/update`, as a Mac does for Windows hosts today) or says which
@@ -695,10 +698,29 @@ Sending mouse and keyboard from the OS event itself is on the
 [roadmap](ROADMAP.md).
 
 After an unexpected transport drop, the viewer reconnects with fresh
-negotiation for up to five minutes: 2/5/10-second waits followed by jittered
+negotiation until stopped, with 2/5/10-second waits followed by jittered
 20–30-second waits. Discovery returning online or an event-loop gap over ten
 seconds advances a pending retry. Explicit refusals, takeover and host ends
 stop automatic retries. The overlay offers Reconnect now and Stop.
+
+Version 6 can negotiate an additional public native TLS route when UDP
+video is missing or persistently damaged. `latch-relay` sends complete
+encoded frames on a video lane and sound, microphone, input, gamepads and
+small control messages on an independent priority lane. ChaCha20-Poly1305
+and HKDF-SHA256 protect records end to end. Session tickets and keys travel
+only over the original authorized Tailscale control connection, which
+remains required. Frame, queue and acknowledgment deadlines bound stalls.
+Relay failure restores UDP routing. Recovered-UDP switch-back and grant
+lifecycle refinements remain under validation.
+[Wire and security details](PROTOCOL.md#public-tcptls-relay)
+
+After acceptance, a first decoded picture must arrive within eight seconds.
+An eight-second decoded-media stall also ends a session despite TCP
+keepalives. Pending reliable input is bounded at 4,096 events, and five
+seconds without input acknowledgment progress ends the session so teardown
+can release held keys and buttons. Host injection failures hold the
+acknowledgment and retry the event for up to two seconds. Persistently
+failing events are then dropped so later input can proceed.
 
 Windows Media Foundation workers answer their caller within a deadline: one
 second for an access unit, five to open a decoder, twenty for the

@@ -1,0 +1,267 @@
+
+running 82 tests
+test api::tests::an_older_hosts_clipboard_does_not_claim_the_selection ... ok
+test api::tests::first_update_version_is_3_1 ... ok
+test api::tests::an_older_host_reports_no_capture_size_or_frame_rate_limit ... ok
+test api::tests::status_round_trips_and_tolerates_missing_fields ... ok
+test api::tests::the_escaped_length_matches_serde_json ... ok
+test api::tests::power_actions_are_lowercase_on_the_wire ... ok
+test api::tests::clipboard_is_cut_on_a_character_boundary ... ok
+test config::tests::config_process_writer ... ok
+test config::tests::machine_name_is_never_empty ... ok
+test dates::tests::a_unix_time_reads_as_utc ... ok
+test dates::tests::civil_round_trips_known_dates ... ok
+test dates::tests::rfc3339_dates_are_read_and_zero_time_means_never ... ok
+test api::tests::clipboard_text_fits_a_request_body_however_it_escapes ... ok
+test config::tests::tests_run_against_a_data_directory_under_target ... ok
+test http::tests::an_address_that_refuses_is_skipped_for_the_next_one ... ok
+test http::tests::client_and_server_agree_over_loopback ... ok
+test http::tests::an_upgraded_connection_carries_the_new_protocol_both_ways ... ok
+test http::tests::garbage_is_refused_not_panicked ... ok
+test config::tests::copying_a_folder_leaves_programs_out_and_is_staged ... ok
+test http::tests::mac_socket_timeouts_and_broken_pipes_read_as_english ... ok
+test http::tests::large_update_body_rejected_for_unauthorized_callers ... ok
+test http::tests::request_reader_leaves_pipelined_control_bytes_on_socket ... ok
+test http::tests::small_body_is_authorized_before_it_is_read ... ok
+test config::tests::a_new_install_takes_over_the_folder_an_older_one_left ... ok
+test config::tests::a_file_that_is_not_text_is_set_aside_like_junk ... ok
+
+running 1 test
+
+running 1 test
+test http::tests::headers_and_binary_bodies_reach_the_handler_and_big_ones_only_on_update ... ok
+test legacy::tests::both_names_identify_a_node ... ok
+test legacy::tests::both_names_identify_our_own_engine ... ok
+test legacy::tests::the_old_data_directory_is_where_4_0_kept_it ... ok
+test legacy::tests::the_old_environment_name_is_a_fallback_and_the_new_one_wins ... ok
+test screens::tests::even_rounds_down_and_never_reaches_zero ... ok
+test screens::tests::stream_modes_cover_every_screen_and_standard_size_without_repeats ... ok
+test screens::tests::within_scales_down_in_proportion_only_when_needed ... ok
+test tailscale::tests::a_stopped_daemon_is_not_running ... ok
+test tailscale::tests::an_idle_peer_has_an_unknown_path_whatever_its_home_relay ... ok
+test tailscale::tests::derp_ids_match_tailscales_map ... ok
+test tailscale::tests::mullvad_and_sharee_nodes_are_no_machines ... ok
+test tailscale::tests::netcheck_is_parsed_and_summarised ... ok
+test tailscale::tests::null_maps_and_lists_read_as_empty ... ok
+test tailscale::tests::only_an_internet_address_is_a_public_one ... ok
+test tailscale::tests::peer_name_uses_magic_dns_first_label_and_falls_back_to_host_name ... ok
+test tailscale::tests::peer_relay_and_tags_are_parsed_without_changing_direct ... ok
+test tailscale::tests::peer_relay_servers_is_parsed_and_garbage_is_not ... ok
+test icon::tests::degenerate_sizes_do_not_panic ... ok
+test tailscale::tests::status_is_parsed_and_windows_peers_sorted ... ok
+test tailscale::tests::tagged_relays_stay_out_of_the_pc_list ... ok
+test tailscale::tests::tailnet_range_is_recognised ... ok
+test tailscale::tests::tailscale_off_means_nobody_is_relayed ... ok
+test tailscale::tests::the_tailnet_name_is_read_when_present ... ok
+test tailscale::tests::userspace_networking_is_told_from_a_kernel_tun ... ok
+test tailscale::tests::whois_is_parsed ... ok
+test update::tests::a_bad_download_leaves_nothing_behind ... ok
+test update::tests::a_cached_asset_is_rechecked_before_use ... ok
+test update::tests::chunked_sized_and_unsized_bodies_are_read ... ok
+test update::tests::digests_are_lowercase_hex ... ok
+test update::tests::failed_and_overlapping_downloads_preserve_verified_destination_bytes ... ok
+test update::tests::host_authentication_requires_published_digest_and_matching_new_tag ... ok
+test update::tests::is_newer_than_offers_3_2_0_over_3_1_2_rc_5_and_not_equals ... ok
+test update::tests::manifests_bind_versions_names_urls_sizes_and_individual_hashes ... ok
+test update::tests::only_windows_takes_a_pushed_host ... ok
+test update::tests::public_redirect_requests_never_carry_legacy_credentials ... ok
+test update::tests::real_github_latest_release_fetch ... ignored, requires a published public release manifest over the network
+test update::tests::redirects_cannot_escape_approved_https_origins ... ok
+test update::tests::release_json_is_parsed_and_compared ... ok
+test update::tests::unsupported_crypto_cpus_return_an_actionable_error_before_provider_entry ... ok
+test update::tests::urls_split_and_headers_are_case_insensitive ... ok
+test wake::tests::mac_parses_common_spellings_and_rejects_junk ... ok
+test wake::tests::magic_packet_is_sync_stream_then_mac_sixteen_times ... ok
+test wake::tests::magic_target_reads_back_the_mac_and_rejects_the_rest ... ok
+test wake::tests::plan_covers_broadcasts_the_pc_and_the_public_address ... ok
+test wake::tests::sending_never_fails_loudly ... ok
+test config::tests::file_lock_coordinates_exclusive_access ... ok
+test config::tests::config_process_writer ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 81 filtered out; finished in 0.07s
+
+test config::tests::config_process_writer ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 81 filtered out; finished in 0.07s
+
+test icon::tests::renders_the_requested_size_with_an_ink_tile_and_the_white_and_blue_mark ... ok
+test http::tests::head_deadline_times_out_slow_headers ... ok
+test config::tests::save_then_load_round_trips_and_junk_falls_back ... ok
+test tailscale::tests::run_limited_kills_a_hung_command ... ok
+test config::tests::concurrent_transactions_preserve_all_updates_and_private_permissions ... ok
+test config::tests::one_value_this_build_cannot_read_costs_only_that_value ... ok
+test config::tests::a_strict_read_never_moves_or_defaults_a_damaged_file ... ok
+
+running 1 test
+test config::tests::transactions_serialize_across_processes ... ok
+test http::tests::upgrade_waits_across_poll_intervals_and_restores_protocol_timeouts ... ok
+test http::tests::upgrade_cancellation_does_not_require_socket_shutdown ... ok
+
+test result: ok. 81 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.44s
+
+
+running 53 tests
+test base64::tests::base64_rfc_vectors ... ok
+test base64::tests::preserves_dimensions_within_96 ... ok
+test color::tests::hdr_highlights_stay_apart_in_sdr_and_keep_their_hue ... ok
+test color::tests::joint_codec_colour_matrix_and_legacy_order ... ok
+test color::tests::chroma_siting_is_optional_on_the_wire ... ok
+test base64::tests::base64_roundtrip_binary ... ok
+test color::tests::negotiation_is_default_off ... ok
+test color::tests::pq_and_gamut_roundtrip ... ok
+test color::tests::sei_is_escaped_and_has_both_payloads ... ok
+test base64::tests::downscales_when_exceeding_96 ... ok
+test color::tests::ten_bit_gradient_has_four_times_the_levels ... ok
+test control::tests::accept_backward_compatible ... ok
+test control::tests::codec_offers_skip_unknown_names_and_preserve_preference ... ok
+test control::tests::cursor_json_format_matches_spec ... ok
+test control::tests::cursor_messages_wire_roundtrip ... ok
+test control::tests::draw_cursor_message_wire_roundtrip ... ok
+test control::tests::cursor_max_shape_fits_max_message ... ok
+test control::tests::gamepads_are_negotiated_and_unknown_kinds_skipped ... ok
+test fec::tests::benchmark_fec ... ignored
+test control::tests::stream_request_backward_compatible ... ok
+test control::tests::unknown_message_type_ignored ... ok
+test fec::tests::mismatched_lengths ... ok
+test fec::tests::parity_only_reconstruction ... ok
+test fec::tests::too_few_shards ... ok
+test gamepad::tests::a_receiver_drops_stale_and_repeated_snapshots ... ok
+test fec::tests::exhaustive_small ... ok
+test gamepad::tests::a_removed_pad_is_sent_as_gone_once_and_unused_slots_stay_silent ... ok
+test gamepad::tests::a_sender_resends_the_newest_until_acknowledged ... ok
+test gamepad::tests::ack_and_feedback_datagrams_parse_strictly ... ok
+test gamepad::tests::every_unacknowledged_pad_rides_in_each_datagram ... ok
+test gamepad::tests::feedback_round_trips ... ok
+test gamepad::tests::malformed_snapshots_are_refused ... ok
+test gamepad::tests::snapshots_round_trip_with_and_without_extras ... ok
+test input::fallible_tests::an_event_that_never_injects_is_dropped_and_the_rest_go_on ... ok
+test input::fallible_tests::failed_release_is_retried_before_acknowledging ... ok
+test probe::tests::batched_millisecond_timestamps_keep_clean_rates_usable ... ok
+test probe::tests::damaged_positions_do_not_fabricate_capacity ... ok
+test probe::tests::spread_measures_the_bottleneck_and_a_lost_tail_still_counts ... ok
+test video::tests::a_recovery_frame_ends_a_loss_only_after_the_frame_it_predicts_from ... ok
+test video::tests::recovery_datagrams_round_trip_and_old_flags_still_parse ... ok
+test video::tests::recovery_requests_fall_back_to_keyframes ... ok
+test wire::tests::the_full_kind_registry_is_unique_and_matches_the_protocol ... ok
+test gamepad::tests::a_lossy_reordering_link_ends_on_the_newest_state ... ok
+test video::tests::keyframes_and_recovery_survive_four_packet_bursts_even_when_tiny ... ok
+test video::tests::every_data_shard_goes_out_before_any_parity ... ok
+test fec::tests::test_encode_matches_scalar ... ok
+test fec::tests::random_patterns_large ... ok
+test transport::tests::segmented_runs_arrive_as_separate_datagrams ... ok
+test transport::tests::batches_preserve_boundaries_and_never_wait_for_more ... ok
+test probe::tests::distributed_arrival_jitter_is_not_a_slow_bottleneck ... ok
+test fec::tests::multiply_accumulate_matches_scalar_for_all_coefficients ... ok
+test video::tests::frame_layout_boundary_is_explicit_and_does_not_consume_a_number ... ok
+test fec::tests::test_simd_addmul_matches_scalar ... ok
+
+test result: ok. 52 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 3 tests
+test the_host_answers_a_repeat_only_once_its_keyframe_had_time_to_arrive ... ok
+test the_viewer_asks_again_at_once_when_a_frame_is_lost ... ok
+test a_lost_recovery_keyframe_is_sent_again_within_a_few_round_trips ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+
+
+running 14 tests
+test bottleneck_serializes_bounds_and_removes_queue ... ok
+test av1_offer_is_additive_and_unknown_codecs_still_fall_through ... ok
+test legacy_report_is_additive_and_socket_errors_are_portable ... ok
+test lost_startup_idr_requests_recovery_and_accepts_next_idr ... ok
+test startup_grace_bounds_silence_and_allows_a_healthy_idr_to_finish ... ok
+test recovered_audio_pts_follows_negotiated_five_ms_packets ... ok
+test test_7_performance_video_and_fec ... ignored
+test microphone_packets_are_kind_13_and_older_fields_stay_off_the_wire ... ok
+test test_6_control_messages_roundtrip_and_errors ... ok
+test test_4_audio_5_pct_loss ... ok
+test test_2_burst_loss_and_no_impairment ... ok
+test test_3_input_10k_events_lossy_link ... ok
+test test_1_random_video_frames_lossy_link ... ok
+test test_5_wire_fuzz_random_and_mutations ... ok
+
+test result: ok. 13 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 18 tests
+test audio_after_a_lost_packet_is_released_when_the_host_goes_quiet ... ok
+test audio_given_up_at_the_end_of_a_sound_leaves_no_deadline_behind ... ok
+test audio_packetizer_limits_data_and_parity_without_consuming_rejected_sequence ... ok
+test another_frames_timeout_leaves_an_assembling_frame_alone ... ok
+test audio_resynchronizes_across_sequence_wrap ... ok
+test input_backlog_waits_for_ack_or_resend_without_spinning ... ok
+test input_continuous_motion_retransmits_oldest_after_loss ... ok
+test reordered_audio_parity_does_not_discard_data_that_arrives_after_it ... ok
+test audio_recovers_after_long_blackout_with_data_or_parity_first ... ok
+test input_full_queue_never_changes_sent_payload_or_moves_across_keys ... ok
+test input_full_queue_preserves_relative_motion_without_saturation ... ok
+test video_timeout_advances_past_head_with_no_shards ... ok
+test wire_rejects_oversized_datagrams_of_every_kind ... ok
+test video_initial_keyframe_requests_start_only_after_loss ... ok
+test input_overflow_preserves_oldest_and_critical_events ... ok
+test input_backlog_never_discards_critical_events_or_creates_sequence_gaps ... ok
+test input_receiver_buffers_the_hard_cap_window ... ok
+test input_lost_ack_does_not_mutate_already_applied_motion ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 14 tests
+test client::tests::incomplete_oversized_and_wrong_lane_frames_never_deliver ... ok
+test client::tests::production_resolution_rejects_tailnet_and_private_addresses ... ok
+test client::tests::priority_backpressure_and_whole_unsent_frame_discard ... ok
+test crypto::tests::key_derivation_matches_rfc5869_case_one ... ok
+test daemon::tests::pairing_role_capabilities_are_single_use_per_lane ... ok
+test crypto::tests::authentication_binds_counter_lane_direction_session_and_generation ... ok
+test wire::tests::records_reject_oversize_and_truncation ... ok
+test quota::tests::failed_persistence_is_sticky ... ok
+test quota::tests::month_rollover_invalidates_live_socket_credit ... ok
+test wire::tests::tls_hostname_verification_remains_enabled ... ok
+test wire::tests::partial_tls_writes_preserve_record_framing ... ok
+test quota::tests::restart_and_backwards_month_do_not_reset_budget ... ok
+
+running 1 test
+test crypto::tests::cpu_rejection_is_a_result ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+test crypto::tests::cpu_rejection_is_a_result ... ok
+test wire::tests::stalled_and_closed_tls_peers_fail_on_bounded_deadlines ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 12 tests
+test pre_cancelled_dns_and_connect_stop_without_waiting ... ok
+test public_roots_reject_test_certificate ... ok
+test daemon_restart_preserves_spent_transfer_reservations ... ok
+test wrong_keys_never_reach_ready ... ok
+test cancelling_silent_tls_handshake_and_drop_are_bounded ... ok
+test frame_ack_elapsed_is_authenticated_and_consumed_on_the_callers_cadence ... ok
+test real_tls_two_lanes_complete_frame_and_authenticated_control ... ok
+test repeated_frames_advance_the_bounded_authenticated_ack_window ... ok
+test exhausted_receive_queue_closes_attempt_and_propagates_failure ... ok
+test pilot_admission_bounds_outstanding_grants_per_creator_ip ... ok
+test replayed_attachment_cannot_rejoin ... ok
+test delayed_ack_path_does_not_limit_video_to_eight_frames_per_round_trip ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.65s
+
+
+running 1 test
+test tests::bounded_percentiles ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

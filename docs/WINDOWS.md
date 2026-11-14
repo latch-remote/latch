@@ -556,15 +556,18 @@ When no viewing or sharing stream is active, it downloads the published
 probation and rollback path as a pushed update. Automatic updates must be
 enabled in Settings; `accept_updates` in `host.toml` also gates installation.
 
-For every pushed update, the receiving PC independently looks up the claimed
-`v<version>` release in `MrBeldum/latch` using HTTPS. The version must be newer
+For every pushed update, the receiving PC independently fetches the claimed
+version's `release.json` from `latch-remote/latch-releases` using HTTPS. The version must be newer
 and the executable must exactly match the bare `latch-host.exe` asset's digest
 and size. The sender's hash alone is insufficient. Old Mac header names still
 work. Offline PCs, missing digests and releases without that bare asset are
 refused with a readable error on the pushing Mac. For a release predating the
 asset, update the PC once by hand using its Windows zip; no archive fallback is
-downloaded. Private repositories require `LATCH_GITHUB_TOKEN` or `github_token`
-in the PC's client configuration as well as on the Mac.
+downloaded. Version 6 public downloads require no GitHub credentials and
+ignore legacy token settings. URLs must exactly match the manifest's
+version-tagged public asset URLs. An older 5.x PC can still check the former
+repository and reject a push from a new Mac. Download the public zip once,
+extract it and run `install-host.ps1` to migrate, preserving settings.
 
 Linux checks and announces newer versions in Settings and the status line,
 including the release URL, but never replaces its executable. Download the
@@ -572,8 +575,9 @@ matching Linux tarball, verify it against the release's `SHA256SUMS`, and
 follow `deploy/native/README.md` to replace the binary and restart the service;
 container installations must rebuild/redeploy their image.
 
-GitHub digests and build attestations establish the GitHub/TLS release boundary;
-they do not provide an independent publisher signature if GitHub is compromised.
+GitHub HTTPS and the public manifest establish the release trust boundary.
+Private-source attestations are opt-in and unavailable by default.
+Windows releases remain unsigned. Publisher signing remains open work.
 
 After authentication, the service stages `latch-host.exe.new` beside itself,
 renames the running file to `latch-host.exe.old`, moves the new file in and

@@ -1,0 +1,4 @@
+   Compiling latch-relay v6.0.0 (/tmp/latch6-field-mac-final-20261114/crates/relay)
+   Compiling latch-stream v6.0.0 (/tmp/latch6-field-mac-final-20261114/crates/stream)
+   Compiling latch-engine v6.0.0 (/tmp/latch6-field-mac-final-20261114/crates/engine)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 4.99s

@@ -1,0 +1,124 @@
+
+running 8 tests
+test actual_relay_audio_and_microphone_reach_pcm_sinks ... FAILED
+test automatic_blackhole_recovery_real_tls_input_and_udp_fallback ... [2m2026-11-14T10:30:50.672795Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) [3msend_bytes[0m[2m=[0m8388608 [3mreceive_bytes[0m[2m=[0m8388608
+[2m2026-11-14T10:30:50.914981Z[0m [34mDEBUG[0m [2mlatch_stream::video::mediafoundation[0m[2m:[0m decoder ICodecAPI low-latency mode: Invalid argument (VT_UI4 != pValue->vt) (0x80070057)
+[2m2026-11-14T10:30:50.974391Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+[2m2026-11-14T10:30:50.974429Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test is watching: 128├ù128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+[2m2026-11-14T10:30:50.975247Z[0m [34mDEBUG[0m [2mlatch_stream::video::mediafoundation[0m[2m:[0m decoder ICodecAPI low-latency mode: Invalid argument (VT_UI4 != pValue->vt) (0x80070057)
+[2m2026-11-14T10:30:52.025056Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:30:52.040950Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay preparation failed [3merror[0m[2m=[0mAn invalid argument was supplied. (os error 10022)
+[2m2026-11-14T10:30:52.041130Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mAbort
+[2m2026-11-14T10:30:54.056172Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:30:54.071200Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay preparation failed [3merror[0m[2m=[0mAn invalid argument was supplied. (os error 10022)
+[2m2026-11-14T10:30:54.071338Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mAbort
+[2m2026-11-14T10:30:56.074514Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:30:56.089783Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay preparation failed [3merror[0m[2m=[0mAn invalid argument was supplied. (os error 10022)
+[2m2026-11-14T10:30:56.089899Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mAbort
+[2m2026-11-14T10:30:56.691124Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test stopped watching after 5 s: the viewer disconnected
+FAILED
+test cancelled_prepare_joins_its_worker_and_rejects_endpoint_role_and_generation ... [2m2026-11-14T10:30:56.721032Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mRequest
+FAILED
+test finite_byte_grants_renew_after_actual_video_transfer ... [2m2026-11-14T10:30:58.726000Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) [3msend_bytes[0m[2m=[0m8388608 [3mreceive_bytes[0m[2m=[0m8388608
+[2m2026-11-14T10:30:58.726637Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+[2m2026-11-14T10:30:58.726659Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test is watching: 128├ù128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+[2m2026-11-14T10:30:58.744627Z[0m [34mDEBUG[0m [2mlatch_stream::video::mediafoundation[0m[2m:[0m decoder ICodecAPI low-latency mode: Invalid argument (VT_UI4 != pValue->vt) (0x80070057)
+[2m2026-11-14T10:30:59.791455Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:30:59.806523Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay preparation failed [3merror[0m[2m=[0mAn invalid argument was supplied. (os error 10022)
+[2m2026-11-14T10:30:59.806718Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mAbort
+[2m2026-11-14T10:31:01.816140Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:31:01.831716Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay preparation failed [3merror[0m[2m=[0mAn invalid argument was supplied. (os error 10022)
+[2m2026-11-14T10:31:01.831827Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mAbort
+[2m2026-11-14T10:31:03.837198Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:31:03.853329Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay preparation failed [3merror[0m[2m=[0mAn invalid argument was supplied. (os error 10022)
+[2m2026-11-14T10:31:03.853442Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mAbort
+[2m2026-11-14T10:31:06.762765Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test stopped watching after 8 s: the viewer disconnected
+FAILED
+test finite_grants_get_fresh_authorization_without_stranding_media ... [2m2026-11-14T10:31:06.776563Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) [3msend_bytes[0m[2m=[0m8388608 [3mreceive_bytes[0m[2m=[0m8388608
+[2m2026-11-14T10:31:06.777184Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+[2m2026-11-14T10:31:06.777205Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test is watching: 128├ù128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+[2m2026-11-14T10:31:06.794970Z[0m [34mDEBUG[0m [2mlatch_stream::video::mediafoundation[0m[2m:[0m decoder ICodecAPI low-latency mode: Invalid argument (VT_UI4 != pValue->vt) (0x80070057)
+[2m2026-11-14T10:31:07.839582Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:31:07.854847Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay preparation failed [3merror[0m[2m=[0mAn invalid argument was supplied. (os error 10022)
+[2m2026-11-14T10:31:07.855051Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mAbort
+[2m2026-11-14T10:31:09.862103Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:31:09.877168Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay preparation failed [3merror[0m[2m=[0mAn invalid argument was supplied. (os error 10022)
+[2m2026-11-14T10:31:09.877284Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mAbort
+[2m2026-11-14T10:31:11.883973Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:31:11.899577Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay preparation failed [3merror[0m[2m=[0mAn invalid argument was supplied. (os error 10022)
+[2m2026-11-14T10:31:11.899680Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mAbort
+[2m2026-11-14T10:31:13.799234Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test stopped watching after 7 s: the viewer disconnected
+FAILED
+test monthly_cap_fails_closed_with_bounded_retry_and_direct_recovery ... [2m2026-11-14T10:31:13.826566Z[0m [32m INFO[0m [2mlatch_stream::session[0m[2m:[0m viewer UDP buffers (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max) [3msend_bytes[0m[2m=[0m8388608 [3mreceive_bytes[0m[2m=[0m8388608
+[2m2026-11-14T10:31:13.827237Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m host UDP buffers: send=8388608 receive=8388608 bytes (requested 8388608/8388608; Linux may cap at net.core.wmem_max/rmem_max)
+[2m2026-11-14T10:31:13.827257Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test is watching: 128├ù128 at 30 fps, 2000 kb/s, Latch software H.264 (test pattern)
+[2m2026-11-14T10:31:13.845154Z[0m [34mDEBUG[0m [2mlatch_stream::video::mediafoundation[0m[2m:[0m decoder ICodecAPI low-latency mode: Invalid argument (VT_UI4 != pValue->vt) (0x80070057)
+[2m2026-11-14T10:31:14.880635Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:31:14.896615Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay preparation failed [3merror[0m[2m=[0mAn invalid argument was supplied. (os error 10022)
+[2m2026-11-14T10:31:14.896790Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mAbort
+[2m2026-11-14T10:31:16.902057Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:31:16.917361Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay preparation failed [3merror[0m[2m=[0mAn invalid argument was supplied. (os error 10022)
+[2m2026-11-14T10:31:16.917461Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mAbort
+[2m2026-11-14T10:31:18.922432Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mHost [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mRequest
+[2m2026-11-14T10:31:18.937842Z[0m [33m WARN[0m [2mlatch_stream::session[0m[2m:[0m relay preparation failed [3merror[0m[2m=[0mAn invalid argument was supplied. (os error 10022)
+[2m2026-11-14T10:31:18.937948Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m3 [3maction[0m[2m=[0mAbort
+[2m2026-11-14T10:31:19.843490Z[0m [32m INFO[0m [2mlatch_engine::server[0m[2m:[0m relay runtime test stopped watching after 6 s: the viewer disconnected
+FAILED
+test negotiation_rejects_stale_malformed_and_unconfigured_offers ... [2m2026-11-14T10:31:19.870539Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m2 [3maction[0m[2m=[0mOffer([REDACTED])
+[2m2026-11-14T10:31:19.870578Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mCommit
+[2m2026-11-14T10:31:19.870589Z[0m [34mDEBUG[0m [2mlatch_stream::session[0m[2m:[0m relay negotiation [3mrole[0m[2m=[0mViewer [3mattempt[0m[2m=[0m1 [3maction[0m[2m=[0mOffer([REDACTED])
+ok
+test resource_rejection_retries_after_the_occupied_grant_expires ... FAILED
+
+failures:
+
+---- actual_relay_audio_and_microphone_reach_pcm_sinks stdout ----
+
+thread 'actual_relay_audio_and_microphone_reach_pcm_sinks' (4656) panicked at crates\engine\tests\relay_runtime.rs:701:50:
+called `Result::unwrap()` on an `Err` value: Refusal { status: 500, message: "could not capture the screen: enumerate outputs: A resource is not available at the time of the call, but may become available later. (0x887A0022)" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- automatic_blackhole_recovery_real_tls_input_and_udp_fallback stdout ----
+
+thread 'automatic_blackhole_recovery_real_tls_input_and_udp_fallback' (7900) panicked at crates\engine\tests\relay_runtime.rs:245:13:
+deadline exceeded, stats Stats { color: ColorDescription { primaries: 1, transfer: 1, matrix: 1, full_range: false, bit_depth: 8, hdr: None, chroma: Left }, fps: 0.0, mbps: 0.0, received_mbps: 0.0, rtt_ms: 0, rtt_var_ms: 0, decode_ms: 0.0, decode_p95_ms: 0.0, frame_budget_ms: 33.333332, decode_capacity_fps: 0, host_ms: 0.0, assembly_ms: 0.0, queue_ms: 0.0, width: 128, height: 128, decoder: "Media Foundation (DXVA)", encoder: "Latch software H.264 (test pattern)", codec: "H.264", loss_pct: 0.0, fec_recovered: 0, audio: "", audio_latency: Latency { queued_ms: 0.0, device_ms: 0.0, jitter_ms: 0.0, underruns: 0 }, mic: "", video_problem: None, applied_bitrate_kbps: 1406, wire_budget_kbps: 2000, application_limited: true, requested_bitrate_kbps: 2000, pacing_queue_ms: 0.0, send_errors: 0, send_retries: 0, socket_send_bytes: 8388608, socket_receive_bytes: 8388608, host_socket_send_bytes: 8388608, host_socket_receive_bytes: 8388608, frames_lost: 0, window_ms: 271, received_fps: 0.0, raw_loss_pct: 0.0, frames_dropped: 0, frame_jitter_ms: 0.0 }
+
+---- cancelled_prepare_joins_its_worker_and_rejects_endpoint_role_and_generation stdout ----
+
+thread 'cancelled_prepare_joins_its_worker_and_rejects_endpoint_role_and_generation' (15516) panicked at crates\engine\tests\relay_runtime.rs:598:9:
+grant worker never connected
+
+---- finite_byte_grants_renew_after_actual_video_transfer stdout ----
+
+thread 'finite_byte_grants_renew_after_actual_video_transfer' (15220) panicked at crates\engine\tests\relay_runtime.rs:245:13:
+deadline exceeded, stats Stats { color: ColorDescription { primaries: 1, transfer: 1, matrix: 1, full_range: false, bit_depth: 8, hdr: None, chroma: Left }, fps: 0.0, mbps: 0.0, received_mbps: 0.0, rtt_ms: 0, rtt_var_ms: 0, decode_ms: 0.0, decode_p95_ms: 0.0, frame_budget_ms: 33.333332, decode_capacity_fps: 0, host_ms: 0.0, assembly_ms: 0.0, queue_ms: 0.0, width: 128, height: 128, decoder: "Media Foundation (DXVA)", encoder: "Latch software H.264 (test pattern)", codec: "H.264", loss_pct: 0.0, fec_recovered: 0, audio: "", audio_latency: Latency { queued_ms: 0.0, device_ms: 0.0, jitter_ms: 0.0, underruns: 0 }, mic: "", video_problem: None, applied_bitrate_kbps: 1406, wire_budget_kbps: 2000, application_limited: true, requested_bitrate_kbps: 2000, pacing_queue_ms: 0.0, send_errors: 0, send_retries: 0, socket_send_bytes: 8388608, socket_receive_bytes: 8388608, host_socket_send_bytes: 8388608, host_socket_receive_bytes: 8388608, frames_lost: 0, window_ms: 270, received_fps: 0.0, raw_loss_pct: 0.0, frames_dropped: 0, frame_jitter_ms: 0.0 }
+
+---- finite_grants_get_fresh_authorization_without_stranding_media stdout ----
+
+thread 'finite_grants_get_fresh_authorization_without_stranding_media' (2592) panicked at crates\engine\tests\relay_runtime.rs:245:13:
+deadline exceeded, stats Stats { color: ColorDescription { primaries: 1, transfer: 1, matrix: 1, full_range: false, bit_depth: 8, hdr: None, chroma: Left }, fps: 0.0, mbps: 0.0, received_mbps: 0.0, rtt_ms: 0, rtt_var_ms: 0, decode_ms: 0.0, decode_p95_ms: 0.0, frame_budget_ms: 33.333332, decode_capacity_fps: 0, host_ms: 0.0, assembly_ms: 0.0, queue_ms: 0.0, width: 128, height: 128, decoder: "Media Foundation (DXVA)", encoder: "Latch software H.264 (test pattern)", codec: "H.264", loss_pct: 0.0, fec_recovered: 0, audio: "", audio_latency: Latency { queued_ms: 0.0, device_ms: 0.0, jitter_ms: 0.0, underruns: 0 }, mic: "", video_problem: None, applied_bitrate_kbps: 1406, wire_budget_kbps: 2000, application_limited: true, requested_bitrate_kbps: 2000, pacing_queue_ms: 0.0, send_errors: 0, send_retries: 0, socket_send_bytes: 8388608, socket_receive_bytes: 8388608, host_socket_send_bytes: 8388608, host_socket_receive_bytes: 8388608, frames_lost: 0, window_ms: 277, received_fps: 0.0, raw_loss_pct: 0.0, frames_dropped: 0, frame_jitter_ms: 0.0 }
+
+---- monthly_cap_fails_closed_with_bounded_retry_and_direct_recovery stdout ----
+
+thread 'monthly_cap_fails_closed_with_bounded_retry_and_direct_recovery' (15428) panicked at crates\engine\tests\relay_runtime.rs:485:5:
+assertion `left == right` failed
+  left: 0
+ right: 1
+
+---- resource_rejection_retries_after_the_occupied_grant_expires stdout ----
+
+thread 'resource_rejection_retries_after_the_occupied_grant_expires' (3412) panicked at crates\engine\tests\relay_runtime.rs:461:78:
+called `Result::unwrap()` on an `Err` value: Os { code: 10022, kind: InvalidInput, message: "An invalid argument was supplied." }
+
+
+failures:
+    actual_relay_audio_and_microphone_reach_pcm_sinks
+    automatic_blackhole_recovery_real_tls_input_and_udp_fallback
+    cancelled_prepare_joins_its_worker_and_rejects_endpoint_role_and_generation
+    finite_byte_grants_renew_after_actual_video_transfer
+    finite_grants_get_fresh_authorization_without_stranding_media
+    monthly_cap_fails_closed_with_bounded_retry_and_direct_recovery
+    resource_rejection_retries_after_the_occupied_grant_expires
+
+test result: FAILED. 1 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29.31s
+

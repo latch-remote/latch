@@ -1,0 +1,10 @@
+    Checking latch-proto v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/proto)
+   Compiling latch-host v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/host)
+    Checking latch-codec v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/codec)
+    Checking latch-relay v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/relay)
+    Checking latch-core v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/core)
+    Checking latch-stream v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/stream)
+    Checking latch-ui v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/ui)
+    Checking latch-engine v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/engine)
+    Checking latch-client v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/client)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 11.63s

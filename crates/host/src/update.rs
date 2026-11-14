@@ -3,8 +3,8 @@
 //!
 //! The Mac can fetch and push an update, or Windows can pull one. The sender
 //! POSTs the executable to `/v1/update` with its version and SHA-256. The
-//! service authenticates the bytes against GitHub, checks the PE headers and a
-//! newer version, and stages the file beside itself. Then it renames:
+//! service independently resolves the version's public manifest, checks the PE
+//! headers and a newer version, and stages the file beside itself. Then it renames:
 //! Windows lets a running executable be renamed but not overwritten. The new
 //! exe is started with `--replaces <pid>`, which makes it wait for the old
 //! service to let go of the port, and the old one exits after answering.
@@ -90,9 +90,7 @@ pub fn refuse_self_update(engine_running: bool, someone_watching: bool) -> bool 
 /// Check the upload and stage it beside `exe`. Returns the version it
 /// carries.
 pub fn stage(req: &Request, exe: &Path) -> Result<Version, Rejected> {
-    let cfg = latch_client::config::ClientConfig::load();
-    let token = update::token(cfg.github_token.as_deref());
-    stage_with(req, exe, |v| update::for_version(v, token.as_deref()))
+    stage_with(req, exe, |v| update::for_version(v, None))
 }
 
 fn stage_with(
@@ -466,12 +464,62 @@ mod tests {
 
     fn test_stage(req: &Request, exe: &Path) -> Result<Version, Rejected> {
         stage_with(req, exe, |v| {
-            let json = serde_json::json!({"tag_name": format!("v{v}"), "assets": [{
-                "name": update::HOST_EXE, "url": "https://api.github.com/unused",
+            let json = serde_json::json!({"version": v.to_string(), "tag_name": format!("v{v}"), "prerelease": false, "assets": [{
+                "name": update::HOST_EXE,
+                "url": format!("https://github.com/{}/releases/download/v{v}/{}", update::REPO, update::HOST_EXE),
                 "size": req.body.len(), "digest": format!("sha256:{}", update::sha256_hex(&req.body))
             }]});
-            update::parse_release(&serde_json::to_vec(&json)?)
+            update::parse_manifest(&serde_json::to_vec(&json)?)
         })
+    }
+
+    #[test]
+    fn sender_hash_cannot_replace_the_receivers_version_size_and_digest_checks() {
+        let dir =
+            std::env::temp_dir().join(format!("latch-independent-upd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("latch-host.exe");
+        let body = fake_exe();
+        let version = Version::new(update::current().major + 1, 0, 0);
+        let request = req(
+            Some(&version.to_string()),
+            Some(&update::sha256_hex(&body)),
+            body.clone(),
+        );
+        let published = update::Release {
+            version: version.clone(),
+            tag: format!("v{version}"),
+            prerelease: false,
+            assets: vec![update::Asset {
+                name: update::HOST_EXE.into(),
+                url: format!(
+                    "https://github.com/{}/releases/download/v{version}/{}",
+                    update::REPO,
+                    update::HOST_EXE
+                ),
+                size: body.len() as u64,
+                sha256: Some(update::sha256_hex(&body)),
+            }],
+        };
+        for change in 0..4 {
+            let mut release = published.clone();
+            match change {
+                0 => {
+                    release.assets[0].sha256 =
+                        Some(update::sha256_hex(b"different published executable"))
+                }
+                1 => release.assets[0].size += 1,
+                2 => release.version.patch += 1,
+                _ => release.assets[0].sha256 = None,
+            }
+            assert!(stage_with(&request, &exe, |claimed| {
+                assert_eq!(claimed, &version);
+                Ok(release)
+            })
+            .is_err());
+            assert!(!staged(&exe).exists());
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

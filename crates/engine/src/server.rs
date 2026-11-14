@@ -18,6 +18,7 @@ use latch_proto::input::InputReceiver;
 use latch_proto::rtt::RttEstimator;
 use latch_proto::video::{KeyframeAnswers, OutFrame, Packetizer, DEFAULT_FEC_PERCENT};
 use latch_proto::wire::{self, Datagram};
+use latch_stream::session::RelayRoute;
 use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
 use std::io::Write;
@@ -75,6 +76,7 @@ pub type Prepare =
     Box<dyn Fn(&StreamRequest) -> anyhow::Result<Option<Box<dyn FnOnce() + Send>>> + Send + Sync>;
 
 pub struct Options {
+    pub relay: Option<latch_relay::ClientConfig>,
     pub prepare: Option<Prepare>,
     /// Lines for the owner's log (the host window shows them).
     pub log: Box<dyn Fn(String) + Send + Sync>,
@@ -86,6 +88,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            relay: latch_stream::session::relay_config(&control::RelaySettings::default()),
             prepare: None,
             log: Box::new(|line| tracing::info!("{line}")),
             mic: None,
@@ -441,7 +444,13 @@ impl Server {
             .map_or((0, Vec::new()), |p| (p.slots, p.kinds.clone()));
         let feedback = prepared.feedback.clone();
         feedback.start(id);
+        let relay_enabled = prepared.req.relay && self.options.relay.is_some();
         let session = Arc::new(Session {
+            relay: RelayRoute::new(
+                id,
+                latch_relay::Role::Host,
+                relay_enabled.then(|| self.options.relay.clone()).flatten(),
+            ),
             id,
             token,
             viewer: display_name(&prepared.req.name, prepared.peer.ip()),
@@ -469,7 +478,7 @@ impl Server {
             rtt_low: Mutex::new(None),
             train_ping: AtomicU64::new(0),
             train_rtt: Mutex::new(None),
-            pace_kbps: AtomicU32::new(0),
+            pace_kbps: AtomicU32::new(config.bitrate_kbps),
             fec: AtomicU8::new(DEFAULT_FEC_PERCENT),
             fec_burst: AtomicU8::new(0),
             heard_us: AtomicU64::new(self.now_us()),
@@ -517,6 +526,7 @@ impl Server {
         }
         let audio = prepared.audio.take();
         let accept = Accept {
+            relay: relay_enabled,
             color: info.color,
             session: id,
             token: control::token_hex(&token),
@@ -573,8 +583,10 @@ impl Server {
                 .name("stream-pads".into())
                 .spawn(move || {
                     session.feedback.run(|datagram| {
-                        if let Some(addr) = *session.addr.lock() {
-                            let _ = server.udp.send_to(datagram, addr);
+                        if let Some(addr) = (*session.addr.lock())
+                            .or_else(|| session.relay.active().then_some(session.announced))
+                        {
+                            send(&server.udp, &session, datagram, addr);
                         }
                     })
                 })
@@ -665,7 +677,7 @@ impl Server {
                 }),
             );
         }
-        let (messages, inbox) = mpsc::channel();
+        let (messages, inbox) = mpsc::sync_channel(128);
         let reader = tcp.try_clone();
         if let Ok(mut reader) = reader {
             let _ = std::thread::Builder::new()
@@ -683,6 +695,8 @@ impl Server {
         }
         *session.control_writer.lock() = Some(writer);
         let (video, audio) = start_media();
+        let mut relay_controller =
+            crate::congestion::RelayController::new(accept.bitrate_kbps, Instant::now());
         let mut controller =
             crate::congestion::Controller::new(accept.bitrate_kbps, Instant::now());
         let requested_bitrate = accept.bitrate_kbps;
@@ -693,16 +707,11 @@ impl Server {
         let mut train = 0u16;
         // Bytes the encoder had produced at the last viewer report.
         let mut sent_mark = (Instant::now(), session.bytes.load(Ordering::Relaxed));
+        let mut route_revision = session.relay.revision();
+        let mut relay_messages = VecDeque::new();
         let reason = loop {
-            if let Some(e) = session.ended.lock().clone() {
-                // A notice queued just before the end still goes first.
-                if let Some(message) = session.audio_notice.lock().take() {
-                    let _ = session.send_control(&Message::Notice(Notice {
-                        kind: "audio".into(),
-                        message,
-                    }));
-                }
-                let _ = session.send_control(&Message::End(e.clone()));
+            let ended = session.ended.lock().clone();
+            if let Some(e) = ended {
                 break e.message;
             }
             let audio_notice = session.audio_notice.lock().take();
@@ -714,13 +723,94 @@ impl Server {
                     break "the viewer's connection broke".to_string();
                 }
             }
-            match inbox.recv_timeout(Duration::from_millis(20)) {
+            for _ in 0..64 {
+                match session.relay.poll() {
+                    Some((revision, latch_relay::Event::Datagram(bytes))) => {
+                        if revision != session.relay.revision() {
+                            continue;
+                        }
+                        dispatch_datagram(self, session, &bytes, session.announced, true);
+                    }
+                    Some((revision, latch_relay::Event::Control(bytes))) => {
+                        if revision != session.relay.revision() {
+                            continue;
+                        }
+                        let mut source = bytes.as_slice();
+                        match control::read_message(&mut source) {
+                            Ok(
+                                message @ (Message::Report(_)
+                                | Message::Keepalive
+                                | Message::DrawCursor(_)),
+                            ) if source.is_empty() => {
+                                if !session.queue_relay_control(
+                                    &mut relay_messages,
+                                    revision,
+                                    message,
+                                ) {
+                                    break;
+                                }
+                            }
+                            _ => {
+                                session.end(end::TRANSPORT_FAILED, "Invalid relay control packet.")
+                            }
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            if !session
+                .update_relay(|relay| relay.maintain(false, |message| session.send_tcp(message)))
+            {
+                break "the viewer's connection broke".to_string();
+            }
+            if route_revision != session.relay.revision() {
+                route_revision = session.relay.revision();
+                controller = crate::congestion::Controller::new(requested_bitrate, Instant::now());
+                relay_controller =
+                    crate::congestion::RelayController::new(requested_bitrate, Instant::now());
+                fec_policy = crate::congestion::FecPolicy::default();
+                *session.rtt.lock() = RttEstimator::new();
+                *session.keyframe_requests.lock() = KeyframeAnswers::new();
+                *session.rtt_low.lock() = None;
+                *session.train_rtt.lock() = None;
+                session.train_ping.store(0, Ordering::Relaxed);
+                session.transport.probe.lock().take();
+                session
+                    .transport
+                    .budget
+                    .store(requested_bitrate, Ordering::Relaxed);
+                session.pace_kbps.store(0, Ordering::Relaxed);
+                session.keyframe.store(true, Ordering::Release);
+                sent_mark = (Instant::now(), session.bytes.load(Ordering::Relaxed));
+            }
+            let incoming = match inbox.try_recv() {
+                Ok(message) => Ok(message),
+                Err(mpsc::TryRecvError::Disconnected) => Err(mpsc::RecvTimeoutError::Disconnected),
+                Err(mpsc::TryRecvError::Empty) => relay_messages
+                    .pop_front()
+                    .and_then(|(revision, message)| {
+                        (revision == session.relay.revision()).then_some(message)
+                    })
+                    .map(Ok)
+                    .unwrap_or_else(|| inbox.recv_timeout(Duration::from_millis(5))),
+            };
+            match incoming {
+                Ok(Message::Relay(message)) if accept.relay => {
+                    if !session.update_relay(|relay| {
+                        relay.handle(message, |message| session.send_tcp(message))
+                    }) {
+                        break "the viewer's connection broke".to_string();
+                    }
+                }
                 Ok(Message::End(e)) => {
-                    break if e.message.is_empty() {
+                    let message = if e.message.is_empty() {
                         "the viewer disconnected".to_string()
                     } else {
                         e.message
-                    }
+                    };
+                    session.end(end::ENDED, &message);
+                    break message;
                 }
                 Ok(Message::DrawCursor(d)) if session.cursor_supported => {
                     session.heard(self.now_us());
@@ -737,47 +827,88 @@ impl Server {
                     let now = Instant::now();
                     let (then, before) = std::mem::replace(&mut sent_mark, (now, bytes));
                     let secs = now.duration_since(then).as_secs_f64();
-                    if secs >= 0.025 {
-                        controller.observe_sent(
-                            (bytes.saturating_sub(before) as f64 * 8.0 / 1000.0 / secs) as u32,
-                        );
+                    let sent_kbps = (secs >= 0.025).then(|| {
+                        (bytes.saturating_sub(before) as f64 * 8.0 / 1000.0 / secs) as u32
+                    });
+                    if let Some(sent_kbps) = sent_kbps {
+                        controller.observe_sent(sent_kbps);
                     }
                     let queue_ms =
                         session.transport.queue_us.swap(0, Ordering::Relaxed) as f32 / 1000.0;
+                    let relay_ack_ms = session
+                        .relay
+                        .take_frame_ack_elapsed()
+                        .map(|elapsed| elapsed.as_secs_f32() * 1000.0);
+                    let queue_ms =
+                        queue_ms.max(session.relay.queued_frame_age().as_secs_f32() * 1000.0);
                     if let Some(rtt) = session.train_rtt.lock().take() {
                         controller.observe_train_rtt(rtt.as_secs_f32() * 1000.0, now);
                     }
-                    let changed = controller.update(now, &r, host_rtt, queue_ms);
+                    let changed = if session.relay.active() {
+                        let changed = relay_controller.update(
+                            now,
+                            queue_ms,
+                            relay_ack_ms,
+                            sent_kbps.unwrap_or(0),
+                            r.received_kbps,
+                        );
+                        session
+                            .transport
+                            .budget
+                            .store(relay_controller.budget(), Ordering::Relaxed);
+                        changed
+                    } else {
+                        controller.update(now, &r, host_rtt, queue_ms)
+                    };
                     session
                         .transport
                         .probe_pressure
                         .store(controller.probe_pressure(), Ordering::Release);
-                    session
-                        .transport
-                        .budget
-                        .store(controller.budget(), Ordering::Relaxed);
+                    if !session.relay.active() {
+                        session
+                            .transport
+                            .budget
+                            .store(controller.budget(), Ordering::Relaxed);
+                    }
                     if changed {
                         tracing::debug!(
                             requested_bitrate,
-                            wire_kbps = controller.budget(),
+                            wire_kbps = session.transport.budget.load(Ordering::Relaxed),
                             applied_kbps = session.transport.applied.load(Ordering::Relaxed),
                             host_rtt,
                             queue_ms,
+                            relay_ack_ms,
+                            sent_kbps,
+                            received_kbps = r.received_kbps,
+                            decoder_queue_ms = r.queue_ms,
+                            relay = session.relay.active(),
                             loss = r.loss_pct,
                             "bitrate controller decision"
                         );
                     }
-                    session
-                        .pace_kbps
-                        .store(controller.pace_kbps(), Ordering::Relaxed);
+                    session.pace_kbps.store(
+                        if session.relay.active() {
+                            0
+                        } else {
+                            controller.pace_kbps()
+                        },
+                        Ordering::Relaxed,
+                    );
                     let (fec, fec_burst) = fec_policy.update(&r, &controller, now - then);
                     session.fec_burst.store(fec_burst, Ordering::Relaxed);
-                    session.fec.store(fec, Ordering::Relaxed);
+                    session.fec.store(
+                        if session.relay.active() { 0 } else { fec },
+                        Ordering::Relaxed,
+                    );
                     let status = self.status();
                     let report = control::Report {
                         requested_bitrate_kbps: requested_bitrate,
-                        wire_budget_kbps: controller.budget(),
-                        application_limited: controller.application_limited(),
+                        wire_budget_kbps: session.transport.budget.load(Ordering::Relaxed),
+                        application_limited: if session.relay.active() {
+                            sent_kbps.is_some_and(|sent| sent < relay_controller.budget() * 4 / 5)
+                        } else {
+                            controller.application_limited()
+                        },
                         applied_bitrate_kbps: session.transport.applied.load(Ordering::Relaxed),
                         pacing_queue_ms: queue_ms,
                         send_errors: status.send_errors,
@@ -798,12 +929,15 @@ impl Server {
             }
             let now = Instant::now();
             if now - last_keepalive >= KEEPALIVE {
-                if !session.send_control(&Message::Keepalive) {
+                if !session.send_control(&Message::Keepalive)
+                    || (session.relay.active() && !session.send_tcp(&Message::Keepalive))
+                {
                     break "the viewer's connection broke".to_string();
                 }
                 last_keepalive = now;
             }
-            let addr = *session.addr.lock();
+            let addr = (*session.addr.lock())
+                .or_else(|| session.relay.active().then_some(session.announced));
             match addr {
                 None if !session.announced.ip().is_loopback()
                     && now - last_hello >= HELLO_EVERY =>
@@ -816,13 +950,23 @@ impl Server {
                 Some(addr) if now - last_ping >= PING_EVERY => {
                     let mut buf = Vec::with_capacity(16);
                     wire::write_ping(&mut buf, session.id, self.now_us());
-                    let _ = self.udp.send_to(&buf, addr);
+                    send(&self.udp, session, &buf, addr);
                     last_ping = now;
                 }
                 _ => {}
             }
-            // The video sender owns all paced traffic, including idle probes.
-            if addr.is_some() && session.probe_trains {
+            if let Some(addr) = *session.addr.lock() {
+                if !session
+                    .relay
+                    .reassess_udp(&self.udp, addr, requested_bitrate, |message| {
+                        session.send_tcp(message)
+                    })
+                {
+                    break "the viewer's connection broke".to_string();
+                }
+            }
+            // The video sender owns the ordinary idle probe trains.
+            if addr.is_some() && session.probe_trains && !session.relay.active() {
                 if let Some(count) = controller.probe_train(now) {
                     train = train.wrapping_add(1);
                     *session.transport.probe.lock() = Some((train, count));
@@ -836,11 +980,31 @@ impl Server {
                     code: end::VIEWER_SILENT,
                     message: "The viewer stopped answering.".into(),
                 };
-                let _ = session.send_control(&Message::End(e.clone()));
+                session.end(e.code, &e.message);
                 break e.message;
             }
         };
+        // Only an explicit End establishes normal completion. In particular,
+        // a priority worker can mark the route fatal before it records code 6;
+        // cleanup must not win that race with a non-retrying End. Preserve any
+        // already-recorded Stop, takeover or media failure.
+        session.end(end::TRANSPORT_FAILED, &reason);
+        // Terminal lifecycle messages must reach the original control socket
+        // before shutdown discards queued relay traffic. Release every state
+        // guard before sending or running cleanup.
+        let audio_notice = session.audio_notice.lock().take();
+        if let Some(message) = audio_notice {
+            let _ = session.send_tcp(&Message::Notice(Notice {
+                kind: "audio".into(),
+                message,
+            }));
+        }
+        let ended = session.ended.lock().clone();
+        if let Some(ended) = ended {
+            let _ = session.send_tcp(&Message::End(ended));
+        }
         session.stop.store(true, Ordering::Release);
+        session.relay.shutdown();
         if let Some(mut w) = session.control_writer.lock().take() {
             let _ = w.flush();
         }
@@ -963,6 +1127,7 @@ struct InputState {
 }
 
 struct Session {
+    relay: RelayRoute,
     id: u32,
     token: [u8; 16],
     viewer: String,
@@ -1051,10 +1216,12 @@ impl RecoveryState {
             }
             *answer = Some(ack);
         }
-        if let Some(addr) = *session.addr.lock() {
+        if let Some(addr) =
+            (*session.addr.lock()).or_else(|| session.relay.active().then_some(session.announced))
+        {
             let mut out = Vec::with_capacity(16);
             wire::write_recovery_ack(&mut out, session.id, &ack);
-            let _ = server.udp.send_to(&out, addr);
+            send(&server.udp, session, &out, addr);
         }
     }
 
@@ -1141,7 +1308,58 @@ impl TransportState {
 }
 
 impl Session {
+    fn update_relay(&self, update: impl FnOnce(&RelayRoute) -> bool) -> bool {
+        // Stop old input before the first packet on the new route can be
+        // applied and acknowledged. Cleaning up on the next control-loop turn
+        // could unplug a pad whose replacement snapshot was already ACKed.
+        let mut input = self.input.lock();
+        let mut pads = self.pads.lock();
+        let was_active = self.relay.active();
+        let ok = update(&self.relay);
+        if was_active && !self.relay.active() {
+            if let Some(sink) = input.sink.as_mut() {
+                sink.release_all();
+            }
+            if let Some(sink) = pads.sink.as_mut() {
+                sink.unplug_all();
+            }
+        }
+        ok
+    }
+
+    fn queue_relay_control(
+        &self,
+        inbox: &mut VecDeque<(u64, Message)>,
+        revision: u64,
+        message: Message,
+    ) -> bool {
+        if inbox.len() >= 128 {
+            self.end(
+                end::TRANSPORT_FAILED,
+                "Relay control queue filled. Reconnecting to release input.",
+            );
+            return false;
+        }
+        inbox.push_back((revision, message));
+        true
+    }
+
     fn send_control(&self, msg: &Message) -> bool {
+        match self.relay.send_control(msg) {
+            Ok(true) => return true,
+            Err(_) => {
+                self.end(
+                    end::TRANSPORT_FAILED,
+                    "Relay priority queue failed. Reconnecting to release input.",
+                );
+                return false;
+            }
+            Ok(false) => {}
+        }
+        self.send_tcp(msg)
+    }
+
+    fn send_tcp(&self, msg: &Message) -> bool {
         let mut guard = self.control_writer.lock();
         if let Some(writer) = guard.as_mut() {
             control::write_message(writer, msg).is_ok() && writer.flush().is_ok()
@@ -1205,7 +1423,6 @@ impl Session {
 fn receive(server: Weak<Server>) {
     crate::priority::media_thread();
     let mut buf = vec![0u8; latch_proto::MAX_DATAGRAM + 1];
-    let mut out = Vec::with_capacity(64);
     loop {
         let Some(server) = server.upgrade() else {
             return;
@@ -1229,156 +1446,176 @@ fn receive(server: Weak<Server>) {
             // reports those on the next receive).
             Err(_) => continue,
         };
-        let Ok(datagram) = wire::parse(&buf[..n]) else {
-            continue;
+        if let Some(session) = server.current.lock().clone() {
+            dispatch_datagram(&server, &session, &buf[..n], from, false);
         };
-        let Some(session) = server.current.lock().clone() else {
-            continue;
-        };
-        if datagram.session() != session.id {
-            continue;
-        }
-        if let Datagram::Hello {
-            token: Some(token), ..
-        } = datagram
-        {
-            if *token == session.token {
-                let mut addr = session.addr.lock();
-                if *addr != Some(from) {
-                    if addr.is_some() {
-                        server.log(format!("{} moved to {from}", session.viewer));
-                    }
-                    *addr = Some(from);
-                    session.keyframe.store(true, Ordering::Release);
+    }
+}
+
+fn dispatch_datagram(
+    server: &Server,
+    session: &Session,
+    bytes: &[u8],
+    from: SocketAddr,
+    via_relay: bool,
+) {
+    let mut out = Vec::with_capacity(64);
+    let Ok(datagram) = wire::parse(bytes) else {
+        return;
+    };
+    if datagram.session() != session.id {
+        return;
+    }
+    if !via_relay
+        && session.relay.active()
+        && !matches!(datagram, Datagram::Hello { .. } | Datagram::Ping { .. })
+    {
+        return;
+    }
+    if let Datagram::Hello {
+        token: Some(token), ..
+    } = datagram
+    {
+        if *token == session.token {
+            let mut addr = session.addr.lock();
+            if *addr != Some(from) {
+                if addr.is_some() {
+                    server.log(format!("{} moved to {from}", session.viewer));
                 }
-                drop(addr);
-                session.heard(server.now_us());
+                *addr = Some(from);
+                session.keyframe.store(true, Ordering::Release);
             }
-            continue;
+            drop(addr);
+            session.heard(server.now_us());
         }
-        if *session.addr.lock() != Some(from) {
-            continue;
+        return;
+    }
+    if !via_relay && *session.addr.lock() != Some(from) {
+        return;
+    }
+    session.heard(server.now_us());
+    match datagram {
+        Datagram::Input { first, events, .. } => {
+            let next = {
+                let mut guard = session.input.lock();
+                if session.stopping() {
+                    return;
+                }
+                let state = &mut *guard;
+                let display = state.display;
+                let sink = &mut state.sink;
+                state.receiver.try_receive(first, events.iter(), |event| {
+                    let Some(sink) = sink.as_mut() else {
+                        return Ok(());
+                    };
+                    if let Err(e) = sink.apply(&event, display) {
+                        tracing::warn!("input {event:?}: {e:#}");
+                        return Err(e);
+                    }
+                    Ok(())
+                })
+            };
+            wire::write_input_ack(&mut out, session.id, next);
+            send(&server.udp, session, &out, from);
         }
-        session.heard(server.now_us());
-        match datagram {
-            Datagram::Input { first, events, .. } => {
-                let next = {
-                    let mut guard = session.input.lock();
-                    if session.stopping() {
+        Datagram::Pad { updates, .. } => {
+            let mut acks = Vec::with_capacity(updates.count());
+            {
+                let mut guard = session.pads.lock();
+                if session.stopping() {
+                    return;
+                }
+                let pads = &mut *guard;
+                for u in updates.iter() {
+                    if u.slot >= pads.slots {
                         continue;
                     }
-                    let state = &mut *guard;
-                    let display = state.display;
-                    let sink = &mut state.sink;
-                    state.receiver.try_receive(first, events.iter(), |event| {
-                        let Some(sink) = sink.as_mut() else {
-                            return Ok(());
-                        };
-                        if let Err(e) = sink.apply(&event, display) {
-                            tracing::warn!("input {event:?}: {e:#}");
-                            return Err(e);
-                        }
-                        Ok(())
-                    })
-                };
-                wire::write_input_ack(&mut out, session.id, next);
-                let _ = server.udp.send_to(&out, from);
-            }
-            Datagram::Pad { updates, .. } => {
-                let mut acks = Vec::with_capacity(updates.count());
-                {
-                    let mut guard = session.pads.lock();
-                    if session.stopping() {
-                        continue;
-                    }
-                    let pads = &mut *guard;
-                    for u in updates.iter() {
-                        if u.slot >= pads.slots {
-                            continue;
-                        }
-                        if pads.receiver.accept(u.slot, u.seq) {
-                            if let Some(sink) = pads.sink.as_mut() {
-                                let failing = &mut pads.failing[u.slot as usize];
-                                match sink.update(u.slot, u.kind, &u.state) {
-                                    Ok(()) => *failing = false,
-                                    Err(e) if !*failing => {
-                                        *failing = true;
-                                        server.log(format!("gamepad {}: {e:#}", u.slot + 1));
-                                    }
-                                    Err(_) => {}
+                    if pads.receiver.accept(u.slot, u.seq) {
+                        if let Some(sink) = pads.sink.as_mut() {
+                            let failing = &mut pads.failing[u.slot as usize];
+                            match sink.update(u.slot, u.kind, &u.state) {
+                                Ok(()) => *failing = false,
+                                Err(e) if !*failing => {
+                                    *failing = true;
+                                    server.log(format!("gamepad {}: {e:#}", u.slot + 1));
                                 }
+                                Err(_) => {}
                             }
                         }
-                        acks.extend(pads.receiver.ack(u.slot));
+                    }
+                    acks.extend(pads.receiver.ack(u.slot));
+                }
+            }
+            if !acks.is_empty() {
+                wire::write_pad_ack(&mut out, session.id, &acks);
+                send(&server.udp, session, &out, from);
+            }
+        }
+        Datagram::PadFeedbackAck { acks, .. } => {
+            for ack in acks.iter() {
+                session.feedback.ack(ack);
+            }
+        }
+        Datagram::KeyframeRequest { last, .. } => {
+            let rtt = {
+                let rtt = session.rtt.lock();
+                rtt.srtt().map(|srtt| srtt.saturating_sub(rtt.rttvar()))
+            };
+            let wanted = session
+                .keyframe_requests
+                .lock()
+                .request(last, Instant::now(), rtt);
+            if wanted {
+                session.keyframe.store(true, Ordering::Release);
+            }
+        }
+        Datagram::RecoveryRequest { request, .. } if session.recovery.enabled => {
+            let ack = {
+                let mut answer = session.recovery.answer.lock();
+                match *answer {
+                    Some(a) if a.id == request.id => Some(a),
+                    Some(a) if latch_proto::video::before(request.id, a.id) => None,
+                    _ => {
+                        let a = wire::RecoveryAck {
+                            id: request.id,
+                            status: wire::RecoveryStatus::Pending,
+                            frame: 0,
+                        };
+                        *answer = Some(a);
+                        *session.recovery.request.lock() = Some(request);
+                        Some(a)
                     }
                 }
-                if !acks.is_empty() {
-                    wire::write_pad_ack(&mut out, session.id, &acks);
-                    let _ = server.udp.send_to(&out, from);
-                }
+            };
+            if let Some(ack) = ack {
+                wire::write_recovery_ack(&mut out, session.id, &ack);
+                send(&server.udp, session, &out, from);
             }
-            Datagram::PadFeedbackAck { acks, .. } => {
-                for ack in acks.iter() {
-                    session.feedback.ack(ack);
-                }
-            }
-            Datagram::KeyframeRequest { last, .. } => {
-                let rtt = {
-                    let rtt = session.rtt.lock();
-                    rtt.srtt().map(|srtt| srtt.saturating_sub(rtt.rttvar()))
-                };
-                let wanted = session
-                    .keyframe_requests
-                    .lock()
-                    .request(last, Instant::now(), rtt);
-                if wanted {
-                    session.keyframe.store(true, Ordering::Release);
-                }
-            }
-            Datagram::RecoveryRequest { request, .. } if session.recovery.enabled => {
-                let ack = {
-                    let mut answer = session.recovery.answer.lock();
-                    match *answer {
-                        Some(a) if a.id == request.id => Some(a),
-                        Some(a) if latch_proto::video::before(request.id, a.id) => None,
-                        _ => {
-                            let a = wire::RecoveryAck {
-                                id: request.id,
-                                status: wire::RecoveryStatus::Pending,
-                                frame: 0,
-                            };
-                            *answer = Some(a);
-                            *session.recovery.request.lock() = Some(request);
-                            Some(a)
-                        }
-                    }
-                };
-                if let Some(ack) = ack {
-                    wire::write_recovery_ack(&mut out, session.id, &ack);
-                    let _ = server.udp.send_to(&out, from);
-                }
-            }
-            Datagram::Ping { time, .. } => {
-                wire::write_pong(&mut out, session.id, time);
+        }
+        Datagram::Ping { time, .. } => {
+            wire::write_pong(&mut out, session.id, time);
+            if via_relay {
+                send(&server.udp, session, &out, from);
+            } else {
                 let _ = server.udp.send_to(&out, from);
             }
-            Datagram::Mic { packet, .. } => play_mic(&session, Some(&packet)),
-            Datagram::Pong { time, .. } => {
-                let rtt = Duration::from_micros(server.now_us().saturating_sub(time));
-                if session
-                    .train_ping
-                    .compare_exchange(time, 0, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    *session.train_rtt.lock() = Some(rtt);
-                    continue;
-                }
-                session.rtt.lock().sample(rtt);
-                let mut low = session.rtt_low.lock();
-                *low = Some(low.map_or(rtt, |low| low.min(rtt)));
-            }
-            _ => {}
         }
+        Datagram::Mic { packet, .. } => play_mic(session, Some(&packet)),
+        Datagram::Pong { time, .. } => {
+            let rtt = Duration::from_micros(server.now_us().saturating_sub(time));
+            if session
+                .train_ping
+                .compare_exchange(time, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                *session.train_rtt.lock() = Some(rtt);
+                return;
+            }
+            session.rtt.lock().sample(rtt);
+            let mut low = session.rtt_low.lock();
+            *low = Some(low.map_or(rtt, |low| low.min(rtt)));
+        }
+        _ => {}
     }
 }
 
@@ -1580,7 +1817,7 @@ fn encode_video(
         if frame.keyframe {
             last_keyframe = Some(Instant::now());
         }
-        if session.addr.lock().is_none() {
+        if session.addr.lock().is_none() && !session.relay.active() {
             continue;
         }
         // Blocking is deliberate: dropping an encoded reference corrupts the GOP.
@@ -1601,6 +1838,8 @@ fn paced_video(
     let mut sender = latch_proto::transport::SendBatch::default();
     let mut pacer = crate::pacing::Pacer::new(Instant::now());
     let mut lost_reference = false;
+    let mut relay_frame = 0u32;
+    let mut route_revision = session.relay.revision();
     #[cfg(test)]
     let drop_stale = std::env::var_os("PB_DROP").is_some();
     while !session.stopping() {
@@ -1659,7 +1898,9 @@ fn paced_video(
             }
         }
         let _finished = Finished(&session.transport.pending);
-        let Some(addr) = *session.addr.lock() else {
+        let Some(addr) =
+            (*session.addr.lock()).or_else(|| session.relay.active().then_some(session.announced))
+        else {
             continue;
         };
         #[cfg(test)]
@@ -1678,7 +1919,45 @@ fn paced_video(
             lost_reference = true;
             continue;
         }
+        if route_revision != session.relay.revision() {
+            route_revision = session.relay.revision();
+            lost_reference = true;
+            recovery_lost(session);
+        }
         if lost_reference && !frame.keyframe {
+            continue;
+        }
+        if session.relay.active() {
+            relay_frame = relay_frame.wrapping_add(1);
+            let complete = latch_proto::video::InFrame {
+                frame: relay_frame,
+                data: frame.data,
+                keyframe: frame.keyframe,
+                recovery: false,
+                host_delay: (frame.captured.elapsed().as_micros() / 100).min(u16::MAX as u128)
+                    as u16,
+                assembly: Duration::ZERO,
+            };
+            session
+                .transport
+                .queue_us
+                .fetch_max(queued.elapsed().as_micros() as u64, Ordering::Relaxed);
+            match session.relay.send_frame(&complete) {
+                Ok(true) => {
+                    session
+                        .bytes
+                        .fetch_add(complete.data.len() as u64, Ordering::Relaxed);
+                    session.frames.fetch_add(1, Ordering::Relaxed);
+                    if complete.keyframe {
+                        session.keyframe_requests.lock().sent(Instant::now());
+                    }
+                    lost_reference = false;
+                }
+                Ok(false) | Err(_) => {
+                    lost_reference = true;
+                    recovery_lost(session);
+                }
+            }
             continue;
         }
         packetizer.set_fec_percent(session.fec.load(Ordering::Relaxed));
@@ -1877,7 +2156,9 @@ fn send_audio(
                 continue;
             }
         }
-        let Some(addr) = *session.addr.lock() else {
+        let Some(addr) =
+            (*session.addr.lock()).or_else(|| session.relay.active().then_some(session.announced))
+        else {
             continue;
         };
         if pcm.len() != audio::FRAME * channels {
@@ -1912,6 +2193,9 @@ fn send_batch(
     batch: &[Vec<u8>],
     to: SocketAddr,
 ) {
+    if session.relay.active() {
+        return;
+    }
     let mut sent = 0;
     let mut failures = 0;
     while sent < batch.len() && !session.stopping() {
@@ -1944,6 +2228,17 @@ fn send_batch(
 /// One datagram, retried briefly when the socket's buffer is full (macOS
 /// says ENOBUFS when a keyframe outruns the interface).
 fn send(udp: &UdpSocket, session: &Session, datagram: &[u8], to: SocketAddr) {
+    match session.relay.send_datagram(datagram) {
+        Ok(true) => return,
+        Err(_) => {
+            session.end(
+                end::TRANSPORT_FAILED,
+                "Relay priority queue failed. Reconnecting to release input.",
+            );
+            return;
+        }
+        Ok(false) => {}
+    }
     for attempt in 0..3 {
         #[cfg(all(test, target_os = "macos"))]
         tests::SEND_CALLS.with(|s| s.set(s.get() + 1));

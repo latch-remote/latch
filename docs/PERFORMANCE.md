@@ -31,6 +31,46 @@ without a record is listed under [Not measured yet](#not-measured-yet).
   side, 500 fps and 1 Gbps. Those are what the protocol can carry, not
   results: no machine here reaches them.
 
+## Latch 6 network recovery
+
+On 14 November, a synthetic VideoToolbox H.264 host on the campus Mac
+streamed through the dedicated Seoul AWS relay to a Windows DXVA viewer.
+A fresh 120-second run at 1080p60 with a 20 Mbps request delivered a median
+13.262 Mbps of video over the public TCP connection. The relay portion
+averaged 50.83 decoded frames and 49.83 renderer submissions per second,
+with no reported lost or dropped frames. Median RTT was 180 ms.
+
+A separate synthetic-input run delivered all ten presses to the decoded
+picture: median 282.67 ms and maximum 339.43 ms. Synthetic audio reached
+the Windows WASAPI endpoint. These are decoded-picture and software
+renderer measurements; physical scanout and acoustic latency were not
+measured. A scoped local forwarder bridged the unsigned Mac fixture's
+tailnet listener to loopback. Fixture UDP was blocked to verify the public
+TCP route independently of Tailscale's underlying transport.
+
+A subsequent 600-second run delivered 30,789 decoded frames. Relay video
+had a median bitrate of 13.362 Mbps and 51.80 decoded frames per second.
+One delay spike exceeded the then-fixed ACK deadline near 548 seconds;
+relay recovery took about five seconds while the session stayed connected.
+The final budget returned to 20 Mbps. A later endpoint fix adapts ACK
+deadlines to measured video RTT while retaining bounded frame queues;
+its delayed-return regression passes. A later field run on that adaptive
+build still recorded an ACK timeout and recovered to UDP. Sudden stalls
+can exceed the current deadline; these checks do not establish uninterrupted
+delivery on every network.
+
+The long fixture's renderer counter saturated at 16,384 samples, so it
+does not establish a full-run renderer rate. A controlled relay denial
+recovered to UDP and back without ending the session. An unimpaired
+60-second observation stayed on UDP. Reverse Windows-software-to-Mac
+hardware-decoder checks delivered all 20 synthetic input responses on
+both UDP and public relay, at approximately 60 decoded fps. The later
+termination, cursor-ordering and shorter receive-poll changes have native
+test coverage only. The relay has four
+session slots; these measurements do not establish capacity for thousands
+of simultaneous relayed users. Raw field records remain in the private
+development repository rather than the corresponding-source archive.
+
 ## Hardware
 
 | Machine | Used as |
@@ -179,7 +219,7 @@ Nobody has yet seen a Latch HDR stream on an HDR panel.
 - Sound latency through physical speakers, and sound against picture.
 
 If you have the hardware for one of these, the issues labelled
-[needs hardware](https://github.com/MrBeldum/latch/labels/needs%20hardware)
+[needs hardware](https://github.com/latch-remote/latch/labels/needs%20hardware)
 say what would help most.
 
 ## Repeat it, or add your machine
