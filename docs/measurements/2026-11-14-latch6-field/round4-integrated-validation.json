@@ -1,0 +1,105 @@
+{
+  "parent": "0fcf0f1b4872804e925480252d47c101128b90a9",
+  "files": [
+    {
+      "path": "crates/client/src/app.rs",
+      "sha256": "1a7e462dfe5a4fbfa5883f0d27162d89216edf3d9fbc92a9c5bb2474e25c5e38"
+    },
+    {
+      "path": "crates/client/src/stream.rs",
+      "sha256": "52f44cf4502cfa122349a52d9ee90d15db8fd68e2ea4796f113b58d86bec17ba"
+    },
+    {
+      "path": "crates/client/src/session.rs",
+      "sha256": "bd51427b21e8e1c31a30ae696db101e3fe828fccff904d721d532dc42eace5fe"
+    },
+    {
+      "path": "crates/relay/tests/transport.rs",
+      "sha256": "967efb8c2a2ad03f4f347829abd04e8bce18c4d6cac23f04a6a05b4efd982a5b"
+    }
+  ],
+  "validation": {
+    "client_library": {
+      "passed": 216,
+      "ignored": 22
+    },
+    "relay_unit": 19,
+    "relay_transport": 13,
+    "parallel_repeat": 13,
+    "sequential_repeat": 13,
+    "strict_workspace_all_targets_clippy": "passed",
+    "windows_workspace_all_targets_compile": "passed",
+    "format_and_whitespace": "passed",
+    "ui_completion_regression": {
+      "before_exit": 101,
+      "after_exit": 0
+    },
+    "ack_fixture_scheduling_regression": {
+      "before_exit": 101,
+      "after_exit": 0
+    }
+  },
+  "commands": [
+    "cargo test --locked --offline -p latch-client -p latch-relay --lib --tests",
+    "cargo clippy --locked --offline --workspace --all-targets -- -D warnings",
+    "cargo check --locked --offline --workspace --all-targets --target x86_64-pc-windows-msvc",
+    "cargo fmt --all -- --check",
+    "git diff --check"
+  ],
+  "ci_failure": {
+    "head": "0fcf0f1b4872804e925480252d47c101128b90a9",
+    "job_url": "https://github.com/latch-remote/latch/actions/runs/43601551015/job/132467173198",
+    "failed_test": "delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole",
+    "reported_transport_result": {
+      "passed": 12,
+      "failed": 1
+    },
+    "local_reproduction": "An injected 150 ms scheduling delay after frame delivery makes the original additive hold fail with video acknowledgment deadline expired. Measure the hold from enqueue instead. Hosted log did not retain the precise close reason; a hosted rerun is still required.",
+    "product_deadlines_changed": false
+  },
+  "logs": [
+    {
+      "path": "latch6-r4-integrated-tests.log",
+      "sha256": "4dc152f502c6543c6f976f694c8cf0a496606d5bb0bad154f0924bb7971cf789"
+    },
+    {
+      "path": "latch6-r4-integrated-clippy.log",
+      "sha256": "80a7d349f60f544efe8acb308c16486e3f745d85d094df9d8571ec167a40a611"
+    },
+    {
+      "path": "latch6-r4-integrated-windows-check.log",
+      "sha256": "36f9ae2efd3e64579a7fc96b7b0fcb1f71d3f524b60b9d21fe545bd31c70ec2c"
+    },
+    {
+      "path": "latch6-r4-ui-race-red.log",
+      "sha256": "5efd13010b123b999b5310c17ee03f4aebf39396c1dbcc7b5c6960db70d510e3"
+    },
+    {
+      "path": "latch6-r4-ui-race-green.log",
+      "sha256": "2838398189ec189a66c0f608961409ccdf9787a8f4aa3a2cffd97b5f53cfaa01"
+    },
+    {
+      "path": "latch6-r4-ack-clock-red.log",
+      "sha256": "c7a2a74d5a7fb6dc841444e5a39b7c7b5d7538f816ebb890a8b8e5a40b7d010f"
+    },
+    {
+      "path": "latch6-r4-ack-clock-green.log",
+      "sha256": "a579fcfc954f0a8df326994a26d52f3a0486fb9c69c344c02af522e92c614c7d"
+    },
+    {
+      "path": "latch6-r4-transport-parallel-repeat.log",
+      "sha256": "83a5927714f4356f84e41501345b6d3fef60af657eead5689653f72fe2d3c8e2"
+    },
+    {
+      "path": "latch6-r4-transport-sequential.log",
+      "sha256": "1a0486b9e47a69a1c17e534b17c29a0b553b822f8bcff3a2520cf42d5f6ef5fd"
+    },
+    {
+      "path": "latch6-0fcf0f1-macos-job.log",
+      "sha256": "a6688dd564a7ed4c50ac7cb91f5f167737391a03cda569f9813dd73dea4450d1"
+    }
+  ],
+  "new_native_ci": "required after push; Windows compile is not native execution",
+  "new_wan_traffic": false,
+  "new_gpu_field_work": false
+}

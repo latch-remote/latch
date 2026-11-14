@@ -1173,7 +1173,7 @@ fn incompatible_host(name: &str, os: &str) -> String {
     } else if os.eq_ignore_ascii_case("linux") {
         "install the latest latch-host-linux release tarball, following deploy/native/README.md."
     } else {
-        "install the latest Latch release from https://github.com/MrBeldum/latch/releases/latest."
+        "install the latest Latch release from https://github.com/latch-remote/latch-releases/releases/latest."
     };
     format!(
         "{name} runs Latch 4.x, which streams differently. Update Latch there to connect: {action}"

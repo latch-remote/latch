@@ -2861,7 +2861,7 @@ pub(crate) mod tests {
     }
 
     /// A session to `server` asking for `requested` (width, height, fps).
-    fn live_to(
+    pub(crate) fn live_to(
         ctx: &egui::Context,
         server: latch_stream::session::Server,
         requested: (u32, u32, u32),

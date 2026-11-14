@@ -1,0 +1,33 @@
+   Compiling latch-relay v6.0.0 (/private/tmp/latch6-r4-ui-race-0fcf0f1b/latch-6.0.0/crates/relay)
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.53s
+     Running tests/transport.rs (/Users/daniel/Desktop/T3_Projects/latch/target/debug/deps/transport-121c865364ef8b37)
+
+running 13 tests
+test pre_cancelled_dns_and_connect_stop_without_waiting ... ok
+test public_roots_reject_test_certificate ... ok
+relay connection closed phase=admission role=none lane=none category=denied_or_quota_exhausted kind=PermissionDenied
+relay connection closed phase=request role=none lane=none category=denied_or_quota_exhausted kind=PermissionDenied
+test cancelling_silent_tls_handshake_and_drop_are_bounded ... ok
+test daemon_restart_preserves_spent_transfer_reservations ... ok
+test pilot_admission_bounds_outstanding_grants_per_creator_ip ... ok
+relay connection closed phase=attached role=host lane=video category=peer_closed kind=UnexpectedEof
+test wrong_keys_never_reach_ready ... ok
+relay connection closed phase=attached role=viewer lane=priority category=peer_closed kind=UnexpectedEof
+relay connection closed phase=attached role=viewer lane=video category=peer_closed kind=UnexpectedEof
+relay connection closed phase=request role=none lane=none category=denied_or_quota_exhausted kind=PermissionDenied
+test frame_ack_elapsed_is_authenticated_and_consumed_on_the_callers_cadence ... relay connection closed phase=request role=none lane=none category=denied_or_quota_exhausted kind=PermissionDenied
+ok
+relay connection closed phase=attached role=host lane=video category=peer_closed kind=UnexpectedEof
+relay connection closed phase=attached role=viewer lane=video category=peer_closed kind=UnexpectedEof
+test repeated_frames_advance_the_bounded_authenticated_ack_window ... ok
+test replayed_attachment_cannot_rejoin ... ok
+test exhausted_receive_queue_closes_attempt_and_propagates_failure ... ok
+relay connection closed phase=attached role=host lane=priority category=peer_closed kind=UnexpectedEof
+test real_tls_two_lanes_complete_frame_and_authenticated_control ... ok
+relay connection closed phase=attached role=host lane=video category=peer_closed kind=UnexpectedEof
+test delayed_ack_path_does_not_limit_video_to_eight_frames_per_round_trip ... ok
+relay connection closed phase=attached role=viewer lane=priority category=peer_closed kind=UnexpectedEof
+test delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.53s
+

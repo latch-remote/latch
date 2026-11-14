@@ -451,21 +451,29 @@ fn delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole() {
             assembly: Duration::ZERO,
         })
         .unwrap();
+        let queued = Instant::now();
         assert!(matches!(
             viewer.recv_timeout(Duration::from_secs(2)),
             Some(Event::Frame(frame)) if frame.frame == number
         ));
+        if number == 12 {
+            // Model scheduling work after receipt. This is already part of
+            // the ACK's age, not extra time to add to the requested delay.
+            thread::sleep(Duration::from_millis(150));
+        }
+        queued
     };
     // Warm the estimator until its initial variance has decayed, then observe
     // sub-deadline jitter before testing an ACK beyond the configured floor.
     let delays = std::iter::repeat_n(20, 12).chain([650, 650, 900]);
     for (number, delay) in delays.enumerate() {
         gate.hold.store(true, Ordering::Release);
-        send(number as u32);
-        thread::sleep(Duration::from_millis(delay));
+        let queued = send(number as u32);
+        thread::sleep(Duration::from_millis(delay).saturating_sub(queued.elapsed()));
+        let event = host.recv_timeout(Duration::ZERO);
         assert!(
-            host.recv_timeout(Duration::ZERO).is_none(),
-            "return-path delay closed video"
+            event.is_none(),
+            "return-path delay closed video: frame={number}, hold={delay}ms, event={event:?}"
         );
         gate.hold.store(false, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(1);

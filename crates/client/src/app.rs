@@ -34,14 +34,20 @@ const RELAY_UNAVAILABLE: &str = "A relay is on this tailnet but isn't available 
 const RELAY_UNGRANTED: &str = "A relay node is online but this device is not granted access.";
 const RELAY_GRANT: &str = "{\n  \"src\": [\"autogroup:member\"],\n  \"dst\": [\"tag:relay\"],\n  \"app\": {\n    \"tailscale.com/cap/relay\": []\n  }\n}";
 const RELAY_DOCS: &str = "https://tailscale.com/docs/features/peer-relay";
-const DOWNLOAD_URL: &str = "https://github.com/MrBeldum/latch/releases/latest";
-const SOURCE_URL: &str = "https://github.com/MrBeldum/latch";
+const DOWNLOAD_URL: &str = "https://github.com/latch-remote/latch-releases/releases/latest";
+const SOURCE_URL: &str = concat!(
+    "https://github.com/latch-remote/latch-releases/releases/tag/v",
+    env!("CARGO_PKG_VERSION")
+);
 
 /// How long a one-line result stays on the machine list.
 const NOTICE_FOR: Duration = Duration::from_secs(12);
 
 /// A one-line result, filled in by a worker thread.
 type Notice = Arc<Mutex<Option<(Tone, String)>>>;
+
+#[cfg(test)]
+type AfterLiveEvents = Box<dyn FnOnce(&Live)>;
 
 enum ConfigEdit {
     Preferences(Box<(ClientConfig, ClientConfig)>),
@@ -187,6 +193,8 @@ pub struct ClientApp {
     /// Present when this process also shares this machine.
     pub local: Option<share::Slot>,
     share_page: Option<Box<dyn share::SharePage>>,
+    #[cfg(test)]
+    after_live_events: Option<AfterLiveEvents>,
 }
 
 impl Drop for ClientApp {
@@ -295,6 +303,8 @@ impl ClientApp {
             display_change: None,
             local: None,
             share_page: None,
+            #[cfg(test)]
+            after_live_events: None,
         }
     }
 
@@ -656,6 +666,10 @@ impl ClientApp {
             self.view
                 .observe_recovery(online, std::time::SystemTime::now(), Instant::now());
             let mut prog = self.progress.lock();
+            // Completion publishes the final event before its release-store.
+            // Snapshot it before draining so a later completion cannot make
+            // us discard an unread terminal event (and its retry intent).
+            let finished = live.session.finished();
             while live.generation == prog.generation {
                 let Ok(ev) = live.events.try_recv() else {
                     break;
@@ -762,6 +776,10 @@ impl ClientApp {
                         .toast(Tone::Warning, format!("No sound on this machine: {e}.")),
                 }
             }
+            #[cfg(test)]
+            if let Some(after) = self.after_live_events.take() {
+                after(live);
+            }
             let is_reconnecting = matches!(
                 self.view.interrupted,
                 Some(crate::stream::Interruption::Reconnecting(ref s)) if s.in_flight
@@ -784,7 +802,7 @@ impl ClientApp {
             }
             // A stop we asked for ends without a Terminated event.
             let ended = matches!(prog.step, Step::Ended { .. });
-            if live.session.finished() {
+            if finished {
                 if self.view.interrupted.is_some() && !prog.cancel {
                     // Retain in-stream view to show interruption overlay until user acts
                 } else {
@@ -4767,6 +4785,101 @@ mod live_snapshot {
             h.state().view.interrupted,
             Some(crate::stream::Interruption::Failed)
         );
+    }
+
+    #[test]
+    fn completion_after_event_drain_preserves_retry_unless_cancelled() {
+        use std::net::{Shutdown, TcpListener};
+
+        for (step, cancel) in [
+            (Step::Connecting, false),
+            (Step::Streaming, false),
+            (Step::Streaming, true),
+        ] {
+            let mut h = snapshots::build(
+                snapshots::Setup::new(Discovery::default()),
+                egui::vec2(800.0, 600.0),
+                1.0,
+                false,
+            );
+            let ctx = h.ctx.clone();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut live = crate::stream::tests::live_to(
+                &ctx,
+                latch_stream::session::Server {
+                    address: address.ip(),
+                    port: address.port(),
+                },
+                (1280, 720, 60),
+            );
+            live.clipboard.stop();
+            if step == Step::Streaming {
+                live.frames.publish(Default::default());
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            live.events = rx;
+            // Keep the real session worker waiting for its upgrade response
+            // until the UI has observed an empty event queue.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let peer = loop {
+                match listener.accept() {
+                    Ok((peer, _)) => break peer,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "session did not connect");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
+            assert!(!live.session.finished());
+            h.state().progress.lock().step = step.clone();
+            *h.state().live.lock() = Some(live);
+            h.state_mut().after_live_events = Some(Box::new(move |live| {
+                assert!(matches!(
+                    live.events.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ));
+                assert!(!live.session.finished());
+                tx.send(Event::Terminated {
+                    code: end::TRANSPORT_FAILED as i32,
+                    message: "transport failed after event drain".into(),
+                })
+                .unwrap();
+                peer.shutdown(Shutdown::Both).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !live.session.finished() {
+                    assert!(Instant::now() < deadline, "session did not finish");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }));
+            h.state_mut().poll_live(&ctx);
+            assert!(
+                h.state().live.lock().is_some(),
+                "unread terminal event was lost"
+            );
+            assert_eq!(h.state().progress.lock().step, step);
+            assert!(h.state().view.interrupted.is_none());
+            if cancel {
+                h.state_mut().disconnect();
+            }
+            h.state_mut().poll_live(&ctx);
+            assert_eq!(
+                matches!(&h.state().view.interrupted,
+                    Some(stream::Interruption::Reconnecting(state))
+                        if state.attempt == 1 && !state.in_flight),
+                !cancel
+            );
+            if cancel {
+                assert!(h.state().live.lock().is_none());
+                assert_eq!(h.state().progress.lock().step, Step::Ended { error: None });
+            } else {
+                let after = h.state().view.interrupted.clone();
+                h.state_mut().poll_live(&ctx);
+                assert_eq!(h.state().view.interrupted, after, "one failure counts once");
+            }
+        }
     }
 
     #[test]

@@ -1,0 +1,27 @@
+   Compiling latch-proto v6.0.0 (/private/tmp/latch6-r4-ui-race-0fcf0f1b/latch-6.0.0/crates/proto)
+   Compiling latch-codec v6.0.0 (/private/tmp/latch6-r4-ui-race-0fcf0f1b/latch-6.0.0/crates/codec)
+   Compiling latch-core v6.0.0 (/private/tmp/latch6-r4-ui-race-0fcf0f1b/latch-6.0.0/crates/core)
+   Compiling latch-relay v6.0.0 (/private/tmp/latch6-r4-ui-race-0fcf0f1b/latch-6.0.0/crates/relay)
+   Compiling latch-ui v6.0.0 (/private/tmp/latch6-r4-ui-race-0fcf0f1b/latch-6.0.0/crates/ui)
+   Compiling latch-stream v6.0.0 (/private/tmp/latch6-r4-ui-race-0fcf0f1b/latch-6.0.0/crates/stream)
+   Compiling latch-client v6.0.0 (/private/tmp/latch6-r4-ui-race-0fcf0f1b/latch-6.0.0/crates/client)
+    Finished `test` profile [optimized + debuginfo] target(s) in 14.37s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (/Users/daniel/Desktop/T3_Projects/latch/target/debug/deps/latch_client-eae8832f56b3372a)
+
+running 1 test
+
+thread 'app::live_snapshot::completion_after_event_drain_preserves_retry_unless_cancelled' (81290219) panicked at crates/client/src/app.rs:4848:13:
+unread terminal event was lost
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test app::live_snapshot::completion_after_event_drain_preserves_retry_unless_cancelled ... FAILED
+
+failures:
+
+failures:
+    app::live_snapshot::completion_after_event_drain_preserves_retry_unless_cancelled
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 237 filtered out; finished in 0.98s
+
+error: test failed, to rerun pass `-p latch-client --lib`
