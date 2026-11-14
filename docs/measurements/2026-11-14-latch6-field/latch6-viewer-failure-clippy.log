@@ -1,0 +1,18 @@
+    Checking objc2-core-graphics v0.3.2
+    Checking latch-proto v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/proto)
+    Checking latch-codec v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/codec)
+    Checking objc2-app-kit v0.3.2
+    Checking objc2-game-controller v0.3.2
+    Checking webbrowser v1.2.4
+    Checking arboard v3.6.1
+    Checking latch-core v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/core)
+    Checking latch-relay v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/relay)
+    Checking egui-winit v0.31.1
+    Checking eframe v0.31.1
+    Checking latch-stream v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/stream)
+    Checking latch-ui v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/ui)
+    Checking egui_kittest v0.31.1
+    Checking latch-client v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/client)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 3.92s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

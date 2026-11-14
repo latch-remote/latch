@@ -108,7 +108,9 @@ A failed relay attempt leaves or returns routing to UDP. If that path
 still cannot deliver usable video, the media watchdog ends the session and
 the reconnect overlay appears. After a minute on relay, a bounded UDP load
 probe can return the stream to a healthy direct path. This probe currently
-covers requests up to 40 Mbps. Finite relay grants renew automatically.
+covers requests up to 40 Mbps. At the relay's time or traffic limit, Latch
+returns briefly to UDP and starts a fresh relay connection. On a network
+where UDP is blocked, video can pause for several seconds during renewal.
 Priority queue exhaustion ends the
 session to release held keys and buttons. Local acceptance of a packet
 into a queue does not guarantee remote delivery.

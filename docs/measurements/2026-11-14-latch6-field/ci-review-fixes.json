@@ -1,0 +1,49 @@
+{
+  "baseline": "fb9b4f0dc5338106eecfc66bd5ea95caa50729e1",
+  "scratch": "/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0",
+  "patch": "/tmp/latch6-review-and-ci-fixes.patch",
+  "patch_sha256": "5fcb32df66db2d2a612a7ecb74d2e41dfb40fbde18fe6036af9b0faaff36b9bb",
+  "files": [
+    {
+      "path": "crates/stream/src/session.rs",
+      "sha256": "d4610cd2aa3000df5c732bbb3ad1bf20a2ed248d0ce1b3a2d9f0c560952202e7"
+    },
+    {
+      "path": "crates/stream/Cargo.toml",
+      "sha256": "b22ded769e5205bb8641a886bf65ed5f0317df0b5116517cda6a4ad23110930a"
+    },
+    {
+      "path": "Cargo.lock",
+      "sha256": "54f6ec1c4fdbf907d1d9fde0eca9d11db6133efc3708267892be1da3ac31ded0"
+    },
+    {
+      "path": "crates/client/src/app.rs",
+      "sha256": "e45e1b8c7e87b987c4ac4ff973fc1afc60fcabc4762555d10c1e0cd14102dd80"
+    },
+    {
+      "path": "crates/engine/src/server.rs",
+      "sha256": "d68c69a5fcb30bfc86d434f9cdfc24e1779c161612ff8ba6c9e433e60ea72e3e"
+    },
+    {
+      "path": "crates/engine/tests/relay_runtime.rs",
+      "sha256": "f788683d21b69cecec7ca60873069da0fb2fcaaaa0ccc3cbd3d3b512f41a4d86"
+    },
+    {
+      "path": "crates/engine/tests/support/lifecycle.rs",
+      "sha256": "3d8e0886c664d4f983909fd6a71ee5a4536326fd4c82047d800ae26e0c183c4c"
+    }
+  ],
+  "macos_ci_failure": "byte allowance consumption took about 7.1 seconds before a two-second renewal cooldown; the eight-second wait included both",
+  "linux_ci_failure": "new-route pad update could be acknowledged before deferred fallback cleanup unplugged it",
+  "validation": {
+    "session_tests": 22,
+    "ui_retry_test": "passed",
+    "input_transition_order_test": "passed",
+    "relay_runtime_tests": 9,
+    "relay_runtime_seconds": 118.64,
+    "strict_clippy": "engine/stream/client all targets passed",
+    "windows_msvc_compile": "engine/stream all targets passed",
+    "hosted_rerun": "pending integration and push"
+  },
+  "review_candidate_unchanged": true
+}

@@ -1,0 +1,27 @@
+   Compiling latch-proto v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/proto)
+   Compiling latch-codec v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/codec)
+   Compiling latch-core v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/core)
+   Compiling latch-relay v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/relay)
+   Compiling latch-stream v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/stream)
+    Finished `test` profile [optimized + debuginfo] target(s) in 8.14s
+     Running unittests src/lib.rs (/Users/daniel/Desktop/T3_Projects/latch/target/debug/deps/latch_stream-4c056a784707176b)
+
+running 1 test
+test session::tests::viewer_relay_backpressure_retries_unless_stopped_or_renegotiating ... FAILED
+
+failures:
+
+---- session::tests::viewer_relay_backpressure_retries_unless_stopped_or_renegotiating stdout ----
+
+thread 'session::tests::viewer_relay_backpressure_retries_unless_stopped_or_renegotiating' (81019513) panicked at crates/stream/src/session.rs:3396:21:
+inbox overflow: false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+relay connection closed phase=attached role=host lane=video category=peer_closed kind=UnexpectedEof
+
+
+failures:
+    session::tests::viewer_relay_backpressure_retries_unless_stopped_or_renegotiating
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 0.14s
+
+error: test failed, to rerun pass `-p latch-stream --lib`

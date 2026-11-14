@@ -1,0 +1,6 @@
+    Checking latch-proto v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/proto)
+    Checking latch-codec v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/codec)
+    Checking latch-core v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/core)
+    Checking latch-relay v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/relay)
+    Checking latch-stream v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/stream)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 3.01s

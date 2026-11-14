@@ -89,6 +89,56 @@ fn sockets() -> (TcpStream, TcpStream) {
     (host, client)
 }
 
+#[test]
+fn route_changes_finish_before_new_udp_pad_updates_are_acknowledged() {
+    use latch_proto::gamepad::{PadKind, PadState, PadUpdate};
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let address = udp.local_addr().unwrap();
+    let session = session(address);
+    session.pads.lock().slots = 1;
+    let server = Server::bind(0, Options::default()).unwrap();
+    let (started, entered) = mpsc::channel();
+    let mut worker = None;
+    assert!(session.update_relay(|_| {
+        let server = server.clone();
+        let session = session.clone();
+        worker = Some(std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            wire::write_pad(
+                &mut bytes,
+                session.id,
+                &[PadUpdate {
+                    slot: 0,
+                    seq: 1,
+                    kind: Some(PadKind::Xbox),
+                    state: PadState::default(),
+                }],
+            );
+            started.send(()).unwrap();
+            dispatch_datagram(&server, &session, &bytes, address, false);
+        }));
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        // The new route may already be visible, but delivery must wait until
+        // its transition has released the previous route's virtual devices.
+        let error = udp.recv(&mut [0; 1500]).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        true
+    }));
+    udp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut bytes = [0; 1500];
+    let length = udp.recv(&mut bytes).expect("new-route pad acknowledgment");
+    let Datagram::PadAck { acks, .. } = wire::parse(&bytes[..length]).unwrap() else {
+        panic!("expected a pad acknowledgment");
+    };
+    assert_eq!(acks.iter().next().unwrap().seq, 1);
+    worker.unwrap().join().unwrap();
+}
+
 type Next = Box<dyn FnMut(bool, Duration, &mut VideoInfo) -> anyhow::Result<EncodedVideo> + Send>;
 
 struct Video {

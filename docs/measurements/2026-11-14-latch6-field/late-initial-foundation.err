@@ -1,0 +1,87 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling serde_core v1.0.229
+   Compiling serde v1.0.229
+   Compiling windows-link v0.2.1
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.151
+   Compiling cfg-if v1.0.4
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling zeroize v1.9.0
+   Compiling windows-sys v0.61.2
+   Compiling once_cell v1.21.4
+   Compiling rustls-pki-types v1.15.1
+   Compiling getrandom v0.4.3
+   Compiling rustls v0.23.46
+   Compiling untrusted v0.9.0
+   Compiling subtle v2.6.1
+   Compiling rustls-webpki v0.103.16
+   Compiling version_check v0.9.5
+   Compiling webpki-roots v1.0.11
+   Compiling windows_x86_64_msvc v0.48.5
+   Compiling simd-adler32 v0.3.10
+   Compiling graviola v0.4.2
+   Compiling typenum v1.20.1
+   Compiling autocfg v1.5.1
+   Compiling crc32fast v1.5.1
+   Compiling adler2 v2.0.1
+   Compiling generic-array v0.14.7
+   Compiling syn v3.0.4
+   Compiling windows-targets v0.48.5
+   Compiling miniz_oxide v0.9.1
+   Compiling socket2 v0.6.5
+   Compiling equivalent v1.0.2
+   Compiling hashbrown v0.17.1
+   Compiling num-traits v0.2.19
+   Compiling flate2 v1.1.10
+   Compiling indexmap v2.14.1
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling windows-sys v0.48.0
+   Compiling syn v2.0.119
+   Compiling miniz_oxide v0.8.9
+   Compiling fdeflate v0.3.7
+   Compiling anyhow v1.0.104
+   Compiling pxfm v0.1.30
+   Compiling rustls-graviola v0.4.0
+   Compiling toml_write v0.1.2
+   Compiling option-ext v0.2.0
+   Compiling bitflags v2.13.1
+   Compiling winnow v0.7.15
+   Compiling dirs-sys v0.4.1
+   Compiling png v0.18.1
+   Compiling digest v0.10.7
+   Compiling tracing-core v0.1.36
+   Compiling cpufeatures v0.2.17
+   Compiling pin-project-lite v0.2.17
+   Compiling bytemuck v1.25.2
+   Compiling byteorder-lite v0.1.0
+   Compiling sha2 v0.10.9
+   Compiling moxcms v0.8.1
+   Compiling directories v5.0.1
+   Compiling if-addrs v0.15.0
+   Compiling semver v1.0.28
+   Compiling image v0.25.10
+   Compiling serde_derive v1.0.229
+   Compiling tracing-attributes v0.1.31
+   Compiling latch-proto v6.0.0 (C:\Users\Daniel\dev\latch6-field-20261114\crates\proto)
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling toml_edit v0.22.27
+   Compiling latch-relay v6.0.0 (C:\Users\Daniel\dev\latch6-field-20261114\crates\relay)
+   Compiling toml v0.8.23
+   Compiling tracing v0.1.44
+   Compiling latch-core v6.0.0 (C:\Users\Daniel\dev\latch6-field-20261114\crates\core)
+    Finished `test` profile [optimized + debuginfo] target(s) in 54.47s
+     Running unittests src\lib.rs (target\debug\deps\latch_core-b3de9a6087c2f11d.exe)
+     Running unittests src\lib.rs (target\debug\deps\latch_proto-786dc5c2e6d40a55.exe)
+     Running tests\keyframe_recovery.rs (target\debug\deps\keyframe_recovery-3e1a9040448ee2aa.exe)
+     Running tests\protocol.rs (target\debug\deps\protocol-9d6fe5d1ff451da5.exe)
+     Running tests\regressions.rs (target\debug\deps\regressions-aa29c91e0668fddb.exe)
+     Running unittests examples\transport.rs (target\debug\examples\transport-5b0f43876be25da1.exe)
+     Running unittests src\lib.rs (target\debug\deps\latch_relay-850620832f8f6f16.exe)
+     Running unittests src\main.rs (target\debug\deps\latch_relay-982c17513b653d54.exe)
+     Running tests\transport.rs (target\debug\deps\transport-01df58da6acef03a.exe)
+error: test failed, to rerun pass `-p latch-relay --test transport`

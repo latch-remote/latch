@@ -5,12 +5,14 @@ $d = "$env:USERPROFILE\dev\latch6-field-final-20261114"
 Set-Location $d
 $env:CARGO_TARGET_DIR = "$env:USERPROFILE\dev\latch6-field-20261114\target"
 $cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
+$script:checksFailed = $false
 function CargoCheck($label, $arguments) {
     $label=$Prefix+$label
     $start = Get-Date
     $ErrorActionPreference = 'Continue'
     & $cargo ($arguments -split ' ') 1> "$d\$label.out" 2> "$d\$label.err"
     $result = $LASTEXITCODE
+    if ($result -ne 0) { $script:checksFailed = $true }
     $ErrorActionPreference = 'Stop'
     [pscustomobject]@{ label=$label; exit=$result; elapsed_s=((Get-Date)-$start).TotalSeconds; command="cargo $arguments" } | ConvertTo-Json -Compress | Add-Content "$d\${Prefix}native-results.jsonl"
 }
@@ -22,3 +24,4 @@ CargoCheck 'windows-examples' 'build --locked -p latch-engine --example serve --
 CargoCheck 'workspace-check' 'check --locked --workspace --all-targets'
 Set-Content "$d\${Prefix}native-done.txt" (Get-Date -Format o)
 Get-Content "$d\${Prefix}native-results.jsonl"
+if ($script:checksFailed) { exit 1 }

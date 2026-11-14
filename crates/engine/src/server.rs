@@ -708,7 +708,6 @@ impl Server {
         // Bytes the encoder had produced at the last viewer report.
         let mut sent_mark = (Instant::now(), session.bytes.load(Ordering::Relaxed));
         let mut route_revision = session.relay.revision();
-        let mut relay_was_active = session.relay.active();
         let mut relay_messages = VecDeque::new();
         let reason = loop {
             let ended = session.ended.lock().clone();
@@ -751,7 +750,9 @@ impl Server {
                                     break;
                                 }
                             }
-                            _ => session.end(end::ENDED, "Invalid relay control packet."),
+                            _ => {
+                                session.end(end::TRANSPORT_FAILED, "Invalid relay control packet.")
+                            }
                         }
                     }
                     Some(_) => {}
@@ -759,23 +760,12 @@ impl Server {
                 }
             }
             if !session
-                .relay
-                .maintain(false, |message| session.send_tcp(message))
+                .update_relay(|relay| relay.maintain(false, |message| session.send_tcp(message)))
             {
                 break "the viewer's connection broke".to_string();
             }
             if route_revision != session.relay.revision() {
                 route_revision = session.relay.revision();
-                let relay_active = session.relay.active();
-                if relay_was_active && !relay_active {
-                    if let Some(sink) = session.input.lock().sink.as_mut() {
-                        sink.release_all();
-                    }
-                    if let Some(sink) = session.pads.lock().sink.as_mut() {
-                        sink.unplug_all();
-                    }
-                }
-                relay_was_active = relay_active;
                 controller = crate::congestion::Controller::new(requested_bitrate, Instant::now());
                 relay_controller =
                     crate::congestion::RelayController::new(requested_bitrate, Instant::now());
@@ -807,10 +797,9 @@ impl Server {
             };
             match incoming {
                 Ok(Message::Relay(message)) if accept.relay => {
-                    if !session
-                        .relay
-                        .handle(message, |message| session.send_tcp(message))
-                    {
+                    if !session.update_relay(|relay| {
+                        relay.handle(message, |message| session.send_tcp(message))
+                    }) {
                         break "the viewer's connection broke".to_string();
                     }
                 }
@@ -1313,6 +1302,25 @@ impl TransportState {
 }
 
 impl Session {
+    fn update_relay(&self, update: impl FnOnce(&RelayRoute) -> bool) -> bool {
+        // Stop old input before the first packet on the new route can be
+        // applied and acknowledged. Cleaning up on the next control-loop turn
+        // could unplug a pad whose replacement snapshot was already ACKed.
+        let mut input = self.input.lock();
+        let mut pads = self.pads.lock();
+        let was_active = self.relay.active();
+        let ok = update(&self.relay);
+        if was_active && !self.relay.active() {
+            if let Some(sink) = input.sink.as_mut() {
+                sink.release_all();
+            }
+            if let Some(sink) = pads.sink.as_mut() {
+                sink.unplug_all();
+            }
+        }
+        ok
+    }
+
     fn queue_relay_control(
         &self,
         inbox: &mut VecDeque<(u64, Message)>,

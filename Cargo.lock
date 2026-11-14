@@ -2172,6 +2172,7 @@ dependencies = [
  "objc2-game-controller",
  "parking_lot",
  "rand",
+ "rustls",
  "serde",
  "serde_json",
  "tracing",

@@ -4779,6 +4779,12 @@ mod live_snapshot {
                 latch_proto::control::end::TRANSPORT_FAILED as i32,
                 true,
             ),
+            (
+                true,
+                false,
+                latch_proto::control::end::TRANSPORT_FAILED as i32,
+                false,
+            ),
             (true, false, 2, false),
             (false, true, 2, false),
             (false, false, 1, false),

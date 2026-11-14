@@ -2040,10 +2040,8 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         }
     }
     *inner.link.lock() = None;
-    match outcome {
-        Outcome::Stopped => {}
-        Outcome::Failed(stage, message) => inner.emit(Event::Failed { stage, message }),
-        Outcome::Ended(code, message) => inner.emit(Event::Terminated { code, message }),
+    if let Some(event) = outcome.event() {
+        inner.emit(event);
     }
 }
 
@@ -2086,13 +2084,24 @@ enum Outcome {
     Ended(i32, String),
 }
 
+impl Outcome {
+    fn event(self) -> Option<Event> {
+        match self {
+            Self::Stopped => None,
+            Self::Failed(stage, message) => Some(Event::Failed { stage, message }),
+            Self::Ended(code, message) => Some(Event::Terminated { code, message }),
+        }
+    }
+}
+
 /// The control connection: keepalives and reports out, notices and the end
 /// in; and the clock that gives up on a silent host.
 fn send_control(inner: &Inner, message: &Message) -> bool {
-    match inner.relay.lock().send_control(message) {
+    let relay = inner.relay.lock().clone();
+    match relay.send_control(message) {
         Ok(true) => return true,
         Err(_) => {
-            inner.attempt_over.store(true, Ordering::Release);
+            relay.fail();
             return false;
         }
         Ok(false) => {}
@@ -2270,21 +2279,30 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 send_tcp(inner, message)
             })
         {
-            return Outcome::Ended(-1, "The authorized control connection broke.".into());
+            return Outcome::Ended(
+                control::end::TRANSPORT_FAILED as i32,
+                "The stream transport failed. Reconnecting…".into(),
+            );
         }
         if now - last_keepalive >= KEEPALIVE {
             last_keepalive = now;
             if (!send_control(inner, &Message::Keepalive) || !send_tcp(inner, &Message::Keepalive))
                 && !inner.stopping()
             {
-                return Outcome::Ended(-1, "The connection to the host broke.".into());
+                return Outcome::Ended(
+                    control::end::TRANSPORT_FAILED as i32,
+                    "The connection to the host broke.".into(),
+                );
             }
         }
         if now - last_report >= REPORT_EVERY {
             last_report = now;
             let report = inner.feedback.lock().clone();
             if !send_control(inner, &Message::Report(report)) && !inner.stopping() {
-                return Outcome::Ended(-1, "The connection to the host broke.".into());
+                return Outcome::Ended(
+                    control::end::TRANSPORT_FAILED as i32,
+                    "The connection to the host broke.".into(),
+                );
             }
         }
         {
@@ -2330,6 +2348,28 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 "The host stopped answering.".into(),
             );
         }
+    }
+}
+
+fn receive_relay_control(inner: &Inner, revision: u64, bytes: &[u8]) {
+    let relay = inner.relay.lock().clone();
+    let mut source = bytes;
+    match control::read_message(&mut source) {
+        Ok(
+            message @ (Message::Report(_)
+            | Message::Keepalive
+            | Message::Notice(_)
+            | Message::Cursor(_)
+            | Message::End(_)),
+        ) if source.is_empty() => {
+            let mut messages = inner.relay_messages.lock();
+            if messages.len() >= 128 {
+                relay.fail();
+            } else {
+                messages.push_back((revision, message));
+            }
+        }
+        _ => relay.fail(),
     }
 }
 
@@ -2479,24 +2519,7 @@ fn receive(
                     if revision != relay.revision() {
                         continue;
                     }
-                    let mut source = bytes.as_slice();
-                    match control::read_message(&mut source) {
-                        Ok(
-                            message @ (Message::Report(_)
-                            | Message::Keepalive
-                            | Message::Notice(_)
-                            | Message::Cursor(_)
-                            | Message::End(_)),
-                        ) if source.is_empty() => {
-                            let mut messages = inner.relay_messages.lock();
-                            if messages.len() >= 128 {
-                                inner.attempt_over.store(true, Ordering::Release);
-                            } else {
-                                messages.push_back((revision, message));
-                            }
-                        }
-                        _ => inner.attempt_over.store(true, Ordering::Release),
-                    }
+                    receive_relay_control(inner, revision, &bytes);
                 }
                 Some(_) => {}
                 None => break,
@@ -2526,9 +2549,7 @@ fn receive(
         }
         if media_seen && now - last_ping >= PING_EVERY {
             wire::write_ping(&mut out, session, inner.now_us());
-            if routed_datagram(&relay, &udp, &out, host).is_err() {
-                inner.attempt_over.store(true, Ordering::Release);
-            }
+            let _ = routed_datagram(&relay, &udp, &out, host);
             last_ping = now;
         }
         if let Some(link) = inner.link.lock().as_mut() {
@@ -2670,9 +2691,7 @@ fn receive(
                 rtt.srtt(),
             ) {
                 wire::write_recovery_request(&mut out, session, &request);
-                if routed_datagram(&relay, &udp, &out, host).is_err() {
-                    inner.attempt_over.store(true, Ordering::Release);
-                }
+                let _ = routed_datagram(&relay, &udp, &out, host);
             }
         }
         // With recovery frames, a loss asks for a keyframe only once the
@@ -2693,9 +2712,7 @@ fn receive(
                     reassembler.last_delivered().unwrap_or(0)
                 },
             );
-            if routed_datagram(&relay, &udp, &out, host).is_err() {
-                inner.attempt_over.store(true, Ordering::Release);
-            }
+            let _ = routed_datagram(&relay, &udp, &out, host);
         }
         if now - report_start >= REPORT_EVERY {
             let stats = reassembler.stats();
@@ -2865,10 +2882,17 @@ pub(crate) fn routed_datagram(
     bytes: &[u8],
     host: SocketAddr,
 ) -> std::io::Result<()> {
-    if !relay.send_datagram(bytes)? {
-        let _ = udp.send_to(bytes, host);
+    match relay.send_datagram(bytes) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            let _ = udp.send_to(bytes, host);
+            Ok(())
+        }
+        Err(error) => {
+            relay.fail();
+            Err(error)
+        }
     }
-    Ok(())
 }
 
 /// When whole frames arrived in the current statistics window.
@@ -3025,16 +3049,12 @@ fn handle(
             drop(deliver);
             if !acks.is_empty() {
                 wire::write_pad_feedback_ack(out, session, &acks);
-                if routed_datagram(&inner.relay.lock(), udp, out, from).is_err() {
-                    inner.attempt_over.store(true, Ordering::Release);
-                }
+                let _ = routed_datagram(&inner.relay.lock(), udp, out, from);
             }
         }
         Datagram::Ping { time, .. } => {
             wire::write_pong(out, session, *time);
-            if routed_datagram(&inner.relay.lock(), udp, out, from).is_err() {
-                inner.attempt_over.store(true, Ordering::Release);
-            }
+            let _ = routed_datagram(&inner.relay.lock(), udp, out, from);
         }
         Datagram::Pong { time, .. } => {
             let sample = inner.now_us().saturating_sub(*time);
@@ -3221,6 +3241,179 @@ fn receive_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ViewerRelay {
+        inner: Arc<Inner>,
+        events: mpsc::Receiver<Event>,
+        tcp: TcpStream,
+        _control_peer: TcpStream,
+        peer: latch_relay::Transport,
+        cancel: latch_relay::Cancel,
+        daemon: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+        quota: std::path::PathBuf,
+    }
+
+    impl ViewerRelay {
+        fn new() -> Self {
+            use latch_relay::daemon::{Daemon, DaemonConfig};
+            use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+
+            let quota = std::env::temp_dir().join(format!(
+                "latch-viewer-failure-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            let mut config = DaemonConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                vec![CertificateDer::from_pem_slice(include_bytes!(
+                    "../../relay/tests/certs/server.pem"
+                ))
+                .unwrap()],
+                PrivateKeyDer::from_pem_slice(include_bytes!(
+                    "../../relay/tests/certs/server-key.pem"
+                ))
+                .unwrap(),
+                quota.clone(),
+                32 * 1024 * 1024,
+            )
+            .unwrap();
+            config.initialize_quota = true;
+            let daemon = Daemon::bind(config).unwrap();
+            let endpoint =
+                latch_relay::Endpoint::new("localhost", daemon.local_addr().unwrap().port())
+                    .unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots
+                .add(
+                    CertificateDer::from_pem_slice(include_bytes!(
+                        "../../relay/tests/certs/ca.pem"
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+            let mut config = latch_relay::ClientConfig::with_roots(endpoint, roots).unwrap();
+            config.limits.priority_queue_bytes = 1280;
+            let cancel = latch_relay::Cancel::new();
+            let run_cancel = cancel.clone();
+            let worker = std::thread::spawn(move || daemon.run(&run_cancel));
+            let grant = latch_relay::create_grant(&config, &cancel).unwrap();
+            let keys = latch_relay::SessionKeys::generate().unwrap();
+            let peer =
+                latch_relay::Transport::connect(config.clone(), grant.host, keys.clone()).unwrap();
+            let viewer =
+                Arc::new(latch_relay::Transport::connect(config, grant.viewer, keys).unwrap());
+            for transport in [&peer, viewer.as_ref()] {
+                assert!(matches!(
+                    transport.recv_timeout(Duration::from_secs(5)),
+                    Some(latch_relay::Event::Ready)
+                ));
+            }
+            let (tx, events) = mpsc::channel();
+            let inner = Arc::new(Inner::new(
+                tx,
+                Arc::new(FrameSlot::default()),
+                Box::new(|| {}),
+            ));
+            let route = Arc::new(RelayRoute::new(7, latch_relay::Role::Viewer, None));
+            route.state.lock().transport = Some(viewer);
+            route.activate(&mut route.state.lock());
+            *inner.relay.lock() = route;
+            // Start at the established-session boundary, after first publication.
+            inner.connected.store(true, Ordering::Release);
+            inner.announced.store(true, Ordering::Release);
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (control_peer, _) = listener.accept().unwrap();
+            *inner.control_writer.lock() = Some(tcp.try_clone().unwrap());
+            *inner.tcp.lock() = Some(tcp.try_clone().unwrap());
+            Self {
+                inner,
+                events,
+                tcp,
+                _control_peer: control_peer,
+                peer,
+                cancel,
+                daemon: Some(worker),
+                quota,
+            }
+        }
+    }
+
+    impl Drop for ViewerRelay {
+        fn drop(&mut self) {
+            let _ = self.tcp.shutdown(Shutdown::Both);
+            self.inner.relay.lock().shutdown();
+            self.peer.shutdown();
+            self.cancel.cancel();
+            let _ = self.daemon.take().unwrap().join();
+            let _ = std::fs::remove_file(&self.quota);
+        }
+    }
+
+    #[test]
+    fn viewer_relay_backpressure_retries_unless_stopped_or_renegotiating() {
+        let accept: Accept = serde_json::from_value(serde_json::json!({
+            "session": 7, "token": "00000000000000000000000000000000",
+            "codec": "h264-baseline", "width": 64, "height": 64, "fps": 30,
+            "bitrate_kbps": 2000, "encoder": "test", "audio": null, "relay": true
+        }))
+        .unwrap();
+        for inbox_overflow in [false, true] {
+            for action in ["recover", "stop", "codec fallback"] {
+                let mut viewer = ViewerRelay::new();
+                let route = viewer.inner.relay.lock().clone();
+                if inbox_overflow {
+                    let mut bytes = Vec::new();
+                    control::write_message(&mut bytes, &Message::Keepalive).unwrap();
+                    for _ in 0..=128 {
+                        receive_relay_control(&viewer.inner, route.revision(), &bytes);
+                    }
+                    assert_eq!(viewer.inner.relay_messages.lock().len(), 128);
+                } else {
+                    // A single record exceeds this fixture's queue, so the
+                    // actual TLS writer cannot race away the capacity failure.
+                    let message = Message::Notice(control::Notice {
+                        kind: "video".into(),
+                        message: "x".repeat(2000),
+                    });
+                    assert!(!send_control(&viewer.inner, &message));
+                }
+                match action {
+                    "stop" => Session {
+                        inner: viewer.inner.clone(),
+                    }
+                    .stop(),
+                    "codec fallback" => {
+                        *viewer.inner.renegotiate.lock() = Some((
+                            Codec::Hevc,
+                            "test decoder failure".into(),
+                            video::FailureKind::Decode,
+                        ));
+                        viewer.inner.attempt_over.store(true, Ordering::Release);
+                    }
+                    _ => {}
+                }
+                let started = Instant::now();
+                let outcome = control_loop(&viewer.inner, &mut viewer.tcp, &accept);
+                if let Some(event) = outcome.event() {
+                    viewer.inner.emit(event);
+                }
+                assert!(started.elapsed() < Duration::from_secs(1));
+                if action == "recover" {
+                    assert!(
+                        matches!(
+                            viewer.events.try_recv(),
+                            Ok(Event::Terminated { code, .. })
+                                if code == control::end::TRANSPORT_FAILED as i32
+                        ),
+                        "inbox overflow: {inbox_overflow}"
+                    );
+                } else {
+                    assert!(viewer.events.try_recv().is_err(), "{action}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn terminal_and_cursor_controls_always_keep_original_ordered_connection() {

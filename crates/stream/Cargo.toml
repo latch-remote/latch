@@ -66,4 +66,5 @@ evdev = "0.13"
 alsa = "0.11"
 
 [dev-dependencies]
+rustls = { version = "=0.23.46", default-features = false, features = ["std"] }
 tracing-subscriber.workspace = true

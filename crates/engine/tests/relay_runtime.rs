@@ -499,7 +499,10 @@ fn finite_byte_grants_renew_after_actual_video_transfer() {
     let pilot = Pilot::with_limits(|config| config.limits.session_bytes = 1024 * 1024);
     let running = Running::with_pattern(pilot.config.clone(), true, "noise");
     for grant in 1..=4 {
-        running.wait(Duration::from_secs(8), || {
+        // Include consuming the byte allowance, then the two-second renewal
+        // cooldown and TLS setup. Hosted runners can take seven seconds just
+        // to reach the byte threshold; this is not a throughput benchmark.
+        running.wait(Duration::from_secs(20), || {
             pilot.metrics.grants_created.load(Ordering::Acquire) >= grant
                 && running.session.relay_active()
                 && running.session.connected()

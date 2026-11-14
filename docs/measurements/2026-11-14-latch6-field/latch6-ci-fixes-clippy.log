@@ -1,0 +1,10 @@
+    Checking latch-stream v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/stream)
+    Checking arboard v3.6.1
+    Checking egui-winit v0.31.1
+    Checking eframe v0.31.1
+    Checking latch-engine v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/engine)
+    Checking latch-client v6.0.0 (/private/tmp/latch6-viewer-failure-fix-fb9b4f0d/latch-6.0.0/crates/client)
+    Checking egui_kittest v0.31.1
+    Finished `dev` profile [optimized + debuginfo] target(s) in 3.54s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

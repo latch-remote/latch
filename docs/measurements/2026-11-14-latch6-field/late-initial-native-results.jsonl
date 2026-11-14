@@ -1,0 +1,10 @@
+{"label":"lifecycle","exit":0,"elapsed_s":182.2723763,"command":"cargo test --locked -p latch-engine --test lifecycle -- --test-threads=1"}
+{"label":"relay-runtime","exit":101,"elapsed_s":33.3569309,"command":"cargo test --locked -p latch-engine --test relay_runtime -- --test-threads=1"}
+{"label":"windows-examples","exit":0,"elapsed_s":17.906082599999998,"command":"cargo build --locked -p latch-engine --example serve --example pipeline_bench -p latch-client --example present -p latch-stream --example view --example pads"}
+{"label":"workspace-check","exit":0,"elapsed_s":80.1677644,"command":"cargo check --locked --workspace --all-targets"}
+{"label":"foundation","exit":101,"elapsed_s":3733.2260407999997,"command":"cargo test --locked -p latch-core -p latch-proto -p latch-relay --all-targets"}
+{"label":"platform-libs","exit":0,"elapsed_s":14.142767599999999,"command":"cargo test --locked -p latch-engine -p latch-stream -p latch-client --lib"}
+{"label":"lifecycle","exit":0,"elapsed_s":4126.995873,"command":"cargo test --locked -p latch-engine --test lifecycle -- --test-threads=1"}
+{"label":"relay-runtime","exit":0,"elapsed_s":127.78641669999999,"command":"cargo test --locked -p latch-engine --test relay_runtime -- --test-threads=1"}
+{"label":"windows-examples","exit":0,"elapsed_s":1.0216176,"command":"cargo build --locked -p latch-engine --example serve --example pipeline_bench -p latch-client --example present -p latch-stream --example view --example pads"}
+{"label":"workspace-check","exit":0,"elapsed_s":1.0069384,"command":"cargo check --locked --workspace --all-targets"}
