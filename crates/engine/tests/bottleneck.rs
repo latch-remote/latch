@@ -7,6 +7,9 @@
 #[allow(dead_code)]
 #[path = "../src/congestion.rs"]
 mod congestion;
+#[allow(dead_code)]
+#[path = "../src/pacing.rs"]
+mod pacing;
 #[path = "support/relay.rs"]
 mod relay;
 
@@ -18,6 +21,37 @@ use latch_stream::{Event, FrameSlot, Session, Settings};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
+
+#[test]
+fn clean_frame_trains_fit_a_shallow_relay_queue() {
+    let start = Instant::now();
+    let controller = congestion::Controller::new(40_000, start);
+    let mut pacer = pacing::Pacer::new(start);
+    let mut link = Link::new(Impairment::NONE, 11);
+    link.set_bandwidth(50_000, Duration::from_millis(4));
+    // 90 KB frames at 30 fps average only 22 Mbps, but an unpaced
+    // frame overflows this 50 Mbps path before the controller sees loss.
+    let packets = vec![vec![0; 1200]; 72];
+    for frame in 0..60 {
+        let mut now = start + Duration::from_micros(frame * 33_333);
+        let mut sent = 0;
+        while sent < packets.len() {
+            let (count, wait) = pacer.batch(now, &packets[sent..], controller.pace_kbps());
+            for packet in &packets[sent..sent + count] {
+                link.send(now, packet);
+            }
+            sent += count;
+            now += wait;
+        }
+        link.receive(now + Duration::from_millis(10));
+        assert!(now < start + Duration::from_micros((frame + 1) * 33_333));
+    }
+    assert_eq!(
+        link.counts().1,
+        0,
+        "frame bursts must not cause recovery loops"
+    );
+}
 
 fn host() -> u16 {
     for _ in 0..50 {

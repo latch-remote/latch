@@ -79,6 +79,7 @@ pub(crate) struct Controller {
     loss_since: Option<Instant>,
     loss_before: (f32, u32),
     severe_since: Option<Instant>,
+    deficit_since: Option<Instant>,
     /// A reversible 20% reduction tests whether queue-free loss follows load.
     loss_probe: Option<LossProbe>,
     random_until: Instant,
@@ -139,6 +140,7 @@ impl Controller {
             loss_since: None,
             loss_before: (0.0, 0),
             severe_since: None,
+            deficit_since: None,
             loss_probe: None,
             random_until: now,
             policer_until: now,
@@ -152,10 +154,12 @@ impl Controller {
 
     pub(crate) fn observe_sent(&mut self, kbps: u32) {
         self.sent_kbps = Some(kbps);
+        // One burst can fill a report window on an otherwise sparse stream.
+        // Require sustained load to forget that it was underfilled.
         self.app_limited_windows = if kbps < self.budget * 4 / 5 {
-            self.app_limited_windows.saturating_add(1)
+            self.app_limited_windows.saturating_add(1).min(8)
         } else {
-            0
+            self.app_limited_windows.saturating_sub(1)
         };
     }
 
@@ -167,21 +171,12 @@ impl Controller {
         self.pacing || self.resume.is_some()
     }
 
-    /// Pacer rate: congestion spreads frame trains at 2.5x the budget; a
-    /// clean path sends them at once.
+    /// Spread frame trains at the wire budget even on a clean path. Sending
+    /// a whole encoded frame at once can overflow a relay's policer despite
+    /// the average rate fitting; loss then forces another large keyframe.
     pub(crate) fn pace_kbps(&self) -> u32 {
-        let ordinary = if self.pacing {
-            self.budget.saturating_mul(5) / 2
-        } else {
-            0
-        };
-        self.resume.map_or(ordinary, |rate| {
-            if ordinary == 0 {
-                rate
-            } else {
-                ordinary.min(rate)
-            }
-        })
+        self.resume
+            .map_or(self.budget, |rate| self.budget.min(rate))
     }
 
     pub(crate) fn probe_pressure(&self) -> bool {
@@ -254,15 +249,12 @@ impl Controller {
         let falling = delay + 0.5 < self.previous_delay;
         self.gradient = self.gradient * 0.5 + (delay - self.previous_delay) * 0.5;
         self.previous_delay = delay;
-        // Idle streams never learned their radio jitter, and pacing does
-        // not teach it: the estimate stays frozen while pacing, and the
-        // first false queue is what turned pacing on. Keep the floor
-        // until the sender actually fills its budget. Dropping it at the
-        // first cut makes a few milliseconds of jitter — under the idle
-        // threshold — look like a standing queue, and the next cut then
-        // adopts one sparse window's send rate.
+        // Relayed ping jitter does not disappear when motion fills the
+        // budget, and the learned estimate freezes under pressure. Keep
+        // its RTT-scaled floor through cuts and recovery probes too.
         let jitter = self
             .jitter
+            .max(self.base_rtt().map_or(0.0, |rtt| rtt.as_secs_f32() * 100.0))
             .max(if self.application_limited() { 3.0 } else { 0.0 });
         let threshold = 6.0f32.max(self.min_rtt[1].min(self.min_rtt[0]) * 0.1);
         queued |= delay > threshold.max(jitter * 3.0);
@@ -329,7 +321,7 @@ impl Controller {
         }
         // A small probe needs a smaller queue threshold than an emergency
         // cut. Wait for its own feedback before increasing again.
-        let probe_queued = self.probe.is_some() && delay > 3.0f32.max(self.jitter * 2.0);
+        let probe_queued = self.probe.is_some() && delay > 3.0f32.max(jitter * 2.0);
         queued |= probe_queued;
         let old = self.budget;
         let underfilled = self
@@ -338,6 +330,15 @@ impl Controller {
         let deficit = self
             .sent_kbps
             .is_some_and(|sent| report.received_kbps < sent * 9 / 10);
+        let sustained_deficit = if deficit {
+            // Host and viewer windows cover different frames across an RTT.
+            // One quiet viewer window cannot measure a capacity collapse.
+            let since = *self.deficit_since.get_or_insert(now);
+            now.duration_since(since) >= horizon
+        } else {
+            self.deficit_since = None;
+            false
+        };
         let severe = if loss > 10.0 && deficit {
             let since = *self.severe_since.get_or_insert(now);
             now.duration_since(since) >= horizon.max(Duration::from_millis(500))
@@ -363,7 +364,7 @@ impl Controller {
             self.loss_before.0 += report.loss_pct.max(loss);
             self.loss_before.1 += 1;
         }
-        let app_limited = self.application_limited() && !self.pacing;
+        let app_limited = self.application_limited();
         // Give parity feedback a chance before testing loss against offered load.
         // A radio burst cannot prove a policer: loss must improve at a lower
         // *actual* send rate. Never ratchet an inconclusive test down again.
@@ -493,7 +494,7 @@ impl Controller {
             let fits = (u64::from(path) * 9 / 10).min(u64::from(u32::MAX)) as u32;
             let train_queued = self.train_rtt.is_some_and(|(ms, at)| {
                 now.duration_since(at) < PROBE_MEMORY
-                    && ms - rtt.as_secs_f32() * 1000.0 > (self.jitter * 3.0).max(1.0)
+                    && ms - rtt.as_secs_f32() * 1000.0 > (jitter * 3.0).max(1.0)
             });
             if path < self.budget / 4 * 3 && (train_queued || queued || deficit && loss > 0.0) {
                 self.held.get_or_insert(self.budget);
@@ -565,10 +566,9 @@ impl Controller {
                 self.resume_step = now;
             }
         }
-        // A local queue is a sender that cannot keep up; while pacing it is
-        // mostly the pacer's own spreading of large frames at low budgets,
-        // and cutting further only makes that pacer slower.
-        let pressure = queued || (queue_ms > 20.0 && !app_limited && !self.pacing()) || damaged;
+        // Every frame is paced. Its local serialization time is not a
+        // network queue: cutting the budget only makes that wait longer.
+        let pressure = queued || damaged;
         self.pressure_windows = if pressure {
             self.pressure_windows.saturating_add(1)
         } else {
@@ -591,7 +591,13 @@ impl Controller {
         let collapsed = received > 0
             && sent >= 2000
             && received < sent / 2
-            && ((loss > 10.0 && (!underfilled || severe)) || delay > 20.0);
+            && sustained_deficit
+            // Sparse host/viewer windows describe different frames on a
+            // long RTT path. Delay alone cannot make their mismatch a
+            // capacity measurement, even after pacing has been enabled.
+            && (!app_limited || severe)
+            && ((loss > 10.0 && (!underfilled || severe))
+                || delay > 20.0 && sustained_deficit);
         // While a policer's rate is remembered, damage near it is a repeat of
         // that overshoot, not a blip.
         let lossy = self
@@ -639,17 +645,15 @@ impl Controller {
             if now.duration_since(self.last_cut) >= spacing && !late && !draining {
                 // A target cut above the encoder's actual wire rate has no effect.
                 // An idle queue cuts the rate a resumed train may use.
-                let offered = if app_limited && queued && !damaged {
-                    self.budget
-                } else {
-                    self.sent_kbps.unwrap_or(self.budget).min(self.budget)
-                };
+                // An individual sender window can fall between frame
+                // trains. It is not the rate that congested the path.
+                let offered = self.budget;
                 // What got through bounds the new offered rate: a standing
                 // FIFO delivers its bottleneck rate. A viewer that omits
                 // throughput still reports loss: about the offered rate less
                 // the share lost got through.
                 let through = if received > 0 {
-                    received
+                    received.max(self.received_kbps as u32)
                 } else {
                     (f64::from(offered) * (1.0 - f64::from(loss.clamp(0.0, 100.0)) / 100.0)) as u32
                 };
@@ -785,6 +789,26 @@ impl Controller {
                 }
             }
         }
+        if self.budget < old {
+            tracing::debug!(
+                old,
+                budget = self.budget,
+                sent,
+                received,
+                smoothed_received = self.received_kbps,
+                delay,
+                jitter,
+                queued,
+                damaged,
+                app_limited,
+                collapsed,
+                probe_queued,
+                loss,
+                frames_lost = report.frames_lost,
+                queue_ms,
+                "bitrate cut evidence"
+            );
+        }
         self.budget != old
     }
 }
@@ -882,6 +906,98 @@ pub(crate) fn video_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paced_motion_survives_local_serialization_and_unaligned_relay_feedback() {
+        let start = Instant::now();
+        let mut c = Controller::new(40_000, start);
+        for tick in 1..=40 {
+            c.observe_sent(40_000);
+            c.update(
+                start + Duration::from_millis(tick * 50),
+                &Report {
+                    rtt_ms: if tick == 25 { 192.0 } else { 150.0 },
+                    received_kbps: if tick == 25 { 200 } else { 40_000 },
+                    unrecovered_loss_pct: Some(0.0),
+                    window_ms: 50,
+                    ..Default::default()
+                },
+                if tick == 25 { 192.0 } else { 150.0 },
+                30.0,
+            );
+            assert_eq!(c.budget(), 40_000);
+        }
+    }
+
+    #[test]
+    fn recovery_probes_keep_the_relay_jitter_allowance() {
+        let start = Instant::now();
+        let mut c = Controller::new(50_000, start);
+        let mut cut = false;
+        for tick in 0..400 {
+            let extra = if (40..45).contains(&tick) {
+                100.0
+            } else {
+                (tick % 5) as f32 * 2.0
+            };
+            let sent = c.budget() * 9 / 10;
+            c.observe_sent(sent);
+            c.update(
+                start + Duration::from_millis(tick * 50),
+                &Report {
+                    rtt_ms: 150.0 + extra,
+                    received_kbps: sent,
+                    unrecovered_loss_pct: Some(0.0),
+                    window_ms: 50,
+                    ..Default::default()
+                },
+                150.0 + extra,
+                20.0,
+            );
+            cut |= c.budget() < 50_000;
+        }
+        assert!(cut, "must exercise recovery from a real delay step");
+        assert_eq!(
+            c.budget(),
+            50_000,
+            "normal relay jitter must not reject every probe"
+        );
+    }
+
+    #[test]
+    fn late_loss_does_not_use_a_gap_between_sender_frames_as_capacity() {
+        let start = Instant::now();
+        let mut c = Controller::new(40_000, start);
+        c.observe_sent(40_000);
+        c.update(
+            start,
+            &Report {
+                rtt_ms: 150.0,
+                ..Default::default()
+            },
+            150.0,
+            0.0,
+        );
+        for tick in 1..=2 {
+            c.observe_sent(0);
+            c.update(
+                start + Duration::from_millis(tick * 50),
+                &Report {
+                    rtt_ms: 250.0,
+                    received_kbps: 25_000,
+                    loss_pct: 20.0,
+                    unrecovered_loss_pct: Some(20.0),
+                    frames_lost: 1,
+                    window_ms: 50,
+                    ..Default::default()
+                },
+                250.0,
+                20.0,
+            );
+        }
+        assert!(c.budget() >= 15_000, "25 Mbps was arriving: {}", c.budget());
+        assert!(c.budget() < 40_000, "still back off from real congestion");
+    }
     #[test]
     fn loss_only_reductions_require_rate_correlation() {
         for policer in [false, true] {
@@ -1064,6 +1180,9 @@ mod tests {
             c.update(t, &report(300, 0), 150.0, 0.0);
             trains += usize::from(c.probe_train(t).is_some());
         }
+        t += Duration::from_millis(50);
+        c.observe_sent(300);
+        c.update(t, &report(300, 0), 150.0, 0.0);
         let mut paces = Vec::new();
         for _ in 0..8 {
             t += Duration::from_millis(50);
@@ -1072,7 +1191,11 @@ mod tests {
             c.update(t, &report(sent, 0), 150.0, 0.0);
             paces.push(c.pace_kbps());
         }
-        assert_eq!(paces[..5], [4000, 8000, 16_000, 32_000, 0], "{paces:?}");
+        assert_eq!(
+            paces[..5],
+            [4000, 8000, 16_000, 32_000, 40_000],
+            "{paces:?}"
+        );
     }
 
     #[test]
@@ -1114,7 +1237,7 @@ mod tests {
             window(&mut c, t, 50.0 + (tick % 3) as f32 * 1.5, 0.0);
         }
         assert_eq!(c.budget(), 1000);
-        // The pacer at 2.5x the floor holds a large frame for a while; that
+        // The pacer at the floor holds a large frame for a while; that
         // is no network queue.
         let mut recovered = None;
         for tick in 0..100 {
@@ -1127,6 +1250,50 @@ mod tests {
         // Back to the budget it had before the delay, a second after the
         // pacer settles and the delay is gone.
         assert!(recovered.is_some_and(|ms| ms <= 4000), "{recovered:?}");
+    }
+
+    #[test]
+    fn a_relay_rtt_spike_does_not_treat_paced_sparse_motion_as_capacity() {
+        let start = Instant::now();
+        let mut c = Controller::new(15_000, start);
+        let mut minimum = c.budget();
+        for tick in 0..160u32 {
+            let now = start + Duration::from_millis(u64::from(tick + 1) * 50);
+            let sent = if tick % 7 == 0 {
+                16_000
+            } else if tick % 3 == 0 || tick == 50 {
+                2500
+            } else {
+                1000
+            };
+            // A short delay enables pacing, then a relayed ping stalls.
+            // All of the sparse motion still arrives, without damage.
+            let extra = match tick {
+                40 | 41 | 44 | 45 | 48 | 49 => 19.0,
+                50 | 51 => 75.0,
+                _ => (tick % 5) as f32 * 2.0,
+            };
+            c.observe_sent(sent);
+            c.update(
+                now,
+                &Report {
+                    rtt_ms: 170.0 + extra,
+                    // The viewer window precedes this host window by the RTT.
+                    received_kbps: if tick == 50 { 200 } else { sent },
+                    unrecovered_loss_pct: Some(0.0),
+                    window_ms: 50,
+                    ..Default::default()
+                },
+                170.0 + extra,
+                0.0,
+            );
+            minimum = minimum.min(c.budget());
+        }
+        assert!(
+            minimum >= 6000,
+            "sparse delivery became capacity: {minimum}"
+        );
+        assert_eq!(c.budget(), 15_000);
     }
 
     #[test]

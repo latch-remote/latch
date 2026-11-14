@@ -469,7 +469,7 @@ impl Server {
             rtt_low: Mutex::new(None),
             train_ping: AtomicU64::new(0),
             train_rtt: Mutex::new(None),
-            pace_kbps: AtomicU32::new(0),
+            pace_kbps: AtomicU32::new(config.bitrate_kbps),
             fec: AtomicU8::new(DEFAULT_FEC_PERCENT),
             fec_burst: AtomicU8::new(0),
             heard_us: AtomicU64::new(self.now_us()),
