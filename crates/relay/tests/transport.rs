@@ -360,6 +360,8 @@ impl ReturnGate {
                         peers.push(thread::spawn(move || {
                             client.set_nonblocking(true).unwrap();
                             server.set_nonblocking(true).unwrap();
+                            client.set_nodelay(true).unwrap();
+                            server.set_nodelay(true).unwrap();
                             let mut to_server = VecDeque::new();
                             let mut to_client = VecDeque::new();
                             while !stop.load(Ordering::Acquire) {
@@ -436,7 +438,10 @@ fn delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole() {
     let grant = create_grant(&pilot.config, &Cancel::new()).unwrap();
     let keys = SessionKeys::generate().unwrap();
     let mut config = test_config(gate.port);
-    config.limits.stall_timeout = Duration::from_millis(750);
+    // Leave room for hosted-runner/proxy scheduling around sub-floor ACKs.
+    // The estimator unit test covers the production 750 ms floor; the final
+    // held ACK below still exceeds this fixture's floor.
+    config.limits.stall_timeout = Duration::from_secs(2);
     let host = Transport::connect(config, grant.host, keys.clone()).unwrap();
     let viewer = Transport::connect(pilot.config.clone(), grant.viewer, keys).unwrap();
     ready(&host);
@@ -459,13 +464,13 @@ fn delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole() {
         if number == 12 {
             // Model scheduling work after receipt. This is already part of
             // the ACK's age, not extra time to add to the requested delay.
-            thread::sleep(Duration::from_millis(150));
+            thread::sleep(Duration::from_millis(750));
         }
         queued
     };
     // Warm the estimator until its initial variance has decayed, then observe
     // sub-deadline jitter before testing an ACK beyond the configured floor.
-    let delays = std::iter::repeat_n(20, 12).chain([650, 650, 900]);
+    let delays = std::iter::repeat_n(20, 12).chain([1400, 1400, 1400, 2100]);
     for (number, delay) in delays.enumerate() {
         gate.hold.store(true, Ordering::Release);
         let queued = send(number as u32);
@@ -479,15 +484,24 @@ fn delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole() {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             if let Some(elapsed) = host.take_frame_ack_elapsed() {
+                eprintln!("frame={number} hold={delay}ms ack={elapsed:?}");
                 assert!(elapsed >= Duration::from_millis(delay));
                 break;
             }
-            assert!(Instant::now() < deadline, "authenticated ACK never arrived");
+            let event = host.recv_timeout(Duration::ZERO);
+            assert!(
+                event.is_none(),
+                "after return-path release: frame={number}, hold={delay}ms, event={event:?}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "authenticated ACK never arrived: frame={number}, hold={delay}ms"
+            );
             thread::sleep(Duration::from_millis(2));
         }
     }
     gate.hold.store(true, Ordering::Release);
-    send(15);
+    send(16);
     assert_eq!(closed(&host), io::ErrorKind::TimedOut);
 }
 

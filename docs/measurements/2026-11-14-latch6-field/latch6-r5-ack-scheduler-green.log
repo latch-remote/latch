@@ -1,0 +1,26 @@
+   Compiling latch-relay v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/relay)
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.56s
+     Running tests/transport.rs (target/debug/deps/transport-121c865364ef8b37)
+
+running 1 test
+frame=0 hold=20ms ack=395.99875ms
+frame=1 hold=20ms ack=411.520458ms
+frame=2 hold=20ms ack=416.216125ms
+frame=3 hold=20ms ack=409.890041ms
+frame=4 hold=20ms ack=401.438125ms
+frame=5 hold=20ms ack=412.803708ms
+frame=6 hold=20ms ack=407.595542ms
+frame=7 hold=20ms ack=406.261334ms
+frame=8 hold=20ms ack=415.938709ms
+frame=9 hold=20ms ack=406.782084ms
+frame=10 hold=20ms ack=408.292459ms
+frame=11 hold=20ms ack=411.163291ms
+frame=12 hold=1400ms ack=1.433555667s
+frame=13 hold=1400ms ack=1.448467084s
+frame=14 hold=1400ms ack=1.441230334s
+frame=15 hold=2100ms ack=2.275214625s
+relay connection closed phase=attached role=viewer lane=video category=peer_closed kind=UnexpectedEof
+test delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 16.78s
+

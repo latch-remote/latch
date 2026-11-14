@@ -1,0 +1,64 @@
+   Compiling latch-relay v6.0.0 (/Users/daniel/Desktop/T3_Projects/latch/crates/relay)
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.55s
+     Running unittests src/lib.rs (target/debug/deps/latch_relay-d05fe175a6b5f7e3)
+
+running 19 tests
+test client::tests::acknowledgment_deadline_tracks_video_rtt_and_is_always_bounded ... ok
+test daemon::tests::pairing_role_capabilities_are_single_use_per_lane ... ok
+test daemon::tests::diagnostics_classify_deadlines_without_exposing_error_text ... ok
+test client::tests::production_resolution_rejects_tailnet_and_private_addresses ... ok
+test client::tests::priority_backpressure_and_whole_unsent_frame_discard ... ok
+test client::tests::incomplete_oversized_and_wrong_lane_frames_never_deliver ... ok
+test wire::tests::records_reject_oversize_and_truncation ... ok
+test crypto::tests::key_derivation_matches_rfc5869_case_one ... ok
+test crypto::tests::authentication_binds_counter_lane_direction_session_and_generation ... 
+running 1 test
+ok
+test crypto::tests::cpu_rejection_is_a_result ... test client::tests::resolver_reuses_hostname_addresses_with_each_requested_port ... ok
+ok
+
+test result: oktest wire::tests::tls_hostname_verification_remains_enabled ... ok
+. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered outtest wire::tests::partial_tls_writes_preserve_record_framing ... ok
+; finished in 0.02s
+
+test quota::tests::failed_persistence_is_sticky ... ok
+test crypto::tests::cpu_rejection_is_a_result ... ok
+test wire::tests::stalled_and_closed_tls_peers_fail_on_bounded_deadlines ... ok
+test client::tests::resolver_queue_waits_for_capacity_and_observes_deadline_and_cancel ... ok
+test quota::tests::month_rollover_invalidates_live_socket_credit ... ok
+test quota::tests::restart_and_backwards_month_do_not_reset_budget ... ok
+test daemon::tests::exhausted_admission_preserves_existing_credit_and_keeps_running ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running unittests src/main.rs (target/debug/deps/latch_relay-2ff383c350ed1059)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/transport.rs (target/debug/deps/transport-121c865364ef8b37)
+
+running 13 tests
+test pre_cancelled_dns_and_connect_stop_without_waiting ... ok
+test public_roots_reject_test_certificate ... ok
+test daemon_restart_preserves_spent_transfer_reservations ... ok
+test cancelling_silent_tls_handshake_and_drop_are_bounded ... ok
+test pilot_admission_bounds_outstanding_grants_per_creator_ip ... ok
+test wrong_keys_never_reach_ready ... ok
+test frame_ack_elapsed_is_authenticated_and_consumed_on_the_callers_cadence ... ok
+test replayed_attachment_cannot_rejoin ... ok
+test exhausted_receive_queue_closes_attempt_and_propagates_failure ... ok
+test repeated_frames_advance_the_bounded_authenticated_ack_window ... ok
+test real_tls_two_lanes_complete_frame_and_authenticated_control ... ok
+test delayed_ack_path_does_not_limit_video_to_eight_frames_per_round_trip ... ok
+test delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.23s
+
+   Doc-tests latch_relay
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
