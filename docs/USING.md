@@ -132,20 +132,31 @@ use. A brief notice appears when the path changes, for example “UDP is losing
 17% of packets”, “UDP is blocked on this network”, or “UDP recovered”.
 Path changes keep the session and held input alive.
 
-Latch starts relay preparation after 250 ms without UDP packets and detects
-persistent video damage or a busy reduced-rate stream within a trailing
-one-second window. It measures UDP recovery while video stays on relay,
-starting after five seconds, including for requests above 40 Mbps. Repeated
-failures back off, and at most three measured returns to UDP occur per minute.
-If large UDP packets disappear while smaller ones arrive, Latch measures the
-working size and reduces video and input datagrams. The notice reports the
-selected size. Audio packets fit the smallest tested size.
+With media path policy negotiated, Latch prepares the relay after 350 ms
+without UDP. It lets congestion control adapt to a shared uplink limit.
+Persistent loss after reducing the actual UDP rate or queue-free policing
+can select the relay. Complete-frame stall and post-relay recovery timers
+allow for round-trip latency. A healthy distant path keeps UDP.
 
-Relay setup and frame stalls have deadlines. A relay close restores UDP
-and retries after 100 ms when UDP has not delivered a fresh picture. Three
-consecutive failed attempts wait thirty seconds. Setup failures wait two
-seconds between attempts. At a relay grant's time or
-traffic limit Latch briefly returns to UDP for fresh authorization. If neither
+After at least five seconds on relay, Latch tests UDP at a rate based on what
+the relay is delivering. The paced check shares the media budget, stops on
+loss or relay pressure, and uses under 2.9% duty. Further tests wait thirty
+and then sixty seconds after successful handoffs. Failed or cancelled checks
+wait sixty seconds. Three measured returns per rolling minute bound
+flapping. A return begins at the proven rate and adapts upward.
+
+For size-dependent UDP black holes, video and input use a measured smaller
+size. Audio shortens packets only when that measurement requires it. Stream
+performance reports the selected size. Route notices are coalesced, with
+initial classification, size changes, failed setup and grant renewal silent.
+
+A silently stalled relay is detected from video ACK progress after at least
+350 ms, allowing longer on high-latency paths. Fresh authorization or usable
+UDP restores media. Active failures have a 100 ms retry cooldown, recovery
+allows a UDP keyframe round trip, and three consecutive failures wait thirty
+seconds. Setup failures wait two seconds. A grant reaching its time or
+traffic allowance renews authorization. A session starts at most sixty
+relay grant attempts per rolling hour. If neither
 path can deliver usable video within the session's eight-second watchdog,
 the reconnect overlay appears. Local queue acceptance alone cannot establish
 remote delivery.

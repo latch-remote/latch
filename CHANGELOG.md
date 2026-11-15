@@ -79,18 +79,24 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Streaming and recovery
 
-- Prepare relay recovery after 250 ms without UDP and detect bursty damage
-  and busy UDP rate limits using a trailing feedback window. Keep repaired
-  loss on UDP and bound repeated path changes.
-- Reassess recovered UDP after five seconds, including 60 Mbps requests.
-  Preserve held input, virtual gamepads and sound across media handoffs.
+- Prepare relay recovery after 350 ms without UDP. Distinguish persistent
+  UDP damage from shared-uplink congestion and use RTT-relative recovery
+  timers. Detect silent relay ACK stalls before the hard transport deadline.
+- Reassess UDP after five seconds using paced, ramped checks sized from
+  actual relay delivery and sharing its congestion budget. Start returned UDP
+  at its measured rate. Preserve held input, gamepads and sound.
 - Negotiate datagram-size tests and reduce video and input packet sizes for
-  path-MTU black holes. Keep audio packets within the tested size floor.
+  path-MTU black holes. Shorten audio packets only after measuring a smaller
+  MTU, preserving the previous packet rate on healthy paths.
 - Shorten active-relay retry and grant-renewal cooldowns to 100 ms. Recover
   priority backpressure through UDP and fresh relay authorization.
 - Show the media path, reason and elapsed time in Stream performance, with
   a brief notice when the path changes. Preserve protocol-1 compatibility
-  with 6.0.0 hosts and viewers.
+  with 6.0.0 hosts and viewers, including their original timers and handoffs.
+- Cancel cleared preparation triggers, reuse prepared grants within their
+  lifetime, back off repeated cancellations and cap grant starts at sixty
+  per session-hour. Coalesce path notices and expose typed carrier and reason
+  values for network-environment wiring.
 - Move relay quota persistence off the network loop and batch durable byte
   reservations so credited video and priority lanes keep running during disk flushes.
 

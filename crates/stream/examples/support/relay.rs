@@ -2,6 +2,9 @@
 use rustls::pki_types::{pem::PemObject, CertificateDer};
 
 pub fn relay(args: &[String]) -> anyhow::Result<Option<latch_relay::ClientConfig>> {
+    if args.iter().any(|arg| arg == "--no-relay") {
+        return Ok(None);
+    }
     let value = |name: &str| {
         args.windows(2)
             .find(|pair| pair[0] == name)
@@ -34,4 +37,14 @@ pub fn relay(args: &[String]) -> anyhow::Result<Option<latch_relay::ClientConfig
         config = config.with_tls_roots(roots)?;
     }
     Ok(Some(config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_opt_out_has_no_relay_configuration() {
+        assert!(relay(&["--no-relay".into()]).unwrap().is_none());
+    }
 }

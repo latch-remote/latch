@@ -14,7 +14,14 @@ pub fn proxy() -> (UdpSocket, TcpListener) {
 #[allow(dead_code)]
 pub fn host() -> (Arc<Server>, TcpListener) {
     ports::retry_bind(|| {
-        let server = Server::bind(0, Options::default())?;
+        // UDP fixtures must not inherit the production relay default.
+        let server = Server::bind(
+            0,
+            Options {
+                relay: None,
+                ..Options::default()
+            },
+        )?;
         let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, server.port()))?;
         Ok((server, tcp))
     })

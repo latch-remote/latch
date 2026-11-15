@@ -797,6 +797,11 @@ fn audio_packets_split_the_frame_evenly_and_always_fit() {
     }
     for (channels, samples) in [(1, 240), (2, 240), (6, 80), (8, 60)] {
         assert_eq!(audio_packet_samples(channels), samples, "{channels} ch");
+        assert_eq!(
+            audio_packet_samples_with_limit(channels, 1000),
+            samples,
+            "policy doubled the {channels}-channel packet rate"
+        );
         assert_eq!(audio::FRAME % samples, 0);
         assert!(
             latch_codec::audio::max_coded_len(channels, samples) <= latch_proto::audio::MAX_PAYLOAD

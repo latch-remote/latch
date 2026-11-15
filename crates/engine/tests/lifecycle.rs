@@ -43,6 +43,7 @@ fn preparation_stays_reserved_until_run_or_drop_and_takeover_waits_for_slow_undo
     let server = Server::bind(
         0,
         Options {
+            relay: None,
             prepare: Some(Box::new({
                 let active = active.clone();
                 move |req| {

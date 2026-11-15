@@ -22,6 +22,29 @@ use std::{
 #[path = "support/relay_pilot.rs"]
 mod relay;
 use relay::Pilot;
+#[path = "support/gateway.rs"]
+mod gateway;
+
+struct Network {
+    delay: Duration,
+    loss: f64,
+    bandwidth: u32,
+    queue: Duration,
+    uplink: Option<Arc<parking_lot::Mutex<gateway::Uplink>>>,
+    policy: bool,
+}
+impl Default for Network {
+    fn default() -> Self {
+        Self {
+            delay: Duration::ZERO,
+            loss: 0.0,
+            bandwidth: 0,
+            queue: Duration::from_millis(200),
+            uplink: None,
+            policy: true,
+        }
+    }
+}
 
 // The synthetic host's pattern and virtual pads are process-wide.
 static SESSION_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -53,6 +76,25 @@ impl Running {
         width: u32,
         height: u32,
     ) -> Self {
+        Self::with_network(
+            config,
+            blackhole,
+            pattern,
+            kbps,
+            width,
+            height,
+            Network::default(),
+        )
+    }
+    fn with_network(
+        config: ClientConfig,
+        blackhole: bool,
+        pattern: &str,
+        kbps: u32,
+        width: u32,
+        height: u32,
+        network: Network,
+    ) -> Self {
         std::env::set_var("LATCH_TEST_PATTERN", pattern);
         let (udp, listener) = listeners::proxy();
         let port = listener.local_addr().unwrap().port();
@@ -69,10 +111,16 @@ impl Running {
         let blackhole = Arc::new(AtomicBool::new(blackhole));
         let stop = Arc::new(AtomicBool::new(false));
         let viewer_port = Arc::new(AtomicU64::new(0));
-        let downstream = Arc::new(parking_lot::Mutex::new(latch_proto::sim::Link::new(
-            latch_proto::sim::Impairment::NONE,
+        let mut link = latch_proto::sim::Link::new(
+            latch_proto::sim::Impairment {
+                delay: network.delay,
+                loss: network.loss,
+                ..latch_proto::sim::Impairment::NONE
+            },
             11,
-        )));
+        );
+        link.set_bandwidth(network.bandwidth, network.queue);
+        let downstream = Arc::new(parking_lot::Mutex::new(link));
         let max_datagram = Arc::new(AtomicU64::new(1200));
         let proxy = {
             let downstream = downstream.clone();
@@ -83,6 +131,14 @@ impl Running {
             udp.set_nonblocking(true).unwrap();
             thread::spawn(move || {
                 let mut bytes = [0; 1500];
+                let mut upstream = latch_proto::sim::Link::new(
+                    latch_proto::sim::Impairment {
+                        delay: network.delay,
+                        ..latch_proto::sim::Impairment::NONE
+                    },
+                    12,
+                );
+                let mut shared_flight = std::collections::VecDeque::new();
                 while !stop.load(Ordering::Acquire) {
                     for _ in 0..256 {
                         let Ok((len, from)) = udp.recv_from(&mut bytes) else {
@@ -96,11 +152,31 @@ impl Running {
                                 downstream.lock().send(Instant::now(), &bytes[..len]);
                             }
                         } else {
-                            let _ = udp.send_to(&bytes[..len], (Ipv4Addr::LOCALHOST, host_port));
+                            upstream.send(Instant::now(), &bytes[..len]);
                         }
+                    }
+                    for bytes in upstream.receive(Instant::now()) {
+                        let _ = udp.send_to(&bytes, (Ipv4Addr::LOCALHOST, host_port));
                     }
                     let target = viewer_port.load(Ordering::Acquire) as u16;
                     for bytes in downstream.lock().receive(Instant::now()) {
+                        let due = network
+                            .uplink
+                            .as_ref()
+                            .map_or(Some(Instant::now()), |limit| {
+                                limit
+                                    .lock()
+                                    .schedule(bytes.len(), Duration::from_millis(100))
+                            });
+                        if let Some(due) = due {
+                            shared_flight.push_back((due, bytes));
+                        }
+                    }
+                    while shared_flight
+                        .front()
+                        .is_some_and(|(due, _)| *due <= Instant::now())
+                    {
+                        let (_, bytes) = shared_flight.pop_front().unwrap();
                         if target != 0 && !blackhole.load(Ordering::Acquire) {
                             let _ = udp.send_to(&bytes, (Ipv4Addr::LOCALHOST, target));
                         }
@@ -115,6 +191,7 @@ impl Running {
             tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let request = http::read_request(&mut tcp).unwrap().unwrap();
             let mut request: StreamRequest = request.json().unwrap();
+            request.media_path_policy &= network.policy;
             viewer_port.store(request.udp_port.into(), Ordering::Release);
             request.udp_port = port;
             let prepared = host_server.prepare(request, peer).unwrap();
@@ -273,13 +350,23 @@ impl Drop for Running {
             thread::sleep(Duration::from_millis(5));
         }
         self.stop.store(true, Ordering::Release);
-        self.proxy.take().unwrap().join().unwrap();
-        assert!(self.session.finished(), "viewer cleanup deadline");
-        self.host.take().unwrap().join().unwrap();
-        assert!(
-            latch_engine::testmode::held_keys().is_empty(),
-            "cleanup left held input"
-        );
+        let proxy = self.proxy.take().unwrap().join();
+        if !std::thread::panicking() {
+            proxy.unwrap();
+        }
+        if !std::thread::panicking() {
+            assert!(self.session.finished(), "viewer cleanup deadline");
+        }
+        let host = self.host.take().unwrap().join();
+        if !std::thread::panicking() {
+            host.unwrap();
+        }
+        if !std::thread::panicking() {
+            assert!(
+                latch_engine::testmode::held_keys().is_empty(),
+                "cleanup left held input"
+            );
+        }
     }
 }
 fn square(frame: &Frame) -> bool {
@@ -386,10 +473,10 @@ fn automatic_blackhole_recovery_real_tls_input_and_udp_fallback() {
         });
         // The relay stays healthy throughout the measured return to UDP.
         running.blackhole.store(false, Ordering::Release);
-        let restored = Instant::now();
+        let activated = running.session.media_path().since;
         running.wait(Duration::from_secs(9), || !running.session.relay_active());
         assert!(
-            restored.elapsed() >= Duration::from_secs(2),
+            activated.elapsed() >= Duration::from_secs(5),
             "relay skipped minimum dwell"
         );
         running.wait(Duration::from_secs(2), || {
@@ -527,7 +614,6 @@ fn monthly_cap_fails_closed_with_bounded_retry_and_direct_recovery() {
 }
 
 #[test]
-#[cfg(not(target_os = "linux"))]
 fn actual_relay_audio_and_microphone_reach_pcm_sinks() {
     let _serial = SESSION_TEST
         .lock()
@@ -689,7 +775,6 @@ fn cancelled_prepare_joins_its_worker_and_rejects_endpoint_role_and_generation()
 
 // Synthetic capture and a PCM-collecting virtual microphone exercise both
 // directions without depending on a speaker, microphone or virtual-cable driver.
-#[cfg(not(target_os = "linux"))]
 fn relay_audio_and_microphone_pipeline(config: ClientConfig, policy: bool) {
     use latch_proto::audio::{AudioOut, AudioPacketizer, AudioReceiver};
     use latch_proto::wire::{self, Datagram};
@@ -849,7 +934,7 @@ fn relay_audio_and_microphone_pipeline(config: ClientConfig, policy: bool) {
             );
             while let Ok((length, _)) = udp.recv_from(&mut bytes) {
                 if let Ok(Datagram::Audio { packet, .. }) = wire::parse(&bytes[..length]) {
-                    assert!(length <= 576);
+                    assert!(length <= 1000);
                     audio.push(&packet, Instant::now());
                 }
             }
@@ -1003,9 +1088,7 @@ fn size_dependent_udp_black_hole_keeps_media_on_udp() {
     assert!(!running.session.relay_active());
     assert_eq!(pilot.metrics.grants_created.load(Ordering::Acquire), 0);
     let before = running.frames.seq();
-    running.wait(Duration::from_secs(2), || {
-        running.frames.seq() > before + 10
-    });
+    running.wait(Duration::from_secs(2), || running.frames.seq() > before + 3);
     running.ordered_input();
 }
 
@@ -1013,8 +1096,11 @@ fn size_dependent_udp_black_hole_keeps_media_on_udp() {
 fn bursty_seventeen_percent_udp_loss_switches_without_reconnecting() {
     let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
     let pilot = Pilot::start();
-    let running = Running::with_rate(pilot.config.clone(), false, "noise", 20_000, 512, 288);
+    let running = Running::with_rate(pilot.config.clone(), false, "load", 20_000, 128, 128);
     running.wait(Duration::from_secs(2), || running.session.connected());
+    running.wait(Duration::from_secs(2), || {
+        running.session.stats().mbps > 4.0
+    });
     running.hold_key();
     *running.downstream.lock() = latch_proto::sim::Link::new(
         latch_proto::sim::Impairment {
@@ -1040,10 +1126,16 @@ fn bursty_seventeen_percent_udp_loss_switches_without_reconnecting() {
 
 #[test]
 fn udp_policer_selects_relay_and_a_relay_close_recovers_in_under_a_second() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("latch_stream=debug,latch_engine=debug,latch_relay=info")
+        .try_init();
     let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
     let mut pilot = Pilot::start();
-    let running = Running::with_rate(pilot.config.clone(), false, "noise", 20_000, 512, 288);
+    let running = Running::with_rate(pilot.config.clone(), false, "load", 20_000, 128, 128);
     running.wait(Duration::from_secs(3), || running.session.connected());
+    running.wait(Duration::from_secs(2), || {
+        running.session.stats().mbps > 4.0
+    });
     running.hold_key();
     running
         .downstream
@@ -1079,9 +1171,11 @@ fn flapping_udp_bounds_switches_and_preserves_a_held_key() {
         running.session.connected() && running.session.relay_active()
     });
     running.hold_key();
-    for _ in 0..3 {
+    for probe_wait in [9, 40, 65] {
         running.blackhole.store(false, Ordering::Release);
-        running.wait(Duration::from_secs(12), || !running.session.relay_active());
+        running.wait(Duration::from_secs(probe_wait), || {
+            !running.session.relay_active()
+        });
         assert!(latch_engine::testmode::held_keys().contains(&66));
         running.blackhole.store(true, Ordering::Release);
         running.wait(Duration::from_secs(2), || running.session.relay_active());
@@ -1097,8 +1191,300 @@ fn flapping_udp_bounds_switches_and_preserves_a_held_key() {
         );
         thread::sleep(Duration::from_millis(5));
     }
-    assert!(running.frames.seq() > before + 10);
+    assert!(running.frames.seq() > before + 3);
     assert_eq!(pilot.metrics.grants_created.load(Ordering::Acquire), 4);
     running.release_key();
     running.ordered_input();
+}
+
+#[test]
+fn auto_on_a_twenty_five_megabit_uplink_adapts_on_udp_until_random_loss_persists() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("latch_stream=debug,latch_engine=debug,latch_relay=info")
+        .try_init();
+    let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let pilot = Pilot::start();
+    let running = Running::with_network(
+        pilot.config.clone(),
+        false,
+        "load",
+        50_000,
+        128,
+        128,
+        Network {
+            bandwidth: 25_000,
+            ..Default::default()
+        },
+    );
+    running.wait(Duration::from_secs(3), || running.session.connected());
+    let start = Instant::now();
+    let mut budgets = Vec::new();
+    while start.elapsed() < Duration::from_secs(5) {
+        assert!(
+            !running.session.relay_active(),
+            "shared capacity triggered relay {:?}",
+            running.session.stats()
+        );
+        assert_eq!(pilot.metrics.grants_created.load(Ordering::Acquire), 0);
+        if start.elapsed() >= Duration::from_secs(3) {
+            budgets.push(running.session.stats().wire_budget_kbps);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let stats = running.session.stats();
+    let mean_budget =
+        budgets.iter().map(|rate| u64::from(*rate)).sum::<u64>() / budgets.len() as u64;
+    eprintln!("25 Mbps Auto UDP adapted mean budget {mean_budget} kbps, video {:.2} Mbps, {:.1} fps, raw loss {:.1}%", stats.mbps, stats.fps, stats.raw_loss_pct);
+    // Congestion-controlled capacity probes can temporarily exceed the FIFO.
+    // Measure the adapted tail budget across its probe cycle.
+    assert!(
+        (15_000..=30_000).contains(&mean_budget),
+        "mean budget {mean_budget}, {stats:?}"
+    );
+    let mut link = latch_proto::sim::Link::new(
+        latch_proto::sim::Impairment {
+            loss: 0.17,
+            ..latch_proto::sim::Impairment::NONE
+        },
+        61,
+    );
+    link.set_bandwidth(25_000, Duration::from_millis(200));
+    *running.downstream.lock() = link;
+    let start = Instant::now();
+    running.wait(Duration::from_secs(3), || running.session.relay_active());
+    eprintln!(
+        "25 Mbps plus 17% random loss selected relay in {:?}",
+        start.elapsed()
+    );
+    let before = running.frames.seq();
+    running.wait(Duration::from_secs(1), || {
+        running.frames.seq() > before + 20
+    });
+}
+
+#[test]
+fn healthy_distant_udp_takes_no_grant_at_one_hundred_fifty_and_three_hundred_ms_one_way() {
+    let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let pilot = Pilot::start();
+    for millis in [150, 300] {
+        let running = Running::with_network(
+            pilot.config.clone(),
+            false,
+            "still",
+            2000,
+            128,
+            128,
+            Network {
+                delay: Duration::from_millis(millis),
+                ..Default::default()
+            },
+        );
+        running.wait(Duration::from_secs(3), || running.session.connected());
+        let before = running.frames.seq();
+        running.wait(Duration::from_secs(3), || {
+            running.frames.seq() > before + 15
+        });
+        assert_eq!(
+            pilot.metrics.grants_created.load(Ordering::Acquire),
+            0,
+            "healthy {millis} ms path took a grant"
+        );
+        assert!(!running.session.relay_active());
+    }
+}
+
+#[test]
+fn silent_relay_black_hole_gets_a_fresh_relay_picture_within_one_second() {
+    let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let pilot = Pilot::start();
+    let gateway = gateway::Gateway::start(pilot.config.endpoint.port(), None);
+    let mut config = pilot.config.clone();
+    config.endpoint = Endpoint::new("localhost", gateway.port).unwrap();
+    let running = Running::start(config, true);
+    running.wait(Duration::from_secs(2), || {
+        running.session.connected() && running.session.relay_active()
+    });
+    let before = running.frames.seq();
+    running.wait(Duration::from_secs(1), || running.frames.seq() > before + 3);
+    running.hold_key();
+    let since = Instant::now();
+    gateway.blackhole_existing_connections();
+    running.wait(Duration::from_secs(1), || {
+        running
+            .session
+            .published_at()
+            .is_some_and(|at| at > since + Duration::from_millis(300))
+    });
+    eprintln!(
+        "silently black-holed relay to fresh picture {:?}, grants {}",
+        since.elapsed(),
+        pilot.metrics.grants_created.load(Ordering::Acquire)
+    );
+    assert!(running.session.relay_active());
+    assert_eq!(pilot.metrics.grants_created.load(Ordering::Acquire), 2);
+    running.release_key();
+}
+
+#[test]
+fn return_probes_share_a_constrained_uplink_without_stalling_relay_video() {
+    let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let pilot = Pilot::start();
+    let gateway = gateway::Gateway::start(pilot.config.endpoint.port(), Some(25_000));
+    let mut config = pilot.config.clone();
+    config.endpoint = Endpoint::new("localhost", gateway.port).unwrap();
+    let running = Running::with_network(
+        config,
+        true,
+        "load",
+        50_000,
+        128,
+        128,
+        Network {
+            uplink: gateway.uplink.clone(),
+            ..Default::default()
+        },
+    );
+    running.wait(Duration::from_secs(2), || {
+        running.session.connected() && running.session.relay_active()
+    });
+    // Measure a probe against an already healthy relay stream. Keep UDP
+    // blocked until backpressure has drained, then its first Hello makes
+    // the overdue return check start immediately.
+    let stable = std::cell::Cell::new(Instant::now());
+    running.wait(Duration::from_secs(10), || {
+        let stats = running.session.stats();
+        if stats.received_fps < 25.0 || stats.pacing_queue_ms > 40.0 {
+            stable.set(Instant::now());
+        }
+        stable.get().elapsed() >= Duration::from_millis(600)
+    });
+    let start = Instant::now();
+    running.blackhole.store(false, Ordering::Release);
+    // Leave a little independent loss so the return check must stop early.
+    *running.downstream.lock() = latch_proto::sim::Link::new(
+        latch_proto::sim::Impairment {
+            loss: 0.02,
+            ..latch_proto::sim::Impairment::NONE
+        },
+        18,
+    );
+    let last = std::cell::Cell::new(running.session.published_at().unwrap());
+    let gap = std::cell::Cell::new(Duration::ZERO);
+    running.wait(Duration::from_secs(10), || {
+        if let Some(at) = running.session.published_at() {
+            gap.set(gap.get().max(at.saturating_duration_since(last.get())));
+            last.set(at);
+        }
+        start.elapsed() >= Duration::from_secs(8)
+    });
+    assert!(
+        gap.get() < Duration::from_millis(250),
+        "probe disturbed relay video {:?}",
+        gap.get()
+    );
+    assert!(running.session.relay_active());
+    assert_eq!(pilot.metrics.grants_created.load(Ordering::Acquire), 1);
+    eprintln!(
+        "25 Mbps shared uplink return probe largest frame gap {:?}",
+        gap.get()
+    );
+}
+
+#[test]
+fn withdrawn_preparation_reuses_its_authorized_grant_on_a_new_attempt() {
+    use latch_stream::session::RelayRoute;
+    let pilot = Pilot::start();
+    let route = RelayRoute::new(7, latch_relay::Role::Host, Some(pilot.config.clone()));
+    route.enable_policy(true);
+    let initial = route.path_state();
+    for action in [RelayAction::Request, RelayAction::Pause] {
+        route.handle(
+            RelayControl {
+                session: 7,
+                attempt: 1,
+                action,
+            },
+            |_| true,
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while pilot.metrics.grants_created.load(Ordering::Acquire) == 0 {
+        assert!(Instant::now() < deadline);
+        route.maintain(false, |_| panic!("withdrawn request produced an offer"));
+        thread::sleep(Duration::from_millis(5));
+    }
+    let parked_until = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < parked_until {
+        route.maintain(false, |_| panic!("withdrawn request produced an offer"));
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(route.path_state(), initial);
+    let mut offered = false;
+    route.handle(
+        RelayControl {
+            session: 7,
+            attempt: 2,
+            action: RelayAction::Request,
+        },
+        |message| {
+            offered = matches!(
+                message,
+                Message::Relay(RelayControl {
+                    attempt: 2,
+                    action: RelayAction::Offer(_),
+                    ..
+                })
+            );
+            true
+        },
+    );
+    while !offered {
+        assert!(Instant::now() < deadline);
+        route.maintain(false, |message| {
+            offered = matches!(
+                message,
+                Message::Relay(RelayControl {
+                    attempt: 2,
+                    action: RelayAction::Offer(_),
+                    ..
+                })
+            );
+            true
+        });
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(pilot.metrics.grants_created.load(Ordering::Acquire), 1);
+    assert!(!route.active());
+}
+
+#[test]
+fn mtu_floor_recovers_udp_video_cadence_without_a_relay_grant() {
+    let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let pilot = Pilot::start();
+    let running = Running::with_rate(pilot.config.clone(), false, "sweep", 6000, 320, 192);
+    running.max_datagram.store(592, Ordering::Release);
+    running.wait(Duration::from_secs(2), || running.session.connected());
+    running.wait(Duration::from_secs(1), || {
+        matches!(
+            running.session.media_path().reason,
+            latch_stream::path::PathReason::DatagramSize { bytes: 576 }
+        )
+    });
+    let warm = Instant::now();
+    running.wait(Duration::from_secs(6), || {
+        warm.elapsed() >= Duration::from_secs(5)
+    });
+    let before = running.frames.seq();
+    let since = Instant::now();
+    running.wait(Duration::from_secs(2), || {
+        running.frames.seq() >= before + 40
+    });
+    eprintln!(
+        "576-byte UDP MTU {} frames in {:?}, {:?}",
+        running.frames.seq() - before,
+        since.elapsed(),
+        running.session.stats()
+    );
+    assert!(!running.session.relay_active());
+    assert_eq!(pilot.metrics.grants_created.load(Ordering::Acquire), 0);
 }

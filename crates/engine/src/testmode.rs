@@ -1,4 +1,4 @@
-//! `LATCH_TEST_PATTERN=still|sweep|noise` makes the engine stream the
+//! `LATCH_TEST_PATTERN=still|sweep|noise|load` makes the engine stream the
 //! synthetic desktop of [`crate::pattern`] instead of the screen, and feed
 //! it the viewer's input. A host in this mode needs no screen, permission
 //! or GPU, so a whole session can be checked anywhere: known pixels arrive,
@@ -48,6 +48,7 @@ pub fn motion() -> Option<Motion> {
         "still" => Some(Motion::Still),
         "sweep" => Some(Motion::Sweep),
         "noise" => Some(Motion::Noise),
+        "load" => Some(Motion::Sweep),
         _ => None,
     }
 }
@@ -83,7 +84,58 @@ pub fn open_video(config: &VideoConfig, motion: Motion) -> anyhow::Result<Box<dy
             }),
         )?));
     }
-    Ok(Box::new(SoftwarePipeline::new(shared, config)?))
+    let pipeline = Box::new(SoftwarePipeline::new(shared, config)?);
+    if std::env::var("LATCH_TEST_PATTERN").is_ok_and(|value| value == "load") {
+        return Ok(Box::new(LoadPattern {
+            pipeline,
+            kbps: config.bitrate_kbps,
+            fps: config.fps,
+        }));
+    }
+    Ok(pipeline)
+}
+
+/// A cheap real H.264 picture plus standards-defined filler NAL units fills
+/// the encoder target. Network capacity tests stay independent of CPU speed.
+struct LoadPattern {
+    pipeline: Box<dyn VideoPipeline>,
+    kbps: u32,
+    fps: u32,
+}
+impl VideoPipeline for LoadPattern {
+    fn info(&self) -> crate::video::VideoInfo {
+        self.pipeline.info()
+    }
+    fn next(
+        &mut self,
+        keyframe: bool,
+        idle: Duration,
+    ) -> anyhow::Result<crate::video::EncodedVideo> {
+        let mut frame = self.pipeline.next(keyframe, idle)?;
+        let bytes = (u64::from(self.kbps) * 1000 / 8 / u64::from(self.fps.max(1))) as usize;
+        if frame.data.len() + 6 < bytes {
+            frame.data.extend_from_slice(&[0, 0, 0, 1, 12]);
+            frame.data.resize(bytes - 1, 0xff);
+            frame.data.push(0x80);
+        }
+        Ok(frame)
+    }
+    fn set_bitrate(&mut self, kbps: u32) {
+        self.kbps = kbps;
+        self.pipeline.set_bitrate(kbps);
+    }
+    fn recovers(&self) -> bool {
+        self.pipeline.recovers()
+    }
+    fn recover_from(&mut self, picture: u64) -> bool {
+        self.pipeline.recover_from(picture)
+    }
+    fn set_cursor_drawn(&mut self, drawn: bool) -> bool {
+        self.pipeline.set_cursor_drawn(drawn)
+    }
+    fn take_cursor(&mut self) -> Option<crate::video::CursorUpdate> {
+        self.pipeline.take_cursor()
+    }
 }
 
 pub fn open_input() -> anyhow::Result<Box<dyn InputSink>> {

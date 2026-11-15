@@ -20,33 +20,86 @@ pub enum MediaPath {
     LatchRelay,
 }
 
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carrier {
+    Native,
+    Tls,
+    WebSocket,
+    HttpConnect,
+}
+
+impl Carrier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Tls => "tls",
+            Self::WebSocket => "websocket",
+            Self::HttpConnect => "http-connect",
+        }
+    }
+}
+
+impl std::fmt::Display for Carrier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Native => "Native",
+            Self::Tls => "TLS",
+            Self::WebSocket => "WebSocket",
+            Self::HttpConnect => "HTTP CONNECT",
+        })
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayFailure {
+    Closed,
+    Stalled,
+    Backpressure,
+    Preparation,
+}
+
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathReason {
     Initial,
     UdpBlocked,
     UdpStalled,
-    UdpLoss {
-        percent: u8,
-    },
-    UdpFrameLoss {
-        percent: u8,
-    },
-    UdpLimited {
-        kbps: u32,
-    },
+    UdpLoss { percent: u8 },
+    UdpFrameLoss { percent: u8 },
+    UdpLimited { kbps: u32 },
     UdpRecovered,
-    DatagramSize {
-        bytes: u16,
-    },
-    RelayUnavailable(String),
-    /// Carrier/proxy/captive-portal/TLS diagnostics supplied by future wiring.
-    Environment {
-        code: String,
-        detail: String,
-    },
+    DatagramSize { bytes: u16 },
+    RelayUnavailable(RelayFailure),
+    RelayRenewal,
+    CaptivePortal,
+    TlsInterception,
+    ProxyAuth,
 }
 
 impl PathReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::UdpBlocked => "udp-blocked",
+            Self::UdpStalled => "udp-stalled",
+            Self::UdpLoss { .. } => "udp-loss",
+            Self::UdpFrameLoss { .. } => "udp-frame-loss",
+            Self::UdpLimited { .. } => "udp-limited",
+            Self::UdpRecovered => "udp-recovered",
+            Self::DatagramSize { .. } => "datagram-size",
+            Self::RelayUnavailable(RelayFailure::Closed) => "relay-closed",
+            Self::RelayUnavailable(RelayFailure::Stalled) => "relay-stalled",
+            Self::RelayUnavailable(RelayFailure::Backpressure) => "relay-backpressure",
+            Self::RelayUnavailable(RelayFailure::Preparation) => "relay-preparation",
+            Self::RelayRenewal => "relay-renewal",
+            Self::CaptivePortal => "captive-portal",
+            Self::TlsInterception => "tls-interception",
+            Self::ProxyAuth => "proxy-auth",
+        }
+    }
+
     pub fn description(&self) -> String {
         match self {
             Self::Initial => "Media uses Tailscale UDP".into(),
@@ -61,9 +114,18 @@ impl PathReason {
                 )
             }
             Self::UdpRecovered => "UDP recovered".into(),
-            Self::DatagramSize { bytes } => format!("UDP recovered with {bytes}-byte datagrams"),
-            Self::RelayUnavailable(detail) => format!("Latch relay unavailable. {detail}"),
-            Self::Environment { detail, .. } => detail.clone(),
+            Self::DatagramSize { bytes } => format!("UDP uses {bytes}-byte datagrams"),
+            Self::RelayUnavailable(failure) => match failure {
+                RelayFailure::Closed => "The relay connection closed",
+                RelayFailure::Stalled => "The relay stopped acknowledging video",
+                RelayFailure::Backpressure => "The relay priority queue filled",
+                RelayFailure::Preparation => "The relay could not connect",
+            }
+            .into(),
+            Self::RelayRenewal => "Renewing the relay connection".into(),
+            Self::CaptivePortal => "This network requires a browser sign-in".into(),
+            Self::TlsInterception => "This network intercepts TLS connections".into(),
+            Self::ProxyAuth => "The network proxy requires authentication".into(),
         }
     }
 }
@@ -72,9 +134,61 @@ impl PathReason {
 pub struct MediaPathState {
     pub path: MediaPath,
     pub reason: PathReason,
-    /// Carrier display name. Transport wiring may supply another negotiated name.
-    pub carrier: Option<String>,
+    pub carrier: Option<Carrier>,
     pub since: Instant,
+}
+
+/// Only committed media changes reach the notice stream. Diagnostic refinement
+/// stays available through media_path(), and flapping coalesces to the latest state.
+pub(crate) struct PathNotices {
+    previous: MediaPathState,
+    last_notice: Option<Instant>,
+    pending: Option<MediaPathState>,
+}
+
+impl PathNotices {
+    pub(crate) fn new(previous: MediaPathState) -> Self {
+        Self {
+            previous,
+            last_notice: None,
+            pending: None,
+        }
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        current: MediaPathState,
+        now: Instant,
+    ) -> Option<MediaPathState> {
+        let changed_carrier = matches!(self.previous.path, MediaPath::LatchRelay)
+            != matches!(current.path, MediaPath::LatchRelay);
+        let changed_reason = self.previous.reason.as_str() != current.reason.as_str()
+            && matches!(
+                current.reason,
+                PathReason::CaptivePortal | PathReason::TlsInterception | PathReason::ProxyAuth
+            );
+        if current.reason == PathReason::RelayRenewal {
+            self.pending = None;
+        } else if (changed_carrier || changed_reason)
+            && !(self.previous.reason == PathReason::RelayRenewal
+                && matches!(current.path, MediaPath::LatchRelay))
+        {
+            self.pending = Some(current.clone());
+        }
+        if self.pending.is_some() {
+            self.pending = Some(current.clone());
+        }
+        self.previous = current;
+        if self
+            .last_notice
+            .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(20))
+        {
+            return None;
+        }
+        let notice = self.pending.take()?;
+        self.last_notice = Some(now);
+        Some(notice)
+    }
 }
 
 impl Default for MediaPathState {
@@ -104,6 +218,7 @@ impl Policy {
         bandwidth_limited: bool,
         fec_limited: bool,
         budget: u32,
+        udp_damage: bool,
     ) -> Option<PathReason> {
         self.windows
             .push_back((now, report, bandwidth_limited, fec_limited));
@@ -141,7 +256,7 @@ impl Policy {
                 limited += ms;
             }
         }
-        if duration < 800 {
+        if duration < 800 || !udp_damage {
             return None;
         }
         if limited * 4 >= duration * 3 {
@@ -213,7 +328,7 @@ impl MtuProbe {
             .early
             .take()
             .filter(|(at, _)| {
-                serial == self.serial.wrapping_add(1)
+                serial == (self.serial.wrapping_add(1) | 0x8000)
                     && now.saturating_duration_since(*at) <= MTU_EARLY_WINDOW
             })
             .map_or([0; 4], |(_, received)| received);
@@ -232,7 +347,7 @@ impl MtuProbe {
         mut datagram: impl FnMut(&[u8]),
     ) -> bool {
         if now >= self.next {
-            self.start(self.serial.wrapping_add(1), now);
+            self.start(self.serial.wrapping_add(1) | 0x8000, now);
             self.next = now + MTU_INTERVAL;
             if !control(PathAction::MtuProbe {
                 serial: self.serial,
@@ -252,7 +367,7 @@ impl MtuProbe {
                     session,
                     self.serial,
                     index as u8 * 3 + self.rounds,
-                    16,
+                    12,
                     *size,
                 );
                 datagram(&bytes);
@@ -262,11 +377,11 @@ impl MtuProbe {
         true
     }
 
-    pub fn observe(&mut self, datagram: &Datagram<'_>) -> bool {
+    pub fn observe(&mut self, datagram: &Datagram<'_>, now: Instant) -> bool {
         if let Datagram::Probe {
             train,
             index,
-            count: 16,
+            count: 12,
             len,
             ..
         } = datagram
@@ -279,8 +394,7 @@ impl MtuProbe {
                 }
                 // UDP can beat its TCP announcement. Cache only the next serial,
                 // and leave unannounced positions available to other probe meters.
-                if *train == self.serial.wrapping_add(1) {
-                    let now = Instant::now();
+                if *train == (self.serial.wrapping_add(1) | 0x8000) {
                     let (at, received) = self.early.get_or_insert((now, [0; 4]));
                     if now.saturating_duration_since(*at) > MTU_EARLY_WINDOW {
                         *at = now;
@@ -327,6 +441,107 @@ mod tests {
     use super::*;
 
     #[test]
+    fn capacity_limiting_and_congestion_loss_need_independent_udp_damage_evidence() {
+        let start = Instant::now();
+        let mut policy = Policy::default();
+        for tick in 0..200 {
+            assert_eq!(
+                policy.observe(
+                    start + Duration::from_millis(tick * 50),
+                    Report {
+                        window_ms: 50,
+                        fps: 60.0,
+                        loss_pct: 25.0,
+                        frames_lost: 3,
+                        unrecovered_loss_pct: Some(20.0),
+                        ..Default::default()
+                    },
+                    true,
+                    true,
+                    22_000,
+                    false
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn notices_ignore_startup_refinement_failed_preparation_mtu_and_renewal_and_coalesce_flapping()
+    {
+        let now = Instant::now();
+        let mut state = MediaPathState::default();
+        let mut notices = PathNotices::new(state.clone());
+        state.path = MediaPath::TailscaleUdp(UdpPath::Direct);
+        assert!(notices.observe(state.clone(), now).is_none());
+        state.reason = PathReason::DatagramSize { bytes: 800 };
+        assert!(notices.observe(state.clone(), now).is_none());
+        // Failed preparation leaves the state untouched.
+        assert!(notices.observe(state.clone(), now).is_none());
+        state.path = MediaPath::LatchRelay;
+        state.reason = PathReason::UdpBlocked;
+        assert_eq!(notices.observe(state.clone(), now), Some(state.clone()));
+        state.path = MediaPath::TailscaleUdp(UdpPath::Direct);
+        state.reason = PathReason::RelayRenewal;
+        assert!(notices
+            .observe(state.clone(), now + Duration::from_secs(1))
+            .is_none());
+        state.path = MediaPath::LatchRelay;
+        state.reason = PathReason::UdpBlocked;
+        assert!(notices
+            .observe(state.clone(), now + Duration::from_secs(2))
+            .is_none());
+        assert!(notices
+            .observe(state.clone(), now + Duration::from_secs(20))
+            .is_none());
+        state.path = MediaPath::TailscaleUdp(UdpPath::Direct);
+        state.reason = PathReason::UdpRecovered;
+        assert!(notices
+            .observe(state.clone(), now + Duration::from_secs(21))
+            .is_some());
+        state.path = MediaPath::LatchRelay;
+        state.reason = PathReason::UdpLoss { percent: 17 };
+        assert!(notices
+            .observe(state.clone(), now + Duration::from_secs(22))
+            .is_none());
+        state.reason = PathReason::UdpLoss { percent: 18 };
+        assert!(notices
+            .observe(state.clone(), now + Duration::from_secs(23))
+            .is_none());
+        assert!(notices
+            .observe(state.clone(), now + Duration::from_secs(41))
+            .is_some());
+        state.reason = PathReason::CaptivePortal;
+        assert!(notices
+            .observe(state.clone(), now + Duration::from_secs(42))
+            .is_none());
+        assert_eq!(
+            notices.observe(state.clone(), now + Duration::from_secs(61)),
+            Some(state)
+        );
+    }
+
+    #[test]
+    fn typed_path_extensions_have_stable_machine_strings_and_plain_descriptions() {
+        assert_eq!(Carrier::Native.as_str(), "native");
+        assert_eq!(Carrier::Tls.as_str(), "tls");
+        assert_eq!(Carrier::WebSocket.as_str(), "websocket");
+        assert_eq!(Carrier::HttpConnect.as_str(), "http-connect");
+        for (reason, code) in [
+            (PathReason::CaptivePortal, "captive-portal"),
+            (PathReason::TlsInterception, "tls-interception"),
+            (PathReason::ProxyAuth, "proxy-auth"),
+        ] {
+            assert_eq!(reason.as_str(), code);
+            assert!(!reason.description().is_empty());
+        }
+        assert_eq!(
+            PathReason::DatagramSize { bytes: 800 }.description(),
+            "UDP uses 800-byte datagrams"
+        );
+    }
+
+    #[test]
     fn intermittent_damage_accumulates_but_repaired_loss_keeps_udp() {
         for loss in [15.0, 17.0, 18.0] {
             for repaired in [false, true] {
@@ -347,6 +562,7 @@ mod tests {
                         false,
                         false,
                         20_000,
+                        true,
                     );
                     if selected.is_some() {
                         break;
@@ -381,6 +597,7 @@ mod tests {
                 true,
                 false,
                 3000,
+                true,
             );
             assert_eq!(
                 reason,
@@ -418,13 +635,13 @@ mod tests {
                     7,
                     serial,
                     index as u8 * 3 + round as u8,
-                    16,
+                    12,
                     *size,
                 );
                 if *size <= 850 {
                     let datagram = wire::parse(&bytes).unwrap();
-                    assert!(viewer.observe(&datagram));
-                    assert!(viewer.observe(&datagram));
+                    assert!(viewer.observe(&datagram, start));
+                    assert!(viewer.observe(&datagram, start));
                 }
             }
         }
@@ -457,6 +674,7 @@ mod tests {
                     false,
                     low_quality,
                     20_000,
+                    true,
                 );
             }
             assert_eq!(
@@ -480,12 +698,12 @@ mod tests {
                             7,
                             0x8001,
                             index as u8 * 3 + round,
-                            16,
+                            12,
                             *size,
                         );
                         let datagram = wire::parse(&bytes).unwrap();
-                        assert!(!viewer.observe(&datagram));
-                        assert!(!viewer.observe(&datagram));
+                        assert!(!viewer.observe(&datagram, start));
+                        assert!(!viewer.observe(&datagram, start));
                     }
                 }
             }
@@ -525,6 +743,7 @@ mod tests {
                 false,
                 false,
                 20_000,
+                true,
             );
         }
         assert_eq!(reason, Some(PathReason::UdpLoss { percent: 17 }));
@@ -549,6 +768,7 @@ mod tests {
                 false,
                 false,
                 20_000,
+                true,
             );
         }
         assert_eq!(reason, None);

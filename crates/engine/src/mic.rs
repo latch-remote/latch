@@ -31,16 +31,15 @@ pub struct MicOut {
 /// own for this system.
 pub type MicOpener = Box<dyn Fn(&AudioFormat) -> anyhow::Result<MicOut> + Send + Sync>;
 
-/// A player for a viewer's microphone: this system's own, else `opener`'s.
+/// A player for a viewer's microphone, using an injected opener when present.
 pub fn open(opener: Option<&MicOpener>) -> anyhow::Result<MicOut> {
+    if let Some(open) = opener {
+        return open(&format());
+    }
     #[cfg(target_os = "linux")]
     {
-        let _ = opener;
         crate::linux::open_mic(&format())
     }
     #[cfg(not(target_os = "linux"))]
-    match opener {
-        Some(open) => open(&format()),
-        None => anyhow::bail!("this host cannot play a microphone"),
-    }
+    anyhow::bail!("this host cannot play a microphone")
 }

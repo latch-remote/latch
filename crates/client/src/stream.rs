@@ -1136,13 +1136,13 @@ impl View {
                             }
                             if !overflow {
                                 let state = live.session.media_path();
-                                let route = match &state.path {
-                                    latch_stream::path::MediaPath::LatchRelay => "Latch relay",
-                                    latch_stream::path::MediaPath::TailscaleUdp(_) => {
-                                        "Tailscale UDP"
+                                let route = match state.path {
+                                    latch_stream::path::MediaPath::LatchRelay => {
+                                        path.media_label(&state)
                                     }
+                                    latch_stream::path::MediaPath::TailscaleUdp(_) => path.label(),
                                 };
-                                ui::tag(ui, Some(path.media_tone(&state)), route).on_hover_text(
+                                ui::tag(ui, Some(path.media_tone(&state)), &route).on_hover_text(
                                     format!(
                                         "{}. {}",
                                         path.media_label(&state),

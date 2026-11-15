@@ -460,6 +460,27 @@ add rule inet lab impairment iifname "viewer" drop''')
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=3)
 
+    def qualify_udp_loss(self):
+        # Fast relay recovery ends UDP exposure before a representative loss
+        # sample exists. Qualify the same qdisc with a real decoded UDP stream.
+        duration = SCENARIOS["d1"][1]
+        viewer = self.spawn("v", "loss-qualification", [
+            ROOT / "target/debug/examples/view", "100.64.0.1", "--no-relay",
+            "--width", "640", "--height", "360", "--fps", "30", "--kbps", "6000",
+            "--seconds", duration, "--events", self.output / "loss-qualification.jsonl"],
+            {"RUST_LOG": "warn"})
+        if viewer.wait(timeout=duration + 12):
+            raise RuntimeError("UDP loss qualification stream failed")
+        events = read_events(self.output / "loss-qualification.jsonl")
+        if not any(event.get("kind") == "sample" and event.get("decoded_seq", 0) > 0 for event in events):
+            raise RuntimeError("UDP loss qualification decoded no real media")
+        # Path/relay evidence and quality timings belong to the fresh session.
+        # Keep qdisc counters, including the qualified real media sample.
+        for role in ("c", "i"):
+            self.ns(role, "nft", "reset", "counters", "table", "inet", "lab")
+        for role in ("h", "v"):
+            self.ns(role, "nft", "reset", "counters", "table", "inet", "media")
+
     def execute(self):
         self.topology()
         self.certificate("relay", "relay.netlab.test")
@@ -500,6 +521,8 @@ add rule inet lab impairment iifname "viewer" drop''')
         self.spawn("h", "host", [ROOT / "target/debug/examples/serve", "--bind", "100.64.0.1", "--telemetry", *common],
                    {"LATCH_TEST_PATTERN": "noise" if self.scenario in ("d1", "d2") else "sweep", "LATCH_TEST_AUDIO": "clicks", "LATCH_LINUX_ENCODER": "software", "RUST_LOG": "info"})
         self.ready("host", "serving on")
+        if self.scenario == "d1":
+            self.qualify_udp_loss()
         duration = SCENARIOS[self.scenario][1]
         self.started = time.monotonic()
         viewer = self.spawn("v", "viewer", [ROOT / "target/debug/examples/view", "100.64.0.1",

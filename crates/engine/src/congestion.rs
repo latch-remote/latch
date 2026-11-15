@@ -40,6 +40,12 @@ impl RelayController {
         }
     }
 
+    pub(crate) fn at_rate(ceiling: u32, kbps: u32, now: Instant) -> Self {
+        let mut controller = Self::new(ceiling, now);
+        controller.budget = kbps.clamp(ceiling.min(1000), ceiling);
+        controller
+    }
+
     pub(crate) fn budget(&self) -> u32 {
         self.budget
     }
@@ -157,9 +163,22 @@ pub(crate) struct Controller {
     random_until: Instant,
     policer_until: Instant,
     random_floor: Option<f32>,
+    udp_damage: bool,
+    media_path_policy: bool,
+    random_damage_until: Instant,
+    policer_rtt_ms: Option<f32>,
+    path_samples: VecDeque<PathSample>,
+}
+
+struct PathSample {
+    at: Instant,
+    sent: u32,
+    received: u32,
+    loss: f32,
 }
 
 struct LossProbe {
+    rtt_ms: f32,
     budget: u32,
     sent: u32,
     /// The test's reduced budget, and what was sent while it was measured.
@@ -221,11 +240,38 @@ impl Controller {
             random_until: now,
             policer_until: now,
             random_floor: None,
+            udp_damage: false,
+            media_path_policy: false,
+            random_damage_until: now,
+            policer_rtt_ms: None,
+            path_samples: VecDeque::new(),
         }
     }
 
     pub(crate) fn budget(&self) -> u32 {
         self.budget
+    }
+
+    pub(crate) fn udp_damage(&self) -> bool {
+        self.udp_damage
+    }
+
+    pub(crate) fn enable_media_policy(&mut self, enabled: bool) {
+        self.media_path_policy = enabled;
+        if enabled && self.sent_kbps.is_none() && self.capacity.is_none() {
+            // Establish delivery before spending an unused Auto ceiling.
+            self.budget = self.budget.min(8000);
+            self.pacing = true;
+        }
+    }
+
+    pub(crate) fn at_rate(ceiling: u32, kbps: u32, now: Instant) -> Self {
+        let mut controller = Self::new(ceiling, now);
+        controller.budget = kbps.clamp(controller.floor, ceiling);
+        controller.capacity = Some(controller.budget);
+        controller.pacing = true;
+        controller.probe_at = now + Duration::from_secs(1);
+        controller
     }
 
     pub(crate) fn observe_sent(&mut self, kbps: u32) {
@@ -420,6 +466,82 @@ impl Controller {
         let probe_queued = self.probe.is_some() && delay > probe_threshold;
         queued |= probe_queued;
         let old = self.budget;
+        let mut recent_loss = report.loss_pct;
+        if self.media_path_policy {
+            self.path_samples.push_back(PathSample {
+                at: now,
+                sent: self.sent_kbps.unwrap_or(0),
+                received: report.received_kbps,
+                // Reassembly can report old losses while a large frame is
+                // still draining after a cut. Those windows cannot test the
+                // reduced offer yet.
+                loss: if queue_ms < 100.0 {
+                    report.loss_pct
+                } else {
+                    0.0
+                },
+            });
+            self.path_samples
+                .retain(|sample| now.saturating_duration_since(sample.at) <= LOSSY_MEMORY);
+            let period = horizon.max(Duration::from_millis(300));
+            let earlier_delivery = self
+                .path_samples
+                .iter()
+                .filter(|sample| now.saturating_duration_since(sample.at) > period)
+                .map(|sample| sample.received)
+                .max()
+                .unwrap_or(0);
+            let recent: Vec<_> = self
+                .path_samples
+                .iter()
+                .filter(|sample| now.saturating_duration_since(sample.at) <= period)
+                .collect();
+            let count = recent.len() as u64;
+            let sent = recent
+                .iter()
+                .map(|sample| u64::from(sample.sent))
+                .sum::<u64>();
+            let loss = recent.iter().map(|sample| sample.loss).sum::<f32>();
+            recent_loss = loss / count.max(1) as f32;
+            // Compare actual sends below previously demonstrated delivery.
+            // A FIFO drains at this offer. A policer or random loss can keep
+            // discarding packets after that backoff without a standing queue.
+            if count >= 4
+                && recent.first().is_some_and(|sample| {
+                    now.saturating_duration_since(sample.at) >= period * 3 / 4
+                })
+                && sent > 0
+                && sent * 5 < u64::from(earlier_delivery) * count * 4
+                && loss >= count as f32 * 10.0
+                && delay < 20.0f32.max(rtt.as_secs_f32() * 200.0)
+            {
+                self.random_damage_until = now + LOSSY_MEMORY;
+            }
+        }
+        // Queue growth is evidence of a shared capacity limit. Only queue-free
+        // loss surviving an actual rate reduction, or a confirmed policer,
+        // makes TCP a promising alternative to UDP.
+        self.udp_damage = !queued
+            && (now < self.policer_until
+                && self
+                    .policer_rtt_ms
+                    .zip(self.base_rtt())
+                    .is_some_and(|(before, rtt)| rtt.as_secs_f32() * 1000.0 >= before * 0.8)
+                || report.loss_pct >= 10.0
+                    && (self.loss_probe.as_ref().is_some_and(|probe| {
+                        probe.samples >= 4
+                            && probe.sum / probe.samples as f32 >= 10.0
+                            && probe.sum / probe.samples as f32 + 2.0 >= probe.loss * 0.9
+                            && probe.sent_sum / u64::from(probe.samples)
+                                < u64::from(probe.sent) * 9 / 10
+                    }) || now < self.random_damage_until
+                        || now < self.policer_until
+                            && self.random_floor.is_some_and(|floor| floor >= 10.0)));
+        self.udp_damage |= self.media_path_policy
+            && now < self.random_damage_until
+            && recent_loss >= 3.0
+            && delay < 20.0f32.max(rtt.as_secs_f32() * 200.0);
+        self.udp_damage &= queue_ms < 100.0;
         let underfilled = self
             .sent_kbps
             .is_some_and(|sent| sent < self.budget * 4 / 5);
@@ -448,6 +570,21 @@ impl Controller {
         if underfilled && !queued && loss > 10.0 && !severe {
             damaged = false;
         }
+        // Negotiated path assessment also tests persistent FEC-repaired loss.
+        // Its reduced-rate observation distinguishes radio damage from an
+        // overshoot even when parity concealed every missing video frame.
+        let feedback_ready = !self.media_path_policy || queue_ms < 100.0;
+        if !feedback_ready {
+            damaged = false;
+        }
+        let residual_damage = damaged;
+        if self.media_path_policy
+            && feedback_ready
+            && report.loss_pct >= 10.0
+            && recent_loss >= 10.0
+        {
+            damaged = true;
+        }
         // Damage still arriving within a cut's feedback horizon belongs
         // to the previous offer, including delayed frame-loss accounting.
         if !queued && now.duration_since(self.last_cut) < horizon {
@@ -475,11 +612,19 @@ impl Controller {
         // Give parity feedback a chance before testing loss against offered load.
         // A radio burst cannot prove a policer: loss must improve at a lower
         // *actual* send rate. Never ratchet an inconclusive test down again.
+        let loss_test_min = if self.media_path_policy {
+            1000
+        } else {
+            LOSS_TEST_MIN_KBPS
+        };
         if !queued
+            && feedback_ready
             && self.sent_kbps.is_some()
             && report.received_kbps > 0
             && (report.loss_pct > 0.0 || self.loss_probe.is_some() || self.loss_since.is_some())
-            && (loss < 50.0 || loss < 80.0 && self.sent_kbps.unwrap_or(0) >= LOSS_TEST_MIN_KBPS)
+            && (self.media_path_policy
+                || loss < 50.0
+                || loss < 80.0 && self.sent_kbps.unwrap_or(0) >= loss_test_min)
         {
             let raw = report.loss_pct.max(loss);
             let mut confirmed = false;
@@ -513,7 +658,20 @@ impl Controller {
                         && sent >= u64::from(probe.limit) * 85 / 100
                         && probe.samples > 0
                         && (improved || cleared);
+                    tracing::debug!(
+                        before_loss = probe.loss,
+                        after_loss = floor,
+                        sent,
+                        before_sent = probe.sent,
+                        limit = probe.limit,
+                        confirmed,
+                        "UDP reduced-rate result"
+                    );
                     if confirmed {
+                        // A nearly lossless lower offer must keep its RTT.
+                        // A draining FIFO is shared capacity, even if its first
+                        // standing queue temporarily looked like propagation.
+                        self.policer_rtt_ms = (floor < 0.5).then_some(probe.rtt_ms);
                         let capacity = (f64::from(probe.sent) * f64::from(100.0 - probe.loss)
                             / f64::from((100.0 - floor).max(1.0)))
                             as u32;
@@ -548,6 +706,12 @@ impl Controller {
                     } else {
                         self.budget = probe.budget;
                         self.random_until = now + LOSSY_MEMORY;
+                        if floor >= 10.0
+                            && floor + 2.0 >= probe.loss * 0.9
+                            && sent < u64::from(probe.sent) * 9 / 10
+                        {
+                            self.random_damage_until = now + LOSSY_MEMORY;
+                        }
                     }
                     self.loss_since = None;
                     self.probe_at = self.probe_at.max(now + horizon);
@@ -564,8 +728,9 @@ impl Controller {
                 let (sum, windows, damage_windows) = self.loss_before;
                 let mean = sum / windows.max(1) as f32;
                 if now.duration_since(since) >= Duration::from_millis(500)
-                    && (self.sent_kbps.unwrap_or(0) < LOSS_TEST_MIN_KBPS
+                    && (self.sent_kbps.unwrap_or(0) < loss_test_min
                         || damage_windows < 2
+                        || self.media_path_policy && !residual_damage && mean < 10.0
                         || self
                             .random_floor
                             .is_some_and(|floor| floor > 1.0 && mean <= floor + 2.0))
@@ -583,8 +748,16 @@ impl Controller {
                     } else {
                         self.budget
                     };
-                    let limit = (offered * 4 / 5).max(self.floor);
+                    // A loss plateau can initially hide a standing FIFO.
+                    // Test below actual delivery so a shared queue can drain.
+                    let tested = if self.media_path_policy {
+                        offered.min(report.received_kbps)
+                    } else {
+                        offered
+                    };
+                    let limit = (tested * 4 / 5).max(self.floor);
                     self.loss_probe = Some(LossProbe {
+                        rtt_ms: rtt.as_secs_f32() * 1000.0,
                         budget: self.budget,
                         sent: self.sent_kbps.unwrap_or(self.budget),
                         limit,
@@ -737,7 +910,8 @@ impl Controller {
             *kbps = (*kbps).max(self.received_kbps as u32);
         }
         let sent = self.sent_kbps.unwrap_or(0);
-        let collapsed = received > 0
+        let collapsed = feedback_ready
+            && received > 0
             && sent >= 2000
             && received < sent / 2
             && (sustained_deficit
@@ -1054,6 +1228,14 @@ pub(crate) fn video_budget(
     )
 }
 
+/// Complete relay frames need neither UDP shard headers nor parity.
+pub(crate) fn relay_video_budget(wire_kbps: u32, priority_kbps: u32) -> u32 {
+    wire_kbps
+        .saturating_sub(priority_kbps)
+        .max(wire_kbps / 2)
+        .max(1)
+}
+
 pub(crate) fn video_budget_sized(
     wire_kbps: u32,
     fec: u8,
@@ -1064,7 +1246,11 @@ pub(crate) fn video_budget_sized(
     datagram_size: usize,
 ) -> u32 {
     let available = wire_kbps
-        .saturating_sub(if audio { 1200 } else { 0 })
+        .saturating_sub(if audio {
+            1200 * 1000 / datagram_size.clamp(576, 1000) as u32
+        } else {
+            0
+        })
         .max(wire_kbps / 2);
     let fps = u64::from(fps.max(1));
     let allowance = u64::from(available) * 1000 * 96 / 100 / 8 / fps;
@@ -2262,5 +2448,123 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod media_path_tests {
+    use super::*;
+
+    #[test]
+    fn queued_capacity_stays_udp_while_reduced_rate_random_loss_and_policing_identify_damage() {
+        let start = Instant::now();
+        for (random_loss, capacity, fifo) in [
+            (false, 25_000, true),
+            (true, 25_000, true),
+            (false, 3000, false),
+        ] {
+            let mut controller = Controller::new(50_000, start);
+            controller.enable_media_policy(true);
+            // Exercise an overshoot even when no low RTT was observed yet.
+            controller.budget = 50_000;
+            let mut evidence = false;
+            for tick in 0..160 {
+                let sent = controller.budget();
+                let congested = fifo && sent > capacity;
+                let received = sent.min(capacity) * if random_loss { 83 } else { 100 } / 100;
+                let loss = sent.saturating_sub(received) as f32 * 100.0 / sent.max(1) as f32;
+                controller.observe_sent(sent);
+                controller.update(
+                    start + Duration::from_millis(tick * 50),
+                    &Report {
+                        window_ms: 50,
+                        rtt_ms: if congested { 100.0 } else { 10.0 },
+                        loss_pct: loss,
+                        unrecovered_loss_pct: Some(loss),
+                        received_kbps: received,
+                        frames_lost: u64::from(loss > 0.0),
+                        ..Default::default()
+                    },
+                    if congested { 100.0 } else { 10.0 },
+                    0.0,
+                );
+                evidence |= controller.udp_damage();
+                assert!(
+                    random_loss || !fifo || !controller.udp_damage(),
+                    "FIFO tick {tick}, budget {}, base {:?}, policer base {:?}, probe {:?}",
+                    controller.budget(),
+                    controller.base_rtt(),
+                    controller.policer_rtt_ms,
+                    controller.loss_probe.as_ref().map(|probe| (
+                        probe.loss,
+                        probe.sum,
+                        probe.samples,
+                        probe.sent,
+                        probe.sent_sum
+                    ))
+                );
+            }
+            assert_eq!(
+                evidence,
+                random_loss || !fifo,
+                "random loss {random_loss}, FIFO {fifo}, budget {}",
+                controller.budget()
+            );
+        }
+    }
+
+    #[test]
+    fn policy_warms_an_unknown_udp_path_and_preserves_legacy_and_measured_rates() {
+        let now = Instant::now();
+        let mut controller = Controller::new(50_000, now);
+        assert_eq!(controller.budget(), 50_000);
+        controller.enable_media_policy(true);
+        assert_eq!(controller.budget(), 8000);
+        let mut measured = Controller::at_rate(50_000, 22_000, now);
+        measured.enable_media_policy(true);
+        assert_eq!(measured.budget(), 22_000);
+        let mut relay = RelayController::at_rate(50_000, 8000, now);
+        assert_eq!(relay.budget(), 8000);
+        for tick in 1..=20 {
+            relay.update(
+                now + Duration::from_secs(tick),
+                0.0,
+                Some(10.0),
+                relay.budget(),
+                relay.budget(),
+            );
+        }
+        assert_eq!(relay.budget(), 50_000);
+    }
+
+    #[test]
+    fn complete_relay_frames_reserve_audio_without_udp_parity() {
+        assert_eq!(relay_video_budget(6000, 1200), 4800);
+        assert_eq!(relay_video_budget(6000, 500), 5500);
+        assert_eq!(relay_video_budget(20_000, 0), 20_000);
+        assert_eq!(relay_video_budget(1000, 1200), 500);
+    }
+
+    #[test]
+    fn returning_udp_starts_at_the_proven_rate_and_retains_its_ceiling() {
+        let start = Instant::now();
+        let mut controller = Controller::at_rate(50_000, 22_000, start);
+        assert_eq!(controller.budget(), 22_000);
+        assert_eq!(controller.pace_kbps(), 22_000);
+        for tick in 0..400 {
+            controller.observe_sent(controller.budget());
+            controller.update(
+                start + Duration::from_millis(tick * 50),
+                &Report {
+                    window_ms: 50,
+                    rtt_ms: 10.0,
+                    received_kbps: controller.budget(),
+                    ..Default::default()
+                },
+                10.0,
+                0.0,
+            );
+        }
+        assert_eq!(controller.budget(), 50_000);
     }
 }

@@ -262,6 +262,9 @@ pub struct Report {
     pub wire_budget_kbps: u32,
     #[serde(default)]
     pub application_limited: bool,
+    /// Negotiated media-path policy evidence from the host's rate test.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub udp_damage: bool,
     #[serde(default)]
     pub queue_ms: f32,
     #[serde(default)]
@@ -415,6 +418,12 @@ pub enum RelayAction {
     UdpProbeReady {
         first: u16,
     },
+    /// Cancel an in-progress negotiated probe on loss or relay pressure.
+    UdpProbeCancel {
+        first: u16,
+    },
+    /// Withdraw a preparation trigger before an offer is committed.
+    Pause,
     Direct,
     DirectReady,
     /// The authority's retry clock can lag the viewer's after a transition.

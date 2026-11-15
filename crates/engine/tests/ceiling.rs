@@ -13,6 +13,7 @@ fn a_cold_software_host_does_not_take_4k_at_the_display_refresh_rate() {
     let server = Server::bind(
         0,
         Options {
+            relay: None,
             prepare: Some(Box::new({
                 let seen = seen.clone();
                 move |req| {

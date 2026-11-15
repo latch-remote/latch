@@ -772,27 +772,39 @@ keys. Capability and key debug formatting is redacted.
 After both lanes complete end-to-end key confirmation, the viewer sends
 `Ready`. The host sends `Commit`, the viewer activates and replies
 `Committed`, and the host activates. `Abort` resets the current attempt.
-Negotiation has a six-second application deadline. Failed attempts cool
-down for two seconds during setup, or 100 ms after an active route fails.
+Negotiation has a six-second application deadline. Failed setup attempts cool
+down for two seconds. Active failures wait two seconds with older peers and
+100 ms with `media_path_policy` negotiated.
 Three failures increase the cooldown to thirty seconds.
 A single cancellable grant worker prevents preparation work accumulating.
 
-UDP reassessment uses `UdpProbe { first, kbps }`,
-`UdpProbeResult { first, received, span_us }`, `Direct` and `DirectReady`.
-After five seconds on relay the host sends one second of UDP padding while
-media remains on relay. Qualification and cooldown numbers are specified in
-ENGINE.md. A peer without `media_path_policy` retains the legacy 50 Mbps
-padding ceiling and 1,200-byte datagrams. With the capability negotiated,
-`UdpProbeSized { first, kbps, datagram_size }` allows 2,000–1,250,000 kbps
-and sizes 576–1,200 bytes. Its result has the existing shape. The host tests
-125% of the requested wire budget. Both sides derive the same packet count
-by rounding down the one-second packet budget to whole sixteen-packet trains.
-The viewer answers `UdpProbeSized` with `UdpProbeReady { first }` after
-installing its receiver. The host then starts the 100 ms settle period and
-padding. The sized-probe result window is two seconds from its first UDP
-arrival, or the announcement if no UDP arrives. Host readiness/result expiry
-is three seconds, restarted on readiness. Neither new controls,
-`UdpProbeSized` nor `UdpProbeReady` are sent without the capability.
+UDP reassessment with an older peer uses `UdpProbe { first, kbps }`,
+`UdpProbeResult { first, received, span_us }`, `Direct` and `DirectReady`,
+with its original sixty-second dwell, one-second padding, 50 Mbps ceiling
+and two-second handoff cooldown.
+
+With `media_path_policy` negotiated, `UdpProbeSized { first, kbps,
+datagram_size }` accepts 2,000–1,000,000 kbps and 576–1,200-byte datagrams.
+The host sizes it from 110% of actual relay delivery, capped by the request.
+The receiver responds with `UdpProbeReady { first }`. After 100 ms settle,
+padding ramps from 25% to 100% over 200 ms and holds for 400 ms. Both peers
+round `kbps × 525 / 8 / (datagram_size + 80)` packets to whole sixteen-packet
+trains. Scheduling slack may extend transmission by 250 ms. Sized train
+identifiers occupy a wholly reserved range below `0x8000`. The existing
+result shape counts every unique position and measures first-to-last arrival.
+Its report window is two seconds from first arrival, with a three-second
+host expiry. `UdpProbeCancel { first }` cancels a current test on loss or
+relay pressure. Media and padding share the measured congestion budget.
+Qualification and retry numbers are specified in ENGINE.md.
+
+`Pause` withdraws a preparation trigger before an offer. The host can retain
+the prepared grant for at most twenty seconds within its lifetime and reuse
+it with a new attempt number. Active grant renewal retains `Renew`.
+`Pause`, sized probes, readiness and cancellation controls require negotiation.
+Host `Report.udp_damage` is an optional boolean, omitted when false and
+emitted only under this capability. It indicates queue-free damage surviving
+an actual rate reduction or confirmed policing. A reduced budget by itself
+supplies no such evidence.
 
 ### Negotiated path controls
 
@@ -800,12 +812,15 @@ Control kind 9 is `Path { session, action }`, carried only over the original
 authorized Tailscale TCP connection when both request and accept set
 `media_path_policy`. Session mismatches and actions for the other role are
 ignored. The capability works independently of public-relay opt-out.
-Missing capabilities preserve 6.0.0 behavior in either peer role.
+Missing capabilities preserve the 6.0.0 media timers, fallback triggers,
+controller behavior and held-input cleanup in either peer role. Local path
+indicators and coalesced notices remain available with older peers because
+they describe the transport already carrying media and require no wire change.
 
 - `MtuProbe { serial }` announces a host size test. Three rounds 100 ms apart
   send existing kind-16 Probe datagrams at 1,200, 1,000, 800 and 576 bytes.
-  `train` equals `serial`, `count` is 16 and `index` is `size_index * 3 + round`.
-  Indexes 12–15 are unused. These positions are consumed separately from
+  `train` equals `serial` with its high bit set, `count` is 12 and `index`
+  is `size_index * 3 + round`. These positions are consumed separately from
   ordinary throughput probes and relay reassessment.
 - `MtuResult { serial, received }` is the viewer's response after 600 ms.
   `received` is four unique-position counts in size order, each from zero
@@ -817,7 +832,11 @@ Missing capabilities preserve 6.0.0 behavior in either peer role.
 - `MtuApplied { datagram_size }` tells the viewer the selected size for input
   batching and path diagnosis. Sizes outside 576–1,200 are ignored. Existing
   per-frame video shard lengths remain authoritative for reassembly. Audio
-  frames are negotiated to fit the 576-byte floor including parity overhead.
+  initially fit 1,000 bytes and use shorter self-describing PCM frames only
+  after a smaller MTU is measured, down to the 576-byte floor including parity.
+  Relay audio retains the 1,000-byte framing independently of UDP MTU.
+  Audio sequence numbers and parity survive a size change. Microphone frames
+  retain their existing size below the floor.
 
 `PathChanged` is a local stream-session event, with no new on-wire user-facing
 reason strings. Environment and carrier diagnostics can extend the local

@@ -514,7 +514,7 @@ mod media_path_tests {
             "Tailscale UDP · Via your relay"
         );
         state.path = MediaPath::LatchRelay;
-        state.carrier = Some("TLS".into());
+        state.carrier = Some(latch_stream::path::Carrier::Tls);
         state.reason = PathReason::UdpLoss { percent: 17 };
         assert_eq!(tailscale.media_label(&state), "Latch relay · TLS");
         assert_eq!(state.reason.description(), "UDP is losing 17% of packets");

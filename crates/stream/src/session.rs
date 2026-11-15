@@ -10,7 +10,10 @@
 //! thread decodes frames in order and publishes the newest to the renderer.
 
 use crate::audio::Player;
-use crate::path::{MediaPath, MediaPathState, MtuProbe, PathReason, Policy, UdpPath};
+use crate::path::{
+    Carrier, MediaPath, MediaPathState, MtuProbe, PathNotices, PathReason, Policy, RelayFailure,
+    UdpPath,
+};
 use crate::video::{self, Decoder, FrameSlot};
 use latch_proto::audio::{AudioOut, AudioReceiver};
 use latch_proto::control::{self, Accept, Codec, Message, Report, StreamRequest};
@@ -54,6 +57,7 @@ struct RelayOffer {
 enum RelayPhase {
     Idle,
     Preparing,
+    Prepared,
     Offered,
     CommitSent,
     Active,
@@ -68,6 +72,8 @@ const UDP_REASSESS_DWELL: Duration = Duration::from_secs(5);
 const UDP_REASSESS_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const UDP_PROBE_SETTLE: Duration = Duration::from_millis(100);
 const UDP_PROBE_REPORT: Duration = Duration::from_secs(2);
+const UDP_POLICY_PROBE: Duration = Duration::from_millis(600);
+const UDP_POLICY_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
 struct UdpProbe {
     first: u16,
@@ -79,6 +85,10 @@ struct UdpProbe {
     seen: Vec<u16>,
     first_received: Option<Instant>,
     last_received: Option<Instant>,
+    paced_at: Instant,
+    credit: f64,
+    policy: bool,
+    relay_ack: Duration,
 }
 impl UdpProbe {
     fn new(first: u16, kbps: u32) -> Self {
@@ -95,6 +105,10 @@ impl UdpProbe {
             seen: vec![0; (kbps as usize * 1000 / 8 / (datagram_size + 80) / 16).max(1)],
             first_received: None,
             last_received: None,
+            paced_at: Instant::now(),
+            credit: 0.0,
+            policy: false,
+            relay_ack: Duration::ZERO,
         }
     }
     fn packets(&self) -> u32 {
@@ -106,9 +120,35 @@ impl UdpProbe {
         self.sent == self.packets()
             && received <= self.packets()
             && received * 1000 >= self.packets() * 995
-            && (800_000..=1_200_000).contains(&span_us)
+            && if self.policy {
+                (450_000..=1_000_000).contains(&span_us)
+            } else {
+                (800_000..=1_200_000).contains(&span_us)
+            }
             && u64::from(received) * (self.datagram_size + 80) as u64 * 8 * 1000
-                >= u64::from(self.kbps) * u64::from(span_us) * 9 / 10
+                >= u64::from(self.kbps) * u64::from(span_us) * if self.policy { 45 } else { 90 }
+                    / 100
+    }
+
+    fn policy(first: u16, kbps: u32, datagram_size: usize) -> Self {
+        let mut probe = Self::sized(first, kbps, datagram_size);
+        // 200 ms linear ramp from 25% to 100%, then 400 ms at full rate.
+        probe.seen.resize(
+            (kbps as usize * 525 / 8 / (datagram_size + 80) / 16).max(1),
+            0,
+        );
+        probe.policy = true;
+        probe
+    }
+
+    fn rate(&self, now: Instant) -> u32 {
+        let elapsed = now.saturating_duration_since(self.started + UDP_PROBE_SETTLE);
+        if now < self.started + UDP_PROBE_SETTLE
+            || elapsed >= UDP_POLICY_PROBE + Duration::from_millis(250)
+        {
+            return 0;
+        }
+        (f64::from(self.kbps) * (0.25 + elapsed.as_secs_f64() / 0.2 * 0.75).min(1.0)) as u32
     }
 }
 
@@ -116,7 +156,22 @@ struct RelayAttempt {
     path: MediaPathState,
     udp_path: UdpPath,
     reason: PathReason,
-    close_reason: String,
+    close_reason: RelayFailure,
+    paused: bool,
+    cached_offer: Option<control::RelayPayload>,
+    cancels: u32,
+    last_ack: Instant,
+    ack_rtt: Duration,
+    ack_base: Duration,
+    ack_sample: Option<Duration>,
+    frame_pending: Option<Instant>,
+    video_backpressure: Option<Instant>,
+    priority_since: Instant,
+    priority_bytes: u64,
+    priority_kbps: Option<u32>,
+    relay_delivery: VecDeque<(Instant, u32)>,
+    grant_starts: VecDeque<Instant>,
+    return_kbps: Option<u32>,
     switchbacks: VecDeque<Instant>,
     number: u64,
     phase: RelayPhase,
@@ -173,7 +228,22 @@ impl RelayRoute {
                 path: MediaPathState::default(),
                 udp_path: UdpPath::Unknown,
                 reason: PathReason::UdpStalled,
-                close_reason: String::new(),
+                close_reason: RelayFailure::Closed,
+                paused: false,
+                cached_offer: None,
+                cancels: 0,
+                last_ack: now,
+                ack_rtt: Duration::ZERO,
+                ack_base: Duration::MAX,
+                ack_sample: None,
+                frame_pending: None,
+                video_backpressure: None,
+                priority_since: now,
+                priority_bytes: 0,
+                priority_kbps: None,
+                relay_delivery: VecDeque::new(),
+                grant_starts: VecDeque::new(),
+                return_kbps: None,
                 switchbacks: VecDeque::new(),
                 number: 0,
                 phase: RelayPhase::Idle,
@@ -183,8 +253,8 @@ impl RelayRoute {
                 started: now,
                 retry_at: now,
                 failures: 0,
-                next_probe: now + UDP_REASSESS_DWELL,
-                probe_delay: UDP_REASSESS_DWELL,
+                next_probe: now + Duration::from_secs(60),
+                probe_delay: Duration::from_secs(60),
                 probe_serial: 0,
                 udp_probe: None,
                 returning_direct: false,
@@ -203,6 +273,11 @@ impl RelayRoute {
     }
     pub fn enable_policy(&self, enabled: bool) {
         self.policy_enabled.store(enabled, Ordering::Release);
+        if enabled {
+            let mut state = self.state.lock();
+            state.next_probe = Instant::now() + UDP_REASSESS_DWELL;
+            state.probe_delay = UDP_POLICY_PROBE_INTERVAL;
+        }
     }
     pub fn policy_enabled(&self) -> bool {
         self.policy_enabled.load(Ordering::Acquire)
@@ -210,6 +285,14 @@ impl RelayRoute {
     pub fn datagram_size(&self) -> usize {
         self.datagram_size.load(Ordering::Acquire) as usize
     }
+    pub fn audio_datagram_size(&self) -> usize {
+        if self.active() {
+            1000
+        } else {
+            self.datagram_size().min(1000)
+        }
+    }
+
     pub fn set_datagram_size(&self, bytes: usize) {
         let bytes = bytes.clamp(576, latch_proto::MAX_DATAGRAM);
         let old = self.datagram_size.swap(bytes as u32, Ordering::AcqRel);
@@ -269,12 +352,26 @@ impl RelayRoute {
         state.path = MediaPathState {
             path: MediaPath::LatchRelay,
             reason: state.reason.clone(),
-            carrier: Some("TLS".into()),
+            carrier: Some(Carrier::Tls),
             since: Instant::now(),
         };
         state.phase = RelayPhase::Active;
         state.started = Instant::now();
-        state.next_probe = state.next_probe.max(state.started + UDP_REASSESS_DWELL);
+        let dwell = if self.policy_enabled() {
+            UDP_REASSESS_DWELL
+        } else {
+            Duration::from_secs(60)
+        };
+        state.next_probe = state.next_probe.max(state.started + dwell);
+        state.last_ack = state.started;
+        state.frame_pending = None;
+        state.video_backpressure = None;
+        state.priority_since = state.started;
+        state.priority_bytes = 0;
+        state.priority_kbps = None;
+        state.ack_rtt = Duration::ZERO;
+        state.ack_base = Duration::MAX;
+        state.relay_delivery.clear();
         self.revision.fetch_add(1, Ordering::AcqRel);
         self.active.store(true, Ordering::Release);
     }
@@ -284,17 +381,17 @@ impl RelayRoute {
         // Leaving it pending would reset Idle again and move its retry deadline.
         self.failed.store(false, Ordering::Release);
         self.active.store(false, Ordering::Release);
-        self.revision.fetch_add(1, Ordering::AcqRel);
-        state.path = MediaPathState {
-            path: MediaPath::TailscaleUdp(state.udp_path),
-            reason: PathReason::RelayUnavailable(if state.close_reason.is_empty() {
-                "The relay attempt ended".into()
-            } else {
-                std::mem::take(&mut state.close_reason)
-            }),
-            carrier: None,
-            since: Instant::now(),
-        };
+        if was_active || !self.policy_enabled() {
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
+        if was_active {
+            state.path = MediaPathState {
+                path: MediaPath::TailscaleUdp(state.udp_path),
+                reason: PathReason::RelayUnavailable(state.close_reason),
+                carrier: None,
+                since: Instant::now(),
+            };
+        }
         state.cancel.cancel();
         if let Some(transport) = state.transport.take() {
             transport.shutdown();
@@ -317,6 +414,10 @@ impl RelayRoute {
         state.grant_bytes = 0;
         state.traffic_bytes = 0;
         state.media_delivered = false;
+        state.cached_offer = None;
+        state.paused = false;
+        state.frame_pending = None;
+        state.video_backpressure = None;
         state.phase = RelayPhase::Idle;
         state.udp_probe = None;
         state.returning_direct = false;
@@ -325,15 +426,73 @@ impl RelayRoute {
         state.failures = state.failures.saturating_add(1);
         let cooldown = if state.failures >= 3 {
             Duration::from_secs(30)
-        } else if was_active {
+        } else if was_active && self.policy_enabled() {
             Duration::from_millis(100)
         } else {
             Duration::from_secs(2)
         };
         state.retry_at = Instant::now() + cooldown;
     }
-    /// Called by the host control owner. Padding is bounded to one second,
-    /// the requested wire rate plus 25%, and 2048 packets per turn. Media stays on relay.
+
+    fn handoff_cooldown(&self) -> Duration {
+        if self.policy_enabled() {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(2)
+        }
+    }
+
+    pub fn pacing_udp_probe(&self) -> bool {
+        self.state
+            .lock()
+            .udp_probe
+            .as_ref()
+            .is_some_and(|probe| probe.policy && probe.ready && probe.sent < probe.packets())
+    }
+
+    pub fn take_return_kbps(&self) -> Option<u32> {
+        self.state.lock().return_kbps.take()
+    }
+
+    /// The probe and relay encoder spend one measured wire budget.
+    pub fn relay_media_budget(&self, controller_budget: u32) -> u32 {
+        let state = self.state.lock();
+        let Some(probe) = state
+            .udp_probe
+            .as_ref()
+            .filter(|p| p.policy && p.ready && p.sent < p.packets())
+        else {
+            return controller_budget;
+        };
+        controller_budget.min(
+            probe
+                .kbps
+                .saturating_sub(probe.rate(Instant::now()))
+                .max(1000),
+        )
+    }
+
+    pub fn observe_relay_delivery(&self, now: Instant, kbps: u32) {
+        let mut state = self.state.lock();
+        if state.phase == RelayPhase::Active && state.udp_probe.is_none() {
+            state.relay_delivery.push_back((now, kbps));
+            while state
+                .relay_delivery
+                .front()
+                .is_some_and(|(at, _)| now.saturating_duration_since(*at) > Duration::from_secs(5))
+            {
+                state.relay_delivery.pop_front();
+            }
+        }
+    }
+
+    fn defer_udp_reassessment(&self, state: &mut RelayAttempt) {
+        if self.policy_enabled() {
+            state.next_probe = Instant::now() + UDP_REASSESS_MAX_BACKOFF;
+        }
+    }
+    /// The negotiated check replaces relay video budget for 600 ms, ramps over
+    /// 200 ms, and never catches up a delayed control turn with a packet burst.
     pub fn reassess_udp(
         &self,
         udp: &UdpSocket,
@@ -346,32 +505,65 @@ impl RelayRoute {
             return true;
         }
         let now = Instant::now();
+        let policy = self.policy_enabled();
         state
             .switchbacks
             .retain(|at| now.saturating_duration_since(*at) < Duration::from_secs(60));
-        // Three measured returns per minute bound flapping, including repeated
-        // short recoveries. Failure always remains free to restore UDP.
-        let max_kbps = if self.policy_enabled.load(Ordering::Acquire) {
-            control::MAX_BITRATE_KBPS * 5 / 4
+        let measured = state
+            .relay_delivery
+            .iter()
+            .map(|(_, rate)| u64::from(*rate))
+            .sum::<u64>()
+            / state.relay_delivery.len().max(1) as u64;
+        // A request is a ceiling. A busy or idle relay's actual delivery is the
+        // evidence for a return rate, with 10% headroom and a 1 Mbps video floor.
+        let kbps = if policy {
+            (measured as u32)
+                .saturating_mul(11)
+                .div_ceil(10)
+                .clamp(2000, requested_kbps.max(2000))
         } else {
-            50_000
+            requested_kbps.saturating_mul(5).div_ceil(4).max(2000)
         };
-        // 25% headroom above the requested total wire budget.
-        let kbps = requested_kbps.saturating_mul(5).div_ceil(4).max(2000);
         if state.udp_probe.is_none()
             && !state.returning_direct
             && now >= state.next_probe
-            && kbps <= max_kbps
-            && state.switchbacks.len() < 3
+            && (policy || kbps <= 50_000)
+            && (!policy || state.switchbacks.len() < 3)
+            && (!policy || !state.relay_delivery.is_empty())
         {
-            state.probe_serial = state.probe_serial.wrapping_add(512);
+            let mut probe = if policy {
+                UdpProbe::policy(0, kbps, self.datagram_size())
+            } else {
+                UdpProbe::new(0, kbps)
+            };
+            probe.relay_ack = state.ack_rtt;
+            let trains = probe.seen.len() as u16;
+            state.probe_serial = if policy {
+                // MTU serials always have the high bit set. Reserve the whole
+                // train range, including at the maximum protocol bitrate.
+                if u32::from(state.probe_serial) + u32::from(trains) >= 0x8000 {
+                    0
+                } else {
+                    state.probe_serial
+                }
+            } else {
+                state.probe_serial.wrapping_add(512)
+            };
             let first = state.probe_serial;
-            let mut probe = UdpProbe::sized(first, kbps, self.datagram_size());
-            probe.ready = !self.policy_enabled();
+            probe.first = first;
+            probe.ready = !policy;
+            if policy {
+                state.probe_serial += trains;
+            }
             state.udp_probe = Some(probe);
             state.next_probe = now + state.probe_delay;
-            state.probe_delay = (state.probe_delay * 2).min(UDP_REASSESS_MAX_BACKOFF);
-            let action = if self.policy_enabled.load(Ordering::Acquire) {
+            state.probe_delay = (state.probe_delay * 2).min(if policy {
+                UDP_REASSESS_MAX_BACKOFF
+            } else {
+                Duration::from_secs(600)
+            });
+            let action = if policy {
                 control::RelayAction::UdpProbeSized {
                     first,
                     kbps,
@@ -384,6 +576,31 @@ impl RelayRoute {
                 return false;
             }
         }
+        let baseline = state
+            .udp_probe
+            .as_ref()
+            .map_or(state.ack_rtt, |probe| probe.relay_ack);
+        let ack_pressure = state.ack_rtt > baseline + Duration::from_millis(100).max(baseline);
+        let ack_stale = state.frame_pending.is_some_and(|since| {
+            now.saturating_duration_since(since.max(state.last_ack))
+                > baseline.min(Duration::from_millis(250)) + Duration::from_millis(150)
+        });
+        if policy
+            && (ack_pressure || ack_stale)
+            && state
+                .udp_probe
+                .as_ref()
+                .is_some_and(|probe| probe.sent < probe.packets())
+        {
+            if let Some(probe) = state.udp_probe.take() {
+                self.defer_udp_reassessment(&mut state);
+                tracing::debug!(?ack_pressure, ?ack_stale, ack_rtt = ?state.ack_rtt, ack_base = ?state.ack_base, "stopping UDP probe to protect relay delivery");
+                return send(&self.message(
+                    state.number,
+                    control::RelayAction::UdpProbeCancel { first: probe.first },
+                ));
+            }
+        }
         let Some(probe) = state.udp_probe.as_mut() else {
             return true;
         };
@@ -391,19 +608,32 @@ impl RelayRoute {
             return true;
         }
         let elapsed = now.saturating_duration_since(probe.started + UDP_PROBE_SETTLE);
-        if elapsed > Duration::from_millis(1250) {
-            return true;
-        }
-        let due = (elapsed.as_secs_f64() * f64::from(probe.kbps) * 1000.0
-            / 8.0
-            / (probe.datagram_size + 80) as f64) as u32;
-        let end = due.min(probe.packets()).min(probe.sent + 2048);
+        let end = if policy {
+            let rate = probe.rate(now);
+            // At most 5 ms of accumulated credit. Scheduler delays discard
+            // credit, so the sender can never dump a one-second backlog.
+            let step = now
+                .saturating_duration_since(probe.paced_at)
+                .as_secs_f64()
+                .min(0.005);
+            probe.paced_at = now;
+            probe.credit += step * f64::from(rate) * 1000.0 / 8.0;
+            let packets = (probe.credit / (probe.datagram_size + 80) as f64) as u32;
+            probe.credit -= f64::from(packets) * (probe.datagram_size + 80) as f64;
+            (probe.sent + packets).min(probe.packets())
+        } else {
+            if elapsed > Duration::from_millis(1250) {
+                return true;
+            }
+            let due = (elapsed.as_secs_f64() * f64::from(probe.kbps) * 1000.0
+                / 8.0
+                / (probe.datagram_size + 80) as f64) as u32;
+            due.min(probe.packets()).min(probe.sent + 64)
+        };
         let first = probe.first;
         let datagram_size = probe.datagram_size;
         let positions = probe.sent..end;
         probe.sent = end;
-        // Padding can involve thousands of socket writes. Keep relay media and
-        // input free to use the route while the control owner sends this batch.
         drop(state);
         let mut bytes = Vec::with_capacity(latch_proto::MAX_DATAGRAM);
         for position in positions {
@@ -415,7 +645,6 @@ impl RelayRoute {
                 16,
                 datagram_size,
             );
-            // A failed send remains a missing position in the result.
             let _ = udp.send_to(&bytes, addr);
         }
         true
@@ -483,6 +712,9 @@ impl RelayRoute {
             .try_send_datagram(bytes)
         {
             Ok(()) => {
+                state.priority_bytes = state
+                    .priority_bytes
+                    .saturating_add((bytes.len() + 80) as u64);
                 state.traffic_bytes = state.traffic_bytes.saturating_add((bytes.len() * 2) as u64);
                 Ok(true)
             }
@@ -491,7 +723,7 @@ impl RelayRoute {
                     self.fail();
                     return Err(error);
                 }
-                state.close_reason = "The relay priority queue filled".into();
+                state.close_reason = RelayFailure::Backpressure;
                 self.failed.store(true, Ordering::Release);
                 Ok(false)
             }
@@ -535,7 +767,7 @@ impl RelayRoute {
                     self.fail();
                     return Err(error);
                 }
-                state.close_reason = "The relay priority queue filled".into();
+                state.close_reason = RelayFailure::Backpressure;
                 self.failed.store(true, Ordering::Release);
                 Ok(false)
             }
@@ -553,11 +785,49 @@ impl RelayRoute {
             .map_or(Duration::ZERO, |transport| transport.queued_frame_age())
     }
 
+    /// Reserve recent priority traffic with fast attack and gradual release.
+    pub fn priority_budget_kbps(&self, now: Instant) -> Option<u32> {
+        let mut state = self.state.lock();
+        let elapsed = now.saturating_duration_since(state.priority_since);
+        if elapsed >= Duration::from_millis(100) {
+            let measured =
+                (state.priority_bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1000.0) as u32;
+            state.priority_kbps = Some(measured.max(state.priority_kbps.unwrap_or(0) * 9 / 10));
+            state.priority_since = now;
+            state.priority_bytes = 0;
+        }
+        state
+            .priority_kbps
+            .map(|kbps| kbps.saturating_mul(11) / 10 + 64)
+    }
+
+    /// Bounded relay queues can reject a frame between feedback samples.
+    pub fn video_backpressured(&self) -> bool {
+        self.state
+            .lock()
+            .video_backpressure
+            .is_some_and(|at| at.elapsed() < Duration::from_millis(500))
+    }
+
     pub fn take_frame_ack_elapsed(&self) -> Option<Duration> {
         let mut state = self.state.lock();
-        let elapsed = state.transport.as_ref()?.take_frame_ack_elapsed();
-        state.media_delivered |= elapsed.is_some();
-        elapsed
+        Self::refresh_ack(&mut state);
+        state.ack_sample.take()
+    }
+
+    fn refresh_ack(state: &mut RelayAttempt) {
+        if let Some(elapsed) = state
+            .transport
+            .as_ref()
+            .and_then(|t| t.take_frame_ack_elapsed())
+        {
+            state.media_delivered = true;
+            state.last_ack = Instant::now();
+            state.ack_rtt = elapsed;
+            state.ack_base = state.ack_base.min(elapsed);
+            state.ack_sample = Some(state.ack_sample.unwrap_or_default().max(elapsed));
+            state.frame_pending = None;
+        }
     }
 
     pub fn send_frame(&self, frame: &InFrame) -> std::io::Result<bool> {
@@ -572,13 +842,16 @@ impl RelayRoute {
             .try_send_frame(frame)
         {
             Ok(()) => {
+                state.frame_pending.get_or_insert(Instant::now());
                 state.traffic_bytes = state
                     .traffic_bytes
                     .saturating_add((frame.data.len() * 2) as u64);
                 Ok(true)
             }
             Err(error) => {
-                if error.kind() != std::io::ErrorKind::WouldBlock {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    state.video_backpressure = Some(Instant::now());
+                } else {
                     self.failed.store(true, Ordering::Release);
                 }
                 Err(error)
@@ -603,7 +876,7 @@ impl RelayRoute {
             }
             latch_relay::Event::Closed { kind, message } => {
                 tracing::warn!(role = ?self.role, ?kind, %message, "relay closed, falling back to UDP");
-                state.close_reason = message.chars().take(256).collect();
+                state.close_reason = RelayFailure::Closed;
                 self.failed.store(true, Ordering::Release);
                 None
             }
@@ -620,6 +893,43 @@ impl RelayRoute {
             return false;
         }
         let mut state = self.state.lock();
+        Self::refresh_ack(&mut state);
+        if self.policy_enabled()
+            && state.phase == RelayPhase::Active
+            && state.frame_pending.is_some_and(|since| {
+                since.elapsed()
+                    >= Duration::from_millis(350)
+                        .max(state.ack_rtt * 2 + Duration::from_millis(100))
+            })
+        {
+            state.close_reason = RelayFailure::Stalled;
+            self.failed.store(true, Ordering::Release);
+        }
+        // The viewer can withdraw its request until the offer is sent. Keep a
+        // single host preparation parked for reuse, bounded by its grant and
+        // the relay's unattached-lane lifetime. No media route changes here.
+        if self.policy_enabled()
+            && self.role == latch_relay::Role::Viewer
+            && !wanted
+            && matches!(state.phase, RelayPhase::Preparing | RelayPhase::Offered)
+        {
+            let number = state.number;
+            self.reset(&mut state);
+            state.cancels = state.cancels.saturating_add(1);
+            state.retry_at =
+                Instant::now() + Duration::from_secs((1u64 << state.cancels.min(5)).min(30));
+            if !send(&self.message(number, A::Pause)) {
+                return false;
+            }
+        }
+        if state.paused
+            && (state.started.elapsed() >= Duration::from_secs(20)
+                || state
+                    .grant_deadline
+                    .is_some_and(|deadline| Instant::now() + Duration::from_secs(1) >= deadline))
+        {
+            self.reset(&mut state);
+        }
         let renewing = self.role == latch_relay::Role::Host
             && state.phase == RelayPhase::Active
             && (state
@@ -633,10 +943,40 @@ impl RelayRoute {
             // advertised combined allowance for records and in-flight media.
             let number = state.number;
             self.reset(&mut state);
+            if self.policy_enabled() {
+                state.path.reason = PathReason::RelayRenewal;
+            }
             state.failures = 1;
-            state.retry_at = Instant::now() + Duration::from_millis(100);
+            state.retry_at = Instant::now() + self.handoff_cooldown();
             if !send(&self.message(number, A::Renew)) {
                 return false;
+            }
+        }
+        if self.policy_enabled() && self.role == latch_relay::Role::Viewer {
+            let lossy = state.udp_probe.as_mut().is_some_and(|probe| {
+                let Some(first) = probe.first_received else {
+                    return false;
+                };
+                let positions = probe
+                    .seen
+                    .iter()
+                    .rposition(|bits| *bits != 0)
+                    .map_or(0, |index| index * 16);
+                let received: u32 = probe
+                    .seen
+                    .iter()
+                    .take(positions / 16)
+                    .map(|bits| bits.count_ones())
+                    .sum();
+                first.elapsed() >= Duration::from_millis(100)
+                    && positions >= 64
+                    && received * 100 < positions as u32 * 99
+            });
+            if lossy {
+                let probe = state.udp_probe.take().unwrap();
+                if !send(&self.message(state.number, A::UdpProbeCancel { first: probe.first })) {
+                    return false;
+                }
             }
         }
         if state.phase == RelayPhase::Active
@@ -674,12 +1014,15 @@ impl RelayRoute {
                 )) {
                     return false;
                 }
+            } else {
+                self.defer_udp_reassessment(&mut state);
             }
         }
         let failed = self.failed.swap(false, Ordering::AcqRel);
         if failed
             || (state.returning_direct && state.started.elapsed() >= Duration::from_secs(6))
-            || (state.phase != RelayPhase::Idle
+            || (!state.paused
+                && state.phase != RelayPhase::Idle
                 && state.phase != RelayPhase::Active
                 && state.started.elapsed() >= Duration::from_secs(6))
         {
@@ -689,7 +1032,7 @@ impl RelayRoute {
             if healthy_handoff {
                 state.path.reason = PathReason::UdpRecovered;
                 state.failures = 0;
-                state.retry_at = Instant::now() + Duration::from_millis(100);
+                state.retry_at = Instant::now() + self.handoff_cooldown();
             }
             if !send(&self.message(number, A::Abort)) {
                 return false;
@@ -712,15 +1055,20 @@ impl RelayRoute {
                         state.grant_deadline = Some(prepared.grant_deadline);
                         state.grant_bytes = prepared.grant_bytes;
                         state.transport = Some(prepared.transport);
-                        state.phase = RelayPhase::Offered;
-                        if !send(&self.message(state.number, A::Offer(prepared.offer))) {
-                            return false;
+                        state.cached_offer = Some(prepared.offer);
+                        state.phase = RelayPhase::Prepared;
+                        if !state.paused {
+                            let payload = Self::prepared_offer(&mut state);
+                            state.phase = RelayPhase::Offered;
+                            if !send(&self.message(state.number, A::Offer(payload))) {
+                                return false;
+                            }
                         }
                     }
                     Err(error) => {
                         tracing::warn!(%error, "relay preparation failed");
                         let number = state.number;
-                        state.close_reason = error.to_string().chars().take(256).collect();
+                        state.close_reason = RelayFailure::Preparation;
                         self.reset(&mut state);
                         if !send(&self.message(number, A::Abort)) {
                             return false;
@@ -762,6 +1110,18 @@ impl RelayRoute {
         }
         true
     }
+
+    fn prepared_offer(state: &mut RelayAttempt) -> control::RelayPayload {
+        let payload = state
+            .cached_offer
+            .take()
+            .expect("prepared grant has an offer");
+        let mut offer: RelayOffer =
+            serde_json::from_str(payload.as_str()).expect("locally created offer");
+        offer.attempt = state.number;
+        control::RelayPayload::new(serde_json::to_string(&offer).expect("serializable offer"))
+            .expect("bounded offer")
+    }
     pub fn handle(
         &self,
         message: control::RelayControl,
@@ -774,6 +1134,17 @@ impl RelayRoute {
         tracing::debug!(role = ?self.role, attempt = message.attempt, action = ?message.action, "relay negotiation");
         let mut state = self.state.lock();
         if self.role == latch_relay::Role::Host && matches!(message.action, A::Request) {
+            if self.policy_enabled() && state.paused && message.attempt > state.number {
+                state.number = message.attempt;
+                state.paused = false;
+                state.started = Instant::now();
+                if state.phase == RelayPhase::Prepared {
+                    let payload = Self::prepared_offer(&mut state);
+                    state.phase = RelayPhase::Offered;
+                    return send(&self.message(state.number, A::Offer(payload)));
+                }
+                return true;
+            }
             if self.config.is_none()
                 || state.phase != RelayPhase::Idle
                 || state.preparing.is_some()
@@ -791,6 +1162,16 @@ impl RelayRoute {
                         millis: remaining.as_millis().clamp(250, 30_000) as u32,
                     },
                 ));
+            }
+            if self.policy_enabled() {
+                let now = Instant::now();
+                state
+                    .grant_starts
+                    .retain(|at| now.saturating_duration_since(*at) < Duration::from_secs(3600));
+                if state.grant_starts.len() >= 60 {
+                    return send(&self.message(message.attempt, A::RetryAfter { millis: 30_000 }));
+                }
+                state.grant_starts.push_back(now);
             }
             let config = self.config.as_ref().unwrap().clone();
             state.number = message.attempt;
@@ -846,6 +1227,21 @@ impl RelayRoute {
             return true;
         }
         match message.action {
+            A::Pause
+                if self.policy_enabled()
+                    && self.role == latch_relay::Role::Host
+                    && matches!(state.phase, RelayPhase::Preparing | RelayPhase::Prepared) =>
+            {
+                state.paused = true;
+            }
+            A::Pause
+                if self.policy_enabled()
+                    && self.role == latch_relay::Role::Host
+                    && matches!(state.phase, RelayPhase::Offered | RelayPhase::CommitSent) =>
+            {
+                self.reset(&mut state);
+                return send(&self.message(message.attempt, A::Abort));
+            }
             A::Offer(payload)
                 if self.role == latch_relay::Role::Viewer
                     && state.phase == RelayPhase::Preparing =>
@@ -918,7 +1314,15 @@ impl RelayRoute {
                 && (2000..=1_250_000).contains(&kbps)
                 && (576..=1200).contains(&datagram_size) =>
             {
-                state.udp_probe = Some(UdpProbe::sized(first, kbps, usize::from(datagram_size)));
+                if usize::from(first)
+                    + UdpProbe::policy(first, kbps, usize::from(datagram_size))
+                        .seen
+                        .len()
+                    >= 0x8000
+                {
+                    return true;
+                }
+                state.udp_probe = Some(UdpProbe::policy(first, kbps, usize::from(datagram_size)));
                 return send(&self.message(message.attempt, A::UdpProbeReady { first }));
             }
             A::UdpProbeReady { first }
@@ -930,7 +1334,14 @@ impl RelayRoute {
                     if probe.first == first && !probe.ready {
                         probe.ready = true;
                         probe.started = Instant::now();
+                        probe.paced_at = probe.started + UDP_PROBE_SETTLE;
                     }
+                }
+            }
+            A::UdpProbeCancel { first } if self.policy_enabled() => {
+                if state.udp_probe.as_ref().is_some_and(|p| p.first == first) {
+                    state.udp_probe = None;
+                    self.defer_udp_reassessment(&mut state);
                 }
             }
             A::UdpProbeResult {
@@ -942,10 +1353,18 @@ impl RelayRoute {
                     if probe.first != first {
                         state.udp_probe = Some(probe);
                     } else if probe.healthy(received, span_us) {
+                        if self.policy_enabled() {
+                            let measured =
+                                u64::from(received) * (probe.datagram_size + 80) as u64 * 8 * 1000
+                                    / u64::from(span_us.max(1));
+                            state.return_kbps = Some((measured * 9 / 10) as u32);
+                        }
                         state.switchbacks.push_back(Instant::now());
                         state.returning_direct = true;
                         state.started = Instant::now();
                         return send(&self.message(message.attempt, A::Direct));
+                    } else {
+                        self.defer_udp_reassessment(&mut state);
                     }
                 }
             }
@@ -956,14 +1375,14 @@ impl RelayRoute {
                 state.path.reason = PathReason::UdpRecovered;
                 // A measured, healthy handoff is not a failed relay attempt.
                 state.failures = 0;
-                state.retry_at = Instant::now() + Duration::from_millis(100);
+                state.retry_at = Instant::now() + self.handoff_cooldown();
                 return send(&self.message(message.attempt, A::DirectReady));
             }
             A::DirectReady if self.role == latch_relay::Role::Host && state.returning_direct => {
                 self.reset(&mut state);
                 state.failures = 0;
                 state.path.reason = PathReason::UdpRecovered;
-                state.retry_at = Instant::now() + Duration::from_millis(100);
+                state.retry_at = Instant::now() + self.handoff_cooldown();
             }
             A::RetryAfter { millis }
                 if self.role == latch_relay::Role::Viewer
@@ -983,8 +1402,11 @@ impl RelayRoute {
                 if state.phase == RelayPhase::Active {
                     self.reset(&mut state);
                 }
+                if self.policy_enabled() {
+                    state.path.reason = PathReason::RelayRenewal;
+                }
                 state.failures = 1;
-                state.retry_at = Instant::now() + Duration::from_millis(100);
+                state.retry_at = Instant::now() + self.handoff_cooldown();
             }
             A::Abort if state.phase != RelayPhase::Idle => self.reset(&mut state),
             _ => {}
@@ -1168,6 +1590,7 @@ pub struct Stats {
     pub applied_bitrate_kbps: u32,
     pub wire_budget_kbps: u32,
     pub application_limited: bool,
+    pub udp_damage: bool,
     pub requested_bitrate_kbps: u32,
     pub pacing_queue_ms: f32,
     pub send_errors: u64,
@@ -1336,13 +1759,13 @@ impl VideoHealth {
         }
     }
 
-    fn network_stalled(&self, accepted: Instant, now: Instant, fps: u32) -> bool {
+    fn network_stalled(&self, accepted: Instant, now: Instant, fps: u32, rtt: Duration) -> bool {
         let grace = if self.last_encoded.is_some() {
             Duration::from_millis(700)
         } else {
             Duration::from_secs(1)
         }
-        .max(Duration::from_secs_f64(2.0 / f64::from(fps.max(1))));
+        .max(rtt * 2 + Duration::from_secs_f64(2.0 / f64::from(fps.max(1))));
         now.saturating_duration_since(self.last_encoded.unwrap_or(accepted)) >= grace
     }
 
@@ -1462,6 +1885,7 @@ struct Inner {
     /// When anything last came from the host, µs since `epoch`.
     heard_us: AtomicU64,
     udp_heard_us: AtomicU64,
+    udp_video_us: AtomicU64,
     mtu: Mutex<MtuProbe>,
     /// Video packets the network lost in the last second, rebuilt or not,
     /// in thousandths of a percent: what the host sizes its FEC by.
@@ -1562,6 +1986,7 @@ impl Inner {
             epoch: Instant::now(),
             heard_us: AtomicU64::new(0),
             udp_heard_us: AtomicU64::new(0),
+            udp_video_us: AtomicU64::new(0),
             mtu: Mutex::new(MtuProbe::new(Instant::now())),
             feedback: Mutex::new(Report::default()),
             feedback_revision: AtomicU64::new(0),
@@ -2085,6 +2510,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         .lock()
         .enable_policy(request.media_path_policy && accept.media_path_policy);
     inner.udp_heard_us.store(0, Ordering::Relaxed);
+    inner.udp_video_us.store(0, Ordering::Relaxed);
     inner.relay_messages.lock().clear();
     inner
         .cursor_supported
@@ -2341,7 +2767,41 @@ fn busy_video(stats: &Stats) -> bool {
         && stats.applied_bitrate_kbps > 0
         && stats.received_fps > 0.0
         && stats.mbps.is_finite()
-        && stats.mbps * 1000.0 >= stats.applied_bitrate_kbps as f32 * 0.75
+        && (stats.mbps * 1000.0 >= stats.applied_bitrate_kbps as f32 * 0.75
+            || !stats.application_limited)
+}
+
+#[derive(Default)]
+struct LegacyFallback {
+    damage_since: Option<Instant>,
+    bandwidth_since: Option<Instant>,
+}
+impl LegacyFallback {
+    fn wanted(
+        &mut self,
+        now: Instant,
+        picture_age: Duration,
+        report: &Report,
+        limited: bool,
+    ) -> bool {
+        if report.frames_lost > 0 || report.unrecovered_loss_pct.unwrap_or(0.0) > 1.0 {
+            self.damage_since.get_or_insert(now);
+        } else if report.fps > 0.0 {
+            self.damage_since = None;
+        }
+        if limited {
+            self.bandwidth_since.get_or_insert(now);
+        } else {
+            self.bandwidth_since = None;
+        }
+        picture_age >= Duration::from_secs(1)
+            || self
+                .damage_since
+                .is_some_and(|since| now.saturating_duration_since(since) >= Duration::from_secs(2))
+            || self
+                .bandwidth_since
+                .is_some_and(|since| now.saturating_duration_since(since) >= Duration::from_secs(5))
+    }
 }
 
 fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Outcome {
@@ -2367,7 +2827,9 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
     let mut policy = Policy::default();
     let mut feedback_revision = 0;
     let mut reason = None;
-    let mut path_state = inner.relay.lock().path_state();
+    let mut healthy_since = None;
+    let mut notices = PathNotices::new(inner.relay.lock().path_state());
+    let mut legacy = LegacyFallback::default();
     loop {
         if inner.stopping() {
             if let Some(w) = inner.control_writer.lock().as_mut() {
@@ -2443,6 +2905,7 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 stats.applied_bitrate_kbps = report.applied_bitrate_kbps;
                 stats.wire_budget_kbps = report.wire_budget_kbps;
                 stats.application_limited = report.application_limited;
+                stats.udp_damage = report.udp_damage;
                 stats.requested_bitrate_kbps = report.requested_bitrate_kbps;
                 stats.pacing_queue_ms = report.pacing_queue_ms;
                 stats.send_errors = report.send_errors;
@@ -2493,52 +2956,93 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
         let now = Instant::now();
         let published = inner.published_us.load(Ordering::Relaxed);
         let relay = inner.relay.lock().clone();
-        let udp_seen = inner.udp_heard_us.load(Ordering::Relaxed);
-        let blocked = udp_seen == 0 && accepted.elapsed() >= Duration::from_millis(250);
-        let missing = inner
-            .video_health
-            .lock()
-            .network_stalled(accepted, now, accept.fps);
-        // Observe each receive window once. A second 50 ms sampling clock
-        // can repeatedly miss windows at an unlucky phase and postpone fallback.
-        if relay.active() {
-            policy = Policy::default();
-            reason = None;
-        } else if inner.feedback_revision.load(Ordering::Acquire) != feedback_revision {
-            feedback_revision = inner.feedback_revision.load(Ordering::Acquire);
-            let stats = inner.stats.lock();
-            reason = policy.observe(
+        let wanted = if relay.policy_enabled() {
+            let rtt = Duration::from_millis(u64::from(inner.stats.lock().rtt_ms));
+            let path = relay.path_state();
+            let mtu_settling = matches!(path.reason, PathReason::DatagramSize { .. })
+                && now.saturating_duration_since(path.since) < Duration::from_secs(1).max(rtt * 2);
+            let udp_seen = inner.udp_heard_us.load(Ordering::Relaxed);
+            let blocked =
+                udp_seen == 0 && accepted.elapsed() >= Duration::from_millis(350).max(rtt);
+            let stalled = inner
+                .video_health
+                .lock()
+                .network_stalled(accepted, now, accept.fps, rtt);
+            let video_progress = inner.udp_video_us.load(Ordering::Relaxed);
+            let missing = stalled
+                && (video_progress == 0
+                    || inner.now_us().saturating_sub(video_progress)
+                        >= 350_000u64.max(rtt.as_micros() as u64 * 2)
+                    || inner.stats.lock().udp_damage);
+            if relay.active() || mtu_settling {
+                policy = Policy::default();
+                reason = None;
+                healthy_since = None;
+            } else if inner.feedback_revision.load(Ordering::Acquire) != feedback_revision {
+                feedback_revision = inner.feedback_revision.load(Ordering::Acquire);
+                let stats = inner.stats.lock();
+                let report = inner.feedback.lock().clone();
+                let candidate = policy.observe(
+                    now,
+                    report.clone(),
+                    relay_bandwidth_limited(&stats),
+                    relay_fec_limited(&stats),
+                    stats.wire_budget_kbps,
+                    stats.udp_damage,
+                );
+                if candidate.is_some() {
+                    reason = candidate;
+                    healthy_since = None;
+                } else if report.fps > 0.0 && report.loss_pct < 3.0 && report.frames_lost == 0 {
+                    let since = *healthy_since.get_or_insert(now);
+                    if now.saturating_duration_since(since) >= rtt.max(Duration::from_millis(100)) {
+                        reason = None;
+                    }
+                } else {
+                    healthy_since = None;
+                }
+            }
+            if blocked {
+                relay.request_reason(PathReason::UdpBlocked);
+            } else if let Some(reason) = reason.clone() {
+                relay.request_reason(reason);
+            } else if missing && !mtu_settling {
+                relay.request_reason(PathReason::UdpStalled);
+            }
+            let current = relay.path_state();
+            let recovering = matches!(
+                current.reason,
+                PathReason::RelayUnavailable(_) | PathReason::RelayRenewal
+            ) && current.since.elapsed()
+                >= Duration::from_millis(100).max(rtt + Duration::from_millis(150))
+                && (published == 0
+                    || inner.epoch + Duration::from_micros(published) < current.since);
+            blocked || missing && !mtu_settling || reason.is_some() || recovering
+        } else {
+            let picture_age = if published == 0 {
+                now.saturating_duration_since(accepted)
+            } else {
+                Duration::from_micros(inner.now_us().saturating_sub(published))
+            };
+            legacy.wanted(
                 now,
-                inner.feedback.lock().clone(),
-                relay_bandwidth_limited(&stats),
-                relay_fec_limited(&stats),
-                stats.wire_budget_kbps,
-            );
-        }
-        if blocked {
-            relay.request_reason(PathReason::UdpBlocked);
-        } else if let Some(reason) = reason.clone() {
-            relay.request_reason(reason);
-        } else if missing {
-            relay.request_reason(PathReason::UdpStalled);
-        }
-        let current = relay.path_state();
-        let recovering = matches!(current.reason, PathReason::RelayUnavailable(_))
-            && current.since.elapsed() >= Duration::from_millis(100)
-            && (published == 0 || inner.epoch + Duration::from_micros(published) < current.since);
-        if !relay.maintain(
-            blocked || missing || reason.is_some() || recovering,
-            |message| send_tcp(inner, message),
-        ) {
+                picture_age,
+                &inner.feedback.lock(),
+                !relay.active() && {
+                    let stats = inner.stats.lock();
+                    relay_bandwidth_limited(&stats)
+                        && stats.mbps * 1000.0 >= stats.applied_bitrate_kbps as f32 * 0.75
+                },
+            )
+        };
+        if !relay.maintain(wanted, |message| send_tcp(inner, message)) {
             return Outcome::Ended(
                 control::end::TRANSPORT_FAILED as i32,
                 "The stream transport failed. Reconnecting…".into(),
             );
         }
-        let current_path = relay.path_state();
-        if current_path != path_state {
-            path_state = current_path.clone();
-            inner.emit(Event::PathChanged(current_path));
+        if let Some(state) = notices.observe(relay.path_state(), now) {
+            inner.emit(Event::PathChanged(state));
         }
         if accept.media_path_policy {
             let action = inner.mtu.lock().report(now);
@@ -2707,11 +3211,24 @@ fn receive(
     // arrived was handled: wait for the next datagram or timer.
     let relay = inner.relay.lock().clone();
     let mut route_revision = relay.revision();
+    let mut audio_datagram_size = relay.audio_datagram_size();
     let mut relay_frames = 0u64;
     let mut relay_report_frames = 0u64;
     let mut last_relay_frame = None;
     let mut drained = false;
     while !inner.stopping() {
+        if accept.media_path_policy && audio_datagram_size != relay.audio_datagram_size() {
+            audio_datagram_size = relay.audio_datagram_size();
+            if let Some(format) = &accept.audio {
+                let fits = latch_codec::audio::frame_samples_within(
+                    format.channels as usize,
+                    audio_datagram_size.min(1000) - 18,
+                )
+                .max(1);
+                let base = (format.frame_samples as usize).max(1);
+                audio_rx.set_packet_samples((base / base.div_ceil(fits)) as u32, format.rate);
+            }
+        }
         if route_revision != relay.revision() {
             route_revision = relay.revision();
             // Restore the UDP address immediately after relay teardown, even
@@ -2835,7 +3352,10 @@ fn receive(
                 if let Ok(datagram) = wire::parse(bytes) {
                     if datagram.session() == session {
                         inner.udp_heard_us.store(inner.now_us(), Ordering::Relaxed);
-                        if accept.media_path_policy && inner.mtu.lock().observe(&datagram) {
+                        if matches!(datagram, Datagram::Video { .. }) {
+                            inner.udp_video_us.store(inner.now_us(), Ordering::Relaxed);
+                        }
+                        if accept.media_path_policy && inner.mtu.lock().observe(&datagram, now) {
                             return;
                         }
                         if relay.active() {
@@ -2895,7 +3415,11 @@ fn receive(
                     if let Ok(datagram) = wire::parse(&buf[..n]) {
                         if datagram.session() == session {
                             inner.udp_heard_us.store(inner.now_us(), Ordering::Relaxed);
-                            if accept.media_path_policy && inner.mtu.lock().observe(&datagram) {
+                            if matches!(datagram, Datagram::Video { .. }) {
+                                inner.udp_video_us.store(inner.now_us(), Ordering::Relaxed);
+                            }
+                            if accept.media_path_policy && inner.mtu.lock().observe(&datagram, now)
+                            {
                                 continue;
                             }
                             if relay.active() {
@@ -4012,7 +4536,19 @@ mod tests {
         };
         assert!(relay_bandwidth_limited(&stats));
         stats.mbps = 0.1;
+        stats.application_limited = true;
         assert!(!relay_bandwidth_limited(&stats), "quiet desktop");
+        stats.application_limited = false;
+        stats.raw_loss_pct = 17.0;
+        assert!(
+            relay_bandwidth_limited(&stats),
+            "busy host with damaged delivery"
+        );
+        stats.application_limited = true;
+        assert!(
+            !relay_bandwidth_limited(&stats),
+            "quiet host with incidental loss"
+        );
         stats.mbps = 3.5;
         stats.wire_budget_kbps = 15_000;
         assert!(!relay_bandwidth_limited(&stats), "healthy path");
@@ -4608,6 +5144,267 @@ mod media_policy_tests {
     use super::*;
 
     #[test]
+    fn probe_rate_uses_delivery_and_reserves_budget_with_bounded_pacing_credit() {
+        let route = RelayRoute::new(7, latch_relay::Role::Host, None);
+        route.enable_policy(true);
+        {
+            let mut state = route.state.lock();
+            state.number = 1;
+            route.activate(&mut state);
+            state.next_probe = Instant::now();
+            state.relay_delivery.push_back((Instant::now(), 20_000));
+        }
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        route.reassess_udp(&udp, udp.local_addr().unwrap(), 1_000_000, |_| true);
+        let first = {
+            let mut state = route.state.lock();
+            let probe = state.udp_probe.as_mut().unwrap();
+            assert_eq!(probe.kbps, 22_000);
+            assert!(usize::from(probe.first) + probe.seen.len() < 0x8000);
+            probe.first
+        };
+        route.handle(
+            control::RelayControl {
+                session: 7,
+                attempt: 1,
+                action: control::RelayAction::UdpProbeReady { first },
+            },
+            |_| true,
+        );
+        {
+            let mut state = route.state.lock();
+            let probe = state.udp_probe.as_mut().unwrap();
+            probe.started -= Duration::from_millis(300);
+            probe.paced_at -= Duration::from_secs(1);
+        }
+        let budget = route.relay_media_budget(50_000);
+        assert!(
+            budget <= 2_000,
+            "UDP reservation did not lower relay budget {budget}"
+        );
+        route.reassess_udp(&udp, udp.local_addr().unwrap(), 1_000_000, |_| true);
+        let state = route.state.lock();
+        let probe = state.udp_probe.as_ref().unwrap();
+        assert!(
+            probe.sent > 0 && probe.sent <= 11,
+            "late control turn dumped {} packets",
+            probe.sent
+        );
+        assert!(state.next_probe >= probe.started + Duration::from_secs(29));
+    }
+
+    #[test]
+    fn relay_ack_growth_cancels_a_return_probe_and_datagram_changes_do_not_change_route_revision() {
+        let route = RelayRoute::new(7, latch_relay::Role::Host, None);
+        route.enable_policy(true);
+        {
+            let mut state = route.state.lock();
+            state.number = 1;
+            route.activate(&mut state);
+            state.udp_probe = Some(UdpProbe::policy(0, 20_000, 1200));
+            state.ack_base = Duration::from_millis(10);
+            state.ack_rtt = Duration::from_millis(200);
+        }
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut cancelled = false;
+        route.reassess_udp(&udp, udp.local_addr().unwrap(), 50_000, |message| {
+            cancelled = matches!(
+                message,
+                Message::Relay(control::RelayControl {
+                    action: control::RelayAction::UdpProbeCancel { first: 0 },
+                    ..
+                })
+            );
+            true
+        });
+        assert!(cancelled);
+        assert!(route.state.lock().next_probe >= Instant::now() + Duration::from_secs(59));
+        // Once sending finishes, ACK jitter cannot invalidate the already
+        // received measurement while its report crosses the control lane.
+        {
+            let mut state = route.state.lock();
+            let mut probe = UdpProbe::policy(16, 20_000, 1200);
+            probe.sent = probe.packets();
+            state.udp_probe = Some(probe);
+        }
+        route.reassess_udp(&udp, udp.local_addr().unwrap(), 50_000, |_| {
+            panic!("completed probe was cancelled")
+        });
+        assert!(route.state.lock().udp_probe.is_some());
+        assert_eq!(route.relay_media_budget(25_000), 25_000);
+        route.state.lock().video_backpressure = Some(Instant::now());
+        assert!(route.video_backpressured());
+        route.state.lock().video_backpressure = Some(Instant::now() - Duration::from_millis(400));
+        assert!(route.video_backpressured());
+        route.state.lock().video_backpressure = Some(Instant::now() - Duration::from_secs(1));
+        assert!(!route.video_backpressured());
+        let revision = route.revision();
+        route.set_datagram_size(800);
+        assert_eq!(route.revision(), revision);
+        assert_eq!(route.audio_datagram_size(), 1000);
+        let now = Instant::now();
+        {
+            let mut state = route.state.lock();
+            state.priority_since = now - Duration::from_millis(100);
+            state.priority_bytes = 10_000;
+        }
+        assert_eq!(route.priority_budget_kbps(now), Some(944));
+        assert_eq!(
+            route.priority_budget_kbps(now + Duration::from_millis(100)),
+            Some(856)
+        );
+        route.shutdown();
+        assert_eq!(route.audio_datagram_size(), 800);
+    }
+
+    #[test]
+    fn negotiated_grant_starts_are_bounded_to_sixty_per_rolling_hour() {
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(
+                CertificateDer::from_pem_slice(include_bytes!("../../relay/tests/certs/ca.pem"))
+                    .unwrap(),
+            )
+            .unwrap();
+        let config = latch_relay::ClientConfig::with_roots(
+            latch_relay::Endpoint::new("localhost", 1).unwrap(),
+            roots,
+        )
+        .unwrap();
+        let route = RelayRoute::new(7, latch_relay::Role::Host, Some(config));
+        route.enable_policy(true);
+        route.state.lock().grant_starts.extend([Instant::now(); 60]);
+        let mut delayed = false;
+        route.handle(
+            control::RelayControl {
+                session: 7,
+                attempt: 1,
+                action: control::RelayAction::Request,
+            },
+            |message| {
+                delayed = matches!(
+                    message,
+                    Message::Relay(control::RelayControl {
+                        action: control::RelayAction::RetryAfter { millis: 30_000 },
+                        ..
+                    })
+                );
+                true
+            },
+        );
+        assert!(delayed);
+        assert!(!route.pending());
+    }
+
+    #[test]
+    fn old_peers_in_both_roles_keep_legacy_dwell_backoff_cooldown_and_uncancelled_preparation() {
+        for role in [latch_relay::Role::Host, latch_relay::Role::Viewer] {
+            let route = RelayRoute::new(7, role, None);
+            assert!(!route.policy_enabled());
+            assert_eq!(route.state.lock().probe_delay, Duration::from_secs(60));
+            assert_eq!(route.handoff_cooldown(), Duration::from_secs(2));
+            {
+                let mut state = route.state.lock();
+                route.activate(&mut state);
+                assert!(state.next_probe >= state.started + Duration::from_secs(60));
+                state.switchbacks.extend([Instant::now(); 3]);
+                route.reset(&mut state);
+                assert!(
+                    state.retry_at.saturating_duration_since(Instant::now())
+                        > Duration::from_millis(1900)
+                );
+                state.phase = RelayPhase::Preparing;
+            }
+            route.maintain(false, |_| panic!("legacy preparation was cancelled"));
+            assert!(route.pending());
+        }
+    }
+
+    #[test]
+    fn an_old_host_keeps_one_second_stalls_two_second_damage_and_five_second_limiting() {
+        let start = Instant::now();
+        for (damage, limited, threshold) in [
+            (false, false, 1000),
+            (true, false, 2000),
+            (false, true, 5000),
+        ] {
+            let mut fallback = LegacyFallback::default();
+            for ms in (0..=threshold).step_by(50) {
+                let report = Report {
+                    fps: 60.0,
+                    frames_lost: u64::from(damage),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    fallback.wanted(
+                        start + Duration::from_millis(ms),
+                        if damage || limited {
+                            Duration::ZERO
+                        } else {
+                            Duration::from_millis(ms)
+                        },
+                        &report,
+                        limited
+                    ),
+                    ms == threshold
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cleared_preparation_cancels_before_offer_without_changing_the_media_state_and_backs_off() {
+        let route = RelayRoute::new(7, latch_relay::Role::Viewer, None);
+        route.enable_policy(true);
+        let initial = route.path_state();
+        for expected_seconds in [2, 4, 8, 16, 30] {
+            route.state.lock().phase = RelayPhase::Preparing;
+            let mut paused = false;
+            route.maintain(false, |message| {
+                paused = matches!(
+                    message,
+                    Message::Relay(control::RelayControl {
+                        action: control::RelayAction::Pause,
+                        ..
+                    })
+                );
+                true
+            });
+            assert!(paused);
+            assert!(!route.pending());
+            assert_eq!(route.path_state(), initial);
+            let remaining = route
+                .state
+                .lock()
+                .retry_at
+                .saturating_duration_since(Instant::now());
+            assert!(remaining > Duration::from_millis(expected_seconds * 1000 - 100));
+        }
+    }
+
+    #[test]
+    fn high_rtt_video_stall_and_recovery_graces_allow_keyframe_round_trips() {
+        let start = Instant::now();
+        let health = VideoHealth {
+            last_encoded: Some(start),
+            ..Default::default()
+        };
+        for one_way in [150, 300] {
+            let rtt = Duration::from_millis(one_way * 2);
+            let grace =
+                Duration::from_millis(700).max(rtt * 2 + Duration::from_secs_f64(2.0 / 30.0));
+            assert!(!health.network_stalled(
+                start,
+                start + grace - Duration::from_millis(1),
+                30,
+                rtt
+            ));
+            assert!(health.network_stalled(start, start + grace, 30, rtt));
+        }
+    }
+
+    #[test]
     fn sized_udp_padding_waits_for_ready_and_reports_from_first_arrival() {
         let host = RelayRoute::new(7, latch_relay::Role::Host, None);
         let viewer = RelayRoute::new(7, latch_relay::Role::Viewer, None);
@@ -4616,6 +5413,7 @@ mod media_policy_tests {
             let mut state = route.state.lock();
             state.number = 1;
             route.activate(&mut state);
+            state.relay_delivery.push_back((Instant::now(), 2000));
             state.next_probe = Instant::now();
         }
         let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -4651,6 +5449,8 @@ mod media_policy_tests {
             let probe = state.udp_probe.as_mut().unwrap();
             assert!(probe.ready);
             probe.started -= Duration::from_millis(200);
+            probe.paced_at = Instant::now() - Duration::from_millis(5);
+            probe.credit = 1280.0;
         }
         host.reassess_udp(&udp, udp.local_addr().unwrap(), 2000, |_| true);
         assert!(host.state.lock().udp_probe.as_ref().unwrap().sent > 0);
@@ -4698,6 +5498,7 @@ mod media_policy_tests {
                 let mut state = route.state.lock();
                 state.number = attempt;
                 route.activate(&mut state);
+                state.relay_delivery.push_back((Instant::now(), 60_000));
                 state.next_probe = Instant::now();
             }
             let mut messages = Vec::new();
@@ -4725,7 +5526,7 @@ mod media_policy_tests {
                     action: control::RelayAction::UdpProbeResult {
                         first,
                         received: packets,
-                        span_us: 1_000_000,
+                        span_us: 600_000,
                     },
                 },
                 |message| {
@@ -4760,6 +5561,7 @@ mod media_policy_tests {
             {
                 let mut state = host.state.lock();
                 host.activate(&mut state);
+                state.relay_delivery.push_back((Instant::now(), requested));
                 state.next_probe = Instant::now();
             }
             let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -4770,7 +5572,7 @@ mod media_policy_tests {
                     ..
                 }) = message
                 {
-                    assert_eq!(*kbps, requested * 5 / 4);
+                    assert_eq!(*kbps, requested);
                     sent = true;
                 }
                 true
@@ -4786,10 +5588,30 @@ mod media_policy_tests {
             last_encoded: Some(accepted + Duration::from_secs(2)),
             ..Default::default()
         };
-        assert!(!health.network_stalled(accepted, accepted + Duration::from_millis(2600), 60));
-        assert!(health.network_stalled(accepted, accepted + Duration::from_millis(2700), 60));
+        assert!(!health.network_stalled(
+            accepted,
+            accepted + Duration::from_millis(2600),
+            60,
+            Duration::ZERO
+        ));
+        assert!(health.network_stalled(
+            accepted,
+            accepted + Duration::from_millis(2700),
+            60,
+            Duration::ZERO
+        ));
         health.last_encoded = Some(accepted);
-        assert!(!health.network_stalled(accepted, accepted + Duration::from_secs(1), 1));
-        assert!(health.network_stalled(accepted, accepted + Duration::from_secs(2), 1));
+        assert!(!health.network_stalled(
+            accepted,
+            accepted + Duration::from_secs(1),
+            1,
+            Duration::ZERO
+        ));
+        assert!(health.network_stalled(
+            accepted,
+            accepted + Duration::from_secs(2),
+            1,
+            Duration::ZERO
+        ));
     }
 }

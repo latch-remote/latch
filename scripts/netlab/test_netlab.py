@@ -5,7 +5,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from middlebox import alpns
 from netlab import Lab, classify, evaluate, main, run_scenario
@@ -23,6 +23,22 @@ def healthy_events():
 
 
 class VerdictTests(unittest.TestCase):
+    def test_loss_qualification_requires_real_decode_and_disables_relay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lab = Lab("d1", Path(directory))
+            process = Mock()
+            process.wait.return_value = 0
+            with patch.object(lab, "spawn", return_value=process) as spawn, \
+                    patch.object(lab, "ns") as ns, patch("netlab.read_events", return_value=healthy_events()):
+                lab.qualify_udp_loss()
+                self.assertIn("--no-relay", spawn.call_args.args[2])
+                process.wait.assert_called_once_with(timeout=52)
+                self.assertEqual(ns.call_count, 4)
+            with patch.object(lab, "spawn", return_value=process), \
+                    patch("netlab.read_events", return_value=[]):
+                with self.assertRaisesRegex(RuntimeError, "decoded no real media"):
+                    lab.qualify_udp_loss()
+
     def test_cleanup_continues_after_diagnostic_timeouts(self):
         with tempfile.TemporaryDirectory() as directory:
             lab = Lab("a", Path(directory))

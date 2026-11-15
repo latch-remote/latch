@@ -121,9 +121,14 @@ bad-to-good probability 50%, loss 100% in the bad state and 0% in the
 good state. Its stationary mean is 17%, with a two-packet mean burst.
 The qdisc is on campus `viewer` egress, where host-to-viewer media flows.
 An explicit priomap keeps every other protocol in the clean band. All
-veth TSO/GSO/GRO features are disabled and checked. The measured netem
-drop fraction, `drops / (packets + drops)`, must be 15–18% over at least
-1,000 real media packets. An invalid impairment is ERROR.
+veth TSO/GSO/GRO features are disabled and checked. Fast relay recovery can end UDP exposure before it provides a representative
+loss sample. d1 first runs a separate forty-second, UDP-only decoded stream
+through the same qdisc, then starts a fresh session for all recovery and
+quality assertions. The qualifier uses the measurement example's explicit
+`--no-relay` option. Path/relay counters and timing restart for the measured
+session. Qdisc statistics retain the qualified real-media sample.
+The measured netem drop fraction, `drops / (packets + drops)`, must be
+15–18% over at least 1,000 real media packets. An invalid impairment is ERROR.
 
 d2 uses a tc police action at 3 Mbps with an 8 KiB burst. The noise stream
 requests 6 Mbps and must produce policer drops and a measured one-second
