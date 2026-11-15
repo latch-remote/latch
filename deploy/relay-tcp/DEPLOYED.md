@@ -1,9 +1,12 @@
 # Dedicated Seoul relay deployment
 
-The current dual-role configuration was verified on 2026-11-15 UTC. The
-Lightsail instance now also carries the operator tailnet's Tailscale peer
-relay. Current tuning, measurements and teardown state follow the original
-deployment history below. [Current configuration](#dual-role-consolidation-on-2026-11-15)
+Production was upgraded on 2026-11-15 at 09:03:28 UTC, then reapplied at 09:10:02 UTC to the 6.0.0
+native TLS/HTTPS WebSocket relay from main `7684946`, with the diagnostic
+forced-carrier option included in this PR. The executable SHA-256 is
+`8382f4f604af565ae71744fd19c696b5deac0012227c0ff0243a399e2094a9f9`.
+It listens on `[::]:443` with IPv4-mapped acceptance. The existing
+`small_3_0` instance remains the single $12/month production relay.
+[WebSocket deployment](#websocket-upgrade-on-2026-11-15)
 
 Deployment began on 2026-11-14 UTC. The dedicated endpoint is
 `relay.latch.rune.foo:443`, DNS-only A record `54.116.93.176`.
@@ -296,9 +299,8 @@ The native binary remains SHA-256
 `0b2b3f500cf5c9a42b49fd361dc443be309b9f92b9b7049c99e41781302c02a7`.
 Public WebPKI, TLS and ALPN checks passed after tuning. Both services and
 the offload unit are enabled for boot. Live module loading, effective settings, service ordering, sockets and durable
-quota were verified without a reboot. **The reboot persistence check is still
-pending.** The orchestrator will perform it with the new relay build deployment
-when fewer coding agents depend on the Mac–Windows path.
+quota were verified without a reboot. **Boot persistence remains unverified.** A future maintenance window must
+coordinate the shared Mac–Windows peer-relay dependency.
 [Live verification evidence](results/live-verification-20261115/README.md)
 
 ### Persistent relay tuning
@@ -436,3 +438,175 @@ address would be separate from the attached IPv4 static allocation.
 The old EC2 instance and security group were removed after backup verification
 on 2026-11-15 at approximately 06:15 UTC. The recurring relay instance cost is
 Lightsail `small_3_0` only. [Completed teardown](LIGHTSAIL.md#completed-teardown)
+
+## WebSocket upgrade on 2026-11-15
+
+### Build and maintenance
+
+The host is Ubuntu 24.04 x86-64 with glibc 2.39. The replacement was built on
+the Mac in an Ubuntu 24.04 x86-64 Docker container using Rust
+`1.100.0 (0ef1bc386 2026-11-09)`, `cargo build --locked --release -j 4 -p latch-relay`.
+Its highest referenced GLIBC symbol version is 2.34. Docker's Rosetta CPU lacked
+ADX, and Ubuntu's QEMU 8.2 crashed during startup. QEMU 10.2.3 with `-cpu max`
+and the matching Ubuntu x86-64 loader/libraries ran the unmodified executable's
+complete `selftest.py --binary` successfully. This covered dual-stack sockets,
+TLS/ALPN, HTTP, WebSocket, limits, exclusive ledger locking, retained reservations,
+exhaustion across restart and corruption rejection. Mac relay tests and strict
+Clippy passed, including forced-carrier cache and fallback regressions.
+
+The baseline service was active with PID 6541 and zero automatic restarts.
+Its executable SHA-256 was
+`0b2b3f500cf5c9a42b49fd361dc443be309b9f92b9b7049c99e41781302c02a7`.
+TCP 443 listened on IPv4. UDP 443 and UDP 41641 belonged to the existing
+Tailscale process. Initial relay metrics showed 703,599,461 network bytes,
+4,894,883,840 reserved bytes, 1,560 accepts, 110 rejects and zero active
+connections/sessions. Every managed sysctl matched the persistent tuning table
+except MTU probing, which was still `1`.
+
+The installer ran during a single brief `latch-relay` stop, using the current
+certificate lineage and the existing 500,000,000,000-byte budget. It preserved
+the exact stopped ledger and local limits. The stopped ledger contained
+5,101,453,312 reserved bytes and had SHA-256
+`478b5525fcd497e8b0265a8bae673168019538b50e91190fcfdd1090bcd6b42a`.
+The only live tuning change was `net.ipv4.tcp_mtu_probing=2`, with the same
+value written to `/etc/sysctl.d/90-latch-relay.conf`. Existing offloads and daemon
+drop-ins were retained. The measured stop/install/start interval through a
+successful local native WebPKI/ALPN handshake was **0.877 seconds**. A Mac
+paired native probe passed immediately afterward.
+
+Tailscaled retained PID 10234, start time 2026-11-15 04:24:38 UTC and zero
+restarts. Network management retained PID 482 and its prior start time.
+The Mac still reported the Windows peer through `peer-relay 54.116.93.176:443`.
+The host stayed online throughout the maintenance.
+
+### Bounded public transport measurements
+
+Both roles ran on the UCLA campus Mac over Wi-Fi `en0`. macOS withheld the
+SSID. The existing public IPv4 SSH rule matched the campus connection, and
+public IPv6 HTTPS worked from the Mac. Each run lasted 40 seconds at 60 fps,
+including a 10-second quarter-rate warm-up. Throughput and frame-delay
+percentiles use the reporting windows identified in the table. Completed
+runs use the final approximately 10-second full-rate window. Failed runs can
+include warm-up or end before reaching full rate.
+CPU is the service CPU delta over the whole run, including setup and warm-up,
+as a percentage of one core. Frame delay measures enqueue to complete-frame
+receipt across both Mac–Seoul WAN legs. These short measurements include
+normal path variability.
+
+| Run / target Mbps | Stream seconds | Payload Mbps | Frame delay p50 / p95 ms | CPU, one core | Result / reporting window |
+| --- | --- | --- | --- | --- | --- |
+| before-native-5 | 40.14 | 5.007 | 151.3 / 167.6 | 2.21% | complete, final 10 s |
+| before-native-20 | 40.14 | 20.027 | 158.7 / 308.7 | 3.45% | complete, final 10 s |
+| after-native-5 | 40.13 | 5.008 | 152.6 / 158.8 | 2.22% | complete, final 10 s |
+| after-native-20 | 33.07 | 17.570 | 314.0 / 500.2 | 3.10% | timeout, last 3.1 s |
+| after-websocket-5 | 12.67 | 1.790 | 236.8 / 400.9 | 2.03% | timeout, mixed warm-up/full rate |
+| after-websocket-20 | 5.04 | 3.406 | 745.6 / 1141.1 | 1.90% | timeout, warm-up only |
+| rollback-native-20 | 3.02 | 3.643 | 264.9 / 716.5 | 2.26% | timeout, warm-up only |
+| retry-native-20 | 15.40 | 9.483 | 162.3 / 401.9 | 2.72% | timeout, mixed warm-up/full rate |
+| retry-websocket-5 | 21.34 | 3.167 | 190.0 / 367.5 | 2.05% | timeout, mixed warm-up/full rate |
+| retry-websocket-20 | 5.25 | 4.426 | 156.5 / 417.9 | 2.46% | timeout, warm-up only |
+
+The old build supported only native TLS. Every post-upgrade measurement with
+observed sockets used IPv4, matching the initial IPv4-only deployment.
+The first 5-Mbps upgrade run completed. The first native 20-Mbps timeout
+triggered restoration of the prior binary/unit at 09:08:57 UTC, retaining the
+live quota, and withdrawal of the upgrade's AAAA record. That prior binary also
+timed out, after 3.02 seconds during its quarter-rate warm-up. The replacement
+was reapplied after reproducing the failure on the prior version. Subsequent
+native/WebSocket 1-Mbps paired health checks completed after the certificate
+renewal hook finished. The bounded capacity retries above still timed out.
+These runs establish carrier functionality and document the observed capacity
+limit on this changing campus path. Sustained 20-Mbps operation remains
+unverified. The transport deadlines and tests retain their existing settings.
+
+The second installation preserved 5,286,395,904 reserved bytes exactly, ledger
+SHA-256 `f283efec2c0ca3b0ce5b4db0a40f6b19178cd88b883abb44c364badbe2982624`.
+Its stop/install/start/local-ALPN verification interval was **0.937 seconds**.
+The intervening rollback stop-to-listen interval was **0.333 seconds** from the
+journal. The requested Certbot dry run invoked its deployment hook at
+09:10:07 UTC, with a further **0.055-second** stop-to-listen interval.
+The four recorded interruption intervals total approximately **2.20 seconds**.
+A health attempt overlapping that renewal restart ended with EOF, followed by
+successful native and WebSocket checks after renewal.
+
+
+### Live verification
+
+- Native ALPN paired health passed immediately after the first upgrade and
+  again after the final installation/renewal. Forced grant and all four lanes
+  reported `Native`, with complete frames and priority/control echoes.
+- Forced WebSocket paired health passed, with the grant and all four lanes
+  reporting `WebSocket`, complete frames and priority/control echoes.
+- A loopback-only HTTP CONNECT proxy carried both forced carriers to the live
+  relay, five tunnels each. Both six-second 1-Mbps probes passed. The proxy
+  shut down after ten verified tunnels.
+- Plain `curl https://relay.latch.rune.foo/` returned HTTP 200 and `OK`.
+  `GET /relay` without upgrade returned HTTP 426 and WebSocket version 13.
+- `selftest.py --live relay.latch.rune.foo` passed public hostname, certificate
+  chain and native ALPN validation.
+- `certbot renew --dry-run --run-deploy-hooks --cert-name relay.latch.rune.foo`
+  succeeded, including the deployed certificate hook and retained quota.
+- The production listener accepted both IP families. Public IPv6 certificate,
+  native ALPN and HTTP checks passed before each AAAA publication.
+- The existing Tailscale UDP listeners and peer-relay path were retained.
+  Its process/start time and network manager process/start time stayed equal.
+
+The optional full x86-64 library suite under QEMU passed 40 tests and hit an
+emulation limitation in the self-spawning CPU-rejection test. The complete
+Mac suite and native CI provide coverage for that subprocess behavior. The
+required matching-userspace Linux executable selftest passed under QEMU 10.2.3.
+
+### IPv6 and DNS
+
+AWS STS matched account `043189681495` before AWS changes. Lightsail dual-stack
+assigned `2406:da12:417:7f00:7baf:3615:172a:fe6f`. The running host acquired
+its address and default route automatically within several minutes. Existing
+network management continued running. Its live IPv6 lease renewed during
+verification. The TCP 80/443 and UDP 443/41641 rules gained public IPv6 scope.
+SSH gained only the current operator IPv6 `/128`. Existing IPv4 firewall rules
+were verified equal before and after the changes.
+
+Direct public IPv6 from the Mac verified TCP 443, the public certificate chain
+and hostname, native `latch-relay/1` ALPN and HTTP 200. Only after those checks,
+the existing Cloudflare DNS-edit credential created the DNS-only AAAA for the
+assigned address, TTL 300. The existing DNS-only A record remained exactly
+`54.116.93.176`. Authoritative Cloudflare DNS and a public recursive resolver
+returned the AAAA. Boot persistence awaits a separately coordinated maintenance
+window. Tailscaled retains its existing IPv4 peer-relay static endpoint.
+
+### Backups and rollback
+
+The dated root-only host backup is
+`/var/backups/latch-relay/pre-wss-20261115T085100Z/`. It contains the previous
+executable, unit/drop-ins, limits, budget, TLS identity, sysctl file, network
+helper and quota snapshots. The Mac backup is
+`/Volumes/Backup/latch-relay-seoul-1-pre-wss-2026-11-15/`, containing
+`pre-wss.tar.gz`, the exact `quota.stopped` and `quota.redeploy-stopped` captured before each replacement,
+and `EXCLUSIONS.txt`. Certificate private keys, ACME account state, SSH keys and
+Tailscale state were excluded from the Mac copy. The archive and ELF executable
+were read back successfully.
+
+The rollback script passed shell syntax, backup hash, executable, retained
+limits/budget and live-ledger prerequisite checks before the upgrade. Run it
+through the existing pinned SSH alias if rollback is needed.
+
+```sh
+ssh -F "$HOME/.ssh/latch6-lightsail.conf" latch6-relay \
+  'sudo bash /var/backups/latch-relay/pre-wss-20261115T085100Z/rollback.sh'
+```
+
+It briefly stops `latch-relay`, restores the previous executable/unit/configuration
+and MTU probing value, then starts the service with the current live quota.
+It retains `[::]:443` for the published AAAA. The prior executable passed a
+disposable-ledger IPv4/IPv6 native TLS test before updating the rollback script.
+Retain all reservations accumulated after the upgrade when rolling back.
+
+### Future port 80 probe
+
+The host currently leaves TCP 80 to Certbot standalone HTTP-01. For the later
+anonymous `GET /netenv/probe` returning an empty 204, give the relay a plain
+HTTP port-80 listener and serve `/.well-known/acme-challenge/` from a restricted
+ACME webroot directory. Switch Certbot to the webroot authenticator and retain
+the validated certificate deployment hook. One listener can then answer both
+paths continuously through renewal. This follow-up requires implementation and
+its own renewal verification.

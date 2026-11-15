@@ -6,6 +6,16 @@ GitHub release notes, so each version gets a heading of the form
 
 ## Unreleased
 
+### Deployment
+
+- Upgrade the single Seoul relay to native TLS and HTTPS WebSocket on TCP 443,
+  retain its durable quota, and apply always-on TCP MTU probing. Record the
+  bounded before/after measurements, verified backups, initial 0.877-second upgrade and 0.937-second reinstallation.
+- Enable Lightsail IPv6 and matching firewall scopes, verify public IPv6 TLS,
+  and publish a DNS-only AAAA while preserving the existing A record.
+- Add explicit carrier and CONNECT proxy options to the bounded paired probe,
+  with per-lane diagnostics and carrier-selection regression tests.
+
 ### Relay connectivity
 
 - Add HTTPS WebSocket relay fallback on TCP 443 alongside native
