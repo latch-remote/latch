@@ -1053,6 +1053,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn baseline_starts_through_the_viewer_entry_point_with_or_without_libva() {
+        let (bytes, width, height) = super::super::probe_baseline();
+        let mut decoder =
+            crate::video::new_decoder_for_stream(Codec::H264Baseline, width, height).unwrap();
+        let frame = decoder
+            .decode(&bytes, true, None)
+            .unwrap()
+            .expect("Baseline picture");
+        assert!(super::super::probe_picture_ok(&frame, width, height));
+    }
+
     /// With a VA-API GPU, each probed codec decodes a stream of several
     /// pictures too (`LATCH_TEST_VAAPI=1` makes its absence a failure).
     #[test]
