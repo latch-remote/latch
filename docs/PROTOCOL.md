@@ -645,30 +645,48 @@ existing keyframe messages.
 ALPN `http/1.1` or an absent ALPN selects an HTTP/1.1 server. A WebSocket
 client offers `h2, http/1.1` with the relay hostname as SNI. The daemon
 selects HTTP/1.1 and upgrades `GET /relay` using RFC 6455 version 13.
-Ordinary HTTP requests receive a small `200 OK` text response and close.
+Root GET/HEAD requests receive a small `200 OK` response. Unknown paths receive
+404, unsupported methods 405 with Allow, malformed requests 400, failed upgrades
+on `/relay` 426 with WebSocket version 13, and excessive headers 431. Responses
+include ordinary content headers and close after one request.
 Each endpoint opens separate outbound priority and video connections.
 
 Production clients verify the relay hostname using public WebPKI roots.
-Private, loopback and tailnet destinations are filtered. IPv4-mapped
-addresses and `64:ff9b::/96` NAT64 answers receive the embedded IPv4 checks.
-RFC 8215 translation addresses and global network-specific DNS64 prefixes
-are accepted. ULA translation prefixes are discovered through RFC 7050
-`ipv4only.arpa`, supporting RFC 6052 /32, /40, /48, /56, /64 and /96 layouts
-and checking embedded public IPv4 destinations. IPv4 and IPv6 connections
-race with a 250 ms stagger and actual socket readiness checks on Windows.
-An unreachable address family shares the bounded connection deadline.
+Private, loopback, link-local, ULA and tailnet destinations are always filtered,
+including 100.64.0.0/10, fd7a:115c:a1e0::/48 and its 4via6 range.
+IPv4-mapped addresses receive the embedded IPv4 checks. The well-known
+`64:ff9b::/96` must embed a public relay A answer. RFC 7050 discovery requires
+both `ipv4only.arpa` addresses (192.0.0.170 and .171) under a consistent legal
+RFC 6052 /32, /40, /48, /56, /64 or /96 prefix, with zero reserved u octet.
+Reserved suffix bits are ignored per RFC 6052. Matching global network-specific
+and RFC 8215 translation addresses
+must embed a public IPv4 from the relay's A answers. RFC 8215 subprefixes use
+the discovered layout. ULA prefixes remain denied. Missing A answers or
+unvalidated RFC 8215 prefixes fail closed. Global IPv6 addresses outside
+identified translation prefixes retain ordinary public IPv6 filtering.
+IPv4 and IPv6 race with a 250 ms stagger and socket readiness checks on Windows.
 The supplied systemd unit binds `[::]:443` with IPv4-mapped connections enabled.
-Admission keys normalize mapped IPv4 and the well-known NAT64 /96. NAT64
-translation normally presents its gateway's IPv4 source to the daemon.
+Admission aggregates IPv6 sources by /64 and normalizes mapped IPv4 and
+well-known NAT64 /96 to IPv4. NAT64 normally presents its gateway's IPv4 source.
+Unrecognized translated IPv6 sources share their gateway /64.
 
 ### Carrier ladder and diagnostics
 
-Each connection gets a two-second DNS/TCP/TLS/upgrade budget, bounded further
-by the caller's setup deadline. Native TLS gets at most 750 ms. Refusal,
-reset, timeout or ALPN rejection advances to WebSocket using the remaining
-budget. Grant creation precedes two concurrent lane connections, leaving
-room for pairing, key confirmation and control messages within the six-second
-application negotiation deadline. Carriers can differ between peers and lanes.
+Cold connections have a two-second DNS/TCP/TLS/upgrade budget, bounded by the
+caller's deadline. Native TLS gets at most 750 ms before WebSocket fallback.
+Cloned configurations cache the winning carrier and address for 30 seconds,
+scoped to relay/proxy endpoints. Concurrent attach lanes and later grants try
+the cached path first within 1.25 s. Failure clears the hint and permits the
+other carrier within the original two-second budget.
+With a stable cached path and 200 ms RTT, cold grant open (2 s), concurrent
+warm attach opens (1.25 s), grant/attach/confirmation exchanges (0.6 s) and a
+control hop (0.2 s) total 4.05 s. The regression uses a 4.75 s assertion with
+1.25 s headroom below the six-second application deadline. Changed routes can
+use another full ladder. Carriers can differ between peers and lanes.
+For a fresh host configuration, waiting lanes share the fallback selection as
+soon as native fails, then open WebSocket concurrently. The cold attach cohort
+stays within 2 s. Cold grant plus cold attach plus four 200 ms exchanges total
+4.8 s, tested below 5.5 s with scheduler headroom.
 The native carrier remains wire-compatible with 6.0.0 clients and daemons.
 
 `ClientConfig::proxy` accepts an explicit `ProxyConfig` with optional
@@ -676,29 +694,34 @@ The native carrier remains wire-compatible with 6.0.0 clients and daemons.
 HTTP CONNECT for the relay hostname and port, normally `host:443`, and then
 performs relay TLS inside the tunnel. Proxy DNS may resolve to a local or
 private address. Basic credentials and configuration Debug output are redacted.
+Credential storage, plaintext encoding buffers and the pre-sized CONNECT request
+are zeroizing. Base64 is written directly into the final request allocation.
 Proxy transport uses HTTP over TCP. System and PAC discovery belong to the
 caller.
 
 `create_grant_with_info` returns the grant and `ConnectionInfo` with the selected
-`Carrier`, proxy use, reduced-MSS status and typed `AttemptFailure` history.
+`Carrier`, proxy use, reduced-MSS status/cause and typed `AttemptFailure` history.
 `Transport::connection_info(lane)` exposes the same per-lane data.
 `ConnectError::from_io` and `Transport::failure()` expose user-facing `Failure`
-variants for blocked/disconnected connections, timeout, untrusted certificate
-issuer, probable captive portal, proxy authentication (407), proxy refusal
-(including 403 and 5xx), ALPN/upgrade rejection, and relay admission rejection.
-Untrusted issuers include bounded certificate issuer text. Hostname mismatch,
-plaintext HTTP at the TLS boundary and redirect/HTML upgrade responses identify
-probable captive portals. Untrusted-issuer, portal and proxy failures end the ladder.
-Public-root verification stays enabled throughout. An abrupt pre-handshake
-close has the same observable result for exhausted daemon admission and a
-network filter, and is classified as connection blocked.
+variants for blocked/disconnected connections, `ClosedBeforeHandshake`, timeout,
+untrusted or incomplete certificate chains, probable captive portal, proxy
+authentication/refusal, ALPN/upgrade rejection and relay request rejection.
+Issuer text is bounded and strips Unicode control/format characters.
+Hostname mismatch and plaintext HTTP before verified TLS identify probable
+captive portals. HTTP, HTML and redirects after verified relay TLS indicate
+upgrade rejection and allow a remaining carrier attempt. Untrusted-issuer,
+portal and proxy failures end the ladder. Public-root verification stays enabled.
+An abrupt pre-handshake close cannot distinguish exhausted relay admission
+from a network filter. `ClosedBeforeHandshake` displays "blocked or relay busy".
 
-On a timed-out native rung the WebSocket retry requests a 1200-byte TCP MSS
-on Unix. Linux applies this before connect and macOS before TLS after connect.
-A media timeout records the hint in cloned client configurations for the next
-fresh-grant attempt. `reduce_mss_after_stall()` lets callers retain that hint
-across their own retry policy. `ConnectionInfo::reduced_mss` records whether
-the socket accepted the clamp. Windows uses its platform TCP behavior.
+A TLS handshake stalled after sending ClientHello enables a 1200-byte MSS retry
+on Unix. TLS write/partial-record stalls share an expiring 30-second hint through
+cloned configurations. DNS, connect, idle, ACK and session-lifetime timeouts
+leave the hint untouched. `reduce_mss_after_stall()` records an external stall.
+`ConnectionInfo::reduced_mss_reason` uses `MssReason::{ExplicitStall,
+TlsHandshakeStall, WriteStall, RecordStall}` when the clamp was applied.
+Linux applies it before connect and macOS before TLS after connect.
+Windows uses its platform TCP behavior.
 The Linux server enables `net.ipv4.tcp_mtu_probing=2` through the deployment
 network script, covering its IPv4 and IPv6 sending paths.
 
@@ -747,8 +770,8 @@ and 32-header parse bound. A WebSocket message is bounded to 16 KiB plus the
 four-byte length, including fragments. Both carriers use the same admission,
 durable encrypted-byte quota, queue backpressure and record/stall deadlines.
 An upgraded relay rejection is a length-prefixed one-byte zero record, which
-older clients already reject. Rejections before TLS credit is available close
-the socket. The grant response contains a random rendezvous
+older clients already reject. It is sent only when existing credit can deliver
+it. Rejections before TLS credit is available close the socket. The grant response contains a random rendezvous
 ID, four independent lane tickets, an attachment expiry and session limits.
 An attach request binds the rendezvous ID, role, lane and corresponding
 ticket. The daemon pairs sockets and forwards bounded opaque records.
@@ -795,7 +818,12 @@ viewer's reconnect policy. The original authorized control connection
 remains required throughout.
 
 Daemon defaults bound admission to four sessions globally and two per
-creator IP, with a 60-second attachment window, 900-second session lifetime
+creator source key. IPv6 keys cover /64, while mapped/well-known translated
+IPv4 keys cover one IPv4 address. Defaults also allow 24 connections globally,
+8 per key and 120 accepts per minute globally, 30 per key. The 256-entry rate
+table evicts the oldest window when full. Per-key refusals consume no global
+accept credit. Decoy/scanner responses increment the periodic `http_responses`
+counter and consume no per-event diagnostic budget. Grants have a 60-second attachment window, 900-second session lifetime
 and 512 MiB per session. The CLI defaults to a 10 GiB monthly encrypted TCP
 ingress-plus-egress reservation budget. Operators can override bounded
 limits. A locked persistent ledger reserves byte leases and fsyncs them

@@ -227,7 +227,7 @@ impl TlsSocket {
         if record.is_empty() || record.len() > RECORD_MAX {
             return Err(invalid("invalid outbound relay record"));
         }
-        self.pending = self.carrier.encode(record)?;
+        self.carrier.encode(record, &mut self.pending)?;
         self.written = 0;
         self.sending = Some(Instant::now());
         Ok(())
@@ -237,6 +237,15 @@ impl TlsSocket {
             quota.credit(&mut self.credit, &mut self.credit_epoch)?;
         }
         let was_handshaking = self.conn.is_handshaking();
+        let early_close = |kind| {
+            io::Error::new(
+                kind,
+                crate::ConnectError {
+                    failure: crate::Failure::ClosedBeforeHandshake,
+                    attempts: Vec::new(),
+                },
+            )
+        };
         let metered = self.credit != 0;
         let mut meter = Meter {
             tcp: &mut self.tcp,
@@ -250,16 +259,28 @@ impl TlsSocket {
             match self.conn.write_tls(&mut meter) {
                 Ok(_) => (),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+                Err(e)
+                    if was_handshaking
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::BrokenPipe
+                                | io::ErrorKind::ConnectionAborted
+                        ) =>
+                {
+                    return Err(early_close(e.kind()));
+                }
                 Err(e) => return Err(e),
             }
         }
         if self.conn.wants_read() {
             match self.conn.read_tls(&mut meter) {
                 Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "relay socket closed",
-                    ))
+                    return Err(if was_handshaking {
+                        early_close(io::ErrorKind::UnexpectedEof)
+                    } else {
+                        io::Error::new(io::ErrorKind::UnexpectedEof, "relay socket closed")
+                    })
                 }
                 Ok(_) => {
                     self.conn
@@ -270,11 +291,22 @@ impl TlsSocket {
                             ) => crate::Failure::AlpnRejected.error(),
                             rustls::Error::InvalidMessage(
                                 rustls::InvalidMessage::InvalidContentType,
-                            ) => crate::Failure::CaptivePortal.error(),
+                            ) if was_handshaking => crate::Failure::CaptivePortal.error(),
                             _ => crate::Failure::TlsRejected.error(),
                         })?;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+                Err(e)
+                    if was_handshaking
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::BrokenPipe
+                                | io::ErrorKind::ConnectionAborted
+                        ) =>
+                {
+                    return Err(early_close(e.kind()));
+                }
                 Err(e) => return Err(e),
             }
         }

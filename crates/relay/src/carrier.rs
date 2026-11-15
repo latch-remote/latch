@@ -11,7 +11,54 @@ pub(crate) const HTTP_ALPN: &[u8] = b"http/1.1";
 pub const WEBSOCKET_PATH: &str = "/relay";
 const HTTP_MAX: usize = 8192;
 const MESSAGE_MAX: usize = RECORD_MAX + 4;
-const DECOY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 3\r\nConnection: close\r\n\r\nOK\n";
+fn http_response(status: u16, head: bool) -> Vec<u8> {
+    let (reason, extra) = match status {
+        200 => ("OK", ""),
+        400 => ("Bad Request", ""),
+        404 => ("Not Found", ""),
+        405 => ("Method Not Allowed", "Allow: GET, HEAD\r\n"),
+        426 => (
+            "Upgrade Required",
+            "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n",
+        ),
+        431 => ("Request Header Fields Too Large", ""),
+        _ => unreachable!(),
+    };
+    let body = format!("{reason}\n");
+    let mut response = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n", body.len()).into_bytes();
+    if !head {
+        response.extend_from_slice(body.as_bytes());
+    }
+    response
+}
+fn decoy_response(bytes: &[u8]) -> Vec<u8> {
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut request = httparse::Request::new(&mut headers);
+    let status = match request.parse(bytes) {
+        Err(httparse::Error::TooManyHeaders) => 431,
+        Err(_) | Ok(httparse::Status::Partial) => 400,
+        Ok(httparse::Status::Complete(_)) => {
+            if request.version != Some(1)
+                || header(request.headers, "Host").is_none_or(str::is_empty)
+                || request.headers.iter().any(|h| {
+                    h.name.eq_ignore_ascii_case("Transfer-Encoding")
+                        || (h.name.eq_ignore_ascii_case("Content-Length") && h.value != b"0")
+                })
+            {
+                400
+            } else if !matches!(request.path, Some("/" | WEBSOCKET_PATH)) {
+                404
+            } else if !matches!(request.method, Some("GET" | "HEAD")) {
+                405
+            } else if request.path == Some(WEBSOCKET_PATH) {
+                426
+            } else {
+                200
+            }
+        }
+    };
+    http_response(status, request.method == Some("HEAD"))
+}
 
 #[derive(Default)]
 pub(crate) struct Headers(Vec<u8>);
@@ -115,10 +162,9 @@ pub(crate) fn response_status(bytes: &[u8]) -> io::Result<(u16, bool)> {
     Ok((status, portal))
 }
 fn client_upgrade(bytes: &[u8], accept: &str) -> io::Result<()> {
-    let (status, portal) = response_status(bytes)?;
-    if portal || status == 200 {
-        return Err(Failure::CaptivePortal.error());
-    }
+    // TLS already verified the relay name. Its front end can reject an upgrade.
+    let (status, _) =
+        response_status(bytes).map_err(|_| Failure::UpgradeRejected { status: 0 }.error())?;
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut response = httparse::Response::new(&mut headers);
     response
@@ -186,7 +232,16 @@ impl State {
     pub fn negotiate(&mut self, reader: &mut dyn Read) -> io::Result<Option<Vec<u8>>> {
         match self {
             Self::HttpServer(headers) => {
-                if let Some(bytes) = headers.read(reader)? {
+                let bytes = match headers.read(reader) {
+                    Ok(bytes) => bytes,
+                    Err(_) if headers.0.len() == HTTP_MAX => {
+                        let head = headers.0.starts_with(b"HEAD ");
+                        *self = Self::Closing;
+                        return Ok(Some(http_response(431, head)));
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(bytes) = bytes {
                     match server_upgrade(&bytes) {
                         Ok(Some(response)) => {
                             *self = Self::WebSocket(WebSocket::new(false));
@@ -194,18 +249,16 @@ impl State {
                         }
                         _ => {
                             *self = Self::Closing;
-                            let response = if bytes.starts_with(b"HEAD ") {
-                                &DECOY[..DECOY.len() - 3]
-                            } else {
-                                DECOY
-                            };
-                            return Ok(Some(response.to_vec()));
+                            return Ok(Some(decoy_response(&bytes)));
                         }
                     }
                 }
             }
             Self::HttpClient { headers, accept } => {
-                if let Some(bytes) = headers.read_response(reader)? {
+                if let Some(bytes) = headers
+                    .read_response(reader)
+                    .map_err(|_| Failure::UpgradeRejected { status: 0 }.error())?
+                {
                     client_upgrade(&bytes, accept)?;
                     *self = Self::WebSocket(WebSocket::new(true));
                 }
@@ -214,14 +267,21 @@ impl State {
         }
         Ok(None)
     }
-    pub fn encode(&self, record: &[u8]) -> io::Result<Vec<u8>> {
-        let mut bytes = (record.len() as u32).to_be_bytes().to_vec();
-        bytes.extend_from_slice(record);
+    pub fn encode(&self, record: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
         match self {
-            Self::Native => Ok(bytes),
-            Self::WebSocket(ws) => frame(2, &bytes, ws.client),
-            _ => Err(invalid("relay carrier is not ready")),
+            Self::Native => {
+                output.clear();
+                output.extend_from_slice(&(record.len() as u32).to_be_bytes());
+                output.extend_from_slice(record);
+            }
+            Self::WebSocket(ws) => {
+                let mut bytes = (record.len() as u32).to_be_bytes().to_vec();
+                bytes.extend_from_slice(record);
+                *output = frame(2, &bytes, ws.client)?;
+            }
+            _ => return Err(invalid("relay carrier is not ready")),
         }
+        Ok(())
     }
     pub fn expired(&self, limit: Duration) -> bool {
         matches!(self, Self::WebSocket(ws) if ws.started.is_some_and(|t| t.elapsed() >= limit))
@@ -229,6 +289,9 @@ impl State {
 }
 
 pub(crate) fn frame(opcode: u8, payload: &[u8], masked: bool) -> io::Result<Vec<u8>> {
+    if payload.len() > u16::MAX as usize {
+        return Err(invalid("outbound WebSocket frame exceeds bound"));
+    }
     let mut output = vec![0x80 | opcode];
     let mask_bit = if masked { 0x80 } else { 0 };
     if payload.len() < 126 {
@@ -412,6 +475,89 @@ mod tests {
             .unwrap();
         assert!(response.ends_with(b"\r\n\r\n"));
         assert!(response.windows(17).any(|w| w == b"Content-Length: 3"));
+    }
+    #[test]
+    fn decoy_methods_paths_parse_errors_and_header_limits_follow_http() {
+        for (request, status) in [
+            ("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", 200),
+            ("HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n", 200),
+            ("GET /unknown HTTP/1.1\r\nHost: localhost\r\n\r\n", 404),
+            ("BREW / HTTP/1.1\r\nHost: localhost\r\n\r\n", 405),
+            ("GET /relay HTTP/1.1\r\nHost: localhost\r\n\r\n", 426),
+            (
+                "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n",
+                400,
+            ),
+            ("garbage\r\n\r\n", 400),
+        ] {
+            let mut server = State::HttpServer(Headers::default());
+            let response = server.negotiate(&mut request.as_bytes()).unwrap().unwrap();
+            let text = std::str::from_utf8(&response).unwrap();
+            assert!(text.starts_with(&format!("HTTP/1.1 {status} ")), "{text}");
+            if request.starts_with("HEAD ") {
+                assert!(response.ends_with(b"\r\n\r\n"));
+            }
+            if status == 405 {
+                assert!(text.contains("Allow: GET, HEAD\r\n"));
+            }
+            if status == 426 {
+                assert!(text.contains("Sec-WebSocket-Version: 13\r\n"));
+            }
+            assert!(!text.to_lowercase().contains("latch"));
+        }
+        for request in [
+            format!(
+                "GET / HTTP/1.1\r\nHost: localhost\r\n{}\r\n",
+                "X: a\r\n".repeat(33)
+            ),
+            format!(
+                "GET / HTTP/1.1\r\nHost: localhost\r\nX: {}",
+                "a".repeat(HTTP_MAX)
+            ),
+        ] {
+            let mut server = State::HttpServer(Headers::default());
+            assert!(server
+                .negotiate(&mut request.as_bytes())
+                .unwrap()
+                .unwrap()
+                .starts_with(b"HTTP/1.1 431 "));
+        }
+    }
+    #[test]
+    fn verified_tls_upgrade_responses_are_relay_rejections() {
+        for status in [200, 301, 302, 403, 503] {
+            let response = format!("HTTP/1.1 {status} Response\r\nContent-Type: text/html\r\n\r\n");
+            assert_eq!(
+                crate::ConnectError::from_io(
+                    &client_upgrade(response.as_bytes(), "key").unwrap_err()
+                )
+                .failure,
+                Failure::UpgradeRejected { status }
+            );
+        }
+        assert_eq!(
+            crate::ConnectError::from_io(
+                &client_upgrade(b"<html>Sign in</html>", "key").unwrap_err()
+            )
+            .failure,
+            Failure::UpgradeRejected { status: 0 }
+        );
+    }
+    #[test]
+    fn native_framing_matches_600_and_reuses_write_capacity() {
+        let mut output = Vec::with_capacity(RECORD_MAX + 4);
+        let allocation = output.as_ptr();
+        for record in [&[1][..], &[0][..], &[3][..], &[2; 67][..]] {
+            State::Native.encode(record, &mut output).unwrap();
+            assert_eq!(&output[..4], &(record.len() as u32).to_be_bytes());
+            assert_eq!(&output[4..], record);
+            assert_eq!(output.as_ptr(), allocation);
+        }
+        assert!(frame(2, &vec![0; 65536], true).is_err());
+        assert_eq!(
+            &frame(2, &vec![0; 65535], false).unwrap()[..4],
+            &[0x82, 126, 255, 255]
+        );
     }
     #[test]
     fn websocket_bounds_masking_fragmentation_and_controls() {

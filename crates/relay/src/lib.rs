@@ -16,7 +16,7 @@ pub use client::{
     create_grant, create_grant_with_info, ClientConfig, Endpoint, Event, Transport, TransportLimits,
 };
 pub use crypto::{ensure_supported_cpu, SessionKeys};
-pub use diagnostics::{AttemptFailure, Carrier, ConnectError, ConnectionInfo, Failure};
+pub use diagnostics::{AttemptFailure, Carrier, ConnectError, ConnectionInfo, Failure, MssReason};
 pub use proxy::{BasicCredentials, ProxyConfig};
 pub use wire::{Attachment, Grant, Lane, Role};
 

@@ -94,50 +94,79 @@ connection uses plaintext HTTP. Relay TLS inside the tunnel verifies the relay
 hostname against the configured roots. Production uses public WebPKI roots.
 The caller supplies system/PAC discovery results.
 
-An explicit proxy is authoritative for both carriers. Each connection has a
+An explicit proxy is authoritative for both carriers. A cold connection has a
 two-second ladder, with at most 750 ms for native DNS/TCP/TLS and the remainder
-for WebSocket DNS/TCP/TLS/upgrade. Refusal, reset, timeout and ALPN rejection
-advance the ladder. Untrusted-issuer, portal and proxy failures finish immediately.
-The caller's earlier setup deadline always wins. The ten-second default setup
-limit still covers relay request/pairing and end-to-end confirmation. Applications
-retain their six-second negotiation deadline and cancel expired attempts.
+for WebSocket DNS/TCP/TLS/upgrade. Cloned configurations remember the winning
+carrier and TCP address for 30 seconds, scoped to the relay and proxy endpoint.
+Initial discovery is shared across simultaneous lanes. Both concurrent attach
+lanes and later grants try that path first, within 1.25 s. A failed cached path clears the hint and tries the other carrier within
+the original two-second total budget. Refusal, reset, timeout, ALPN rejection
+and upgrade rejection advance the ladder. Untrusted-issuer, portal and proxy
+failures finish immediately. The caller's earlier setup deadline always wins.
+
+For a stable winning path, cold grant open plus concurrent warm attach opens
+consume at most 2 s + 1.25 s. At 200 ms RTT, the grant exchange, attach reply,
+end-to-end confirmation and one control hop add 0.8 s, totaling 4.05 s.
+The timing regression asserts below 4.75 s, leaving 1.25 s of headroom under the
+application's six-second negotiation deadline. This estimate assumes successful
+warm paths and 200 ms RTT. The warm budget includes room for CONNECT and
+TLS 1.2 handshakes. Changed routes can use the full second ladder.
+For a fresh host configuration, lanes share the fallback selection immediately
+after native fails and open WebSocket concurrently. Cold grant plus cold attach
+cohort plus four 200 ms exchanges total 2 s + 2 s + 0.8 s = 4.8 s. That regression
+asserts below 5.5 s with scheduler headroom.
+The ten-second default setup limit still covers relay request/pairing and
+end-to-end confirmation. Applications cancel attempts at their own deadline.
 
 `create_grant_with_info(&config, &cancel)` returns `(Grant, ConnectionInfo)`.
 `Transport::connection_info(Lane)` returns the chosen path once its connection
-is established. `ConnectionInfo` contains `carrier`, `via_proxy`, `reduced_mss`
-and `earlier_failures`. Each `AttemptFailure` contains its carrier, proxy use
-and `Failure`. `ConnectError::from_io(&error)` recovers typed failures from the
-existing `io::Result` API. `Transport::failure()` retains the terminal typed
-failure while `Event::Closed` keeps its existing shape.
+is established. `ConnectionInfo` contains `carrier`, `via_proxy`, `reduced_mss`,
+`reduced_mss_reason` and `earlier_failures`. `MssReason` identifies explicit,
+TLS-handshake, write or partial-record stalls. Each `AttemptFailure` contains
+its carrier, proxy use and `Failure`. `ConnectError::from_io(&error)` recovers
+typed failures from the existing `io::Result` API. `Transport::failure()` retains
+the terminal typed failure while `Event::Closed` keeps its existing shape.
 
-`Failure` distinguishes connection blocked/disconnected, timeout, TLS interception
-with bounded issuer text, probable captive portal, proxy authentication required,
-proxy refused with HTTP status, ALPN rejected, upgrade rejected with HTTP status,
-relay rejected, TLS rejected, invalid protocol, cancellation and unsupported CPU.
-A private-CA certificate fails verification. A different certificate name, plaintext
-HTTP at the TLS boundary or redirect/HTML at upgrade produces a probable captive
-portal failure. The daemon sends an explicit rejection record when it has TLS
-credit. Pre-handshake admission closes and network closes are observationally
-ambiguous and produce connection-blocked failures.
+`Failure` distinguishes connection blocked/disconnected, `ClosedBeforeHandshake`
+with the message "blocked or relay busy", timeout, untrusted or incomplete TLS
+chains with bounded, control/format-free issuer text, probable captive portal,
+proxy authentication/refusal, ALPN/upgrade rejection, relay rejection, invalid
+protocol, cancellation and unsupported CPU. A different certificate name or
+plaintext HTTP before verified TLS produces a probable captive portal failure.
+HTTP/HTML/redirect responses inside verified relay TLS produce `UpgradeRejected`
+and permit another carrier attempt. The daemon sends `[0]` for request rejection
+when existing TLS credit can deliver it. Exhausted pre-TLS admission closes
+cheaply. This has the same observable result as a network-induced early close,
+so `ClosedBeforeHandshake` preserves that ambiguity.
 
-IPv4 and IPv6 race with a 250 ms stagger. Production permits public DNS64 answers
-through the well-known /96 and RFC 8215 /48 translation prefixes. RFC 7050
-`ipv4only.arpa` discovery also permits ULA network-specific /32, /40, /48, /56,
-/64 and /96 prefixes with public embedded destinations. Ordinary private,
-loopback and tailnet destinations remain filtered. Explicit proxies may reside
-on those local networks.
+IPv4 and IPv6 race with a 250 ms stagger. Production always filters private,
+loopback, link-local, ULA and tailnet destinations, including Tailscale CGNAT,
+ULA and 4via6 ranges. RFC 7050 `ipv4only.arpa` discovery requires both
+192.0.0.170 and .171 under a consistent /32, /40, /48, /56, /64 or /96 prefix,
+using the RFC 6052 layout and zero reserved u octet. Reserved suffix bits
+are ignored per RFC 6052. Matching network-specific and RFC 8215 translation
+addresses must embed a public IPv4
+from the relay's A answers. The well-known `64:ff9b::/96` receives the same
+embedded-public-relay check. RFC 8215 subprefix lengths come from discovery.
+ULA discovery never creates an exception to filtering. A missing relay A answer
+or unvalidated RFC 8215 prefix fails closed. Ordinary global IPv6 remains usable.
+Explicit proxies may reside on local networks.
 
-A native handshake timeout requests a 1200-byte MSS on the WebSocket retry on
-Unix. Linux applies it before connect. macOS applies it after connect and before
-TLS. Media timeouts retain the hint in cloned `ClientConfig` values for a fresh
-grant. Call `config.reduce_mss_after_stall()` to carry an externally detected
-stall into subsequent connections. Reuse cloned configurations across retries.
-`ConnectionInfo::reduced_mss` reports successful application. Windows uses its
-OS TCP behavior. Server TCP MTU probing covers the server's sending direction.
+A stalled TLS handshake after sending ClientHello requests a 1200-byte MSS on
+the next carrier. TLS write and partial-record stalls retain that hint for
+30 seconds in cloned configurations. DNS, connect, idle, application ACK and
+session lifetime timeouts leave the hint untouched. Call
+`config.reduce_mss_after_stall()` for an externally detected path-MTU stall.
+Linux applies the clamp before connect and macOS before TLS after connect.
+`ConnectionInfo::reduced_mss` reports successful application and
+`reduced_mss_reason` reports its cause. Windows uses its OS TCP behavior.
+Server TCP MTU probing covers the server's sending direction.
 
 WebSocket binary messages contain one existing length-prefixed record, at most
 16 KiB plus four bytes, including fragments. Masking, ping/pong and close follow
-RFC 6455. HTTP headers are bounded to 8 KiB and 32 fields. Native and WebSocket
+RFC 6455. HTTP headers are bounded to 8 KiB and 32 fields. Ordinary root GET/HEAD requests
+receive 200, unknown paths 404, unsupported methods 405, invalid requests 400,
+incomplete upgrades on `/relay` 426 with version 13, and excessive headers 431. Native and WebSocket
 share byte quotas, session slots, bounded queues and deadlines. A peer can use
 a different carrier from its partner.
 
@@ -175,16 +204,20 @@ operator overrides, then call `Daemon::bind(config)`. `local_addr()` supports
 loopback port-zero tests, `metrics()` returns fixed atomic counters, and
 `run(&Cancel)` owns the event loop until cancellation. The daemon adds no threads
 per connection. An IPv6 wildcard listen address enables dual-stack IPv4/IPv6
-on one socket. Per-IP limits normalize IPv4-mapped and well-known NAT64 /96
-addresses. The CLI prints metrics on stdout every 30 s.
+on one socket. Admission keys aggregate native IPv6 by /64 and normalize
+IPv4-mapped and well-known NAT64 /96 sources to their IPv4 address. Translators
+normally present their gateway's IPv4 source. Unrecognized translated IPv6
+sources share their gateway /64. The CLI prints metrics on stdout every 30 s,
+including aggregate `http_responses`. Completed decoy responses consume no
+per-event diagnostic lines.
 
 ### Pilot defaults
 
 | Limit | Default |
 | --- | --- |
-| Live connections, global / IP | 24 / 8 |
-| Live grants or sessions, global / creator IP | 4 / 2 |
-| Accepted TCP connections per minute, global / IP | 120 / 30 |
+| Live connections, global / source key | 24 / 8 |
+| Live grants or sessions, global / creator source key | 4 / 2 |
+| Accepted TCP connections per minute, global / source key | 120 / 30 |
 | Rate metadata entries | 256 |
 | Grant attach TTL | 60 s |
 | Session lifetime / encrypted TCP byte cap | 900 s / 512 MiB |
@@ -193,6 +226,11 @@ addresses. The CLI prints metrics on stdout every 30 s.
 | TLS handshake byte limit per connection | 128 KiB |
 | Encrypted application record / forwarding buffer | 16 KiB |
 | CLI monthly ingress plus egress reservation budget | 10 GiB |
+
+The rate table evicts its oldest window when full, allowing a new source to
+compete for global capacity. Per-source rate refusals consume no global accept
+credit. IPv6 address rotation within a /64 shares all connection, session and
+rate limits. Global limits remain shared by every source.
 
 Admission is an anonymous bounded pilot with separate random server-issued host
 and viewer capabilities. Each role carries independent single-use priority and

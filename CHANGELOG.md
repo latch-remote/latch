@@ -18,6 +18,15 @@ GitHub release notes, so each version gets a heading of the form
   filtering, and retain address racing and Windows connect readiness checks.
   Retry stalled Unix paths with a reduced TCP MSS and enable Linux server
   TCP MTU probing in the deployment kit.
+- Harden DNS64 discovery and embedded-IPv4 validation while always denying
+  private and tailnet destinations. Aggregate IPv6 admission by /64 and evict
+  old rate windows so new sources can compete for capacity.
+- Report early TLS closes as blocked or relay busy, keep verified HTTPS upgrade
+  rejection retryable, wipe proxy credential buffers, sanitize certificate issuer
+  text, and aggregate decoy traffic without consuming failure diagnostics.
+- Reuse successful carrier/address selections across lanes and grants. Expire
+  reduced-MSS hints after 30 seconds and report their stall cause. Cover malformed
+  WebSocket frames and control floods over real daemon sockets.
 
 ## 6.0.0 (2026-11-14)
 

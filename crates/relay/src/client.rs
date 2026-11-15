@@ -3,7 +3,7 @@ use crate::{
     invalid, timeout,
     wire::{self, TlsSocket, CHUNK, TICK},
     Attachment, AttemptFailure, Cancel, Carrier, ConnectError, ConnectionInfo, Failure, Grant,
-    Lane, ProxyConfig, SessionKeys,
+    Lane, MssReason, ProxyConfig, SessionKeys,
 };
 use latch_proto::video::{InFrame, MAX_FRAME_LEN};
 use rustls::pki_types::ServerName;
@@ -11,11 +11,8 @@ use std::{
     collections::VecDeque,
     fmt,
     io::{self, Write},
-    net::{SocketAddr, TcpStream, ToSocketAddrs},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Condvar, Mutex, OnceLock,
-    },
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs},
+    sync::{mpsc, Arc, Condvar, Mutex, OnceLock},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -129,7 +126,8 @@ pub struct ClientConfig {
     tls: Arc<rustls::ClientConfig>,
     public_only: bool,
     verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
-    reduced_mss: Arc<AtomicBool>,
+    hints: Arc<Mutex<PathHints>>,
+    opening: Arc<Mutex<()>>,
 }
 impl fmt::Debug for ClientConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -141,10 +139,14 @@ impl fmt::Debug for ClientConfig {
     }
 }
 impl ClientConfig {
-    /// Apply a conservative 1200-byte MSS on subsequent sockets where supported.
-    /// Clones share this hint. Use after a path-MTU stall when starting a fresh grant.
+    /// Apply a conservative 1200-byte MSS for 30 seconds after a path-MTU stall.
+    /// Clones share this expiring hint. Start a fresh grant after partial media.
     pub fn reduce_mss_after_stall(&self) {
-        self.reduced_mss.store(true, Ordering::Relaxed);
+        self.remember_mss_stall(MssReason::ExplicitStall);
+    }
+    fn remember_mss_stall(&self, reason: MssReason) {
+        self.hints.lock().unwrap().reduced_mss =
+            Some((Instant::now() + Duration::from_secs(30), reason));
     }
     pub fn production(endpoint: Endpoint) -> io::Result<Self> {
         let mut config = Self::with_roots(
@@ -179,8 +181,47 @@ impl ClientConfig {
             public_only: false,
             proxy: None,
             verifier,
-            reduced_mss: Arc::new(AtomicBool::new(false)),
+            hints: Arc::new(Mutex::new(PathHints::default())),
+            opening: Arc::new(Mutex::new(())),
         })
+    }
+}
+
+#[derive(Default)]
+struct PathHints {
+    winning: Option<WinningPath>,
+    reduced_mss: Option<(Instant, MssReason)>,
+}
+#[derive(Clone)]
+struct WinningPath {
+    host: String,
+    port: u16,
+    proxy: Option<(String, u16)>,
+    address: Option<SocketAddr>,
+    carrier: Carrier,
+    expires: Instant,
+}
+impl WinningPath {
+    fn matches(&self, config: &ClientConfig) -> bool {
+        self.expires > Instant::now()
+            && self.host == config.endpoint.host()
+            && self.port == config.endpoint.port()
+            && self
+                .proxy
+                .as_ref()
+                .map(|(host, port)| (host.as_str(), *port))
+                == config.proxy.as_ref().map(|p| (p.host(), p.port()))
+    }
+}
+fn mss_stall(error: &io::Error) -> Option<MssReason> {
+    if error.kind() != io::ErrorKind::TimedOut {
+        return None;
+    }
+    match error.to_string().as_str() {
+        "TLS write deadline expired" => Some(MssReason::WriteStall),
+        "TLS record deadline expired" => Some(MssReason::RecordStall),
+        "TLS handshake stalled after ClientHello" => Some(MssReason::TlsHandshakeStall),
+        _ => None,
     }
 }
 
@@ -320,15 +361,12 @@ fn public_address(ip: std::net::IpAddr) -> bool {
                     std::net::Ipv4Addr::from((u32::from(s[6]) << 16) | u32::from(s[7])).into(),
                 );
             }
-            if s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1 {
-                return public_address(translated_v4(ip, 48).into());
-            }
             s[0] & 0xe000 == 0x2000 && !(s[0] == 0x2001 && s[1] == 0x0db8)
         }
     }
 }
-// RFC 6052 embeds IPv4 around the reserved u octet for /32 through /64.
-fn translated_v4(ip: std::net::Ipv6Addr, prefix_len: usize) -> std::net::Ipv4Addr {
+// The u octet is reserved even for /96 (RFC 6052 section 2.2).
+fn translated_v4(ip: Ipv6Addr, prefix_len: usize) -> Option<Ipv4Addr> {
     let bytes = ip.octets();
     let positions = match prefix_len {
         32 => [4, 5, 6, 7],
@@ -337,39 +375,79 @@ fn translated_v4(ip: std::net::Ipv6Addr, prefix_len: usize) -> std::net::Ipv4Add
         56 => [7, 9, 10, 11],
         64 => [9, 10, 11, 12],
         96 => [12, 13, 14, 15],
-        _ => unreachable!(),
+        _ => return None,
     };
-    std::net::Ipv4Addr::new(
+    if bytes[8] != 0 {
+        return None;
+    }
+    Some(Ipv4Addr::new(
         bytes[positions[0]],
         bytes[positions[1]],
         bytes[positions[2]],
         bytes[positions[3]],
-    )
+    ))
 }
-fn allowed_address(ip: std::net::IpAddr, discovery: &[SocketAddr]) -> bool {
-    let std::net::IpAddr::V6(v6) = ip else {
+fn allowed_address(ip: IpAddr, discovery: &[SocketAddr], relay_v4: &[Ipv4Addr]) -> bool {
+    let IpAddr::V6(v6) = ip else {
         return public_address(ip);
     };
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return public_address(v4.into());
+    }
+    // Never let resolver-controlled discovery override private/ULA/tailnet filtering.
+    // This also denies Tailscale's fd7a:115c:a1e0::/48 and 4via6 /64.
+    let s = v6.segments();
+    let well_known = s[..6] == [0x64, 0xff9b, 0, 0, 0, 0];
+    let local_translation = s[..3] == [0x64, 0xff9b, 1];
+    if !public_address(ip) && !well_known && !local_translation {
+        return false;
+    }
+    let relay_public_v4 = |v4: Ipv4Addr| public_address(v4.into()) && relay_v4.contains(&v4);
+    if well_known {
+        return translated_v4(v6, 96).is_some_and(relay_public_v4);
+    }
     for answer in discovery {
-        let std::net::IpAddr::V6(synthesized) = answer.ip() else {
+        let IpAddr::V6(first) = answer.ip() else {
             continue;
         };
-        for prefix_len in [32, 40, 48, 56, 64, 96] {
-            let test = translated_v4(synthesized, prefix_len).octets();
-            if matches!(test, [192, 0, 0, 170 | 171])
-                && v6.octets()[..prefix_len / 8] == synthesized.octets()[..prefix_len / 8]
-            {
-                return public_address(translated_v4(v6, prefix_len).into());
+        for length in [32, 40, 48, 56, 64, 96] {
+            let prefix = &first.octets()[..length / 8];
+            if v6.octets()[..length / 8] != *prefix {
+                continue;
             }
+            let Some(first_v4) = translated_v4(first, length) else {
+                continue;
+            };
+            if !matches!(first_v4.octets(), [192, 0, 0, 170 | 171]) {
+                continue;
+            }
+            // RFC 7050 requires both known IPv4 addresses under one legal prefix.
+            let other = Ipv4Addr::new(
+                192,
+                0,
+                0,
+                if first_v4.octets()[3] == 170 {
+                    171
+                } else {
+                    170
+                },
+            );
+            let paired = discovery.iter().any(|a| {
+                matches!(a.ip(), IpAddr::V6(second)
+                if second.octets()[..length / 8] == *prefix
+                    && translated_v4(second, length) == Some(other))
+            });
+            return paired && translated_v4(v6, length).is_some_and(relay_public_v4);
         }
     }
-    public_address(ip)
+    public_address(ip) && !local_translation
 }
 fn connect_tcp(
     config: &ClientConfig,
     cancel: &Cancel,
     deadline: Instant,
     reduced_mss: bool,
+    preferred: Option<SocketAddr>,
 ) -> io::Result<(TcpStream, bool)> {
     let (host, port) = config
         .proxy
@@ -377,17 +455,38 @@ fn connect_tcp(
         .map_or((config.endpoint.host(), config.endpoint.port()), |p| {
             (p.host(), p.port())
         });
-    let mut addresses = resolve(host, port, cancel, deadline)?;
-    if config.proxy.is_none() && config.public_only {
-        // RFC 7050 discovery is needed only for otherwise filtered IPv6 answers.
-        // The process-wide resolver cache shares this lookup across lanes.
-        let needs_dns64 = addresses.iter().any(|a| matches!(a.ip(), std::net::IpAddr::V6(ip) if !public_address(ip.into()) && !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() && ip.segments()[0] & 0xfe00 == 0xfc00));
+    // A verified successful path lives for 30 seconds and is scoped to this endpoint/proxy.
+    let mut addresses = if let Some(address) = preferred {
+        vec![address]
+    } else {
+        resolve(host, port, cancel, deadline)?
+    };
+    if preferred.is_none() && config.proxy.is_none() && config.public_only {
+        let relay_v4: Vec<_> = addresses
+            .iter()
+            .filter_map(|a| match a.ip() {
+                IpAddr::V4(ip) => Some(ip),
+                _ => None,
+            })
+            .collect();
+        // Discover global and RFC 8215 prefixes too, so embedded private IPv4 is checked.
+        let needs_dns64 = addresses.iter().any(|a| {
+            a.is_ipv6()
+                && (public_address(a.ip())
+                    || matches!(a.ip(), IpAddr::V6(ip) if ip.segments()[..3] == [0x64, 0xff9b, 1]))
+        });
         let discovery = if needs_dns64 {
-            resolve("ipv4only.arpa", 0, cancel, deadline).unwrap_or_default()
+            resolve(
+                "ipv4only.arpa",
+                0,
+                cancel,
+                deadline.min(Instant::now() + Duration::from_millis(150)),
+            )
+            .unwrap_or_default()
         } else {
             Vec::new()
         };
-        addresses.retain(|addr| allowed_address(addr.ip(), &discovery));
+        addresses.retain(|addr| allowed_address(addr.ip(), &discovery, &relay_v4));
     }
     if addresses.is_empty() {
         return Err(io::Error::new(
@@ -487,31 +586,97 @@ fn open(
     deadline: Instant,
 ) -> io::Result<(TlsSocket, ConnectionInfo)> {
     ensure_supported_cpu()?;
+    // Only the initial discovery is serialized. Once its path is published,
+    // waiting lanes open concurrently using that winner.
+    let _initial_open = loop {
+        cancel.check()?;
+        if Instant::now() >= deadline {
+            return Err(timeout());
+        }
+        if config
+            .hints
+            .lock()
+            .unwrap()
+            .winning
+            .as_ref()
+            .is_some_and(|p| p.matches(config))
+        {
+            break None;
+        }
+        match config.opening.try_lock() {
+            Ok(guard) => break Some(guard),
+            Err(std::sync::TryLockError::WouldBlock) => thread::sleep(TICK),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(io::Error::other("relay path discovery stopped"))
+            }
+        }
+    };
     let end = deadline.min(Instant::now() + Duration::from_secs(2));
+    let winning = config
+        .hints
+        .lock()
+        .unwrap()
+        .winning
+        .clone()
+        .filter(|p| p.matches(config));
+    let first = winning.as_ref().map_or(Carrier::Native, |p| p.carrier);
+    let second = if first == Carrier::Native {
+        Carrier::WebSocket
+    } else {
+        Carrier::Native
+    };
     let mut attempts = Vec::new();
-    for carrier in [Carrier::Native, Carrier::WebSocket] {
-        let rung_end = if carrier == Carrier::Native {
-            end.min(Instant::now() + Duration::from_millis(750))
+    let mut retry_mss = None;
+    for (index, carrier) in [first, second].into_iter().enumerate() {
+        let rung_end = if index == 0 {
+            let budget = if winning.is_some() { 1250 } else { 750 };
+            end.min(Instant::now() + Duration::from_millis(budget))
         } else {
             end
         };
-        let reduced_mss = config.reduced_mss.load(Ordering::Relaxed)
-            || attempts
-                .iter()
-                .any(|a: &AttemptFailure| a.failure == Failure::Timeout);
-        match open_carrier(config, cancel, rung_end, carrier, reduced_mss) {
+        let mss_reason = config
+            .hints
+            .lock()
+            .unwrap()
+            .reduced_mss
+            .filter(|(until, _)| *until > Instant::now())
+            .map(|(_, reason)| reason)
+            .or(retry_mss);
+        let reduced_mss = mss_reason.is_some();
+        let preferred = winning
+            .as_ref()
+            .filter(|_| index == 0)
+            .and_then(|p| p.address);
+        match open_carrier(config, cancel, rung_end, carrier, reduced_mss, preferred) {
             Ok((socket, mss)) => {
+                config.hints.lock().unwrap().winning = Some(WinningPath {
+                    host: config.endpoint.host().to_owned(),
+                    port: config.endpoint.port(),
+                    proxy: config
+                        .proxy
+                        .as_ref()
+                        .map(|p| (p.host().to_owned(), p.port())),
+                    address: Some(socket.tcp.peer_addr()?),
+                    carrier,
+                    expires: Instant::now() + Duration::from_secs(30),
+                });
                 return Ok((
                     socket,
                     ConnectionInfo {
                         carrier,
                         via_proxy: config.proxy.is_some(),
                         reduced_mss: mss,
+                        reduced_mss_reason: if mss { mss_reason } else { None },
                         earlier_failures: attempts,
                     },
-                ))
+                ));
             }
             Err(error) => {
+                retry_mss = mss_stall(&error);
+                if let Some(reason) = retry_mss {
+                    config.remember_mss_stall(reason);
+                }
+                config.hints.lock().unwrap().winning = None;
                 let typed = ConnectError::from_io(&error);
                 let failure = typed.failure;
                 let terminal = matches!(
@@ -528,7 +693,22 @@ fn open(
                     via_proxy: config.proxy.is_some(),
                     failure: failure.clone(),
                 });
-                if terminal || carrier == Carrier::WebSocket {
+                if !terminal && index == 0 && _initial_open.is_some() {
+                    // Waiting lanes can start fallback together as soon as native fails.
+                    // This short-lived scheduling hint grants no address/TLS exception.
+                    config.hints.lock().unwrap().winning = Some(WinningPath {
+                        host: config.endpoint.host().to_owned(),
+                        port: config.endpoint.port(),
+                        proxy: config
+                            .proxy
+                            .as_ref()
+                            .map(|p| (p.host().to_owned(), p.port())),
+                        address: None,
+                        carrier: second,
+                        expires: end,
+                    });
+                }
+                if terminal || index == 1 {
                     // Preserve the original I/O kind for existing callers.
                     return Err(io::Error::new(
                         error.kind(),
@@ -549,24 +729,16 @@ fn proxy_connect(
     let Some(proxy) = &config.proxy else {
         return Ok(());
     };
-    let authority = format!("{}:{}", config.endpoint.host(), config.endpoint.port());
-    let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
-    if let Some(credentials) = &proxy.credentials {
-        request.push_str(&format!(
-            "Proxy-Authorization: Basic {}\r\n",
-            credentials.authorization()
-        ));
-    }
-    request.push_str("\r\n");
+    let request = proxy.connect_request(config.endpoint.host(), config.endpoint.port());
     let mut written = 0;
     let mut headers = crate::carrier::Headers::default();
-    let result = (|| loop {
+    loop {
         cancel.check()?;
         if Instant::now() >= deadline {
             return Err(timeout());
         }
         if written < request.len() {
-            match tcp.write(&request.as_bytes()[written..]) {
+            match tcp.write(&request[written..]) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(n) => written += n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
@@ -583,9 +755,7 @@ fn proxy_connect(
             };
         }
         thread::sleep(TICK);
-    })();
-    zeroize::Zeroize::zeroize(&mut request);
-    result
+    }
 }
 fn open_carrier(
     config: &ClientConfig,
@@ -593,8 +763,9 @@ fn open_carrier(
     deadline: Instant,
     carrier: Carrier,
     reduced_mss: bool,
+    preferred: Option<SocketAddr>,
 ) -> io::Result<(TlsSocket, bool)> {
-    let (mut tcp, mss) = connect_tcp(config, cancel, deadline, reduced_mss)?;
+    let (mut tcp, mss) = connect_tcp(config, cancel, deadline, reduced_mss, preferred)?;
     proxy_connect(&mut tcp, config, cancel, deadline)?;
     let name = ServerName::try_from(config.endpoint.host.clone())
         .map_err(|_| invalid("invalid TLS hostname"))?;
@@ -620,7 +791,14 @@ fn open_carrier(
     while !socket.ready() {
         cancel.check()?;
         if Instant::now() >= deadline {
-            return Err(timeout());
+            return Err(if socket.conn.is_handshaking() && socket.transferred > 0 {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "TLS handshake stalled after ClientHello",
+                )
+            } else {
+                timeout()
+            });
         }
         if let Err(error) = socket.pump(None) {
             if let Some(failure) = verification_failure.lock().unwrap().take() {
@@ -824,8 +1002,8 @@ impl Transport {
                     if let Err(e) = run_lane(&config, &attachment, &keys, lane, &shared) {
                         // Capabilities cannot be replayed after partial media. A fresh
                         // application attempt using a cloned config learns this stall.
-                        if e.kind() == io::ErrorKind::TimedOut {
-                            config.reduced_mss.store(true, Ordering::Relaxed);
+                        if let Some(reason) = mss_stall(&e) {
+                            config.remember_mss_stall(reason);
                         }
                         shared.close(e, Some(lane));
                     }
@@ -1469,7 +1647,6 @@ mod tests {
             "8.8.8.8",
             "2606:4700:4700::1111",
             "64:ff9b::808:808",
-            "64:ff9b:1:808:8:800::",
             "2001:4860:64::808:808",
         ] {
             assert!(public_address(address.parse().unwrap()));
@@ -1481,40 +1658,265 @@ mod tests {
     }
     #[test]
     fn dns64_network_specific_prefixes_preserve_public_destination_filtering() {
-        use std::net::{IpAddr, Ipv6Addr};
-        for prefix_len in [32, 40, 48, 56, 64, 96] {
-            let synthesize = |v4: [u8; 4]| {
-                let mut bytes = "fd12:3456:789a:bcde::"
-                    .parse::<Ipv6Addr>()
+        // RFC 6052 Table 1 layout examples, with a public network-specific prefix.
+        let prefixes = [
+            (
+                32,
+                "2001:4860:c000:aa::",
+                "2001:4860:c000:ab::",
+                "2001:4860:808:808::",
+                "2001:4860:a01:203::",
+            ),
+            (
+                40,
+                "2001:4860:1c0:0:aa::",
+                "2001:4860:1c0:0:ab::",
+                "2001:4860:108:808:8::",
+                "2001:4860:10a:102:3::",
+            ),
+            (
+                48,
+                "2001:4860:122:c000:0:aa00::",
+                "2001:4860:122:c000:0:ab00::",
+                "2001:4860:122:808:8:800::",
+                "2001:4860:122:a01:2:300::",
+            ),
+            (
+                56,
+                "2001:4860:122:3c0:0:aa::",
+                "2001:4860:122:3c0:0:ab::",
+                "2001:4860:122:308:8:808::",
+                "2001:4860:122:30a:1:203::",
+            ),
+            (
+                64,
+                "2001:4860:122:344:c0:0:aa00:0",
+                "2001:4860:122:344:c0:0:ab00:0",
+                "2001:4860:122:344:8:808:800:0",
+                "2001:4860:122:344:a:102:300:0",
+            ),
+            (
+                96,
+                "2001:4860:122:344::c000:aa",
+                "2001:4860:122:344::c000:ab",
+                "2001:4860:122:344::808:808",
+                "2001:4860:122:344::a01:203",
+            ),
+        ];
+        let relay = [Ipv4Addr::new(8, 8, 8, 8)];
+        for (length, first, second, public, private) in prefixes {
+            let discovery = [
+                SocketAddr::new(first.parse().unwrap(), 0),
+                SocketAddr::new(second.parse().unwrap(), 0),
+            ];
+            assert_eq!(
+                translated_v4(first.parse().unwrap(), length)
                     .unwrap()
-                    .octets();
-                bytes[prefix_len / 8..].fill(0);
-                let positions = match prefix_len {
-                    32 => [4, 5, 6, 7],
-                    40 => [5, 6, 7, 9],
-                    48 => [6, 7, 9, 10],
-                    56 => [7, 9, 10, 11],
-                    64 => [9, 10, 11, 12],
-                    96 => [12, 13, 14, 15],
-                    _ => unreachable!(),
-                };
-                for (position, value) in positions.into_iter().zip(v4) {
-                    bytes[position] = value;
+                    .octets(),
+                [192, 0, 0, 170]
+            );
+            assert!(
+                allowed_address(public.parse().unwrap(), &discovery, &relay),
+                "{length}"
+            );
+            assert!(
+                !allowed_address(private.parse().unwrap(), &discovery, &relay),
+                "{length}"
+            );
+            assert!(!allowed_address(
+                public.parse().unwrap(),
+                &discovery,
+                &[Ipv4Addr::new(1, 1, 1, 1)]
+            ));
+            let positions = match length {
+                32 => [4, 5, 6, 7],
+                40 => [5, 6, 7, 9],
+                48 => [6, 7, 9, 10],
+                56 => [7, 9, 10, 11],
+                64 => [9, 10, 11, 12],
+                96 => [12, 13, 14, 15],
+                _ => unreachable!(),
+            };
+            for embedded in [
+                [127, 0, 0, 1],
+                [100, 64, 0, 1],
+                [169, 254, 1, 1],
+                [192, 168, 1, 1],
+            ] {
+                let mut bytes = public.parse::<Ipv6Addr>().unwrap().octets();
+                for (position, byte) in positions.into_iter().zip(embedded) {
+                    bytes[position] = byte;
                 }
+                assert!(!allowed_address(
+                    Ipv6Addr::from(bytes).into(),
+                    &discovery,
+                    &[Ipv4Addr::from(embedded)]
+                ));
+            }
+            if length < 96 {
+                // RFC 6052 receivers ignore reserved suffix bits, while enforcing the u octet.
+                let mut bytes = public.parse::<Ipv6Addr>().unwrap().octets();
+                bytes[15] = 1;
+                assert!(allowed_address(
+                    Ipv6Addr::from(bytes).into(),
+                    &discovery,
+                    &relay
+                ));
+            }
+            let mut invalid = public.parse::<Ipv6Addr>().unwrap().octets();
+            invalid[8] = 1;
+            assert_eq!(translated_v4(Ipv6Addr::from(invalid), length), None);
+            if length < 96 {
+                assert!(!allowed_address(
+                    Ipv6Addr::from(invalid).into(),
+                    &discovery,
+                    &relay
+                ));
+            }
+        }
+        // RFC 8215 permits subprefixes of /48. Use discovered layout, never guess /48.
+        for (length, first, second, public, private) in
+            prefixes.into_iter().filter(|(length, ..)| *length >= 48)
+        {
+            let substitute = |s: &str| {
+                let mut bytes = s.parse::<Ipv6Addr>().unwrap().octets();
+                bytes[..6].copy_from_slice(&[0, 0x64, 0xff, 0x9b, 0, 1]);
                 Ipv6Addr::from(bytes)
             };
-            let discovery = [SocketAddr::new(synthesize([192, 0, 0, 170]).into(), 0)];
-            assert!(allowed_address(synthesize([8, 8, 8, 8]).into(), &discovery));
-            for private in [[127, 0, 0, 1], [10, 1, 2, 3], [100, 64, 0, 1]] {
-                assert!(!allowed_address(synthesize(private).into(), &discovery));
-            }
-            assert!(!allowed_address(synthesize([8, 8, 8, 8]).into(), &[]));
+            let discovery = [
+                SocketAddr::new(substitute(first).into(), 0),
+                SocketAddr::new(substitute(second).into(), 0),
+            ];
+            assert!(
+                allowed_address(substitute(public).into(), &discovery, &relay),
+                "{length}"
+            );
             assert!(!allowed_address(
-                "fd7a:115c:a1e0::1".parse::<IpAddr>().unwrap(),
-                &discovery
+                substitute(private).into(),
+                &discovery,
+                &relay
+            ));
+            assert!(!allowed_address(
+                substitute(public).into(),
+                &discovery[..1],
+                &relay
+            ));
+            assert!(!allowed_address(substitute(public).into(), &[], &relay));
+        }
+        for address in ["64:ff9b::808:808", "::ffff:8.8.8.8"] {
+            assert!(allowed_address(address.parse().unwrap(), &[], &relay));
+        }
+        for address in [
+            "64:ff9b::a01:203",
+            "64:ff9b::6440:1",
+            "64:ff9b::7f00:1",
+            "64:ff9b::101:101",
+        ] {
+            assert!(!allowed_address(address.parse().unwrap(), &[], &relay));
+        }
+    }
+    #[test]
+    fn hostile_dns64_discovery_never_opens_private_or_tailnet_destinations() {
+        let relay = [Ipv4Addr::new(161, 224, 171, 18), Ipv4Addr::new(8, 8, 8, 8)];
+        for prefix in [
+            "fd7a:115c:c000:aa::",
+            "fd7a:115c:c000:ab::",
+            "fd12:3456:c000:aa::",
+            "fd12:3456:c000:ab::",
+        ] {
+            let discovery = [SocketAddr::new(prefix.parse().unwrap(), 0)];
+            for destination in [
+                "fd7a:115c:a1e0:ab12:4843:cd96:6258:b240",
+                "fd7a:115c:a1e0:b1a::808:808",
+                "fd12:3456:808:808::",
+                "fc00::808:808",
+                "::1",
+                "fe80::808:808",
+                "100.64.0.1",
+                "10.1.2.3",
+            ] {
+                assert!(!allowed_address(
+                    destination.parse().unwrap(),
+                    &discovery,
+                    &relay
+                ));
+            }
+        }
+        // Even a consistent pair under ULA cannot override the destination filter.
+        let discovery = ["fd12:3456:c000:aa::", "fd12:3456:c000:ab::"]
+            .map(|s| SocketAddr::new(s.parse().unwrap(), 0));
+        assert!(!allowed_address(
+            "fd12:3456:808:808::".parse().unwrap(),
+            &discovery,
+            &relay
+        ));
+        // Single answers, mismatched prefixes, nonzero u octets and illegal layouts fail closed.
+        for answers in [
+            ["64:ff9b:1::c000:aa", "64:ff9b:2::c000:ab"],
+            ["64:ff9b:1:0:100::c000:aa", "64:ff9b:1:0:100::c000:ab"],
+            ["64:ff9b:1:0:c000:aa::", "64:ff9b:1:0:c000:ab::"],
+        ] {
+            let discovery = answers.map(|s| SocketAddr::new(s.parse().unwrap(), 0));
+            assert!(!allowed_address(
+                "64:ff9b:1::808:808".parse().unwrap(),
+                &discovery,
+                &relay
             ));
         }
-        assert!(public_address("::ffff:8.8.8.8".parse().unwrap()));
-        assert!(!public_address("::ffff:127.0.0.1".parse().unwrap()));
+    }
+    #[test]
+    fn mss_hints_expire_and_ignore_unrelated_timeouts() {
+        for message in [
+            "relay deadline expired",
+            "TLS socket idle deadline expired",
+            "video acknowledgment deadline expired",
+            "queued video frame deadline expired",
+        ] {
+            assert_eq!(
+                mss_stall(&io::Error::new(io::ErrorKind::TimedOut, message)),
+                None
+            );
+        }
+        assert_eq!(
+            mss_stall(&io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TLS write deadline expired"
+            )),
+            Some(MssReason::WriteStall)
+        );
+        assert_eq!(
+            mss_stall(&io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TLS record deadline expired"
+            )),
+            Some(MssReason::RecordStall)
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
+        roots
+            .add(CertificateDer::from_pem_slice(include_bytes!("../tests/certs/ca.pem")).unwrap())
+            .unwrap();
+        let config =
+            ClientConfig::with_roots(Endpoint::new("localhost", 443).unwrap(), roots).unwrap();
+        config.reduce_mss_after_stall();
+        let clone = config.clone();
+        assert!(clone
+            .hints
+            .lock()
+            .unwrap()
+            .reduced_mss
+            .is_some_and(
+                |(until, reason)| until > Instant::now() && reason == MssReason::ExplicitStall
+            ));
+        clone.hints.lock().unwrap().reduced_mss = Some((
+            Instant::now() - Duration::from_secs(1),
+            MssReason::ExplicitStall,
+        ));
+        assert!(!config
+            .hints
+            .lock()
+            .unwrap()
+            .reduced_mss
+            .is_some_and(|(until, _)| until > Instant::now()));
     }
 }

@@ -135,16 +135,17 @@ pub struct Metrics {
     pub accepted_connections: AtomicU64,
     pub rejected_connections: AtomicU64,
     pub grants_created: AtomicU64,
+    pub http_responses: AtomicU64,
     pub active_connections: AtomicU64,
     pub active_sessions: AtomicU64,
 }
 impl Metrics {
     /// Fixed public counters. Contains no identifiers, tickets, keys or IPs.
     pub fn snapshot(&self) -> String {
-        format!("network_bytes={} quota_reserved_bytes={} accepted={} rejected={} grants={} connections={} sessions={}",
+        format!("network_bytes={} quota_reserved_bytes={} accepted={} rejected={} grants={} http_responses={} connections={} sessions={}",
             self.network_bytes.load(Ordering::Relaxed), self.quota_reserved_bytes.load(Ordering::Relaxed),
             self.accepted_connections.load(Ordering::Relaxed), self.rejected_connections.load(Ordering::Relaxed),
-            self.grants_created.load(Ordering::Relaxed), self.active_connections.load(Ordering::Relaxed), self.active_sessions.load(Ordering::Relaxed))
+            self.grants_created.load(Ordering::Relaxed), self.http_responses.load(Ordering::Relaxed), self.active_connections.load(Ordering::Relaxed), self.active_sessions.load(Ordering::Relaxed))
     }
 }
 struct Rate {
@@ -283,25 +284,7 @@ impl Daemon {
                     continue;
                 }
                 if let Err(error) = self.step(index) {
-                    let phase = self.connections[index].as_ref().unwrap().phase;
-                    // A completed grant reply closes normally.
-                    if !(matches!(phase, Phase::ReplyAndClose)
-                        && error.kind() == io::ErrorKind::ConnectionAborted)
-                    {
-                        self.diagnose(Some(phase), &error);
-                    }
-                    if error.kind() == io::ErrorKind::PermissionDenied
-                        && matches!(phase, Phase::Request)
-                        && self.connections[index]
-                            .as_ref()
-                            .is_some_and(|c| c.socket.ready())
-                    {
-                        let conn = self.connections[index].as_mut().unwrap();
-                        conn.socket.queue(&[0])?;
-                        conn.phase = Phase::ReplyAndClose;
-                    } else {
-                        self.remove_connection(index);
-                    }
+                    self.connection_error(index, &error);
                 }
             }
             self.quota.check()?;
@@ -334,6 +317,30 @@ impl Daemon {
         self.metrics.active_connections.store(0, Ordering::Relaxed);
         self.metrics.active_sessions.store(0, Ordering::Relaxed);
         Ok(())
+    }
+    fn connection_error(&mut self, index: usize, error: &io::Error) {
+        let conn = self.connections[index].as_ref().unwrap();
+        let phase = conn.phase;
+        let decoy = matches!(conn.socket.carrier, crate::carrier::State::Closing);
+        if !decoy
+            && !(matches!(phase, Phase::ReplyAndClose)
+                && error.kind() == io::ErrorKind::ConnectionAborted)
+        {
+            self.diagnose(Some(phase), error);
+        }
+        let conn = self.connections[index].as_mut().unwrap();
+        // Only send a rejection from existing credit that the next pump can use.
+        // A per-connection queue failure always retires this connection.
+        if error.kind() == io::ErrorKind::PermissionDenied
+            && matches!(phase, Phase::Request)
+            && conn.socket.credit >= (2 * wire::RECORD_MAX) as u64
+            && conn.socket.ready()
+            && conn.socket.queue(&[0]).is_ok()
+        {
+            conn.phase = Phase::ReplyAndClose;
+        } else {
+            self.remove_connection(index);
+        }
     }
     fn diagnose(&mut self, phase: Option<Phase>, error: &io::Error) {
         if self.diagnostic_start.elapsed() >= Duration::from_secs(60) {
@@ -375,7 +382,6 @@ impl Daemon {
         if self.accepts >= self.config.limits.accepts_per_minute {
             return false;
         }
-        self.accepts += 1;
         self.rates
             .retain(|r| r.start.elapsed() < Duration::from_secs(60));
         if let Some(r) = self.rates.iter_mut().find(|r| r.ip == ip) {
@@ -383,11 +389,21 @@ impl Daemon {
                 return false;
             }
             r.accepts += 1;
+            self.accepts += 1;
             return true;
         }
         if self.rates.len() >= self.config.limits.max_rate_entries {
-            return false;
+            // Oldest-window eviction lets a new source compete for global admission.
+            let oldest = self
+                .rates
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, r)| r.start)
+                .unwrap()
+                .0;
+            self.rates.swap_remove(oldest);
         }
+        self.accepts += 1;
         self.rates.push(Rate {
             ip,
             start: Instant::now(),
@@ -432,9 +448,16 @@ impl Daemon {
                 self.diagnose(None, &error);
                 continue;
             }
-            let tls = rustls::ServerConnection::new(self.config.tls.clone())
-                .map_err(|_| invalid("TLS server setup failed"))?;
-            let mut socket = TlsSocket::new(tls.into(), tcp)?;
+            let socket = rustls::ServerConnection::new(self.config.tls.clone())
+                .map_err(|_| invalid("TLS server setup failed"))
+                .and_then(|tls| TlsSocket::new(tls.into(), tcp));
+            let mut socket = match socket {
+                Ok(socket) => socket,
+                Err(error) => {
+                    self.diagnose(None, &error);
+                    continue;
+                }
+            };
             socket.carrier = crate::carrier::State::Detect;
             socket.credit = credit;
             socket.credit_epoch = credit_epoch;
@@ -476,6 +499,12 @@ impl Daemon {
             if s.bytes >= self.config.limits.session_bytes {
                 return Err(denied());
             }
+        }
+        if matches!(conn.phase, Phase::Request)
+            && matches!(conn.socket.carrier, crate::carrier::State::Closing)
+        {
+            self.metrics.http_responses.fetch_add(1, Ordering::Relaxed);
+            conn.phase = Phase::ReplyAndClose;
         }
         pumped?;
         conn.socket.check_deadlines(
@@ -723,9 +752,12 @@ pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
                     bytes[12], bytes[13], bytes[14], bytes[15],
                 ));
             }
-            ip.to_ipv4_mapped()
-                .map(IpAddr::V4)
-                .unwrap_or(IpAddr::V6(ip))
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return IpAddr::V4(v4);
+            }
+            let mut prefix = bytes;
+            prefix[8..].fill(0);
+            IpAddr::V6(std::net::Ipv6Addr::from(prefix))
         }
         ip => ip,
     }
@@ -734,6 +766,101 @@ pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_daemon() -> (Daemon, PathBuf) {
+        use rustls::pki_types::pem::PemObject;
+        let path = std::env::temp_dir().join(format!(
+            "latch-admission-{}-{}",
+            std::process::id(),
+            u64::from_be_bytes(random().unwrap())
+        ));
+        let mut config = DaemonConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![
+                CertificateDer::from_pem_slice(include_bytes!("../tests/certs/server.pem"))
+                    .unwrap(),
+            ],
+            PrivateKeyDer::from_pem_slice(include_bytes!("../tests/certs/server-key.pem")).unwrap(),
+            path.clone(),
+            16 * 1024 * 1024,
+        )
+        .unwrap();
+        config.initialize_quota = true;
+        (Daemon::bind(config).unwrap(), path)
+    }
+    #[test]
+    fn ipv6_prefixes_share_all_admission_buckets_and_rate_rejections_preserve_global_slots() {
+        let (mut daemon, path) = test_daemon();
+        daemon.config.limits.accepts_per_ip_per_minute = 2;
+        let a = normalize_ip("2001:4860:1:2::1".parse().unwrap());
+        let b = normalize_ip("2001:4860:1:2:ffff:ffff:ffff:ffff".parse().unwrap());
+        assert_eq!(a, b);
+        assert_ne!(a, normalize_ip("2001:4860:1:3::1".parse().unwrap()));
+        assert!(daemon.rate_allowed(a));
+        assert!(daemon.rate_allowed(b));
+        for _ in 0..1000 {
+            assert!(!daemon.rate_allowed(b));
+        }
+        assert_eq!(daemon.rates.len(), 1);
+        assert_eq!(daemon.accepts, 2);
+        assert!(daemon.rate_allowed("8.8.8.8".parse().unwrap()));
+        for ip in ["::ffff:192.0.2.1", "64:ff9b::c000:201"] {
+            assert_eq!(
+                normalize_ip(ip.parse().unwrap()),
+                "192.0.2.1".parse::<IpAddr>().unwrap()
+            );
+        }
+        // Unknown network-specific source translation uses the gateway's /64 bucket.
+        assert_eq!(
+            normalize_ip("64:ff9b:1:1234::1".parse().unwrap()),
+            normalize_ip("64:ff9b:1:1234::2".parse().unwrap())
+        );
+        drop(daemon);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn full_rate_table_evicts_oldest_window_and_admits_new_clients() {
+        let (mut daemon, path) = test_daemon();
+        daemon.config.limits.max_rate_entries = 2;
+        for ip in ["1.1.1.1", "8.8.8.8", "9.9.9.9"] {
+            assert!(daemon.rate_allowed(ip.parse().unwrap()));
+        }
+        assert_eq!(daemon.rates.len(), 2);
+        assert!(!daemon
+            .rates
+            .iter()
+            .any(|r| r.ip == "1.1.1.1".parse::<IpAddr>().unwrap()));
+        assert_eq!(daemon.accepts, 3);
+        daemon.accepts = daemon.config.limits.accepts_per_minute;
+        assert!(!daemon.rate_allowed("4.2.2.2".parse().unwrap()));
+        drop(daemon);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn connection_error_retires_one_slot_and_decoys_preserve_diagnostic_budget() {
+        use std::net::TcpStream;
+        let (mut daemon, path) = test_daemon();
+        let tcp = TcpStream::connect(daemon.local_addr().unwrap()).unwrap();
+        daemon.accept().unwrap();
+        for _ in 0..20 {
+            daemon.connections[0].as_mut().unwrap().socket.carrier = crate::carrier::State::Closing;
+            // step counts the HTTP response once, including when the write fails.
+            let _ = daemon.step(0);
+        }
+        assert_eq!(daemon.metrics.http_responses.load(Ordering::Relaxed), 1);
+        daemon.connection_error(0, &io::ErrorKind::ConnectionReset.into());
+        assert_eq!(daemon.diagnostics, 0);
+        assert!(daemon.metrics.snapshot().contains("http_responses=1"));
+        let second = TcpStream::connect(daemon.local_addr().unwrap()).unwrap();
+        daemon.accept().unwrap();
+        daemon.connection_error(0, &denied());
+        assert!(daemon.connections[0].is_none());
+        assert_eq!(daemon.diagnostics, 1);
+        let third = TcpStream::connect(daemon.local_addr().unwrap()).unwrap();
+        daemon.accept().unwrap();
+        assert!(daemon.connections[0].is_some());
+        drop((tcp, second, third, daemon));
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn exhausted_admission_preserves_existing_credit_and_keeps_running() {
         use rustls::pki_types::pem::PemObject;
@@ -861,6 +988,18 @@ mod tests {
     }
     #[test]
     fn wildcard_ipv6_listener_accepts_both_families_and_normalizes_ip_limits() {
+        match TcpListener::bind("[::1]:0") {
+            Ok(listener) => drop(listener),
+            Err(error)
+                if error.kind() == io::ErrorKind::AddrNotAvailable
+                    || matches!(error.raw_os_error(), Some(47 | 97 | 10047 | 10049)) =>
+            {
+                eprintln!("IPv6 loopback unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("IPv6 loopback probe failed: {error}"),
+        }
+
         use rustls::pki_types::pem::PemObject;
         use std::net::TcpStream;
         let path = std::env::temp_dir().join(format!(

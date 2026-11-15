@@ -137,6 +137,26 @@ def check_binary(binary):
                         response = tls.recv(1024)
                         assert response.startswith(b"HTTP/1.1 200 OK\r\n")
                         assert response.endswith(b"\r\n\r\nOK\n")
+            for request, status in (
+                (b"HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n", 200),
+                (b"GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n", 404),
+                (b"BREW / HTTP/1.1\r\nHost: localhost\r\n\r\n", 405),
+                (b"GET /relay HTTP/1.1\r\nHost: localhost\r\n\r\n", 426),
+                (b"invalid\r\n\r\n", 400),
+                (b"GET / HTTP/1.1\r\nHost: localhost\r\nX: " + b"a" * 8192, 431),
+            ):
+                context = tls_context(certificate)
+                context.set_alpn_protocols(["http/1.1"])
+                with socket.create_connection(("127.0.0.1", port), timeout=3) as raw:
+                    with context.wrap_socket(raw, server_hostname="localhost") as tls:
+                        tls.sendall(request)
+                        response = tls.recv(1024)
+                        assert response.startswith(f"HTTP/1.1 {status} ".encode()), response
+                        if request.startswith(b"HEAD "):
+                            assert response.endswith(b"\r\n\r\n")
+                        if status == 426:
+                            assert b"Sec-WebSocket-Version: 13\r\n" in response
+                        assert b"latch" not in response.lower()
             context = tls_context(certificate)
             context.set_alpn_protocols(["h2", "http/1.1"])
             with socket.create_connection(("::1", port), timeout=3) as raw:
