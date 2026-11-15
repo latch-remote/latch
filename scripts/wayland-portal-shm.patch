@@ -5,6 +5,10 @@ xdg-desktop-portal-wlr 0.7.1 checks for DMA-BUF before it negotiates the
 consumer's buffer type. A pixman headless compositor only offers wl_shm.
 Keep the SHM format requirement and exercise the existing SHM producer.
 
+Explicitly trigger the PipeWire graph after queuing a frame. PipeWire
+1.0.5's implicit queue trigger requires the driver to be assigned already.
+A static headless desktop can otherwise lose its only initial frame.
+
 diff --git a/src/screencast/screencast.c b/src/screencast/screencast.c
 --- a/src/screencast/screencast.c
 +++ b/src/screencast/screencast.c
@@ -19,3 +23,14 @@ diff --git a/src/screencast/screencast.c b/src/screencast/screencast.c
  		logprint(INFO, "wlroots: unable to receive a valid format from wlr_screencopy");
  		return -1;
  	}
+diff --git a/src/screencast/pipewire_screencast.c b/src/screencast/pipewire_screencast.c
+--- a/src/screencast/pipewire_screencast.c
++++ b/src/screencast/pipewire_screencast.c
+@@ -521,6 +521,7 @@ void xdpw_pwr_enqueue_buffer(struct xdpw_screencast_instance *cast) {
+ 	logprint(TRACE, "********************");
+ 
+ 	pw_stream_queue_buffer(cast->stream, pw_buf);
++	pw_stream_trigger_process(cast->stream);
+ 
+ done:
+ 	cast->current_frame.xdpw_buffer = NULL;
