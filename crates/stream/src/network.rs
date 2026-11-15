@@ -95,17 +95,30 @@ pub fn diagnosis(host: &str) -> NetworkDiagnosis {
             if latest.proxies.candidates.is_empty() {
                 latest.proxies = entry.latest.proxies.clone();
             }
+            if matches!(latest.captive_portal, CaptivePortal::Captive { .. })
+                && !matches!(entry.latest.captive_portal, CaptivePortal::Captive { .. })
+            {
+                entry.refresh_at = now + Duration::from_secs(1);
+            }
             entry.latest = latest;
         }
         // Never discard a slow PAC result just because its refresh interval
         // elapsed. Consume the completed snapshot before starting a refresh.
         if refresh_due(now, entry.refresh_at, entry.environment.is_pending()) {
             entry.generation = entry.generation.wrapping_add(1);
-            entry.refresh_at = now + Duration::from_secs(5);
+            entry.refresh_at = now + refresh_interval(&entry.latest.captive_portal);
         }
     }
     entry.environment.request(entry.generation, options);
     entry.latest.clone()
+}
+
+fn refresh_interval(portal: &CaptivePortal) -> Duration {
+    if matches!(portal, CaptivePortal::Captive { .. }) {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(5)
+    }
 }
 
 fn refresh_due(now: Instant, refresh_at: Instant, pending: bool) -> bool {
@@ -292,6 +305,14 @@ mod tests {
         ));
         assert!(!refresh_due(now + Duration::from_secs(6), refresh_at, true));
         assert!(refresh_due(now + Duration::from_secs(6), refresh_at, false));
+        assert_eq!(
+            refresh_interval(&CaptivePortal::Captive { portal_url: None }),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            refresh_interval(&CaptivePortal::OpenInternet),
+            Duration::from_secs(5)
+        );
     }
     #[test]
     fn invalid_relay_host_cannot_supply_a_probe_path_or_credentials() {

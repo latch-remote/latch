@@ -2401,12 +2401,13 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 }
             }
         }
-        let status = inner.relay.lock().network_status();
+        let mut status = inner.relay.lock().network_status();
         if (last_network_status.needs_sign_in && !status.needs_sign_in)
             || (!last_network_status.proxy_available && status.proxy_available)
         {
             accepted = Instant::now();
             inner.relay.lock().retry_after_network_change();
+            status = inner.relay.lock().network_status();
         }
         if status != last_network_status {
             inner.emit(Event::Network(status.clone()));

@@ -926,7 +926,8 @@ the discovery cache. The relay re-reads it for fresh connections, including
 recovery attempts. Netenv publishes partial observations so an environment
 proxy can be used while other checks continue. OS discovery has a six-second
 deadline. The eight-host cache samples local routes/environment settings at most
-four times a second and refreshes discovery every five seconds. No session/UI
+four times a second and refreshes discovery every five seconds, or every second
+while a captive portal is confirmed. No session/UI
 thread waits for PAC/WPAD, DNS or an HTTP probe.
 
 `RelayRoute` retains typed terminal failures and the selected lane's

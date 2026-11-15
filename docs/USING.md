@@ -292,8 +292,9 @@ updates ignore the legacy GitHub token settings.
 Latch discovers this network's OS, PAC/WPAD and environment proxy settings in
 background. A cached result is used immediately. Slow discovery continues while
 the connection tries direct access. Changing networks or signing in to a portal
-is detected automatically, with a five-second refresh interval. An in-flight check can take up to six
-seconds and continues across the refresh interval.
+is detected automatically, with a five-second refresh interval, shortened to one
+second while a portal is confirmed. An in-flight check can take up to six seconds
+and continues across the refresh interval.
 
 - **This network needs a sign-in** appears when a portal redirects the anonymous
   connectivity check. Choose **Open network sign-in**, complete the browser's
