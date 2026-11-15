@@ -91,6 +91,8 @@ GitHub release notes, so each version gets a heading of the form
 - Show the media path, reason and elapsed time in Stream performance, with
   a brief notice when the path changes. Preserve protocol-1 compatibility
   with 6.0.0 hosts and viewers.
+- Move relay quota persistence off the network loop and batch durable byte
+  reservations so credited video and priority lanes keep running during disk flushes.
 
 ## 6.0.0 (2026-11-14)
 
