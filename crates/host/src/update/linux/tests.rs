@@ -134,19 +134,7 @@ impl Drop for FixtureUnit {
     }
 }
 
-#[test]
-#[ignore = "called only by the opt-in systemd fixture"]
-fn systemd_fixture_session() {
-    if std::env::var_os("LATCH_SYSTEMD_FIXTURE").is_none() {
-        return;
-    }
-    let dir = latch_core::config::data_dir()
-        .unwrap()
-        .canonicalize()
-        .unwrap();
-    let exe = dir.join("latch-host");
-    let source = dir.join("fixture.rs");
-    fs::write(&source, r#"
+const SYSTEMD_FIXTURE_SOURCE: &str = r#"
         use std::io::{Read, Write};
         use std::process::Command;
         fn main() {
@@ -159,7 +147,14 @@ fn systemd_fixture_session() {
             let data = std::path::PathBuf::from(std::env::var_os("LATCH_DATA_DIR").unwrap());
             let mut starts = std::fs::OpenOptions::new().create(true).append(true).open(data.join("starts.log")).unwrap();
             writeln!(starts, "{}", env!("FIXTURE_VERSION")).unwrap();
-            if env!("FIXTURE_MODE") == "exit" { std::process::exit(7); }
+            if env!("FIXTURE_MODE") == "exit" {
+                // Let the driver observe the completed systemd start job before
+                // crashing, so this case reaches the automatic restart limit.
+                while !data.join("crash-release").exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                std::process::exit(7);
+            }
             let listener = std::net::TcpListener::bind(("0.0.0.0", 47850)).unwrap();
             if data.join("monitor-enabled").exists() {
                 Command::new(std::env::var_os("LATCH_RECOVERY_HELPER").unwrap())
@@ -182,7 +177,21 @@ fn systemd_fixture_session() {
                 let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             }
         }
-    "#).unwrap();
+    "#;
+
+#[test]
+#[ignore = "called only by the opt-in systemd fixture"]
+fn systemd_fixture_session() {
+    if std::env::var_os("LATCH_SYSTEMD_FIXTURE").is_none() {
+        return;
+    }
+    let dir = latch_core::config::data_dir()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    let exe = dir.join("latch-host");
+    let source = dir.join("fixture.rs");
+    fs::write(&source, SYSTEMD_FIXTURE_SOURCE).unwrap();
     assert_eq!(latch_core::CONTROL_PORT, 47850);
     let build = |path: &Path, version: &str, mode: &str| {
         assert!(Command::new("rustc")
@@ -295,7 +304,33 @@ fn systemd_fixture_session() {
             }
         }
         if scenario == "crash-on-start" {
+            wait_for("replacement activation before fixture crash", || {
+                let current = linux::UpdateState::load(&path).unwrap().unwrap();
+                assert!(
+                    !current.terminal(),
+                    "replacement failed before activation: {}",
+                    current.reason
+                );
+                main_pid().is_ok_and(|pid| pid != 0 && pid != old_pid)
+                    && Command::new("systemctl")
+                        .args([
+                            "--user",
+                            "show",
+                            "--property=Job",
+                            "--value",
+                            "latch.service",
+                        ])
+                        .output()
+                        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "0")
+            });
+            fs::write(dir.join("crash-release"), []).unwrap();
             wait_for("replacement start limit", || {
+                let current = linux::UpdateState::load(&path).unwrap().unwrap();
+                assert!(
+                    !current.terminal(),
+                    "replacement finished before the start limit: {}",
+                    current.reason
+                );
                 Command::new("systemctl")
                     .args([
                         "--user",
@@ -632,4 +667,44 @@ fn failed_unit_fixture_entry() {
     let outcome = linux::UpdateState::load(&path).unwrap().unwrap();
     assert_eq!(outcome.phase, linux::Phase::Failed);
     assert_eq!(outcome.failure, linux::FailureKind::Transient);
+}
+
+#[test]
+fn crashing_fixture_waits_for_completed_activation_before_exiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("fixture.rs");
+    let exe = dir.path().join("fixture");
+    fs::write(&source, SYSTEMD_FIXTURE_SOURCE).unwrap();
+    assert!(Command::new("rustc")
+        .arg(&source)
+        .arg("-o")
+        .arg(&exe)
+        .env("FIXTURE_VERSION", "999.0.3")
+        .env("FIXTURE_MODE", "exit")
+        .status()
+        .unwrap()
+        .success());
+    let mut child = Command::new(exe)
+        .env("LATCH_DATA_DIR", dir.path())
+        .env("LATCH_RECOVERY_HELPER", "/usr/bin/true")
+        .spawn()
+        .unwrap();
+    struct Stop<'a>(&'a mut Child);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let stop = Stop(&mut child);
+    wait_for("crashing fixture startup", || {
+        dir.path().join("starts.log").exists()
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(stop.0.try_wait().unwrap().is_none());
+    fs::write(dir.path().join("crash-release"), []).unwrap();
+    wait_for("fixture crash after activation", || {
+        stop.0.try_wait().unwrap().is_some()
+    });
+    assert_eq!(stop.0.wait().unwrap().code(), Some(7));
 }

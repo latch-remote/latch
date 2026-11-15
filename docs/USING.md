@@ -423,8 +423,8 @@ A restart or health failure restores the previous binary and restarts it.
 The fsynced `linux-update.json` journal records progress, inode identities,
 staging location and outcome. On startup, a service detects an unfinished
 update whose supervisor died and restores the previous inode deterministically.
-A running service also monitors for this failure. The fixture exercises both
-startup recovery and recovery while the service keeps running. If restoration
+A running service also monitors for this failure (not exercised by CI; CI covers recovery at the next service start).
+The added running-service monitor case awaits passing CI evidence. If restoration
 itself fails, the update becomes terminal Failed with the recovery copy retained
 and its path reported. The next update can proceed. A journal flock and phase
 compare-and-set serialize writers. Unsafe or unparsable journals are moved aside
@@ -464,9 +464,14 @@ required for local Linux updates.
 Linux updater validation uses local HTTP manifest/artifact fixtures and
 compiled ELF programs on native x64 and arm64 CI. Local development uses
 Docker with Ubuntu 24.04/glibc 2.39. No Linux machine outside CI and containers is available for
-this work. The `Linux updater systemd` CI jobs pass on x64 and arm64 Ubuntu 24.04 runners. They install a fixture `latch.service`, launch the real supervisor from its control group, and check successful probation, wrong-version rollback and rollback after the supervisor is killed following the swap.
-They also exercise a replacement that crashes on start, including the start
+this work. The `Linux updater systemd` CI jobs passed at `5d2959f` on x64 and arm64 Ubuntu 24.04 runners. They install a fixture `latch.service`, launch the real supervisor from its control group, and check successful probation, wrong-version rollback and rollback after the supervisor is killed following the swap.
+The fixture adds a replacement that crashes on start, including the start
 limit and `reset-failed`, and monitor recovery while the service keeps running.
+These two added cases await passing CI evidence. The inspected arm64 job logged
+all three baseline PASS cases, then timed out waiting for the crash case's start
+limit before reaching the monitor case. The crash fixture now waits for the
+start job to complete before exiting, and the driver reports any earlier update
+failure directly.
 The test is ignored during ordinary test runs and requires explicit opt-in
 through the dedicated script, which refuses an existing `latch.service`.
 The fixture bypasses supervisor argv parsing, self-pinning, installation ownership

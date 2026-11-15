@@ -138,8 +138,8 @@ installation. AUR/Nix and container installs use their deployment tools.
 See [Linux update ownership and recovery](../../docs/USING.md#linux-installation-ownership-and-recovery).
 
 Updater tests use Docker locally and native x64/arm64 Linux CI. No Linux machine outside CI and containers is available for this work. CI covers systemd user-session restart, rollback and killed-supervisor recovery with a fixture service; an installed desktop update remains unverified.
-The fixture also exercises crash-on-start/start-limit rollback and running-service
-monitor recovery. It bypasses supervisor argv parsing, self-pinning, installation
+The added crash-on-start/start-limit and running-service monitor cases await
+passing CI evidence with explicit crash-fixture activation gating added. The fixture bypasses supervisor argv parsing, self-pinning, installation
 ownership checks and real GitHub manifest fetching. Real GUI reopening and stream
 continuity remain untested.
 
