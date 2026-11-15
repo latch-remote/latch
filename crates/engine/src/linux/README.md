@@ -1,5 +1,8 @@
 # Linux streaming
 
+Current host/viewer capabilities and verification for every OS pair are in
+the [platform support matrix](../../../../docs/PLATFORMS.md).
+
 `open_video` captures the X11 root window at its current size. The capture
 requires a 32-bit little-endian BGR visual. x11rb handles `DISPLAY` and
 `XAUTHORITY`; no Xlib is linked. MIT-SHM 1.2 server-allocated segments are
@@ -48,7 +51,8 @@ back; modes the server had before are left alone.
 Audio uses Colin Marc's `pulseaudio` 0.3.2 native-protocol client, rather than
 libpulse or a child process. Its normal and build dependency graph contains
 no `cc`, `cmake`, or `nasm-rs`. The default sink's monitor is requested as
-48 kHz stereo S16LE, with 10 ms fragments; the server performs conversion.
+48 kHz S16LE, with 5 ms fragments and stereo, 5.1 or 7.1 channels up to the
+viewer offer and sink layout. The server performs conversion.
 A bounded 64-frame queue absorbs protocol batches without blocking the
 reactor. If the consumer stalls beyond that queue, incoming frames are
 dropped. Reads return false on timeout and leave the destination unchanged.
@@ -82,7 +86,7 @@ pointer coordinates, button and key events, scroll remainders, keyboard
 mapping restoration, known captured pixels, damage, cursor movement, and
 capture resizing. It exercises an existing 1280x720 mode and a created
 3024x1964_60 mode, then restores the original size. `--keys` also exercises
-the shared VK keymap once that parallel implementation is available.
+the shared VK keymap.
 
 `linux_capture 5 out.h264` records a stream and reports capture, conversion,
 and encoding times. `linux_capture 5 --capture-only` forces fresh full-root
@@ -106,12 +110,13 @@ The default `auto_null.monitor` supplied 201 ten-millisecond frames during
 a four-second capture with quiet playback, including 142,562 nonzero
 samples with peak magnitude 113. Nineteen idle reads timed out normally.
 
-The Mac tests pass (two tests); the Linux binary's tests pass (six tests).
-One codec integration test is ignored because this checkout's shared H.264
-encoder and color conversion are still skeletons. Encode throughput and
-bitrate changes inside a live encoder are not measured. VK-key injection
-also awaits the shared keymap. Rotated and multiple-output RandR setups
-and PipeWire's PulseAudio server have not been tested.
+At that revision, the Mac tests passed (two tests) and the Linux binary's
+tests passed (six tests). One codec integration test was ignored while the
+shared H.264 encoder and color conversion were skeletons, and VK-key
+injection awaited the shared keymap. Encode throughput, live bitrate
+changes, rotated and multiple-output RandR setups and PipeWire's PulseAudio
+server were outside that measurement. Current support is recorded in the
+platform matrix linked above.
 
 ## Qualification on the ARM64 test server, 2026-10-30
 

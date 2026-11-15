@@ -19,7 +19,9 @@ KIT = Path(__file__).resolve().parent
 
 
 def check_kit():
-    scripts = [KIT / name for name in ("install.sh", "network.sh", "inspect.sh", "certbot-deploy.sh")]
+    scripts = [KIT / name for name in (
+        "install.sh", "network.sh", "tune-host.sh", "inspect.sh", "certbot-deploy.sh",
+    )]
     for script in scripts:
         subprocess.run(["bash", "-n", str(script)], check=True)
     if shutil.which("shellcheck"):
@@ -38,9 +40,118 @@ def check_kit():
     ):
         assert setting in unit, setting
     assert "--initialize-quota" not in unit
-    assert "tcp_rmem" not in (KIT / "network.sh").read_text()
-    assert "tcp_wmem" not in (KIT / "network.sh").read_text()
+    network = (KIT / "network.sh").read_text()
+    for setting in (
+        "net.ipv4.tcp_congestion_control = bbr", "net.core.default_qdisc = fq",
+        "net.core.rmem_max = 16777216", "net.core.wmem_max = 16777216",
+        "net.ipv4.tcp_rmem = 4096 131072 16777216",
+        "net.ipv4.tcp_wmem = 4096 65536 16777216",
+        "net.ipv4.tcp_mtu_probing = 2", "net.ipv4.tcp_notsent_lowat = 131072",
+        "net.ipv4.tcp_slow_start_after_idle = 0",
+        "net.netfilter.nf_conntrack_max = 131072",
+        "rx-udp-gro-forwarding on rx-gro-list off", "LimitNOFILE=65536",
+        "MemoryHigh=384M", "MemoryMax=512M",
+    ):
+        assert setting in network, setting
+    assert not re.search(
+        r"systemctl (?:restart|stop) (?:latch-relay|tailscaled)(?:\.service)?(?:\s|$)",
+        network,
+    )
+    check_network(network)
     print("PASS kit syntax, operator limits, privilege and persistent-ledger contract")
+
+
+def check_network(network):
+    """Run the installer and model an early boot with conntrack initially absent."""
+    with tempfile.TemporaryDirectory(prefix="latch-network-selftest-") as directory:
+        root = Path(directory).resolve()
+        commands = root / "bin"
+        commands.mkdir()
+        stub = commands / "stub"
+        stub.write_text('''#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+
+root = Path(os.environ["NETWORK_TEST_ROOT"])
+command = Path(sys.argv[0]).name
+args = sys.argv[1:]
+module = root / "module-loaded"
+with (root / "calls").open("a") as log:
+    log.write(command + " " + " ".join(args) + "\\n")
+if command == "id":
+    print(0)
+elif command == "uname":
+    print("Linux")
+elif command == "readlink":
+    print(Path(args[-1]).resolve())
+elif command == "modprobe" and args == ["nf_conntrack"]:
+    if os.environ.get("FAIL_CONNTRACK"):
+        sys.exit(1)
+    module.touch()
+elif command == "sysctl":
+    if args == ["-n", "net.ipv4.tcp_available_congestion_control"]:
+        print("reno cubic bbr")
+    elif args[0] == "-p":
+        values = Path(args[1]).read_text()
+        if "net.netfilter.nf_conntrack_max" in values and not module.exists():
+            sys.exit(1)
+        (root / "effective-sysctls").write_text(values)
+    else:
+        sys.exit(1)
+elif command == "systemctl" and args[0] == "show":
+    print(0)
+elif command == "ip":
+    print("default via 192.0.2.1 dev test0")
+''')
+        stub.chmod(0o755)
+        for command in (
+            "id", "uname", "readlink", "modprobe", "sysctl", "systemctl",
+            "ip", "ethtool", "prlimit", "tc",
+        ):
+            (commands / command).symlink_to(stub)
+        # Redirect filesystem writes while executing the actual shell logic.
+        script = root / "network.sh"
+        for prefix in ("/etc/", "/usr/local/", "/proc/"):
+            network = network.replace(prefix, str(root) + prefix)
+        script.write_text(network)
+        (root / "usr/local/sbin").mkdir(parents=True)
+        env = dict(os.environ, PATH=str(commands) + os.pathsep + os.environ["PATH"],
+                   NETWORK_TEST_ROOT=str(root))
+
+        def run_script(path, **extra):
+            return subprocess.run(["bash", str(path)], env=dict(env, **extra),
+                                  capture_output=True, text=True)
+
+        failed = run_script(script, FAIL_CONNTRACK="1")
+        assert failed.returncode != 0
+        assert not (root / "etc").exists(), "module failure left partial configuration"
+        (root / "etc/systemd/system").mkdir(parents=True)
+        result = run_script(script)
+        assert result.returncode == 0, result.stderr
+        installed = root / "usr/local/sbin/latch-relay-network"
+        result = run_script(installed)
+        assert result.returncode == 0, result.stderr
+        calls = (root / "calls").read_text().splitlines()
+        load = calls.index("modprobe nf_conntrack", 1)
+        apply = next(i for i, call in enumerate(calls) if call.startswith("sysctl -p"))
+        assert load < apply, "sysctls applied before loading conntrack"
+
+        # systemd-modules-load precedes systemd-sysctl at boot. Recreate that
+        # sequence from the installed files, without running the installer.
+        (root / "module-loaded").unlink()
+        (root / "effective-sysctls").unlink()
+        modules = (root / "etc/modules-load.d/latch-relay.conf").read_text().splitlines()
+        for module in modules:
+            subprocess.run([str(commands / "modprobe"), module], env=env, check=True)
+        subprocess.run([str(commands / "sysctl"), "-p",
+                        str(root / "etc/sysctl.d/90-latch-relay.conf")], env=env, check=True)
+        assert "net.netfilter.nf_conntrack_max = 131072" in (
+            root / "effective-sysctls").read_text(), "conntrack ceiling lost at boot"
+        result = subprocess.run(["bash", str(installed), "--offloads-only"],
+                                env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+    print("PASS network install, missing-module failure, installed re-run and boot persistence")
 
 
 def tls_context(certificate=None):

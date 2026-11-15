@@ -1,5 +1,10 @@
 # Dedicated Seoul relay deployment
 
+The current dual-role configuration was verified on 2026-11-15 UTC. The
+Lightsail instance now also carries the operator tailnet's Tailscale peer
+relay. Current tuning, measurements and teardown state follow the original
+deployment history below. [Current configuration](#dual-role-consolidation-on-2026-11-15)
+
 Deployment began on 2026-11-14 UTC. The dedicated endpoint is
 `relay.latch.rune.foo:443`, DNS-only A record `54.116.93.176`.
 The parent-provisioned Lightsail instance is `latch-relay-seoul-1`, bundle
@@ -11,7 +16,7 @@ The initial service/process/socket inventory contained OS management services,
 SSH and local DNS/time services. That inventory established its dedicated
 purpose before installing the relay. SSH uses the parent's pinned configuration
 at `/Users/daniel/.ssh/latch6-lightsail.conf`, alias `latch6-relay`. Public TCP
-22 is restricted to the campus operator address. TCP 80 supports standalone
+22 is restricted to the operator /32. TCP 80 supports standalone
 HTTP-01 renewal. TCP 443 serves native TLS ALPN `latch-relay/1`.
 
 ## Identity and operational configuration
@@ -267,3 +272,167 @@ The two vCPUs have a documented 20% baseline each. Launch-time build/test work
 spent the initial CPU burst reserve. The 10:05 UTC API sample reported zero
 remaining burst percentage/time, so the sustained workload needs direct credit
 and CPU observation. Final operational capacity remains under measurement.
+
+## Dual-role consolidation on 2026-11-15
+
+AWS STS confirmed account `043189681495` before inventory or mutation. Both
+roles now run on the original `small_3_0` instance with its attached static
+IPv4 `54.116.93.176`. TCP 443 serves the native relay. UDP 443 serves the
+Tailscale peer relay and UDP 41641 serves tailscaled transport/discovery.
+TCP 80 remains available for HTTP-01 and SSH stays restricted to the operator /32.
+
+The verified private backup preceded migration of the relay identity from
+EC2. Lightsail runs kernel-mode tailscaled 1.104.7 with relay port 443 and
+static endpoint `54.116.93.176:443`. DNS acceptance, route acceptance and
+Tailscale SSH are disabled, with no advertised routes. The relay needs a
+dedicated tag that may only be a peer-relay destination and has no access
+into the tailnet.
+
+The old EC2 instance and its security group were terminated/deleted on
+2026-11-15 at approximately 06:15 UTC after backup verification. Lightsail
+is the only relay.
+
+The native binary remains SHA-256
+`0b2b3f500cf5c9a42b49fd361dc443be309b9f92b9b7049c99e41781302c02a7`.
+Public WebPKI, TLS and ALPN checks passed after tuning. Both services and
+the offload unit are enabled for boot. Live module loading, effective settings, service ordering, sockets and durable
+quota were verified without a reboot. **The reboot persistence check is still
+pending.** The orchestrator will perform it with the new relay build deployment
+when fewer coding agents depend on the Mac–Windows path.
+[Live verification evidence](results/live-verification-20261115/README.md)
+
+### Persistent relay tuning
+
+`network.sh` installs the following profile. Buffer numbers are bytes. This
+intentionally replaces the previous policy of preserving kernel TCP buffer
+defaults. The values are retained on first-principles grounds. The matched
+measurements demonstrated no throughput or latency improvement.
+
+| Setting | Before | Applied value and reason |
+| --- | --- | --- |
+| TCP congestion control / default qdisc | `bbr` / `fq` | Retain BBR and fq pacing, confirmed on both `ens5` TX queues |
+| `net.core.rmem_max`, `wmem_max` | 4,194,304 each | 16,777,216 each for larger UDP/TCP windows |
+| `net.ipv4.tcp_rmem` | `4096 131072 14868224` | `4096 131072 16777216`, autotuned ceiling |
+| `net.ipv4.tcp_wmem` | `4096 16384 4194304` | `4096 65536 16777216`, moderate initial allocation and larger ceiling |
+| `udp_rmem_min`, `udp_wmem_min` | Kernel defaults | 16,384 each |
+| `tcp_mtu_probing` | 0 | 2, always probe so a PMTU black hole cannot stall a lane (1 during the measurements below) |
+| `tcp_notsent_lowat` | 4,294,967,295 | 131,072, bound queued unsent data while preserving the congestion window |
+| `tcp_slow_start_after_idle` | 1 | 0, preserve the window across brief video pauses under fq pacing |
+| `nf_conntrack_max` | 1,048,576 | 131,072, reduce worst-case table memory on this 2-GB host |
+| Daemon `LimitNOFILE` | Native 1,024 | 65,536 for each daemon, applied live with `prlimit` |
+| Tailscaled memory high / max | Unlimited | 384 / 512 MiB, matching the native daemon's existing containment |
+| `rx-udp-gro-forwarding` | Off | On, helps kernel-forwarded traffic, no demonstrated peer-relay benefit |
+| `rx-gro-list` | Off | Off, compatible with forwarding GRO |
+
+A 20-Mbps stream over a 150-ms path has about 375 KB of bandwidth-delay
+product. The 16-MiB ceilings leave room for many-tens-of-Mbps paths and
+autotuning. They allocate on demand. The 128-KiB unsent threshold represents
+about 52 ms at 20 Mbps and keeps excess application data closer to its bounded
+queue. Conntrack entries at the new ceiling occupy roughly 40 MiB before
+hash/extension overhead. Occupancy was 123 at verification. The script checks
+occupancy before lowering that ceiling. ENA bandwidth, PPS and conntrack
+allowance-exceeded counters were zero.
+
+Generic software GSO and GRO remain enabled. ENA reports hardware UDP
+segmentation `off [fixed]`, so that NIC feature cannot be enabled here.
+`latch-relay-offloads.service` discovers the default interface and applies
+GRO forwarding after network setup and before tailscaled at boot. Tailscale
+recommends this for kernel-forwarded traffic on subnet routers and exit nodes.
+This node advertises no routes. The setting is harmless here, with no evidence
+of benefit for its userspace peer relay.
+
+Conntrack loads through `/etc/modules-load.d/latch-relay.conf` before boot
+sysctls. The script also loads it before writing configuration, so a missing
+module fails before any profile files are changed. Settings persist in
+`/etc/sysctl.d/90-latch-relay.conf`, daemon `relay.conf`
+drop-ins and `/etc/systemd/system/latch-relay-offloads.service`. The boot
+helper is `/usr/local/sbin/latch-relay-network`. `tune-host.sh` reapplies this
+profile and masks ModemManager, multipathd and its socket, udisks2, fwupd and
+its refresh service/timer. The one-disk NVMe inventory had no multipath devices.
+SSH, chrony, Certbot, unattended security updates, logs and SSM stay available.
+
+The Lightsail Xeon 8259CL exposes AES, PCLMULQDQ, BMI1, ADX, AVX and AVX2,
+satisfying the native crypto library's requirements. The host has 1,905 MiB
+RAM and more than 1.4 GiB available after the tests. Measured native cgroup
+memory stayed below 7 MiB, with tailscaled around 19 MiB in the matched test.
+Swap remains absent. Each daemon's 512-MiB hard ceiling bounds process growth,
+leaving approximately 881 MiB for the OS at their combined ceiling. An OOM
+failure ends the affected sessions and systemd restarts that service. A
+tailscaled OOM also drops Tailscale management reachability. Short
+tests leave multi-stream peak memory and long-duration OOM behavior unverified.
+
+### Bounded before and after measurements
+
+All native probe runs had both roles on one Mac on campus Wi-Fi, giving two
+campus–Seoul WAN legs per frame. Matched probes used 25 seconds, 60 fps and
+five seconds of quarter-rate warm-up at each target rate. All-run payload
+rates therefore include the warm-up.
+
+| Native target Mbps | Before payload Mbps / frame p95 ms | After payload Mbps / frame p95 ms | Outcome |
+| --- | --- | --- | --- |
+| 5 | 4.226 / 164.9 | 4.226 / 167.3 | Completed both |
+| 20 | 16.866 / 248.3 | 16.865 / 169.5 | Completed both |
+| 50 | 31.427 / 272.6 | 23.226 / 1,045.5 | Timed out both |
+
+Tuning showed no measurable throughput benefit at 5 or 20 Mbps. The single
+50-Mbps after sample was worse, 23.226 Mbps versus 31.427 Mbps before, with
+p95 1,045.5 ms versus 272.6 ms. No throughput or latency improvement was
+demonstrated. The verified target range from this campus Wi-Fi client is at
+most 20 Mbps per paired session. **50 Mbps is not a verified capacity.**
+
+The high-rate after row uses a retry after an initial Ready failure. Its
+timeout occurred after 11.194 seconds. The corresponding before attempt
+ran 18.402 seconds. Native service CPU around the 20-Mbps target was
+3.54% before and 3.57% after, expressed as one-core utilization. That is
+0.210 and 0.212 CPU percentage points per forwarded Mbps. The sample includes
+setup and idle-tail CPU. A single before/after sample cannot establish causality.
+
+Mac and Windows both reported `peer-relay 54.116.93.176:443:vni:3`. Recorded
+Mac pings measured 147–150 ms and Windows pings measured 136–144 ms. Matched
+SFTP downloads of the existing 13,172,176-byte Windows kernel measured
+2.792 Mbps over EC2 and 3.101 Mbps over Lightsail, taking 37.740 and 33.987
+seconds. Their SHA-256 values matched. Relay process CPU was 1.71% and 2.47%
+of one core, equivalent to 0.613 and 0.797 CPU percentage points per Mbps.
+The CPUs and WAN conditions also differ between those samples.
+
+A separate RAM-only Mac-to-Windows TCP sink received 8,650,752 bytes in
+20.015 seconds, 3.458 Mbps, with about 2.98% of one relay core. Windows used
+its existing PowerShell/.NET tools. The initial stop-and-wait echo attempt
+stalled and exceeded the intended short window before cancellation. A retry
+timed out. Those attempts gave way to the bounded SFTP and upload tests.
+
+The conservative allocation for all tests is below 3 GB combined transfer.
+Available provider metrics advanced from 5.31 to 5.97 GB for the month.
+The provider may report later samples after aggregation. The native guard
+remains 500,000,000,000 combined bytes. Tailscale traffic shares the provider
+allowance. Raw probe output, CPU samples, method, failures and path evidence
+are retained with the results. [Measurement record](results/consolidation-20261115/README.md)
+
+### Sustainable load and cost
+
+The small bundle's two vCPUs have a 20% baseline each, equivalent to 0.4
+sustained vCPU total. Burst reserve reached about 64.5%, or 11,139 seconds
+in the final hourly average. Tests used seconds of CPU, leaving endurance
+after credit depletion unverified. CPU credit depletion lowers sustainable
+compute to the baseline. It creates no Lightsail CPU-credit surcharge.
+
+Retain the $12 small bundle for its 2 GiB RAM, 0.4-vCPU baseline and 3,072-GB
+combined allowance. Micro saves $5 but halves RAM, sustained CPU and some
+transfer headroom. Medium costs $24 while retaining the same CPU baseline.
+Assuming 60 hours/month at 20 Mbps and 10% overhead gives 1,188 GB combined
+and approximately $12/month. The 500-GB native guard permits about 25.3 hours
+at that rate. The full provider allowance supports about 155 hours under
+the same model. The FREE account plan expires on 2026-12-21. Separately, the
+Free Tier API reported $162 remaining credits on 2026-11-15. The instance
+costs $12/month. Detailed bundle, overage and credit figures are in the
+operating guide. [Cost model](LIGHTSAIL.md#bundle-and-transfer-economics)
+
+IPv6 is currently disabled at Lightsail and DNS has no AAAA. Cloudflare
+hosts the zone and its A record. Dual-stack enablement, IPv6 firewall rules, the later native listener
+deployment and a DNS-only AAAA are the remaining steps. The assigned IPv6
+address would be separate from the attached IPv4 static allocation.
+[IPv6 findings](LIGHTSAIL.md#ipv6-and-dns)
+
+The old EC2 instance and security group were removed after backup verification
+on 2026-11-15 at approximately 06:15 UTC. The recurring relay instance cost is
+Lightsail `small_3_0` only. [Completed teardown](LIGHTSAIL.md#completed-teardown)
