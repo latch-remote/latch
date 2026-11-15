@@ -365,19 +365,21 @@ fn delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole() {
             viewer.recv_timeout(Duration::from_secs(2)),
             Some(Event::Frame(frame)) if frame.frame == number
         ));
+        // Separate product delivery and actual hold release from ACK age.
+        let delivered = queued.elapsed();
         if number == 12 {
             // Model scheduling work after receipt. This is already part of
             // the ACK's age, not extra time to add to the requested delay.
             thread::sleep(Duration::from_millis(750));
         }
-        queued
+        (queued, delivered)
     };
     // Warm the estimator until its initial variance has decayed, then observe
     // sub-deadline jitter before testing an ACK beyond the configured floor.
     let delays = std::iter::repeat_n(20, 12).chain([1400, 1400, 1400, 2100]);
     for (number, delay) in delays.enumerate() {
         gate.hold.store(true, Ordering::Release);
-        let queued = send(number as u32);
+        let (queued, delivered) = send(number as u32);
         thread::sleep(Duration::from_millis(delay).saturating_sub(queued.elapsed()));
         let event = host.recv_timeout(Duration::ZERO);
         assert!(
@@ -385,10 +387,12 @@ fn delayed_authenticated_acks_adapt_without_relaxing_a_permanent_blackhole() {
             "return-path delay closed video: frame={number}, hold={delay}ms, event={event:?}"
         );
         gate.hold.store(false, Ordering::Release);
+        let released = queued.elapsed();
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             if let Some(elapsed) = host.take_frame_ack_elapsed() {
-                eprintln!("frame={number} hold={delay}ms ack={elapsed:?}");
+                let release_to_ack = elapsed.saturating_sub(released);
+                eprintln!("frame={number} hold={delay}ms delivered={delivered:?} released={released:?} ack={elapsed:?} release_to_ack={release_to_ack:?}");
                 assert!(elapsed >= Duration::from_millis(delay));
                 break;
             }

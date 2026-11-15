@@ -86,14 +86,16 @@ Then open Latch and click **Connect** beside another machine. The
 ### Package managers
 
 This repository has package definitions for Scoop, the AUR and Nix, in
-[packaging/](packaging/README.md). They install the same releases. None is
-in a public bucket, the AUR or nixpkgs yet, so for now they install from
+[packaging/](packaging/README.md). They install the same releases. Scoop
+installs from the [Latch bucket](https://github.com/latch-remote/scoop-bucket).
+The AUR and nixpkgs packages are not published yet, so those install from
 this repository.
 
 **Scoop (Windows).**
 
 ```powershell
-scoop install https://raw.githubusercontent.com/latch-remote/latch/main/packaging/scoop/latch.json
+scoop bucket add latch https://github.com/latch-remote/scoop-bucket
+scoop install latch/latch
 ```
 
 Scoop runs the release's `install-host.ps1`, which installs Latch to

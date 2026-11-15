@@ -7,6 +7,8 @@ use crate::{
     Attachment, Cancel, Grant, Role,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+#[cfg(test)]
+use std::thread;
 use std::{
     io,
     net::{IpAddr, SocketAddr, TcpListener},
@@ -15,7 +17,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -292,6 +293,8 @@ impl Daemon {
     }
     /// Run until cancellation. Quota persistence failure stops the daemon fail closed.
     pub fn run(mut self, cancel: &Cancel) -> io::Result<()> {
+        let wake = Arc::new(crate::readiness::Wake::new());
+        cancel.register(&wake);
         while !cancel.is_cancelled() {
             let before = self.metrics.network_bytes.load(Ordering::Relaxed);
             if let Some(probe) = &mut self.probe {
@@ -330,12 +333,74 @@ impl Daemon {
                 Ordering::Relaxed,
             );
             if self.metrics.network_bytes.load(Ordering::Relaxed) == before {
-                thread::sleep(TICK);
+                self.wait(&wake, TICK)?;
             }
         }
         self.metrics.active_connections.store(0, Ordering::Relaxed);
         self.metrics.active_sessions.store(0, Ordering::Relaxed);
         Ok(())
+    }
+    fn wait(&self, wake: &crate::readiness::Wake, housekeeping: Duration) -> io::Result<()> {
+        let mut sockets = vec![latch_proto::transport::SocketInterest {
+            socket: socket2::SockRef::from(&self.listener),
+            readable: true,
+            writable: false,
+        }];
+        for connection in self.connections.iter().flatten() {
+            let socket = &connection.socket;
+            // Existing durable credit or a synchronous refill can fund the
+            // next pump. Disk reservations retain the housekeeping cadence.
+            if socket.credit < crate::quota::MIN_CREDIT && !self.quota.can_refill() {
+                continue;
+            }
+            let consume = match connection.phase {
+                Phase::Request => socket.idle_write(),
+                Phase::Attached {
+                    session,
+                    role,
+                    lane,
+                } => self.sessions[session]
+                    .as_ref()
+                    .and_then(|s| s.lanes[1 - role][lane])
+                    .and_then(|peer| self.connections[peer].as_ref())
+                    .is_some_and(|peer| peer.socket.idle_write()),
+                _ => false,
+            };
+            if socket.buffered_read() && (consume || !socket.carrier.ready()) {
+                return Ok(());
+            }
+            let interest = socket.interest();
+            if interest.readable || interest.writable {
+                sockets.push(interest);
+            }
+        }
+        // Active sockets and pending durable credit retain the housekeeping
+        // cadence. An empty daemon can wait for admission or cancellation.
+        let timeout =
+            if self.connections.iter().any(Option::is_some) || self.quota.reservation_pending() {
+                housekeeping
+            } else {
+                self.sessions
+                    .iter()
+                    .flatten()
+                    .map(|session| {
+                        let mut deadline = session.created + self.config.limits.session_lifetime;
+                        if session.used != [3, 3] {
+                            deadline = deadline.min(session.attach_until);
+                        }
+                        deadline.saturating_duration_since(Instant::now())
+                    })
+                    .min()
+                    .unwrap_or(Duration::from_secs(60))
+            };
+        let timeout = if let Some(probe) = &self.probe {
+            let now = Instant::now();
+            probe.add_interests(&mut sockets, now);
+            timeout.min(probe.next_deadline().saturating_duration_since(now))
+        } else {
+            timeout
+        };
+        wake.wait(sockets, timeout)
     }
     fn connection_error(&mut self, index: usize, error: &io::Error) {
         let conn = self.connections[index].as_ref().unwrap();
@@ -816,6 +881,54 @@ mod tests {
         .unwrap();
         config.initialize_quota = true;
         (Daemon::bind(config).unwrap(), path)
+    }
+    #[test]
+    fn low_credit_sockets_wake_when_durable_refill_is_available() {
+        use std::io::Write;
+        use std::net::TcpStream;
+        let (mut daemon, path) = test_daemon();
+        let mut credit = 0;
+        let mut epoch = 0;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match daemon.quota.credit(&mut credit, &mut epoch) {
+                Ok(()) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+                Err(error) => panic!("{error}"),
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(TICK);
+        }
+        let mut peer = TcpStream::connect(daemon.local_addr().unwrap()).unwrap();
+        loop {
+            daemon.accept().unwrap();
+            if daemon.connections.iter().any(Option::is_some) {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(TICK);
+        }
+        let connection = daemon.connections.iter_mut().flatten().next().unwrap();
+        connection.socket.credit = crate::quota::MIN_CREDIT - 1;
+        assert!(daemon.quota.can_refill());
+        let wake = crate::readiness::Wake::new();
+        assert!(wake.interest().is_some());
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            peer.write_all(b"x").unwrap();
+            // Keep the socket alive until the readiness wait has returned.
+            peer
+        });
+        let start = Instant::now();
+        // A long injected housekeeping interval exposes omission from the poll
+        // set. Production calls always use TICK.
+        daemon.wait(&wake, Duration::from_secs(1)).unwrap();
+        let elapsed = start.elapsed();
+        let peer = writer.join().unwrap();
+        assert!(elapsed < Duration::from_millis(100), "{elapsed:?}");
+        drop(peer);
+        drop(daemon);
+        std::fs::remove_file(path).unwrap();
     }
     #[test]
     fn ipv6_prefixes_share_all_admission_buckets_and_rate_rejections_preserve_global_slots() {

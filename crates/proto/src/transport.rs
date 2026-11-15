@@ -16,51 +16,120 @@ pub fn tcp_connect_ready(stream: &TcpStream, wait: Duration) -> io::Result<bool>
     }
 }
 
-#[cfg(unix)]
-fn tcp_writable(stream: &TcpStream, wait: Duration) -> io::Result<bool> {
-    use std::os::fd::AsRawFd;
-    let mut fd = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: libc::POLLOUT,
-        revents: 0,
-    };
-    let timeout = wait.as_millis().min(i32::MAX as u128) as i32;
-    // SAFETY: one valid pollfd for the duration of the bounded call.
-    match unsafe { libc::poll(&mut fd, 1, timeout) } {
-        -1 => {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                Ok(false)
+/// A borrowed socket and the readiness directions that can make progress.
+/// A hangup or socket error also wakes the caller so its next I/O observes it.
+pub struct SocketInterest<'a> {
+    pub socket: socket2::SockRef<'a>,
+    pub readable: bool,
+    pub writable: bool,
+}
+
+/// Level-triggered readiness for nonblocking sockets. Interrupted waits return
+/// immediately so callers can recheck cancellation and absolute deadlines.
+pub fn wait_sockets(sockets: &[SocketInterest<'_>], wait: Duration) -> io::Result<usize> {
+    #[cfg(unix)]
+    {
+        // Round up so a sub-millisecond remaining deadline cannot cause spinning.
+        let timeout = wait
+            .as_millis()
+            .saturating_add(u128::from(!wait.subsec_nanos().is_multiple_of(1_000_000)))
+            .min(i32::MAX as u128) as i32;
+        poll_sockets(sockets, timeout)
+    }
+    #[cfg(windows)]
+    {
+        // WSAPoll's timed waits use the system tick (normally ~15.6 ms).
+        // Rust sleep uses the same high-resolution timer as the old relay loop.
+        // Check readiness between sleeps of at most 2 ms, including long idle
+        // waits, so neither data nor deadlines depend on system timer resolution.
+        let start = std::time::Instant::now();
+        loop {
+            let ready = if sockets.is_empty() {
+                0
             } else {
-                Err(error)
+                poll_sockets(sockets, 0)?
+            };
+            let remaining = wait.saturating_sub(start.elapsed());
+            if ready != 0 || remaining.is_zero() {
+                return Ok(ready);
             }
+            std::thread::sleep(remaining.min(Duration::from_millis(2)));
         }
-        0 => Ok(false),
-        _ if fd.revents & libc::POLLNVAL != 0 => Err(io::ErrorKind::InvalidInput.into()),
-        _ => Ok(fd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0),
     }
 }
 
-#[cfg(windows)]
 fn tcp_writable(stream: &TcpStream, wait: Duration) -> io::Result<bool> {
+    wait_sockets(
+        &[SocketInterest {
+            socket: socket2::SockRef::from(stream),
+            readable: false,
+            writable: true,
+        }],
+        wait,
+    )
+    .map(|ready| ready != 0)
+}
+
+#[cfg(unix)]
+fn poll_sockets(sockets: &[SocketInterest<'_>], timeout: i32) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    let mut fds: Vec<_> = sockets
+        .iter()
+        .map(|socket| libc::pollfd {
+            fd: socket.socket.as_raw_fd(),
+            events: if socket.readable { libc::POLLIN } else { 0 }
+                | if socket.writable { libc::POLLOUT } else { 0 },
+            revents: 0,
+        })
+        .collect();
+    // SAFETY: the initialized array and every borrowed socket remain alive
+    // throughout this call. poll only writes each entry's revents field.
+    let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::Interrupted {
+            Ok(0)
+        } else {
+            Err(error)
+        };
+    }
+    if fds.iter().any(|fd| fd.revents & libc::POLLNVAL != 0) {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    Ok(result as usize)
+}
+
+#[cfg(windows)]
+fn poll_sockets(sockets: &[SocketInterest<'_>], timeout: i32) -> io::Result<usize> {
     use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{
-        WSAGetLastError, WSAPoll, POLLERR, POLLHUP, POLLNVAL, POLLWRNORM, WSAPOLLFD,
+        WSAGetLastError, WSAPoll, POLLNVAL, POLLRDNORM, POLLWRNORM, WSAPOLLFD,
     };
-    let mut fd = WSAPOLLFD {
-        fd: stream.as_raw_socket() as usize,
-        events: POLLWRNORM,
-        revents: 0,
-    };
-    let timeout = wait.as_millis().min(i32::MAX as u128) as i32;
-    // SAFETY: one valid WSAPOLLFD for the duration of the bounded call.
-    match unsafe { WSAPoll(&mut fd, 1, timeout) } {
-        // SAFETY: no preconditions.
-        -1 => Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() })),
-        0 => Ok(false),
-        _ if fd.revents & POLLNVAL != 0 => Err(io::ErrorKind::InvalidInput.into()),
-        _ => Ok(fd.revents & (POLLWRNORM | POLLERR | POLLHUP) != 0),
+    let mut fds: Vec<_> = sockets
+        .iter()
+        .map(|socket| WSAPOLLFD {
+            fd: socket.socket.as_raw_socket() as usize,
+            events: if socket.readable { POLLRDNORM } else { 0 }
+                | if socket.writable { POLLWRNORM } else { 0 },
+            revents: 0,
+        })
+        .collect();
+    // SAFETY: the initialized array and every borrowed socket remain alive
+    // throughout this call. WSAPoll only writes each entry's revents field.
+    let result = unsafe { WSAPoll(fds.as_mut_ptr(), fds.len() as u32, timeout) };
+    if result < 0 {
+        // SAFETY: WSAGetLastError has no preconditions.
+        let error = io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
+        return if error.kind() == io::ErrorKind::Interrupted {
+            Ok(0)
+        } else {
+            Err(error)
+        };
     }
+    if fds.iter().any(|fd| fd.revents & POLLNVAL != 0) {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    Ok(result as usize)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
