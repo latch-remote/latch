@@ -1187,7 +1187,9 @@ impl Resources {
         slot: &FrameSlot,
     ) {
         #[cfg(target_os = "linux")]
-        self.dmabuf = None;
+        {
+            self.dmabuf = None;
+        }
         #[cfg(target_os = "macos")]
         while let Some(old) = self.in_flight_ring.pop_front() {
             queue.on_submitted_work_done(move || drop(old));

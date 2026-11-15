@@ -678,8 +678,8 @@ const PROBATION: u32 = 10;
 /// behind it: if the platform's decoder gives no picture for its first
 /// [`PROBATION`] access units, or fails on them, every access unit from the
 /// next keyframe on goes to `latch-codec` instead. Once the platform's
-/// decoder has given a picture it is trusted, and its errors are the
-/// stream's (a lost reference, say), as with any decoder.
+/// decoder has given a picture, stream errors pass through for keyframe
+/// recovery. A terminal hardware failure still switches to software.
 pub struct Fallback {
     platform: Option<Box<dyn Decoder>>,
     software: Option<software::Software>,
