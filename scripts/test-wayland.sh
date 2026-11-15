@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Private headless compositor and real ScreenCast portal, with SHM buffers.
+set -euo pipefail
+if [[ ${1:-} != --session ]]; then
+    exec dbus-run-session -- "$0" --session "$@"
+fi
+shift
+binary=$(realpath "${1:-target/debug/examples/wayland_smoke}")
+fixture=$(mktemp -d)
+export XDG_RUNTIME_DIR="$fixture/runtime"
+export XDG_CONFIG_HOME="$fixture/config"
+export XDG_STATE_HOME="$fixture/state"
+export XDG_DATA_HOME="$fixture/data"
+export LATCH_WAYLAND_TOKEN_FILE="$XDG_STATE_HOME/wayland-portal.json"
+export XDG_CURRENT_DESKTOP=sway XDG_SESSION_TYPE=wayland
+export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_HEADLESS_OUTPUTS=1
+export LIBSEAT_BACKEND=noop LATCH_LINUX_BACKEND=wayland LATCH_WAYLAND_DMABUF=0
+export RUST_LOG=latch_engine=debug
+unset DISPLAY WAYLAND_DISPLAY SWAYSOCK
+mkdir -p "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME/xdg-desktop-portal-wlr" "$XDG_CONFIG_HOME/xdg-desktop-portal"
+chmod 700 "$XDG_RUNTIME_DIR"
+pids=()
+cleanup() {
+    result=$?
+    trap - EXIT
+    for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+    for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+    if (( result != 0 )); then cat "$fixture"/*.log; fi
+    rm -rf "$fixture"
+    exit "$result"
+}
+trap cleanup EXIT
+cat > "$fixture/sway.conf" <<'CONFIG'
+output HEADLESS-1 mode 640x360
+output HEADLESS-1 bg #345678 solid_color
+CONFIG
+cat > "$XDG_CONFIG_HOME/xdg-desktop-portal-wlr/config" <<'CONFIG'
+[screencast]
+output_name=HEADLESS-1
+chooser_type=none
+max_fps=30
+CONFIG
+cat > "$XDG_CONFIG_HOME/xdg-desktop-portal/portals.conf" <<'CONFIG'
+[preferred]
+default=wlr
+CONFIG
+sway --unsupported-gpu -c "$fixture/sway.conf" > "$fixture/sway.log" 2>&1 &
+pids+=("$!")
+for ((i=0; i<100; i++)); do
+    for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+        if [[ -S $socket ]]; then export WAYLAND_DISPLAY="${socket##*/}"; break 2; fi
+    done
+    sleep 0.1
+done
+: "${WAYLAND_DISPLAY:?headless sway failed to start}"
+for socket in "$XDG_RUNTIME_DIR"/sway-ipc*.sock; do export SWAYSOCK="$socket"; done
+for ((i=0; i<100; i++)); do
+    if grim -o HEADLESS-1 -t ppm "$fixture/ready.ppm" 2> "$fixture/grim.log"; then break; fi
+    sleep 0.1
+done
+test -s "$fixture/ready.ppm"
+dbus-update-activation-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME
+pipewire > "$fixture/pipewire.log" 2>&1 &
+pids+=("$!")
+wireplumber > "$fixture/wireplumber.log" 2>&1 &
+pids+=("$!")
+"${LATCH_TEST_PORTAL_WLR:-/usr/libexec/xdg-desktop-portal-wlr}" -l DEBUG > "$fixture/portal-wlr.log" 2>&1 &
+pids+=("$!")
+/usr/libexec/xdg-desktop-portal -v > "$fixture/portal.log" 2>&1 &
+pids+=("$!")
+for ((i=0; i<100; i++)); do
+    if dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.freedesktop.portal.Desktop | grep -q "boolean true"; then break; fi
+    sleep 0.1
+done
+timeout 45 "$binary"

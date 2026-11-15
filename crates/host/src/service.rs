@@ -528,6 +528,8 @@ impl Service {
         }
         #[cfg(target_os = "macos")]
         setup.extend(crate::unix_setup::permission_items());
+        #[cfg(target_os = "linux")]
+        setup.extend(latch_engine::linux::wayland_setup_item());
         if wake.magic_packet == Some(false) {
             setup.push(format!("Wake-on-LAN is off on {}.", wake.adapter));
         }

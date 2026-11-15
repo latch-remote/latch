@@ -13,7 +13,10 @@ pub fn run(p: &Plan<'_>) -> Result<()> {
         #[cfg(target_os = "macos")]
         request_permissions();
         #[cfg(target_os = "linux")]
-        retire_engine()?;
+        {
+            latch_engine::linux::approve_wayland()?;
+            retire_engine()?;
+        }
         set_autostart(true, p.exe)?;
         #[cfg(target_os = "macos")]
         if firewall_blocks(p.exe) {
