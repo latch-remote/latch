@@ -36,7 +36,8 @@ def check_kit():
         "User=latch-relay", "NoNewPrivileges=yes", "ProtectSystem=strict",
         "StateDirectory=latch-relay", "Restart=always", "StartLimitIntervalSec=0",
         "MemoryMax=512M", "--listen [::]:443", "--monthly-bytes ${MONTHLY_BYTES}",
-        "CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
+        "CapabilityBoundingSet=CAP_NET_BIND_SERVICE", "AmbientCapabilities=CAP_NET_BIND_SERVICE",
+        "--http-listen [::]:80", "--acme-webroot /var/www/latch-relay",
     ):
         assert setting in unit, setting
     assert "--initialize-quota" not in unit
@@ -220,6 +221,48 @@ def check_binary(binary):
                     process.wait(timeout=3)
             process.stderr.close()
 
+        webroot = directory / "webroot"
+        challenge = webroot / ".well-known/acme-challenge"
+        challenge.mkdir(parents=True)
+        (challenge / "token_1").write_bytes(b"proof")
+        (challenge / "too_large").write_bytes(b"x" * 4097)
+        http_args = args.copy()
+        http_args[http_args.index(str(ledger))] = str(directory / "http-quota")
+        process = subprocess.Popen(http_args + ["--initialize-quota", "--http-listen", "[::]:0",
+            "--acme-webroot", str(webroot)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stderr, selectors.EVENT_READ)
+                assert selector.select(timeout=5), "HTTP probe daemon did not start"
+                line = process.stderr.readline().decode(errors="replace")
+            match = re.search(r"HTTP probe on \[::\]:(\d+)", line)
+            assert match, line
+            http_port = int(match[1])
+            for address in ("127.0.0.1", "::1"):
+                for path, expected, body in (
+                    ("/netenv/probe", 204, b""),
+                    ("/.well-known/acme-challenge/token_1", 200, b"proof"),
+                    ("/.well-known/acme-challenge/too_large", 404, b""),
+                    ("/.well-known/acme-challenge/../key.pem", 404, b""),
+                    ("/.well-known/acme-challenge/%2e%2e", 404, b""),
+                    ("/", 404, b""),
+                ):
+                    with socket.create_connection((address, http_port), timeout=3) as stream:
+                        stream.sendall(f"GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+                        response = b""
+                        while chunk := stream.recv(4096):
+                            response += chunk
+                    assert response.startswith(f"HTTP/1.1 {expected} ".encode()), response
+                    assert response.split(b"\r\n\r\n", 1)[1] == body
+                    assert b"Cache-Control: no-store\r\n" in response
+            with socket.create_connection(("127.0.0.1", http_port), timeout=3) as stream:
+                stream.sendall(b"GET /netenv/probe HTTP/1.1\r\n")
+                assert stream.recv(1) == b"", "slow request did not expire"
+            assert process.poll() is None
+        finally:
+            stop(process)
+        print("PASS anonymous HTTP 204, dual stack, ACME webroot, traversal/size rejection and slow-request deadline")
+
         # Exercise the shipped dual-stack listener and HTTP carrier using a
         # separate ledger so the exhaustion assertions retain their small budget.
         carrier_args = args.copy()
@@ -240,8 +283,9 @@ def check_binary(binary):
                     with tls_context(certificate).wrap_socket(raw, server_hostname="localhost") as tls:
                         assert tls.selected_alpn_protocol() == "latch-relay/1"
             for alpn in (["h2", "http/1.1"], []):
-                context = tls_context(certificate)
-                context.set_alpn_protocols(alpn)
+                context = ssl.create_default_context(cafile=str(certificate))
+                if alpn:
+                    context.set_alpn_protocols(alpn)
                 with socket.create_connection(("127.0.0.1", port), timeout=3) as raw:
                     with context.wrap_socket(raw, server_hostname="localhost") as tls:
                         tls.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")

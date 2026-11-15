@@ -8,6 +8,15 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Relay connectivity
 
+- Discover OS and environment CONNECT proxies without delaying session start.
+  Explain proxy authentication, captive portals, TLS interception, HTTPS-only
+  fallback and restricted Tailscale paths in the viewer and examples. Open
+  network sign-in in the browser and resume a pending stream after sign-in.
+- Serve an anonymous HTTP connectivity probe and ACME webroot on the relay's
+  optional port-80 listener. Preserve compatibility with relays lacking it.
+- Retry TCP packet-size black holes with 1200- then 512-byte MSS and retain the
+  selected carrier, proxy and MSS reason in connection diagnostics.
+
 - Add HTTPS WebSocket relay fallback on TCP 443 alongside native
   `latch-relay/1` TLS, with shared admission, durable quotas and bounded queues.
 - Add explicit HTTP CONNECT proxies with redacted Basic credentials and a

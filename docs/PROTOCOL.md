@@ -874,3 +874,40 @@ codec hardware requirements remain separate constraints. Default endpoint
 Field and scale validation are distinct from protocol conformance.
 [Relay implementation](../crates/relay/README.md) ·
 [Deployment](../deploy/relay-tcp/README.md)
+
+## Network environment and anonymous HTTP probe
+
+The configured relay hostname optionally serves plain HTTP on port 80.
+`GET /netenv/probe` returns `204 No Content`, `Content-Length: 0` and
+`Cache-Control: no-store`. The client sends Host, Connection and Cache-Control
+headers without cookies, credentials, peer capabilities, device IDs or User-Agent.
+It follows no redirects. A redirect provides a browser sign-in action. A 404,
+timeout or unavailable probe from an older relay produces no warning by itself.
+This endpoint is independent of the TLS relay framing and version-1 peer protocol.
+
+`GET /.well-known/acme-challenge/<token>` serves a bounded regular file from
+`WEBROOT/.well-known/acme-challenge`. Tokens use ASCII letters, digits, hyphens
+and underscores, at most 128 bytes. Bodies are at most 4096 bytes. Other requests
+get an empty 404. The listener permits eight concurrent requests, 4096 request
+bytes, two seconds per connection, and 120 admitted connections per minute.
+It records no request addresses or paths.
+
+Discovered proxy settings allow direct native TLS followed by direct HTTPS
+WebSocket, then those carriers through HTTP CONNECT. A proxy-only result tries
+the proxy first. Explicit relay-library `ClientConfig::proxy` callers retain
+their authoritative proxy behavior. A verified winning carrier/route is reused
+for 30 seconds and invalidates on route-source changes. Each cold carrier ladder
+has a two-second window, native gets at most 750 ms, and WebSocket uses the
+remaining time. Two silent TLS handshakes permit fresh 1200- and 512-byte MSS
+probes, bounded to an additional 500 ms. A single blocked native ALPN leaves the
+working WebSocket path's MSS alone. All route/carrier discovery shares a hard
+four-second deadline and the existing ten-second setup deadline including DNS
+and the grant response. The session's six-second relay negotiation window and
+existing retry backoff still apply. Certificate or CONNECT-authentication errors
+stop that ladder immediately.
+
+CONNECT contains only the relay hostname/port and optional OS/environment Basic
+proxy authorization. Relay grants and attachment capabilities are written only
+inside hostname-verified TLS after a successful CONNECT. Plain HTTP forwarding
+is unsupported. No stream/control fields change, so 6.0.0 peers and the deployed
+relay remain compatible.

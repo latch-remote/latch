@@ -76,7 +76,8 @@ the requested rate for five seconds can also trigger recovery, even when
 error correction repairs the lost packets. Quiet desktops do not trigger
 this bandwidth check. This can help when UDP media
 is unusable and the authorized Tailscale control connection still works.
-The toolbar shows **Latch TLS relay** when that route is active.
+The toolbar shows **Latch native** or **Latch WebSocket** when that route is active,
+with **via proxy** when a CONNECT tunnel carries it.
 
 Open **Settings → Stream relay** to change **Recover automatically through
 the Latch relay** or **Relay hostname** and its port. The default is
@@ -253,3 +254,39 @@ Setup removes the old engine, its pairing data and its services.
 
 Use `LATCH_DATA_DIR` to override the settings directory. Version 6 public
 updates ignore the legacy GitHub token settings.
+
+## Restrictive networks
+
+Latch discovers this network's OS, PAC/WPAD and environment proxy settings in
+background. A cached result is used immediately. Slow discovery continues while
+the connection tries direct access. Changing networks or signing in to a portal
+is detected automatically, with checks refreshed within five seconds.
+
+- **This network needs a sign-in** appears when a portal redirects the anonymous
+  connectivity check. Choose **Open network sign-in**, complete the browser's
+  sign-in, and leave Latch open. The pending stream resumes automatically.
+- **This network inspects encrypted traffic** means the relay presented an
+  untrusted certificate. Latch refuses the substituted certificate and shows its
+  issuer when available. Ask the network administrator to permit the relay's
+  genuine TLS connection, or use another network.
+- **Proxy required** means Latch is using this network's HTTP CONNECT proxy.
+  **Proxy authentication required** means its supplied credentials are absent
+  or were rejected. Sign in through your OS's proxy configuration or contact the
+  network administrator. Latch never prompts for or guesses proxy credentials.
+- **Using the WebSocket carrier** means native relay TLS was blocked. The path
+  indicator says **Latch WebSocket**, with **via proxy** when applicable.
+- **Tailscale is blocked** or **Tailscale is using DERP only** describes the
+  network evidence reported by Tailscale. Check that Tailscale is signed in and
+  allowed by this network. DERP adds latency.
+
+Healthy networks show no network warning. The relay can retry a stalled TCP
+path with 1200-byte and then 512-byte MSS on Unix. The retry hint expires after
+30 seconds. Windows retains its normal TCP segmentation behavior.
+
+The portal check sends an anonymous plain-HTTP `GET /netenv/probe` to the
+configured relay hostname on port 80. It includes Host, Connection and cache
+control headers. It sends no cookies, authorization, grant material, device or
+account identifier, or User-Agent, and follows no redirects. The relay sees the
+source address as with any connection and does not log probe addresses. A missing
+endpoint on an older relay degrades silently. Set `LATCH_NETENV_PROBE=0` to
+suppress active HTTP checks and use OS portal signals only.

@@ -710,6 +710,7 @@ impl Server {
         let mut sent_mark = (Instant::now(), session.bytes.load(Ordering::Relaxed));
         let mut route_revision = session.relay.revision();
         let mut relay_messages = VecDeque::new();
+        let mut network_status = latch_stream::network::NetworkStatus::default();
         let reason = loop {
             let ended = session.ended.lock().clone();
             if let Some(e) = ended {
@@ -764,6 +765,17 @@ impl Server {
                 .update_relay(|relay| relay.maintain(false, |message| session.send_tcp(message)))
             {
                 break "the viewer's connection broke".to_string();
+            }
+            let status = session.relay.network_status();
+            if status != network_status {
+                for message in &status.messages {
+                    self.log(message.clone());
+                    let _ = session.send_tcp(&Message::Notice(Notice {
+                        kind: "network".into(),
+                        message: message.clone(),
+                    }));
+                }
+                network_status = status;
             }
             if route_revision != session.relay.revision() {
                 route_revision = session.relay.revision();

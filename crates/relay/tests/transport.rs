@@ -1545,3 +1545,25 @@ fn fresh_concurrent_lanes_share_the_first_successful_carrier_discovery() {
     // 2 s grant + 2 s cold attach cohort + four 200 ms exchanges = 4.8 s.
     assert!(started.elapsed() < Duration::from_millis(5500));
 }
+
+#[test]
+fn discovered_proxy_only_environment_uses_connect_before_direct() {
+    let pilot = Pilot::start();
+    let gateway = Gateway::start(
+        pilot.config.endpoint.port(),
+        GatewayMode::Connect {
+            auth: true,
+            status: 200,
+            intercept: false,
+            http_only: false,
+        },
+    );
+    let mut config = proxy_config(&gateway, true);
+    let proxy = config.proxy.clone();
+    config.set_proxy_discovery(move || (proxy.clone(), false));
+    assert!(config.proxy.is_some());
+    let (_, info) = latch_relay::create_grant_with_info(&config, &Cancel::new()).unwrap();
+    assert!(info.via_proxy);
+    assert_eq!(info.carrier, latch_relay::Carrier::Native);
+    assert!(info.earlier_failures.is_empty());
+}

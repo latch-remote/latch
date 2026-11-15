@@ -95,6 +95,7 @@ pub fn run(
             emit(serde_json::json!({
                 "kind":"sample", "elapsed_ms":elapsed_ms, "decoded_seq":sequence,
                 "fps":stats.fps, "path":path, "mbps":stats.mbps,
+                "carrier":session.relay_connection_info().as_ref().map(latch_stream::network::carrier_label),
                 "requested_bitrate_kbps":stats.requested_bitrate_kbps,
                 "applied_bitrate_kbps":stats.applied_bitrate_kbps,
                 "loss_pct":stats.loss_pct, "audio":stats.audio,

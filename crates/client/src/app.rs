@@ -240,6 +240,9 @@ impl ClientApp {
         cfg: ClientConfig,
     ) -> Self {
         ui::apply(&cc.egui_ctx);
+        if cfg.stream.relay.enabled {
+            latch_stream::network::diagnosis(&cfg.stream.relay.host);
+        }
         if let Some(rs) = &cc.wgpu_render_state {
             crate::video::install(&cc.egui_ctx, rs);
         }
@@ -1352,6 +1355,10 @@ impl ClientApp {
             ui::small_print(ui, summary);
         });
         self.tailscale_banner(ui, disc);
+        if self.cfg.stream.relay.enabled {
+            let diagnosis = latch_stream::network::diagnosis(&self.cfg.stream.relay.host);
+            crate::network::show(ui, &latch_stream::network::status(&diagnosis, None, None));
+        }
         if let Some((tone, text, _)) = self.notice.clone() {
             ui::notice(ui, tone, &text);
         }

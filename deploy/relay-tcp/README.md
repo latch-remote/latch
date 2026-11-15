@@ -49,8 +49,10 @@ normally reaches the daemon through a translator's IPv4 source. Native IPv6
 and unrecognized translated IPv6 sources share a /64 admission key.
 
 Use a public WebPKI certificate whose SAN includes `relay.latch.rune.foo`.
-The deployed certificate uses Certbot standalone HTTP-01, with public TCP 80
-reserved for ACME. The enabled `certbot.timer` handles renewal. This daemon
+The production certificate currently uses Certbot standalone HTTP-01. Switch it
+to the webroot authenticator during this upgrade using the steps below. The
+updated unit owns TCP 80 for the anonymous probe and ACME webroot. The enabled
+`certbot.timer` handles renewal. This daemon
 serves native TLS with ALPN `latch-relay/1` and HTTP/1.1 with `http/1.1` or
 absent ALPN on the same port. `GET /relay` supports RFC 6455 WebSocket upgrade.
 Root GET/HEAD requests receive 200, unknown paths 404, unsupported methods 405,
@@ -75,7 +77,7 @@ The `/etc/latch-relay` directory is `root:latch-relay` mode `0750`. The restart
 ends current relay sessions, which need a fresh grant and fresh session keys
 through the authenticated control channel.
 
-Expose TCP 443 publicly for both enabled address families on the dedicated
+Expose TCP 80 and 443 publicly for both enabled address families on the dedicated
 instance. Restrict SSH TCP 22 to
 the operator's current `/32` or a verified private management route. Retain
 key-based SSH, disable password/root login, and verify a second login before
@@ -311,3 +313,43 @@ sudo python3 deploy/relay-tcp/sample-capacity.py 3700 --interval 30
 The sampler emits UTC timestamps and one-core CPU percentages. Fetch Lightsail
 CPU and burst-capacity metrics over the same UTC interval. Separate application
 test overlap when interpreting global daemon counters.
+
+## Enable the anonymous probe and switch Certbot to webroot
+
+Perform this upgrade in an arranged maintenance window. Build the reviewed
+Linux `latch-relay` binary with four Cargo jobs. Copy the binary and this kit to
+the relay host through your normal deployment channel. Retain the current quota
+ledger, budget and operator limits.
+
+1. Stop `latch-relay.service`. Run `install.sh BINARY FULLCHAIN_PEM PRIVATE_KEY_PEM
+   MONTHLY_BYTES` using the existing certificate paths and budget. Omit
+   `--initialize-quota` on upgrades. The installer creates the root-owned,
+   relay-readable `/var/www/latch-relay/.well-known/acme-challenge` webroot.
+2. Install the updated unit with `--http-listen [::]:80 --acme-webroot
+   /var/www/latch-relay`. `systemctl daemon-reload` and
+   `systemctl start latch-relay.service` activate it. The existing
+   `AmbientCapabilities=CAP_NET_BIND_SERVICE` and capability bounding set cover
+   both 80 and 443 under the `latch-relay` account.
+3. Allow inbound TCP 80 in both the provider firewall and host IPv4/IPv6 firewall.
+   Keep TCP 443 open. Confirm the hostname's A and AAAA records reach this host.
+   Verify `curl -i http://RELAY_HOST/netenv/probe` returns an empty 204 with
+   `Content-Length: 0` and `Cache-Control: no-store`.
+4. With the new listener running, run
+   `sudo certbot reconfigure --cert-name RELAY_HOST --webroot -w /var/www/latch-relay`
+   using the existing Certbot certificate name. Remove renewal pre/post hooks
+   that stop/start the relay for standalone port ownership. Retain the existing
+   `certbot-deploy.sh` deploy hook that installs renewed certificate/key files
+   and restarts the relay. Inspect `certbot certificates` and the renewal
+   configuration to confirm the webroot authenticator and path.
+5. Run `sudo certbot renew --cert-name RELAY_HOST --dry-run`, then check
+   `systemctl status latch-relay.service` and `journalctl -u latch-relay.service`.
+   Run `python3 deploy/relay-tcp/selftest.py --binary PATH_TO_LOCAL_BINARY` on a
+   disposable host to exercise both listeners without public test traffic.
+
+The listener bounds request size/time, concurrent connections and global admission.
+It logs no request paths or addresses. It serves only the probe and bounded
+regular ACME challenge files. New clients still stream through the old relay.
+Portal discovery then relies on native OS signals or an actual intercepting
+redirect. A missing probe does not warn. The new unit requires the new binary,
+and leaving Certbot's standalone authenticator in place causes renewal to fail
+because the daemon owns port 80.

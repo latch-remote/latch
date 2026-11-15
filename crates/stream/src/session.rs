@@ -36,6 +36,13 @@ pub fn relay_config(settings: &control::RelaySettings) -> Option<latch_relay::Cl
     }
     latch_relay::Endpoint::new(settings.host.clone(), settings.port)
         .and_then(latch_relay::ClientConfig::production)
+        .map(|mut config| {
+            let host = settings.host.clone();
+            config.set_proxy_discovery(move || {
+                crate::network::proxy_selection(&crate::network::diagnosis(&host))
+            });
+            config
+        })
         .map_err(|error| tracing::warn!(%error, "relay unavailable"))
         .ok()
 }
@@ -125,6 +132,8 @@ struct RelayAttempt {
     grant_bytes: u64,
     traffic_bytes: u64,
     media_delivered: bool,
+    failure: Option<latch_relay::Failure>,
+    connection_info: Option<latch_relay::ConnectionInfo>,
     cancel: latch_relay::Cancel,
     preparing: Option<(
         mpsc::Receiver<std::io::Result<PreparedRelay>>,
@@ -173,6 +182,8 @@ impl RelayRoute {
                 grant_bytes: 0,
                 traffic_bytes: 0,
                 media_delivered: false,
+                failure: None,
+                connection_info: None,
                 cancel: latch_relay::Cancel::new(),
                 preparing: None,
             }),
@@ -194,6 +205,28 @@ impl RelayRoute {
     pub fn pending(&self) -> bool {
         self.state.lock().phase != RelayPhase::Idle
     }
+    pub fn connection_info(&self) -> Option<latch_relay::ConnectionInfo> {
+        self.state.lock().connection_info.clone()
+    }
+    fn retry_after_sign_in(&self) {
+        let mut state = self.state.lock();
+        state.failures = 0;
+        state.retry_at = Instant::now();
+        state.failure = None;
+    }
+    pub fn network_status(&self) -> crate::network::NetworkStatus {
+        let diagnosis = self
+            .config
+            .as_ref()
+            .map(|config| crate::network::diagnosis(config.endpoint.host()))
+            .unwrap_or_default();
+        let state = self.state.lock();
+        crate::network::status(
+            &diagnosis,
+            state.failure.as_ref(),
+            state.connection_info.as_ref(),
+        )
+    }
     pub fn number(&self) -> u64 {
         self.state.lock().number
     }
@@ -206,6 +239,9 @@ impl RelayRoute {
     }
     fn activate(&self, state: &mut RelayAttempt) {
         tracing::info!(role = ?self.role, attempt = state.number, "using Latch TLS relay");
+        if let Some(info) = &state.connection_info {
+            tracing::info!("{}", crate::network::carrier_label(info));
+        }
         state.phase = RelayPhase::Active;
         state.started = Instant::now();
         state.next_probe = state.next_probe.max(state.started + UDP_REASSESS_DWELL);
@@ -240,6 +276,7 @@ impl RelayRoute {
         state.grant_bytes = 0;
         state.traffic_bytes = 0;
         state.media_delivered = false;
+        state.connection_info = None;
         state.phase = RelayPhase::Idle;
         state.udp_probe = None;
         state.returning_direct = false;
@@ -466,11 +503,29 @@ impl RelayRoute {
         state.media_delivered |= matches!(event, latch_relay::Event::Frame(_));
         match event {
             latch_relay::Event::Ready => {
+                state.connection_info = state
+                    .transport
+                    .as_ref()
+                    .and_then(|transport| transport.connection_info(latch_relay::Lane::Video));
+                state.failure = None;
                 state.ready = true;
                 None
             }
             latch_relay::Event::Closed { kind, message } => {
                 tracing::warn!(role = ?self.role, ?kind, %message, "relay closed, falling back to UDP");
+                if let Some(transport) = &state.transport {
+                    state.failure = transport.failure().map(|error| error.failure);
+                }
+                for message in crate::network::status(
+                    &latch_core::netenv::NetworkDiagnosis::default(),
+                    state.failure.as_ref(),
+                    None,
+                )
+                .messages
+                {
+                    tracing::warn!("{message}");
+                }
+                state.connection_info = None;
                 self.failed.store(true, Ordering::Release);
                 None
             }
@@ -486,6 +541,7 @@ impl RelayRoute {
         if self.fatal.load(Ordering::Acquire) {
             return false;
         }
+        let waiting_for_sign_in = self.network_status().needs_sign_in;
         let mut state = self.state.lock();
         let renewing = self.role == latch_relay::Role::Host
             && state.phase == RelayPhase::Active
@@ -580,6 +636,7 @@ impl RelayRoute {
                     }
                     Err(error) => {
                         tracing::warn!(%error, "relay preparation failed");
+                        state.failure = Some(latch_relay::ConnectError::from_io(&error).failure);
                         let number = state.number;
                         self.reset(&mut state);
                         if !send(&self.message(number, A::Abort)) {
@@ -591,6 +648,7 @@ impl RelayRoute {
         }
         if self.role == latch_relay::Role::Viewer
             && wanted
+            && (!waiting_for_sign_in || state.failures == 0)
             && self.config.is_some()
             && state.phase == RelayPhase::Idle
             && state.preparing.is_none()
@@ -1646,6 +1704,14 @@ impl Session {
         self.inner.relay.lock().active()
     }
 
+    pub fn relay_connection_info(&self) -> Option<latch_relay::ConnectionInfo> {
+        self.inner.relay.lock().connection_info()
+    }
+
+    pub fn network_status(&self) -> crate::network::NetworkStatus {
+        self.inner.relay.lock().network_status()
+    }
+
     pub fn stats(&self) -> Stats {
         let mut stats = self.inner.stats.lock().clone();
         stats.video_problem = self.inner.video_health.lock().problem(Instant::now());
@@ -2149,11 +2215,12 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 }
             });
     }
-    let accepted = Instant::now();
+    let mut accepted = Instant::now();
     let mut last_report = Instant::now();
     let mut last_keepalive = Instant::now();
     let mut damage_since: Option<Instant> = None;
     let mut bandwidth_since: Option<Instant> = None;
+    let mut last_network_status = crate::network::NetworkStatus::default();
     loop {
         if inner.stopping() {
             if let Some(w) = inner.control_writer.lock().as_mut() {
@@ -2325,12 +2392,29 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 }
             }
         }
+        let status = inner.relay.lock().network_status();
+        if last_network_status.needs_sign_in && !status.needs_sign_in {
+            accepted = Instant::now();
+            inner.relay.lock().retry_after_sign_in();
+        }
+        if status != last_network_status {
+            for message in &status.messages {
+                inner.emit(Event::Notice(message.clone()));
+            }
+            last_network_status = status.clone();
+        }
+        // Signing in can take longer than the first-picture watchdog. Keep the
+        // authorized control session alive while the portal is confirmed captive.
+        let waiting_for_sign_in = status.needs_sign_in;
         let health = inner.video_health.lock();
-        if health.stalled(now) {
+        if !waiting_for_sign_in && health.stalled(now) {
             return Outcome::Ended(-1, health.stall_message().into());
         }
         drop(health);
-        if !inner.connected.load(Ordering::Acquire) && accepted.elapsed() >= MEDIA_TIMEOUT {
+        if !waiting_for_sign_in
+            && !inner.connected.load(Ordering::Acquire)
+            && accepted.elapsed() >= MEDIA_TIMEOUT
+        {
             if inner.video_health.lock().last_encoded.is_some() {
                 return Outcome::Failed(
                     "decoding".into(),

@@ -911,3 +911,36 @@ process-wide; reopen failures feed the existing Baseline software fallback or
 modern-codec renegotiation. Driver resources stay owned by the abandoned
 worker until its call returns. This recovery has not run against a hung
 driver on Windows hardware.
+
+## Restrictive-network integration
+
+`latch_stream::session::relay_config` is the common configuration entry point
+for the engine, viewer and measurement examples. It attaches a nonblocking
+proxy-discovery callback to the relay configuration. App/service startup warms
+the discovery cache. The relay re-reads it for fresh connections, including
+recovery attempts. Netenv publishes partial observations so an environment
+proxy can be used while other checks continue. OS discovery has a three-second
+deadline. The eight-host cache samples local routes/environment settings at most
+four times a second and refreshes discovery every five seconds. No session/UI
+thread waits for PAC/WPAD, DNS or an HTTP probe.
+
+`RelayRoute` retains typed terminal failures and the selected lane's
+`ConnectionInfo`. `Session::network_status` combines them with local netenv facts.
+Stable notices reach the viewer event stream and examples. The host sends its
+notices through the existing version-1 Notice message. The viewer renders a
+small shared diagnosis surface and opens a `PortalUrl` only after a button click.
+The first-picture watchdog waits while a captive portal is positively known,
+then receives a fresh deadline when the portal opens. Relay attempts continue
+with fresh grants and normal backoff. A successful carrier clears the earlier
+relay error. Unavailable checks and an old relay's missing HTTP probe stay silent.
+
+MSS hints live in the cloned relay configuration. Transport stalls with packet-size
+evidence step down from 1200 to 512 bytes for 30 seconds. Two failed carrier
+handshakes permit the same bounded probe within a connection attempt. Existing
+healthy paths retain their MSS. `ConnectionInfo` reports the applied value and
+reason. TCP_MAXSEG is applied before connect on Linux and before TLS on macOS.
+Windows reports no applied TCP_MAXSEG hint.
+
+PR #110 can join at `Session::relay_connection_info`/`network_status`, the
+viewer's existing path-indicator expression, and the first-picture/relay-retry
+watchdogs. These additions use no media-path-policy enums or protocol changes.
