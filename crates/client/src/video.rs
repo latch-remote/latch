@@ -788,20 +788,13 @@ impl Resources {
                 Err(reason) => {
                     tracing::warn!("DMA-BUF import failed ({reason}); using VA-API readback");
                     latch_stream::video::render_on_dmabuf(false);
-                    self.retire_dmabuf(queue);
+                    self.dmabuf = None;
                 }
             }
             return;
         }
         self.upload_cpu(device, queue, frame, slot);
         slot.rendered(decoded_at);
-    }
-
-    #[cfg(target_os = "linux")]
-    fn retire_dmabuf(&mut self, queue: &wgpu::Queue) {
-        if let Some(old) = self.dmabuf.take() {
-            queue.on_submitted_work_done(move || drop(old));
-        }
     }
 
     #[cfg(target_os = "linux")]
@@ -844,7 +837,7 @@ impl Resources {
             hdr: frame.color.is_hdr() as u32,
         };
         queue.write_buffer(&self.uniforms, 0, &u.bytes());
-        self.retire_dmabuf(queue);
+        self.dmabuf = None;
         self.dmabuf = Some(DmaBufFrame {
             frame: Some(frame),
             queue: queue.clone(),
@@ -1194,7 +1187,7 @@ impl Resources {
         slot: &FrameSlot,
     ) {
         #[cfg(target_os = "linux")]
-        self.retire_dmabuf(queue);
+        self.dmabuf = None;
         #[cfg(target_os = "macos")]
         while let Some(old) = self.in_flight_ring.pop_front() {
             queue.on_submitted_work_done(move || drop(old));
