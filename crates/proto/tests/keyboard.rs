@@ -32,6 +32,14 @@ fn all_pairs_roundtrip_sided_keys_and_negotiated_positions_reliably() {
                 }
             );
         }
+        if keyboard::position(case.vk).is_some() {
+            let mut encoded = Vec::new();
+            events[0].write(&mut encoded);
+            assert_eq!(
+                u16::from_le_bytes([encoded[1], encoded[2]]),
+                (case.usage & 0xffff) as u16
+            );
+        }
         // Release arrives before the press. Retransmitted duplicates
         // are consumed once, so lock keys cannot toggle twice.
         assert_eq!(
@@ -60,7 +68,7 @@ fn all_pairs_roundtrip_sided_keys_and_negotiated_positions_reliably() {
 }
 
 #[test]
-fn legacy_sender_rejects_new_keys_and_retains_original_keys() {
+fn legacy_sender_preserves_kind4_and_gates_unnegotiated_usages() {
     for case in CASES {
         let mut sender = InputSender::new(1);
         sender.push(Event::Key {
@@ -70,7 +78,7 @@ fn legacy_sender_rejects_new_keys_and_retains_original_keys() {
         });
         let mut bytes = Vec::new();
         let sent = sender.poll(Instant::now(), &mut bytes);
-        assert_eq!(sent, keyboard::legacy(case.vk).is_some());
+        assert_eq!(sent, case.vk <= 255);
         if sent {
             assert_eq!(bytes[13], 4);
         }

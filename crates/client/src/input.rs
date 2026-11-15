@@ -336,11 +336,17 @@ impl Held {
         // Only these common editing shortcuts acquire Command on a Mac.
         // No Alt/AltGr combinations are rewritten.
         let editing = |vk| matches!(vk, 0x41 | 0x43 | 0x58 | 0x56 | 0x5a | 0x46);
-        let active = map
-            && (!scoped
-                || (!self.physical.keys().any(|vk| matches!(vk, 0xa4 | 0xa5))
-                    && ((key.down && editing(key.vk))
-                        || self.physical.keys().any(|&vk| vk != key.vk && editing(vk)))));
+        let chord_keys = self
+            .physical
+            .keys()
+            .copied()
+            .filter(|&vk| vk != key.vk)
+            .chain(key.down.then_some(key.vk));
+        let safe_chord = chord_keys.clone().any(editing)
+            && chord_keys
+                .clone()
+                .all(|vk| editing(vk) || matches!(vk, 0xa0..=0xa3 | 0x5b | 0x5c));
+        let active = map && (!scoped || safe_chord);
         // PC->Mac swaps are chord-scoped, including the displaced Super.
         if scoped {
             let modifiers: Vec<_> = self
@@ -600,54 +606,65 @@ mod tests {
                             0x41, 0x43, 0x58, 0x56, 0x5a, 0x46, 0x08, 0x51, 0x48, 0x4d, 0x09, 0x20,
                             0x25, 0x26, 0x27, 0x28, 0x44, 0x52,
                         ] {
-                            let out = Recorder::default();
-                            let mut held = Held::default();
-                            let vm = viewer == "macos";
-                            let hm = host == "macos";
-                            for (vk, down) in [(modifier, true), (letter, true)] {
-                                held.shortcut_key(
-                                    &out,
-                                    crate::keyboard::Key { vk, down },
-                                    vm,
-                                    hm,
-                                    map,
-                                );
-                            }
-                            let editing = matches!(letter, 0x41 | 0x43 | 0x58 | 0x56 | 0x5a | 0x46);
-                            let swapped = map && vm != hm && (vm || editing);
-                            let expected = if swapped {
-                                match modifier {
-                                    0xa2 => 0x5b,
-                                    0xa3 => 0x5c,
-                                    0x5b => 0xa2,
-                                    0x5c => 0xa3,
-                                    _ => unreachable!(),
+                            for shift in [None, Some(0xa0), Some(0xa1)] {
+                                let out = Recorder::default();
+                                out.connected.set(true);
+                                let mut held = Held::default();
+                                if let Some(vk) = shift {
+                                    held.physical_key(&out, vk, true, vk);
                                 }
-                            } else {
-                                modifier
-                            };
-                            assert_eq!(
-                                held.physical[&modifier], expected as i16,
-                                "{viewer}->{host} {modifier:#x}+{letter:#x} map={map}"
-                            );
-                            assert_eq!(
-                                out.take().last(),
-                                Some(&Sent::Key(
-                                    letter as i16,
-                                    true,
-                                    modifier_mask(expected as i16)
-                                ))
-                            );
-                            for (vk, down) in [(letter, false), (modifier, false)] {
-                                held.shortcut_key(
-                                    &out,
-                                    crate::keyboard::Key { vk, down },
-                                    vm,
-                                    hm,
-                                    map,
+                                let vm = viewer == "macos";
+                                let hm = host == "macos";
+                                for (vk, down) in [(modifier, true), (letter, true)] {
+                                    held.shortcut_key(
+                                        &out,
+                                        crate::keyboard::Key { vk, down },
+                                        vm,
+                                        hm,
+                                        map,
+                                    );
+                                }
+                                let editing =
+                                    matches!(letter, 0x41 | 0x43 | 0x58 | 0x56 | 0x5a | 0x46);
+                                let swapped = map && vm != hm && (vm || editing);
+                                let expected = if swapped {
+                                    match modifier {
+                                        0xa2 => 0x5b,
+                                        0xa3 => 0x5c,
+                                        0x5b => 0xa2,
+                                        0x5c => 0xa3,
+                                        _ => unreachable!(),
+                                    }
+                                } else {
+                                    modifier
+                                };
+                                assert_eq!(
+                                    held.physical[&modifier], expected as i16,
+                                    "{viewer}->{host} {modifier:#x}+{letter:#x} map={map}"
                                 );
+                                assert_eq!(
+                                    out.take().last(),
+                                    Some(&Sent::Key(
+                                        letter as i16,
+                                        true,
+                                        modifier_mask(expected as i16)
+                                            | if shift.is_some() { 1 } else { 0 }
+                                    ))
+                                );
+                                for (vk, down) in [(letter, false), (modifier, false)] {
+                                    held.shortcut_key(
+                                        &out,
+                                        crate::keyboard::Key { vk, down },
+                                        vm,
+                                        hm,
+                                        map,
+                                    );
+                                }
+                                if let Some(vk) = shift {
+                                    held.physical_key(&out, vk, false, vk);
+                                }
+                                assert!(!held.any_down());
                             }
-                            assert!(!held.any_down());
                         }
                     }
                 }
@@ -658,6 +675,7 @@ mod tests {
     #[test]
     fn shortcut_swap_keeps_displaced_control_and_altgr_available() {
         let out = Recorder::default();
+        out.connected.set(true);
         let mut held = Held::default();
         for vk in [0xa2, 0x5b, 0x43] {
             held.shortcut_key(
@@ -670,6 +688,21 @@ mod tests {
         }
         assert_eq!(held.physical[&0xa2], 0x5b);
         assert_eq!(held.physical[&0x5b], 0xa2);
+        held.shortcut_key(
+            &out,
+            crate::keyboard::Key {
+                vk: 0x08,
+                down: true,
+            },
+            false,
+            true,
+            true,
+        );
+        assert_eq!(
+            held.physical[&0xa2], 0xa2,
+            "Backspace stays Control even while C is held"
+        );
+        assert_eq!(held.physical[&0x5b], 0x5b);
         held.release_all(&out);
         for vk in [0xa5, 0xa2, 0x43] {
             held.shortcut_key(

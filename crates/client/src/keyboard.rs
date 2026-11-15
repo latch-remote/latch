@@ -2,7 +2,6 @@
 //! Uses the same egui-winit callback as the event-time dispatch work.
 
 use egui::{Event, Modifiers};
-#[cfg(any(not(target_os = "macos"), test))]
 use egui_winit::winit::keyboard::NativeKeyCode;
 #[cfg(any(target_os = "macos", test))]
 use egui_winit::winit::platform::scancode::PhysicalKeyExtScancode;
@@ -191,11 +190,10 @@ fn event_key(
 }
 
 fn native_code(physical: PhysicalKey, iso: bool) -> Option<KeyCode> {
-    #[cfg(target_os = "macos")]
-    let scan = physical.to_scancode().map(|v| v as u16);
-    #[cfg(not(target_os = "macos"))]
     let scan = match physical {
         PhysicalKey::Unidentified(NativeKeyCode::MacOS(code)) => Some(code),
+        #[cfg(target_os = "macos")]
+        PhysicalKey::Code(_) => physical.to_scancode().map(|v| v as u16),
         _ => None,
     };
     if let Some(scan) = scan {
@@ -289,10 +287,7 @@ impl State {
                 .extend(events.iter().cloned().map(|e| (e, None, false)));
             return;
         };
-        if code == KeyCode::AltRight {
-            self.alt_gr = event.state.is_pressed()
-                && event.logical_key == egui_winit::winit::keyboard::Key::Named(NamedKey::AltGraph);
-        }
+        self.logical_modifier(code, &event.logical_key, event.state.is_pressed());
         self.key(
             code,
             event.state.is_pressed(),
@@ -301,6 +296,18 @@ impl State {
             events,
             mods,
         );
+    }
+
+    fn logical_modifier(
+        &mut self,
+        code: KeyCode,
+        logical: &egui_winit::winit::keyboard::Key,
+        down: bool,
+    ) {
+        if code == KeyCode::AltRight {
+            self.alt_gr =
+                down && *logical == egui_winit::winit::keyboard::Key::Named(NamedKey::AltGraph);
+        }
     }
 
     fn key(
@@ -432,10 +439,16 @@ mod tests {
             event_key(physical, &Logical::Character("a".into()), false, true),
             Some(KeyCode::KeyA)
         );
-        assert_ne!(
-            Logical::<String>::Named(NamedKey::Alt),
-            Logical::<String>::Named(NamedKey::AltGraph)
-        );
+        let mut state = State::default();
+        for logical in [
+            Logical::Named(NamedKey::Alt),
+            Logical::Named(NamedKey::AltGraph),
+        ] {
+            state.logical_modifier(KeyCode::AltRight, &logical, true);
+            assert_eq!(state.alt_gr, logical == Logical::Named(NamedKey::AltGraph));
+            state.logical_modifier(KeyCode::AltRight, &logical, false);
+            assert!(!state.alt_gr);
+        }
     }
 
     #[test]
@@ -588,9 +601,15 @@ mod tests {
                 {
                     continue;
                 }
-                let translated = native_code(physical, viewer == "macos")
-                    .and_then(vk)
-                    .unwrap();
+                let native_viewer = viewer == "macos"
+                    || (viewer == "windows" && cfg!(windows))
+                    || (viewer == "linux" && cfg!(target_os = "linux"));
+                let translated = if native_viewer {
+                    native_code(physical, viewer == "macos").and_then(vk)
+                } else {
+                    vk(*code)
+                }
+                .unwrap_or_else(|| panic!("unmapped {viewer} {code:?}"));
                 assert_eq!(translated, case.vk, "{viewer}, {code:?}");
                 // Each host runs its production injection lookup, including
                 // different sided flags and native numeric code spaces.
@@ -619,8 +638,36 @@ mod tests {
                         repeat: false,
                         modifiers: Modifiers::NONE,
                     });
-                } else if down {
-                    upstream.push(Event::Text("<>한".into()));
+                }
+                if down
+                    && matches!(
+                        code,
+                        KeyCode::KeyA
+                            | KeyCode::KeyQ
+                            | KeyCode::KeyY
+                            | KeyCode::IntlBackslash
+                            | KeyCode::IntlRo
+                            | KeyCode::IntlYen
+                            | KeyCode::Numpad0
+                            | KeyCode::Numpad1
+                            | KeyCode::Numpad2
+                            | KeyCode::Numpad3
+                            | KeyCode::Numpad4
+                            | KeyCode::Numpad5
+                            | KeyCode::Numpad6
+                            | KeyCode::Numpad7
+                            | KeyCode::Numpad8
+                            | KeyCode::Numpad9
+                            | KeyCode::NumpadMultiply
+                            | KeyCode::NumpadAdd
+                            | KeyCode::NumpadComma
+                            | KeyCode::NumpadSubtract
+                            | KeyCode::NumpadDecimal
+                            | KeyCode::NumpadDivide
+                            | KeyCode::NumpadEqual
+                    )
+                {
+                    upstream.push(Event::Text("<>".into()));
                 }
             }
             let mut state = State::default();
@@ -654,20 +701,38 @@ mod tests {
                     })
                     .collect::<Vec<_>>()
             };
-            assert_eq!(
-                render(
-                    state.pending.into_iter().map(|(e, _, _)| e).collect(),
-                    false
-                ),
-                render(upstream, true),
-                "{code:?}"
+            let actual = render(
+                state.pending.into_iter().map(|(e, _, _)| e).collect(),
+                false,
             );
-        }
-        // No newly captured virtual key can enter a legacy datagram.
-        for key in egui::Key::ALL {
-            if let Some(vk) = legacy::vk(*key) {
-                assert_eq!(latch_proto::keyboard::legacy(vk as u16), Some(vk as u16));
+            let expected = render(upstream, true);
+            assert_eq!(actual, expected, "{code:?}");
+            let mut sender = latch_proto::input::InputSender::new(1);
+            for event in actual {
+                sender.push(event);
             }
+            let mut bytes = Vec::new();
+            assert_eq!(
+                sender.poll(std::time::Instant::now(), &mut bytes),
+                !expected.is_empty()
+            );
+            if !expected.is_empty() {
+                let latch_proto::wire::Datagram::Input { events, .. } =
+                    latch_proto::wire::parse(&bytes).unwrap()
+                else {
+                    panic!()
+                };
+                assert_eq!(events.iter().collect::<Vec<_>>(), expected, "{code:?}");
+            }
+        }
+        let legacy_codes: BTreeSet<_> = egui::Key::ALL
+            .iter()
+            .filter_map(|&key| legacy::vk(key))
+            .collect();
+        for new_key in [
+            0xe2, 0x15, 0x19, 0x1c, 0x1d, 0xad, 0xae, 0xaf, 0xb0, 0xb1, 0xb2, 0xb3,
+        ] {
+            assert!(!legacy_codes.contains(&new_key));
         }
     }
 
@@ -706,6 +771,9 @@ mod tests {
         }
         for code in [
             KeyCode::AudioVolumeMute,
+            KeyCode::AudioVolumeDown,
+            KeyCode::AudioVolumeUp,
+            KeyCode::MediaTrackPrevious,
             KeyCode::MediaPlayPause,
             KeyCode::MediaTrackNext,
             KeyCode::MediaStop,

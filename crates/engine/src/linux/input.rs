@@ -57,7 +57,6 @@ impl X11Input {
         let mut changed = false;
         while let Some(event) = self.conn.poll_for_event()? {
             match event {
-                Event::UnknownPosition { .. } => {}
                 XEvent::MappingNotify(_) => changed = true,
                 XEvent::Error(error) => anyhow::bail!("X11 input error: {error:?}"),
                 _ => {}

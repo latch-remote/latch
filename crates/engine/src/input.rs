@@ -47,6 +47,9 @@ impl DisplayRect {
 }
 
 pub trait InputSink: Send {
+    /// Select negotiated physical positions while preserving legacy injection.
+    fn set_key_positions(&mut self, _accepted: bool) {}
+
     /// Stream dimensions for platforms whose cursor uses logical display points.
     fn set_stream_size(&mut self, _width: u32, _height: u32) {}
 

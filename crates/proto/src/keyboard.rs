@@ -22,16 +22,6 @@ pub fn position(vk: u16) -> Option<u16> {
     .then(|| vk - 0x100)
 }
 
-/// Image of client input::vk at bf5da0d (6.0.0), plus modifiers,
-/// Caps Lock and the existing toolbar's Print Screen. New viewers must
-/// retain egui/text translation for every other key with an old peer.
-pub fn legacy(vk: u16) -> Option<u16> {
-    matches!(vk, 0x08 | 0x09 | 0x0d | 0x10..=0x12 | 0x14 | 0x1b | 0x20..=0x28
-        | 0x2c..=0x2e | 0x30..=0x39 | 0x41..=0x5a | 0x5b | 0x6b | 0x70..=0x87
-        | 0xba..=0xc0 | 0xdb..=0xde)
-    .then_some(vk)
-}
-
 /// The helper's v1 protocol already accepts all ordinary VKs. This is
 /// deliberately separate from the 6.0.0 viewer's smaller capture set.
 pub fn helper_legacy(vk: u16) -> Option<u16> {

@@ -70,6 +70,7 @@ pub fn open() -> Result<Box<dyn InputSink>> {
         posting: true,
         clicks: ClickCounter::new(),
         stream_size: None,
+        key_positions: false,
     }))
 }
 struct Sink {
@@ -78,6 +79,7 @@ struct Sink {
     posting: bool,
     clicks: ClickCounter,
     stream_size: Option<(u32, u32)>,
+    key_positions: bool,
 }
 struct ClickCounter {
     last: Option<(u32, Instant, Point)>,
@@ -140,6 +142,11 @@ fn button_type(button: u32, down: bool) -> u32 {
     }
 }
 impl Sink {
+    fn keycode(&self, vk: u16, iso: bool) -> Option<u16> {
+        crate::input::keymap::vk_to_mac(vk)
+            .map(|key| latch_proto::keyboard::apple_iso(key, iso && self.key_positions))
+    }
+
     fn flags(&self) -> u64 {
         let has = |codes: &[u16]| codes.iter().any(|c| self.held.keys.contains(c));
         let mut flags = 0;
@@ -239,11 +246,9 @@ impl Sink {
                         if self.held.note(event) {
                             events.push(e);
                         }
-                    } else if let Some(key) = crate::input::keymap::vk_to_mac(*vk) {
-                        let key = latch_proto::keyboard::apple_iso(
-                            key,
-                            latch_proto::keyboard::apple_keyboard_is_iso(),
-                        );
+                    } else if let Some(key) =
+                        self.keycode(*vk, latch_proto::keyboard::apple_keyboard_is_iso())
+                    {
                         let e = Owned::new(CGEventCreateKeyboardEvent(ptr::null(), key, *down))?;
                         // kCGKeyboardEventAutorepeat: repeated down while already held.
                         CGEventSetIntegerValueField(
@@ -383,6 +388,10 @@ fn media_event(kind: u16, down: bool, repeat: bool) -> Result<Owned> {
     })
 }
 impl InputSink for Sink {
+    fn set_key_positions(&mut self, accepted: bool) {
+        self.key_positions = accepted;
+    }
+
     fn set_stream_size(&mut self, width: u32, height: u32) {
         self.stream_size = Some((width.max(1), height.max(1)));
     }
@@ -453,6 +462,7 @@ mod tests {
             posting: false,
             clicks: ClickCounter::new(),
             stream_size: None,
+            key_positions: false,
         }
     }
     fn display() -> DisplayRect {
@@ -463,6 +473,18 @@ mod tests {
             height: 100,
         }
     }
+    #[test]
+    fn iso_host_swap_is_negotiated_and_legacy_codes_keep_their_meaning() {
+        let mut sink = sink();
+        assert_eq!(sink.keycode(0xc0, true), Some(0x32));
+        assert_eq!(sink.keycode(0xe2, true), Some(0x0a));
+        sink.set_key_positions(true);
+        assert_eq!(sink.keycode(0xc0, true), Some(0x0a));
+        assert_eq!(sink.keycode(0xe2, true), Some(0x32));
+        assert_eq!(sink.keycode(0xc0, false), Some(0x32));
+        assert_eq!(sink.keycode(0x41, true), Some(0));
+    }
+
     #[test]
     fn retina_relative_motion_maps_stream_pixels_to_display_points() {
         let mut sink = sink();
@@ -652,6 +674,7 @@ mod tests {
     fn every_viewer_builds_shared_key_codes_flags_and_releases() -> Result<()> {
         for case in latch_proto::keyboard::CASES {
             let mut sink = sink();
+            sink.set_key_positions(true);
             for down in [true, false] {
                 let records = sink.build(
                     &Event::Key {

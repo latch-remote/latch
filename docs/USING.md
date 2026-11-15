@@ -51,7 +51,9 @@ cut, paste, undo/redo and find. Ctrl becomes Command and Win/Super becomes
 Control within those chords. Other combinations keep their physical
 modifiers. In particular Ctrl+Backspace, Q, H, M, Tab, Space and arrows
 remain Control on the Mac, including Terminal and input-source shortcuts.
-Alt/AltGr combinations keep their physical modifiers.
+PC-to-Mac Alt/AltGr combinations keep their physical modifiers. The swap
+applies only while the other held keys are from the six-key set and
+Shift/Ctrl/Win, so holding C while pressing Backspace also keeps Control.
 
 Same-OS pairs and **Send keys as pressed** preserve modifier identities.
 Captured-mouse mode and the **Captured, for games** mouse setting use

@@ -235,18 +235,41 @@ pub(super) fn own_integrity() -> u32 {
     own_token().and_then(|t| integrity(&t)).unwrap_or(MEDIUM)
 }
 
-fn helper_event(event: &Event, key_positions: bool) -> Event {
+fn helper_event(
+    event: &Event,
+    key_positions: bool,
+    held: &mut std::collections::BTreeSet<u16>,
+) -> Option<Event> {
     match event {
         Event::Key {
             vk,
             down,
             modifiers,
-        } if !key_positions => Event::Key {
-            vk: latch_proto::keyboard::helper_legacy(*vk).unwrap_or(0),
-            down: *down,
-            modifiers: *modifiers,
-        },
-        _ => event.clone(),
+        } if !key_positions => {
+            let target = latch_proto::keyboard::helper_legacy(*vk)?;
+            if *down {
+                held.insert(*vk);
+            } else {
+                held.remove(vk);
+                if held
+                    .iter()
+                    .any(|&source| latch_proto::keyboard::helper_legacy(source) == Some(target))
+                {
+                    return None;
+                }
+            }
+            Some(Event::Key {
+                vk: target,
+                down: *down,
+                modifiers: *modifiers,
+            })
+        }
+        Event::UnknownPosition { .. } => None,
+        Event::ReleaseAll => {
+            held.clear();
+            Some(Event::ReleaseAll)
+        }
+        _ => Some(event.clone()),
     }
 }
 
@@ -421,6 +444,7 @@ fn serve_client(mut pipe: impl Read + Write) -> Result<()> {
 pub(super) struct Client {
     pipe: File,
     key_positions: bool,
+    legacy_held: std::collections::BTreeSet<u16>,
 }
 
 impl Client {
@@ -461,6 +485,7 @@ impl Client {
         Ok(Self {
             pipe,
             key_positions: &hello == HELLO2,
+            legacy_held: Default::default(),
         })
     }
 
@@ -471,7 +496,9 @@ impl Client {
         event: &Event,
         display: DisplayRect,
     ) -> std::io::Result<Result<()>> {
-        let event = helper_event(event, self.key_positions);
+        let Some(event) = helper_event(event, self.key_positions, &mut self.legacy_held) else {
+            return Ok(Ok(()));
+        };
         self.pipe.write_all(&encode(&event, display))?;
         let mut status = [0];
         self.pipe.read_exact(&mut status)?;
@@ -575,6 +602,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn v1_aliases_release_only_after_both_sources_and_unknowns_stay_local() {
+        let mut held = Default::default();
+        let key = |vk, down| Event::Key {
+            vk,
+            down,
+            modifiers: 0,
+        };
+        assert!(helper_event(&key(0x0d, true), false, &mut held).is_some());
+        assert!(helper_event(
+            &key(latch_proto::keyboard::KEYPAD_ENTER, true),
+            false,
+            &mut held
+        )
+        .is_some());
+        assert!(helper_event(&key(0x0d, false), false, &mut held).is_none());
+        assert_eq!(
+            helper_event(
+                &key(latch_proto::keyboard::KEYPAD_ENTER, false),
+                false,
+                &mut held
+            ),
+            Some(key(0x0d, false))
+        );
+        assert!(held.is_empty());
+        assert!(helper_event(
+            &Event::UnknownPosition {
+                usage: 0xffff,
+                down: true,
+                modifiers: 0
+            },
+            false,
+            &mut held
+        )
+        .is_none());
+    }
+
+    #[test]
     fn v1_helper_receives_only_legacy_keys_and_v2_advertises_positions() {
         let display = DisplayRect::default();
         for case in latch_proto::keyboard::CASES {
@@ -583,10 +647,19 @@ mod tests {
                 down: true,
                 modifiers: case.mask,
             };
-            let old = encode(&helper_event(&event, false), display);
+            let old = encode(
+                &helper_event(&event, false, &mut Default::default()).unwrap(),
+                display,
+            );
             assert_eq!(old[18], 4);
-            assert_eq!(decode(&old[2..]).unwrap().0, helper_event(&event, false));
-            let new = encode(&helper_event(&event, true), display);
+            assert_eq!(
+                decode(&old[2..]).unwrap().0,
+                helper_event(&event, false, &mut Default::default()).unwrap()
+            );
+            let new = encode(
+                &helper_event(&event, true, &mut Default::default()).unwrap(),
+                display,
+            );
             assert_eq!(
                 new[18],
                 if latch_proto::keyboard::position(case.vk).is_some() {

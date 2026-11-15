@@ -2388,7 +2388,39 @@ impl View {
             self.clipboard_modifier(link.cfg),
             link.live.clipboard.pastes_to_selection(),
         );
-        if alone {
+        // Clipboard transport has completed. Replay the editing key through
+        // the same sided swap as ordinary native shortcuts when its source
+        // modifier is still held. A delayed paste can outlive that modifier.
+        if crate::keyboard::available()
+            && !cfg!(target_os = "macos")
+            && self.host_mac
+            && self.map_shortcuts(link.cfg)
+            && [0xa2, 0xa3, 0x5b, 0x5c]
+                .iter()
+                .any(|&vk| self.held.physical_down(vk))
+        {
+            let vk = match edit {
+                Edit::Copy => input::VK_C,
+                Edit::Cut => input::VK_X,
+                Edit::Paste => input::VK_V,
+            } as u16;
+            for down in [true, false] {
+                self.held.shortcut_key(
+                    link.out,
+                    crate::keyboard::Key { vk, down },
+                    false,
+                    true,
+                    true,
+                );
+            }
+            return;
+        }
+        if alone
+            || (crate::keyboard::available()
+                && !cfg!(target_os = "macos")
+                && self.host_mac
+                && self.map_shortcuts(link.cfg))
+        {
             self.held.chord_alone(link.out, &keys);
         } else {
             self.held.chord(link.out, &keys);
@@ -2799,6 +2831,14 @@ fn toolbar_rule(ui: &mut egui::Ui) {
     );
 }
 
+fn toolbar_key_for_host(label: &str, host_mac: bool) -> bool {
+    match label {
+        "Command+Tab" | "Command+Space" => host_mac,
+        "Windows key" | "Win+L" | "Ctrl+Alt+Delete" | "Alt+Tab" | "Print Screen" => !host_mac,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     pub fn hold_test_key(view: &mut super::View, input: &latch_stream::Input) {
@@ -2813,6 +2853,51 @@ pub(crate) mod tests {
     use crate::config::ClientConfig;
     use crate::session::Live;
     use egui_kittest::kittest::Queryable;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn native_pc_copy_to_mac_uses_the_held_modifier_side() {
+        for (source, target) in [(0xa2, 0x5b), (0xa3, 0x5c)] {
+            let (mut h, tap) = recording_on(View::default(), true, "macos");
+            h.state_mut().cfg.capture_mouse = false;
+            crate::keyboard::test_install(true);
+            crate::keyboard::test_frame(vec![
+                (
+                    key(Key::F35, true, Modifiers::NONE),
+                    Some(crate::keyboard::Key {
+                        vk: source,
+                        down: true,
+                    }),
+                    false,
+                ),
+                (Event::Copy, None, false),
+            ]);
+            frame(&mut h, vec![], Modifiers::CTRL);
+            let sent = tap.take();
+            assert!(sent.contains(&Sent::Key(target, true, latch_stream::input::MOD_META)));
+            assert!(sent.contains(&Sent::Key(input::VK_C, true, latch_stream::input::MOD_META)));
+            assert!(!sent.contains(&Sent::Key(
+                input::VK_C,
+                true,
+                latch_stream::input::MOD_META | latch_stream::input::MOD_CTRL
+            )));
+            crate::keyboard::test_install(false);
+        }
+    }
+
+    #[test]
+    fn mac_clipboard_replay_temporarily_releases_sided_control() {
+        let held = input::SharedHeld::default();
+        let out = Recorder::default();
+        out.connected.set(true);
+        held.physical_key(&out, 0xa2, true, 0xa2);
+        out.take();
+        held.chord_alone(&out, &[input::VK_LWIN, input::VK_C]);
+        assert!(out
+            .take()
+            .contains(&Sent::Key(input::VK_C, true, latch_stream::input::MOD_META)));
+        assert!(held.is_down(0xa2));
+    }
 
     #[test]
     fn toolbar_keys_follow_host_and_game_capture_disables_mapping() {
@@ -2830,8 +2915,10 @@ pub(crate) mod tests {
                 assert_eq!(toolbar_key_for_host(label, host_mac), !host_mac);
             }
         }
-        let mut cfg = ClientConfig::default();
-        cfg.capture_mouse = false;
+        let mut cfg = ClientConfig {
+            capture_mouse: false,
+            ..Default::default()
+        };
         let mut view = View::default();
         // The native observer is installed by production. Enable it here
         // to test game policy through the normal view helper.
@@ -5772,13 +5859,5 @@ pub(crate) mod tests {
         h.get_by_label("Try again").simulate_click();
         h.run_steps(1);
         assert!(h.state().actions.contains(&Action::Reconnect));
-    }
-}
-
-fn toolbar_key_for_host(label: &str, host_mac: bool) -> bool {
-    match label {
-        "Command+Tab" | "Command+Space" => host_mac,
-        "Windows key" | "Win+L" | "Ctrl+Alt+Delete" | "Alt+Tab" | "Print Screen" => !host_mac,
-        _ => true,
     }
 }

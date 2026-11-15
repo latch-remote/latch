@@ -15,6 +15,7 @@ use windows::Win32::{
 #[derive(Default)]
 struct Capture {
     hook: HHOOK,
+    warned: bool,
     consumed: BTreeSet<u16>,
     forwarded: VecDeque<Key>,
 }
@@ -41,8 +42,16 @@ pub fn owns_keys(owned: bool) {
                     SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), HINSTANCE(module.0), 0)
                 })
             } {
-                Ok(hook) => capture.hook = hook,
-                Err(error) => tracing::warn!(%error, "cannot capture Windows system shortcuts"),
+                Ok(hook) => {
+                    capture.hook = hook;
+                    capture.warned = false;
+                }
+                Err(error) => {
+                    if !capture.warned {
+                        tracing::warn!(%error, "cannot capture Windows system shortcuts");
+                    }
+                    capture.warned = true;
+                }
             }
         }
     });
@@ -102,31 +111,7 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
                 if modifier {
                     CAPTURE.with_borrow_mut(|capture| capture.forwarded.push_back(key));
                 }
-                STATE.with_borrow_mut(|s| {
-                    if key.down {
-                        s.pressed.insert(key.vk);
-                    } else {
-                        s.pressed.remove(&key.vk);
-                    }
-                    s.pending.push((
-                        egui::Event::Key {
-                            key: egui::Key::F35,
-                            physical_key: None,
-                            pressed: key.down,
-                            repeat: false,
-                            modifiers: egui::Modifiers::NONE,
-                        },
-                        Some(key),
-                        false,
-                    ));
-                });
-                let mods = STATE.with_borrow(|s| egui::Modifiers {
-                    shift: s.pressed.contains(&0xa0) || s.pressed.contains(&0xa1),
-                    ctrl: s.pressed.contains(&0xa2) || s.pressed.contains(&0xa3),
-                    alt,
-                    ..egui::Modifiers::NONE
-                });
-                crate::early::physical(key, mods);
+                publish(key, alt);
             }
             if swallowed {
                 return LRESULT(1);
@@ -137,9 +122,63 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
     unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
 }
 
+fn publish(key: Key, alt: bool) {
+    STATE.with_borrow_mut(|s| {
+        if key.down {
+            s.pressed.insert(key.vk);
+        } else {
+            s.pressed.remove(&key.vk);
+        }
+        s.pending.push((
+            egui::Event::Key {
+                key: egui::Key::F35,
+                physical_key: None,
+                pressed: key.down,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            Some(key),
+            false,
+        ));
+    });
+    let mods = STATE.with_borrow(|s| egui::Modifiers {
+        shift: s.pressed.contains(&0xa0) || s.pressed.contains(&0xa1),
+        ctrl: s.pressed.contains(&0xa2) || s.pressed.contains(&0xa3),
+        alt,
+        ..egui::Modifiers::NONE
+    });
+    crate::early::physical(key, mods);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hook_publication_orders_shift_before_win() {
+        STATE.with_borrow_mut(|s| s.pending.clear());
+        let shift = Key {
+            vk: 0xa1,
+            down: true,
+        };
+        let win = Key {
+            vk: 0x5b,
+            down: true,
+        };
+        publish(shift, false);
+        publish(win, false);
+        STATE.with_borrow_mut(|s| {
+            assert_eq!(
+                s.pending
+                    .iter()
+                    .filter_map(|(_, key, _)| *key)
+                    .collect::<Vec<_>>(),
+                [shift, win]
+            );
+            s.pending.clear();
+            s.pressed.clear();
+        });
+    }
+
     #[test]
     fn ownership_requires_consumed_down_and_survives_alt_release() {
         let mut capture = Capture::default();

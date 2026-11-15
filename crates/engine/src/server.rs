@@ -415,6 +415,7 @@ impl Server {
             Ok(mut sink) => {
                 let info = prepared.info.as_ref().expect("prepared has video info");
                 sink.set_stream_size(info.width, info.height);
+                sink.set_key_positions(prepared.req.key_positions);
                 prepared.input = Some(sink);
             }
             Err(e) => prepared.input_problem = Some(format!("{e:#}")),

@@ -327,6 +327,6 @@ of eight. Chromium's cross-reference was transcribed into
 Mac entries explicitly describe Latch's input-source approximations.
 [USB HID tables](https://usb.org/sites/default/files/hut1_6.pdf),
 [Windows scan codes](https://learn.microsoft.com/en-us/windows/win32/inputdev/about-keyboard-input#scan-codes),
-[Apple Events.h](https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX14.4.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h),
+[Apple Events.h](https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX10.15.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h),
 [Linux codes](https://github.com/torvalds/linux/blob/master/include/uapi/linux/input-event-codes.h),
 [Chromium cross-reference](https://chromium.googlesource.com/chromium/src/+/main/ui/events/keycodes/dom/dom_code_data.inc).

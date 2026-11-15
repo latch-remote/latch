@@ -1,6 +1,6 @@
 //! Input events and their reliability. See `docs/PROTOCOL.md`, "Input (4)".
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 pub const BUTTON_LEFT: u8 = 1;
@@ -230,7 +230,6 @@ impl Event {
 /// until the host acknowledges it.
 pub struct InputSender {
     key_positions: bool,
-    legacy_held: BTreeSet<u16>,
     session: u32,
     next: u32,
     queue: VecDeque<(u32, Event, bool)>,
@@ -242,7 +241,6 @@ impl InputSender {
     pub fn new(session: u32) -> Self {
         Self {
             key_positions: false,
-            legacy_held: BTreeSet::new(),
             session,
             next: 0,
             queue: Default::default(),
@@ -262,28 +260,12 @@ impl InputSender {
     /// A relative move right after another not yet sent is merged into it
     /// if the sum fits. Sent payloads remain immutable, and coalescing never
     /// crosses another event, preserving click locations and input order.
-    pub fn push(&mut self, mut event: Event) {
-        if matches!(event, Event::ReleaseAll) {
-            self.legacy_held.clear();
-        }
-        if let Event::Key { vk, down, .. } = &mut event {
-            if !self.key_positions {
-                let Some(legacy) = crate::keyboard::legacy(*vk) else {
-                    return;
-                };
-                if *down {
-                    self.legacy_held.insert(*vk);
-                } else {
-                    self.legacy_held.remove(vk);
-                    if self
-                        .legacy_held
-                        .iter()
-                        .any(|&held| crate::keyboard::legacy(held) == Some(legacy))
-                    {
-                        return;
-                    }
-                }
-                *vk = legacy;
+    pub fn push(&mut self, event: Event) {
+        if !self.key_positions {
+            match &event {
+                Event::Key { vk, .. } if *vk > 255 => return,
+                Event::UnknownPosition { .. } => return,
+                _ => {}
             }
         }
         if let Event::Text(text) = &event {

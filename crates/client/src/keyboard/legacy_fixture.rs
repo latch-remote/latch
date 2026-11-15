@@ -1,5 +1,4 @@
-// Verbatim input::vk from bf5da0d, Latch 6.0.0. Keep independent of current maps.
-use crate::input::*;
+// input::vk with historical constants inlined from bf5da0d, Latch 6.0.0. Keep independent of current maps.
 use egui::Key;
 pub fn vk(key: Key) -> Option<i16> {
     use Key::*;
@@ -8,13 +7,13 @@ pub fn vk(key: Key) -> Option<i16> {
         ArrowLeft => 0x25,
         ArrowRight => 0x27,
         ArrowUp => 0x26,
-        Escape => VK_ESCAPE,
-        Tab => VK_TAB,
+        Escape => 0x1B,
+        Tab => 0x09,
         Backspace => 0x08,
         Enter => 0x0D,
         Space => 0x20,
-        Insert => VK_INSERT,
-        Delete => VK_DELETE,
+        Insert => 0x2D,
+        Delete => 0x2E,
         Home => 0x24,
         End => 0x23,
         PageUp => 0x21,

@@ -293,6 +293,9 @@ Other keys keep kind 4. Internally the Rust input type represents a kind-8
 position as `Event::Key.vk = 0x100 + usage`. Those internal values never
 appear as a kind-4 payload from the sender.
 
+The Mac injector applies its ISO native-code swap only when the viewer
+offered `key_positions`, preserving legacy injection for a 6.0.0 viewer.
+
 A viewer connected to a host without `key_positions` uses the 6.0.0
 egui/text translation path. Only the historical `input::vk` image and
 existing modifier, Caps Lock and toolbar events can enter kind 4. ISO and
