@@ -90,6 +90,8 @@ impl PilotLimits {
 /// TLS server configuration and persistent, mandatory economic limits.
 pub struct DaemonConfig {
     pub listen: SocketAddr,
+    pub http_listen: Option<SocketAddr>,
+    pub acme_webroot: Option<PathBuf>,
     pub limits: PilotLimits,
     pub quota_path: PathBuf,
     pub monthly_bytes: u64,
@@ -119,6 +121,8 @@ impl DaemonConfig {
         tls.send_tls13_tickets = 0;
         Ok(Self {
             listen,
+            http_listen: None,
+            acme_webroot: None,
             limits: PilotLimits::default(),
             quota_path,
             monthly_bytes,
@@ -219,6 +223,7 @@ impl Session {
 /// Single nonblocking event loop, fixed slot counts and fixed forwarding buffers.
 pub struct Daemon {
     listener: TcpListener,
+    probe: Option<crate::probe::ProbeServer>,
     config: DaemonConfig,
     quota: Quota,
     metrics: Arc<Metrics>,
@@ -234,6 +239,10 @@ impl Daemon {
     pub fn bind(config: DaemonConfig) -> io::Result<Self> {
         ensure_supported_cpu()?;
         config.limits.validate()?;
+        let probe = config
+            .http_listen
+            .map(|address| crate::probe::ProbeServer::bind(address, config.acme_webroot.as_deref()))
+            .transpose()?;
         let quota = Quota::open(
             &config.quota_path,
             config.monthly_bytes,
@@ -257,6 +266,7 @@ impl Daemon {
         let sessions = (0..config.limits.max_sessions).map(|_| None).collect();
         Ok(Self {
             listener,
+            probe,
             config,
             quota,
             metrics: Arc::new(Metrics::default()),
@@ -272,6 +282,12 @@ impl Daemon {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
     }
+    pub fn http_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.probe
+            .as_ref()
+            .map(|probe| probe.local_addr())
+            .transpose()
+    }
     pub fn metrics(&self) -> Arc<Metrics> {
         self.metrics.clone()
     }
@@ -281,6 +297,9 @@ impl Daemon {
         cancel.register(&wake);
         while !cancel.is_cancelled() {
             let before = self.metrics.network_bytes.load(Ordering::Relaxed);
+            if let Some(probe) = &mut self.probe {
+                probe.poll();
+            }
             self.accept()?;
             for index in 0..self.connections.len() {
                 if self.connections[index].is_none() {

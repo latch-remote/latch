@@ -135,6 +135,9 @@ struct Gateway {
 }
 impl Gateway {
     fn start(destination: u16, mode: GatewayMode) -> Self {
+        Self::start_for_endpoint(destination, mode, 443)
+    }
+    fn start_for_endpoint(destination: u16, mode: GatewayMode, endpoint_port: u16) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -157,6 +160,7 @@ impl Gateway {
                                 client,
                                 destination,
                                 mode,
+                                endpoint_port,
                                 &stopped,
                                 &recovered,
                                 &timings,
@@ -202,6 +206,7 @@ fn run_gateway_connection(
     mut client: TcpStream,
     destination: u16,
     mode: GatewayMode,
+    endpoint_port: u16,
     stopped: &AtomicBool,
     recovered: &AtomicBool,
     lateness: &Mutex<Vec<Duration>>,
@@ -231,8 +236,8 @@ fn run_gateway_connection(
             assert!(header.len() <= 8192);
         }
         let header = String::from_utf8(header).unwrap();
-        // The client must ask for the relay's 443 even though
-        // this fixture sends that tunnel to a high local port.
+        // The client must ask for the configured endpoint port even though
+        // this fixture sends that tunnel to a separate local destination.
         let authority = header
             .lines()
             .next()
@@ -241,7 +246,7 @@ fn run_gateway_connection(
             .unwrap()
             .strip_suffix(" HTTP/1.1")
             .unwrap();
-        assert!(authority.ends_with(":443"));
+        assert!(authority.ends_with(&format!(":{endpoint_port}")));
         assert!(header.contains(&format!("Host: {authority}\r\n")));
         if auth && !header.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n") {
             client.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"test\"\r\nContent-Length: 0\r\n\r\n")?;

@@ -118,6 +118,8 @@ impl TransportLimits {
     }
 }
 
+type ProxyDiscovery = dyn Fn() -> (Option<ProxyConfig>, bool) + Send + Sync;
+
 #[derive(Clone)]
 pub struct ClientConfig {
     pub endpoint: Endpoint,
@@ -130,6 +132,7 @@ pub struct ClientConfig {
     verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
     hints: Arc<Mutex<PathHints>>,
     opening: Arc<Mutex<()>>,
+    proxy_discovery: Option<Arc<ProxyDiscovery>>,
 }
 impl fmt::Debug for ClientConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -142,14 +145,33 @@ impl fmt::Debug for ClientConfig {
     }
 }
 impl ClientConfig {
-    /// Apply a conservative 1200-byte MSS for 30 seconds after a path-MTU stall.
+    /// Refresh discovered CONNECT settings at each connection, without waiting on OS discovery.
+    /// The boolean says the environment allows DIRECT. Explicit `proxy` callers keep their semantics.
+    pub fn set_proxy_discovery(
+        &mut self,
+        discover: impl Fn() -> (Option<ProxyConfig>, bool) + Send + Sync + 'static,
+    ) {
+        self.proxy = discover().0;
+        self.proxy_discovery = Some(Arc::new(discover));
+    }
+
+    /// Step down to 1200, then 512 bytes for 30 seconds after a path-MTU stall.
     /// Clones share this expiring hint. Start a fresh grant after partial media.
     pub fn reduce_mss_after_stall(&self) {
-        self.remember_mss_stall(MssReason::ExplicitStall);
+        let used = self
+            .hints
+            .lock()
+            .unwrap()
+            .reduced_mss
+            .filter(|(until, _, _)| *until > Instant::now())
+            .map(|(_, _, mss)| mss);
+        self.remember_mss_stall(MssReason::ExplicitStall, used);
     }
-    fn remember_mss_stall(&self, reason: MssReason) {
-        self.hints.lock().unwrap().reduced_mss =
-            Some((Instant::now() + Duration::from_secs(30), reason));
+    fn remember_mss_stall(&self, reason: MssReason, used: Option<u32>) {
+        let now = Instant::now();
+        let mut hints = self.hints.lock().unwrap();
+        let mss = next_mss(used);
+        hints.reduced_mss = Some((now + Duration::from_secs(30), reason, mss));
     }
     pub fn production(endpoint: Endpoint) -> io::Result<Self> {
         let mut config = Self::with_roots(
@@ -196,6 +218,7 @@ impl ClientConfig {
             verifier,
             hints: Arc::new(Mutex::new(PathHints::default())),
             opening: Arc::new(Mutex::new(())),
+            proxy_discovery: None,
         })
     }
 }
@@ -203,7 +226,48 @@ impl ClientConfig {
 #[derive(Default)]
 struct PathHints {
     winning: Option<WinningPath>,
-    reduced_mss: Option<(Instant, MssReason)>,
+    reduced_mss: Option<(Instant, MssReason, u32)>,
+}
+fn next_mss(used: Option<u32>) -> u32 {
+    if used.is_some() {
+        512
+    } else {
+        1200
+    }
+}
+
+// Retain the socket's applied MSS with silent TLS deadline evidence. A refusal,
+// reset, policy denial or TCP-connect timeout never creates this marker.
+#[derive(Debug)]
+struct HandshakeStall {
+    used_mss: Option<u32>,
+}
+impl fmt::Display for HandshakeStall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("relay TLS handshake stopped responding")
+    }
+}
+impl std::error::Error for HandshakeStall {}
+fn handshake_stall(error: &io::Error) -> Option<&HandshakeStall> {
+    error.get_ref()?.downcast_ref()
+}
+
+// Expose certificate substitution before proxy policy refusals because it is
+// security evidence the user must see. Prefer actionable policy evidence over
+// ambiguous reachability failures. Proxy credentials can be corrected first,
+// then CONNECT policy, then certificate trust. A block carries more evidence than a deadline. Cancellation and CPU
+// support remain terminal, as do security failures that prohibit another route.
+fn failure_priority(failure: &Failure) -> u8 {
+    match failure {
+        Failure::ProxyAuthenticationRequired => 6,
+        Failure::ProxyRefused { .. } => 5,
+        Failure::TlsInterception { .. } => 7,
+        Failure::TlsRejected => 4,
+        Failure::CaptivePortal => 3,
+        Failure::Timeout => 0,
+        Failure::ConnectionBlocked | Failure::ClosedBeforeHandshake => 1,
+        _ => 2,
+    }
 }
 #[derive(Clone)]
 struct WinningPath {
@@ -522,7 +586,7 @@ fn connect_tcp(
     config: &ClientConfig,
     cancel: &Cancel,
     deadline: Instant,
-    reduced_mss: bool,
+    reduced_mss: Option<u32>,
     preferred: Option<SocketAddr>,
     refresh: bool,
 ) -> io::Result<(TcpStream, bool)> {
@@ -593,7 +657,7 @@ fn connect_tcp(
                 )?;
                 socket.set_nonblocking(true)?;
                 #[cfg(unix)]
-                let mss_applied = reduced_mss && socket.set_tcp_mss(1200).is_ok();
+                let mss_applied = reduced_mss.is_some_and(|mss| socket.set_tcp_mss(mss).is_ok());
                 #[cfg(not(unix))]
                 let mss_applied = {
                     let _ = reduced_mss;
@@ -626,8 +690,10 @@ fn connect_tcp(
                     // Darwin accepts TCP_MAXSEG only after connect. Apply it
                     // before CONNECT/TLS emits application bytes there.
                     #[cfg(unix)]
-                    if reduced_mss && !mss {
-                        mss = socket2::SockRef::from(&tcp).set_tcp_mss(1200).is_ok();
+                    if !mss {
+                        mss = reduced_mss.is_some_and(|value| {
+                            socket2::SockRef::from(&tcp).set_tcp_mss(value).is_ok()
+                        });
                     }
                     #[cfg(not(unix))]
                     let _ = &mut mss;
@@ -649,8 +715,101 @@ fn connect_tcp(
     }
 }
 
-/// Two bounded rungs. An explicit proxy is authoritative for both carriers.
+fn direct_first(direct_allowed: bool, proxy_won: bool) -> bool {
+    direct_allowed && !proxy_won
+}
+fn rung_budget(budget_ms: u64, mss_hint: Option<(Instant, MssReason, u32)>) -> Duration {
+    // Both lanes share this intermediate probe. A concurrent lane must not
+    // spend its full normal handshake budget on the already suspect 1200 MSS.
+    let milliseconds = if matches!(mss_hint, Some((_, MssReason::TlsHandshakeStall, 1200))) {
+        budget_ms.min(150)
+    } else {
+        budget_ms
+    };
+    Duration::from_millis(milliseconds)
+}
+fn bounded_deadline(deadline: Instant, now: Instant, budget: Duration) -> Instant {
+    deadline.min(now + budget)
+}
+
+/// Discovery paths share the caller deadline. Each route has the existing two-second ladder.
 fn open(
+    config: &ClientConfig,
+    cancel: &Cancel,
+    deadline: Instant,
+) -> io::Result<(TlsSocket, ConnectionInfo)> {
+    let deadline = bounded_deadline(deadline, Instant::now(), Duration::from_secs(4));
+    let Some(discover) = &config.proxy_discovery else {
+        return open_carriers(config, cancel, deadline);
+    };
+    let (proxy, direct_allowed) = discover();
+    let mut direct = config.clone();
+    direct.proxy = None;
+    let mut proxied = config.clone();
+    proxied.proxy = proxy;
+    if proxied.proxy.is_none() {
+        return open_carriers(&direct, cancel, deadline);
+    }
+    let proxy_won = config
+        .hints
+        .lock()
+        .unwrap()
+        .winning
+        .as_ref()
+        .is_some_and(|path| path.matches(&proxied));
+    let paths = if direct_first(direct_allowed, proxy_won) {
+        [&direct, &proxied]
+    } else {
+        [&proxied, &direct]
+    };
+    let mut attempts = Vec::new();
+    let mut best_failure = None;
+    for path in paths {
+        match open_carriers(path, cancel, deadline) {
+            Ok((socket, mut info)) => {
+                attempts.append(&mut info.earlier_failures);
+                info.earlier_failures = attempts;
+                return Ok((socket, info));
+            }
+            Err(error) => {
+                let mut typed = ConnectError::from_io(&error);
+                for failure in typed
+                    .attempts
+                    .iter()
+                    .map(|attempt| &attempt.failure)
+                    .chain(std::iter::once(&typed.failure))
+                {
+                    if best_failure
+                        .as_ref()
+                        .is_none_or(|best| failure_priority(failure) > failure_priority(best))
+                    {
+                        best_failure = Some(failure.clone());
+                    }
+                }
+                attempts.append(&mut typed.attempts);
+                if matches!(
+                    typed.failure,
+                    Failure::TlsInterception { .. }
+                        | Failure::CaptivePortal
+                        | Failure::ProxyAuthenticationRequired
+                        | Failure::Cancelled
+                        | Failure::Unsupported
+                ) || std::ptr::eq(path, paths[1])
+                {
+                    if !matches!(typed.failure, Failure::Cancelled | Failure::Unsupported) {
+                        typed.failure = best_failure.unwrap();
+                    }
+                    typed.attempts = attempts;
+                    return Err(typed.into_io());
+                }
+            }
+        }
+    }
+    unreachable!()
+}
+
+/// Two bounded carrier rungs, followed by MSS recovery only when both TLS handshakes stall.
+fn open_carriers(
     config: &ClientConfig,
     cancel: &Cancel,
     deadline: Instant,
@@ -706,19 +865,18 @@ fn open(
     rungs.push_back((Carrier::WebSocket, None, 2000));
     rungs.retain(|(carrier, _, _)| config.carrier.is_none_or(|forced| forced == *carrier));
     let mut attempts = Vec::new();
-    let mut retry_mss = None;
+    let mut mss_recovery = false;
+    let mut silent_handshakes = 0;
     let mut cached_probe = winning.is_some();
     while let Some((carrier, preferred, budget)) = rungs.pop_front() {
-        let rung_end = end.min(Instant::now() + Duration::from_millis(budget));
         let mss_reason = config
             .hints
             .lock()
             .unwrap()
             .reduced_mss
-            .filter(|(until, _)| *until > Instant::now())
-            .map(|(_, reason)| reason)
-            .or(retry_mss);
-        let reduced_mss = mss_reason.is_some();
+            .filter(|(until, _, _)| *until > Instant::now());
+        let reduced_mss = mss_reason.map(|(_, _, value)| value);
+        let rung_end = bounded_deadline(end, Instant::now(), rung_budget(budget, mss_reason));
         match open_carrier(
             config,
             cancel,
@@ -747,17 +905,24 @@ fn open(
                         carrier,
                         via_proxy: config.proxy.is_some(),
                         reduced_mss: mss,
-                        reduced_mss_reason: if mss { mss_reason } else { None },
+                        reduced_mss_reason: if mss {
+                            mss_reason.map(|(_, reason, _)| reason)
+                        } else {
+                            None
+                        },
+                        reduced_mss_value: if mss { reduced_mss } else { None },
                         earlier_failures: attempts,
                     },
                 ));
             }
             Err(error) => {
-                retry_mss = mss_stall(&error);
-                if let Some(reason) = retry_mss {
-                    config.remember_mss_stall(reason);
+                if let Some(reason) = mss_stall(&error) {
+                    config.remember_mss_stall(reason, reduced_mss);
                 }
                 config.hints.lock().unwrap().winning = None;
+                if handshake_stall(&error).is_some() {
+                    silent_handshakes += 1;
+                }
                 let typed = ConnectError::from_io(&error);
                 let failure = typed.failure;
                 let terminal = matches!(
@@ -800,6 +965,29 @@ fn open(
                         local_ip: None,
                         expires: end,
                     });
+                }
+                // A single silent ALPN drop must preserve normal MSS on WebSocket.
+                // Only two stalled TLS handshakes justify probing the smaller packet budget.
+                if cfg!(unix)
+                    && !terminal
+                    && rungs.is_empty()
+                    && !mss_recovery
+                    && attempts.len() >= 2
+                    && silent_handshakes == attempts.len()
+                {
+                    mss_recovery = true;
+                    config.remember_mss_stall(
+                        MssReason::TlsHandshakeStall,
+                        handshake_stall(&error).unwrap().used_mss,
+                    );
+                    end = deadline.min(Instant::now() + Duration::from_millis(500));
+                    let retry_carrier = config.carrier.unwrap_or(Carrier::Native);
+                    rungs.push_back((retry_carrier, None, 150));
+                    rungs.push_back((retry_carrier, None, 350));
+                } else if mss_recovery && !rungs.is_empty() {
+                    if let Some(stall) = handshake_stall(&error) {
+                        config.remember_mss_stall(MssReason::TlsHandshakeStall, stall.used_mss);
+                    }
                 }
                 if terminal || rungs.is_empty() {
                     // Preserve the original I/O kind for existing callers.
@@ -855,7 +1043,7 @@ fn open_carrier(
     cancel: &Cancel,
     deadline: Instant,
     carrier: Carrier,
-    reduced_mss: bool,
+    reduced_mss: Option<u32>,
     preferred: Option<SocketAddr>,
     refresh: bool,
 ) -> io::Result<(TlsSocket, bool)> {
@@ -886,7 +1074,12 @@ fn open_carrier(
         cancel.check()?;
         if Instant::now() >= deadline {
             return Err(if socket.conn.is_handshaking() && socket.transferred > 0 {
-                Failure::ConnectionBlocked.error()
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    HandshakeStall {
+                        used_mss: if mss { reduced_mss } else { None },
+                    },
+                )
             } else {
                 timeout()
             });
@@ -1102,7 +1295,10 @@ impl Transport {
                         // Capabilities cannot be replayed after partial media. A fresh
                         // application attempt using a cloned config learns this stall.
                         if let Some(reason) = mss_stall(&e) {
-                            config.remember_mss_stall(reason);
+                            let used = shared.state.lock().unwrap().connections[lane as usize]
+                                .as_ref()
+                                .and_then(|info| info.reduced_mss_value);
+                            config.remember_mss_stall(reason, used);
                         }
                         shared.close(e, Some(lane));
                     }
@@ -2215,17 +2411,126 @@ mod tests {
             .unwrap()
             .reduced_mss
             .is_some_and(
-                |(until, reason)| until > Instant::now() && reason == MssReason::ExplicitStall
+                |(until, reason, _)| until > Instant::now() && reason == MssReason::ExplicitStall
             ));
         clone.hints.lock().unwrap().reduced_mss = Some((
             Instant::now() - Duration::from_secs(1),
             MssReason::ExplicitStall,
+            1200,
         ));
         assert!(!config
             .hints
             .lock()
             .unwrap()
             .reduced_mss
-            .is_some_and(|(until, _)| until > Instant::now()));
+            .is_some_and(|(until, _, _)| until > Instant::now()));
+    }
+    #[test]
+    fn mss_step_down_and_expiry_use_injected_clock() {
+        let now = Instant::now();
+        let previous = Some((now + Duration::from_secs(30), MssReason::WriteStall, 1200));
+        let hint = |at| {
+            previous
+                .filter(|(until, _, _)| *until > at)
+                .map(|(_, _, mss)| mss)
+        };
+        assert_eq!(next_mss(None), 1200);
+        assert_eq!(next_mss(hint(now + Duration::from_secs(29))), 512);
+        assert_eq!(next_mss(hint(now + Duration::from_secs(30))), 1200);
+    }
+    #[test]
+    fn concurrent_default_mss_failures_keep_the_working_1200_hint() {
+        let config = ClientConfig::production(Endpoint::new("localhost", 443).unwrap()).unwrap();
+        config.remember_mss_stall(MssReason::TlsHandshakeStall, None);
+        config.remember_mss_stall(MssReason::TlsHandshakeStall, None);
+        assert_eq!(config.hints.lock().unwrap().reduced_mss.unwrap().2, 1200);
+        config.remember_mss_stall(MssReason::TlsHandshakeStall, Some(1200));
+        assert_eq!(config.hints.lock().unwrap().reduced_mss.unwrap().2, 512);
+    }
+    #[test]
+    fn refused_tcp_connections_do_not_start_mss_recovery() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut config =
+            ClientConfig::production(Endpoint::new("localhost", port).unwrap()).unwrap();
+        config.public_only = false;
+        let error = open(
+            &config,
+            &Cancel::new(),
+            Instant::now() + Duration::from_secs(4),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(ConnectError::from_io(&error).attempts.len(), 2);
+        assert!(config.hints.lock().unwrap().reduced_mss.is_none());
+    }
+    #[test]
+    fn mss_step_down_uses_failed_socket_and_ignores_other_errors() {
+        assert_eq!(next_mss(None), 1200);
+        // Two default-MSS lanes independently choose 1200, even after the first
+        // lane has published its hint. Only a socket using 1200 can choose 512.
+        assert_eq!(next_mss(None), 1200);
+        assert_eq!(next_mss(Some(1200)), 512);
+        for kind in [
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::TimedOut,
+        ] {
+            assert!(handshake_stall(&io::Error::from(kind)).is_none());
+        }
+    }
+    #[test]
+    fn policy_failures_outrank_reachability_failures() {
+        let failures = [
+            Failure::Timeout,
+            Failure::ConnectionBlocked,
+            Failure::TlsRejected,
+            Failure::ProxyRefused { status: 403 },
+            Failure::ProxyAuthenticationRequired,
+        ];
+        for pair in failures.windows(2) {
+            assert!(failure_priority(&pair[0]) < failure_priority(&pair[1]));
+        }
+        assert!(
+            failure_priority(&Failure::TlsInterception {
+                issuer: "Test CA".into()
+            }) > failure_priority(&Failure::ProxyRefused { status: 403 })
+        );
+    }
+    #[test]
+    fn discovery_order_and_total_budget_use_injected_clock() {
+        assert!(direct_first(true, false));
+        assert!(!direct_first(false, false));
+        assert!(!direct_first(true, true));
+        let now = Instant::now();
+        let end = bounded_deadline(now + Duration::from_secs(10), now, Duration::from_secs(4));
+        assert_eq!(end, now + Duration::from_secs(4));
+        assert_eq!(
+            bounded_deadline(
+                end,
+                now + Duration::from_millis(3900),
+                Duration::from_millis(750)
+            ),
+            end
+        );
+    }
+    #[test]
+    fn concurrent_lanes_share_the_short_intermediate_mss_probe_budget() {
+        let until = Instant::now() + Duration::from_secs(30);
+        assert_eq!(
+            rung_budget(750, Some((until, MssReason::TlsHandshakeStall, 1200))),
+            Duration::from_millis(150)
+        );
+        assert_eq!(
+            rung_budget(750, Some((until, MssReason::ExplicitStall, 1200))),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            rung_budget(750, Some((until, MssReason::TlsHandshakeStall, 512))),
+            Duration::from_millis(750)
+        );
+        assert_eq!(rung_budget(750, None), Duration::from_millis(750));
     }
 }

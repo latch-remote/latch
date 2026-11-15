@@ -1151,6 +1151,28 @@ fn fresh_concurrent_lanes_share_the_first_successful_carrier_discovery() {
 }
 
 #[test]
+fn discovered_proxy_only_environment_uses_connect_before_direct() {
+    let pilot = Pilot::start();
+    let gateway = Gateway::start(
+        pilot.config.endpoint.port(),
+        GatewayMode::Connect {
+            auth: true,
+            status: 200,
+            intercept: false,
+            http_only: false,
+        },
+    );
+    let mut config = proxy_config(&gateway, true);
+    let proxy = config.proxy.clone();
+    config.set_proxy_discovery(move || (proxy.clone(), false));
+    assert!(config.proxy.is_some());
+    let (_, info) = latch_relay::create_grant_with_info(&config, &Cancel::new()).unwrap();
+    assert!(info.via_proxy);
+    assert_eq!(info.carrier, latch_relay::Carrier::Native);
+    assert!(info.earlier_failures.is_empty());
+}
+
+#[test]
 fn forced_carrier_overrides_cached_path_for_grant_and_lanes() {
     use latch_relay::{create_grant_with_info, Carrier, Lane};
     let mut pilot = Pilot::start();
@@ -1199,4 +1221,86 @@ fn forced_native_does_not_fall_back_through_http_only_gateway() {
     let (_, info) = create_grant_with_info(&config, &Cancel::new()).unwrap();
     assert_eq!(info.carrier, Carrier::WebSocket);
     assert!(info.earlier_failures.is_empty());
+}
+
+#[test]
+fn fresh_connections_report_the_applied_mss_step_down() {
+    let pilot = Pilot::start();
+    for expected in [1200, 512] {
+        pilot.config.reduce_mss_after_stall();
+        let (_, info) = latch_relay::create_grant_with_info(&pilot.config, &Cancel::new()).unwrap();
+        assert_eq!(info.reduced_mss, cfg!(unix));
+        assert_eq!(info.reduced_mss_value, cfg!(unix).then_some(expected));
+        assert_eq!(
+            info.reduced_mss_reason,
+            cfg!(unix).then_some(latch_relay::MssReason::ExplicitStall)
+        );
+    }
+}
+
+#[test]
+fn discovered_proxy_refusal_survives_direct_route_failure() {
+    // Let TCP connect and queue the ClientHello without replying, so both direct
+    // carrier handshakes time out without any external network traffic.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let direct_port = listener.local_addr().unwrap().port();
+    let gateway = Gateway::start_for_endpoint(
+        0,
+        GatewayMode::Connect {
+            auth: false,
+            status: 403,
+            intercept: false,
+            http_only: false,
+        },
+        direct_port,
+    );
+    let mut config = proxy_config(&gateway, false);
+    config.endpoint = latch_relay::Endpoint::new("localhost", direct_port).unwrap();
+    let proxy = config.proxy.clone();
+    config.set_proxy_discovery(move || (proxy.clone(), false));
+    let error = latch_relay::create_grant_with_info(&config, &Cancel::new()).unwrap_err();
+    let typed = latch_relay::ConnectError::from_io(&error);
+    assert_eq!(
+        typed.failure,
+        latch_relay::Failure::ProxyRefused { status: 403 }
+    );
+    assert!(typed
+        .attempts
+        .iter()
+        .any(|attempt| !attempt.via_proxy
+            && attempt.failure == latch_relay::Failure::ConnectionBlocked));
+}
+
+#[test]
+fn proxy_refusal_cannot_hide_direct_tls_interception() {
+    let direct = Gateway::start(0, GatewayMode::TlsHttp { status: 200 });
+    let proxy = Gateway::start_for_endpoint(
+        0,
+        GatewayMode::Connect {
+            auth: false,
+            status: 403,
+            intercept: false,
+            http_only: false,
+        },
+        direct.port,
+    );
+    let mut config = proxy_config(&proxy, false);
+    config.endpoint = Endpoint::new("localhost", direct.port).unwrap();
+    config = config
+        .with_tls_roots(rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        })
+        .unwrap();
+    let discovered = config.proxy.clone();
+    config.set_proxy_discovery(move || (discovered.clone(), false));
+    let error = latch_relay::create_grant_with_info(&config, &Cancel::new()).unwrap_err();
+    let typed = latch_relay::ConnectError::from_io(&error);
+    assert!(matches!(
+        typed.failure,
+        latch_relay::Failure::TlsInterception { .. }
+    ));
+    assert!(typed.attempts.iter().any(|attempt| matches!(
+        attempt.failure,
+        latch_relay::Failure::ProxyRefused { status: 403 }
+    )));
 }

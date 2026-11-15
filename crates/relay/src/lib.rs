@@ -7,6 +7,7 @@ mod client;
 mod crypto;
 pub mod daemon;
 mod diagnostics;
+mod probe;
 mod proxy;
 mod quota;
 mod readiness;

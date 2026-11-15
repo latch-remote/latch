@@ -30,11 +30,14 @@ pub fn run(
     while start.elapsed() < Duration::from_secs(seconds) {
         let elapsed_ms = start.elapsed().as_millis();
         for event in events.try_iter() {
+            if matches!(&event, Event::Network(status) if status.messages.is_empty()) {
+                continue;
+            }
             let kind = match &event {
                 Event::Connected => "stream_ready",
                 Event::Terminated { .. } => "terminated",
                 Event::Failed { .. } => "failed",
-                Event::Notice(_) => "notice",
+                Event::Notice(_) | Event::Network(_) => "notice",
                 Event::NoAudio(_) => "audio_error",
                 _ => "event",
             };
@@ -95,6 +98,7 @@ pub fn run(
             emit(serde_json::json!({
                 "kind":"sample", "elapsed_ms":elapsed_ms, "decoded_seq":sequence,
                 "fps":stats.fps, "path":path, "mbps":stats.mbps,
+                "carrier":session.relay_connection_info().as_ref().map(latch_stream::network::carrier_label),
                 "requested_bitrate_kbps":stats.requested_bitrate_kbps,
                 "applied_bitrate_kbps":stats.applied_bitrate_kbps,
                 "loss_pct":stats.loss_pct, "audio":stats.audio,

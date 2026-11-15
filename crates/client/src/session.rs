@@ -1148,6 +1148,8 @@ fn run(c: &Connect, generation: u64) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let ctx = c.ctx.clone();
     let test = test_serve();
+    #[cfg(test)]
+    std::env::set_var("LATCH_NETENV_PROBE", "0");
     let session = Session::start_with_relay(
         Server {
             address: test.map_or(IpAddr::V4(t.ip), |a| a.ip()),

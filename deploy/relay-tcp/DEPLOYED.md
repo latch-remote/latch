@@ -614,8 +614,12 @@ anonymous `GET /netenv/probe` returning an empty 204, give the relay a plain
 HTTP port-80 listener and serve `/.well-known/acme-challenge/` from a restricted
 ACME webroot directory. Switch Certbot to the webroot authenticator and retain
 the validated certificate deployment hook. One listener can then answer both
-paths continuously through renewal. This follow-up requires implementation and
-its own renewal verification.
+paths continuously through renewal. The reviewed branch implements this listener
+and awaits deployment and renewal verification. Follow the README upgrade
+procedure. Stop `certbot.timer`, finish active renewal, install and start the new
+listener, then use Certbot 2.3+ `reconfigure` or edit the renewal configuration
+on older versions. Retain the deployment hook, run a renewal dry-run, then
+re-enable the timer. Fresh installations issue through webroot from the start.
 
 ## Carrier comparison on 2026-11-15
 
