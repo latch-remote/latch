@@ -1290,6 +1290,7 @@ fn fallback_refits_geometry_and_prepares_the_final_mode() {
     assert_eq!(prepared_sizes.lock().last(), Some(&expected));
 }
 
+#[cfg(windows)]
 #[test]
 fn display_codec_negotiation_waits_for_the_previous_capture_to_release_its_topology() {
     let server = Server::bind(0, Options::default()).unwrap();
@@ -1334,4 +1335,49 @@ fn display_codec_negotiation_waits_for_the_previous_capture_to_release_its_topol
     assert_eq!(opened.len(), 1);
     assert_eq!(opened[0].codec, Codec::H264Baseline);
     assert_eq!(opened[0].display.as_deref(), Some("secondary-monitor"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn an_unsupported_codec_preserves_the_current_capture_when_topology_is_unchanged() {
+    let server = Server::bind(0, Options::default()).unwrap();
+    let old = session("127.0.0.1:9".parse().unwrap());
+    *server.current.lock() = Some(old.clone());
+    let req: StreamRequest = serde_json::from_value(serde_json::json!({
+        "protocol": 1, "width": 64, "height": 64, "fps": 30,
+        "bitrate_kbps": 1000, "codecs": ["av1"],
+        "udp_port": 9, "audio": false
+    }))
+    .unwrap();
+    let result = server.prepare_using(
+        req,
+        "127.0.0.1:9".parse().unwrap(),
+        || vec![Codec::H264Baseline],
+        video::Limits::level,
+        |_| panic!("an unsupported codec must be refused before capture opens"),
+    );
+    assert!(matches!(result, Err(Refusal { status: 406, .. })));
+    assert!(!old.stopping());
+}
+
+#[test]
+fn an_offer_containing_only_future_codecs_preserves_the_current_capture() {
+    let server = Server::bind(0, Options::default()).unwrap();
+    let old = session("127.0.0.1:9".parse().unwrap());
+    *server.current.lock() = Some(old.clone());
+    let req: StreamRequest = serde_json::from_value(serde_json::json!({
+        "protocol": 1, "width": 64, "height": 64, "fps": 30,
+        "bitrate_kbps": 1000, "codecs": ["future-codec"],
+        "udp_port": 9, "audio": false
+    }))
+    .unwrap();
+    let result = server.prepare_using(
+        req,
+        "127.0.0.1:9".parse().unwrap(),
+        || panic!("an empty known-codec offer must be refused before probing"),
+        video::Limits::level,
+        |_| panic!("an empty known-codec offer must be refused before capture opens"),
+    );
+    assert!(matches!(result, Err(Refusal { status: 406, .. })));
+    assert!(!old.stopping());
 }

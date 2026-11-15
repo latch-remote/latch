@@ -240,29 +240,21 @@ impl Server {
                 ),
             ));
         }
+        if req.codecs.is_empty() {
+            return Err(Refusal::new(
+                406,
+                "the viewer offered no supported video codecs",
+            ));
+        }
         let Some(opening) = self.opening.lock(TAKEOVER_WAIT) else {
             return Err(Refusal::new(
                 503,
                 "another viewer is still starting a stream here; try again",
             ));
         };
-        let running = self.current.lock().clone();
-        if let Some(old) = running {
-            self.log(format!(
-                "{} takes the stream over from {}",
-                display_name(&req.name, peer.ip()),
-                old.viewer
-            ));
-            old.end(end::TAKEN_OVER, "Another device took this stream over.");
-            if !old.wait_finished(TAKEOVER_WAIT) {
-                return Err(Refusal::new(
-                    503,
-                    "the previous stream is still letting go of the screen; try again",
-                ));
-            }
-        }
-        // The old session's undo restores physical outputs before probing
-        // the adapter that will capture the newly requested display.
+        // Windows must restore physical outputs before probing their adapters.
+        #[cfg(windows)]
+        self.release_current(&req, peer)?;
         let encodable = encodable();
         let original = req.clone();
         // Best first, of those this host encodes at the size it would send.
@@ -295,6 +287,10 @@ impl Server {
                 ),
             ));
         };
+        // Other platforms can reject an unsupported codec while the old
+        // stream continues, before taking its capture over.
+        #[cfg(not(windows))]
+        self.release_current(&req, peer)?;
         // What the encoder for that codec takes here, before the desktop is
         // sized for it: a larger request is scaled down in proportion.
         let limits = limits_for(codec);
@@ -440,6 +436,25 @@ impl Server {
             }
         }
         Ok(prepared)
+    }
+
+    fn release_current(&self, req: &StreamRequest, peer: SocketAddr) -> Result<(), Refusal> {
+        let running = self.current.lock().clone();
+        if let Some(old) = running {
+            self.log(format!(
+                "{} takes the stream over from {}",
+                display_name(&req.name, peer.ip()),
+                old.viewer
+            ));
+            old.end(end::TAKEN_OVER, "Another device took this stream over.");
+            if !old.wait_finished(TAKEOVER_WAIT) {
+                return Err(Refusal::new(
+                    503,
+                    "the previous stream is still letting go of the screen; try again",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Runs a prepared session on the upgraded connection until it ends.
