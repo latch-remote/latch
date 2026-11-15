@@ -11,7 +11,8 @@ GitHub release notes, so each version gets a heading of the form
 - Preserve main's default Command/Ctrl and clipboard mapping in every mouse
   mode, including 6.0.0 hosts. Limit new swap halves to a free mouse and make
   Send keys as pressed the explicit all-mode opt-out. Restore the Mac Quit
-  and Hide menu override in windowed free-mouse streams.
+  and Hide menu override in windowed free-mouse streams. Preserve native
+  paste fallback when the viewer clipboard contains an image or no text.
 - Move Windows keyboard capture to a dedicated message-loop thread with a
   bounded queue, all-modifier ordering and a 250 ms UI watchdog. Release X11
   grabs after a 250 ms UI stall and replay grabbed media controls locally.

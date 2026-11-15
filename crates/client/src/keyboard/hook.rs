@@ -54,6 +54,8 @@ pub struct Event {
     pub alt: bool,
     pub time: u32,
     pub altgr: bool,
+    pub captured: bool,
+    pub queued_at: u64,
 }
 
 #[cfg(any(windows, test))]
@@ -73,20 +75,30 @@ impl Capture {
 
     pub fn consume(&mut self, event: Event, deliver: impl FnOnce(Event) -> bool) -> bool {
         let key = event.key;
-        let Some(consumed) = self.consumed.get_mut(usize::from(key.vk)) else {
+        let owned_down = self
+            .consumed
+            .get(usize::from(key.vk))
+            .copied()
+            .unwrap_or(false);
+        if !key.down && matches!(key.vk, 0x5b | 0x5c) && !owned_down {
             return false;
-        };
+        }
         let swallow = if key.down {
             matches!(key.vk, 0x5b | 0x5c) || (event.alt && matches!(key.vk, 0x09 | 0x20 | 0x73))
         } else {
-            *consumed
+            owned_down
         };
-        // Publish every modifier in hook order. The UI suppresses its winit duplicate.
-        let modifier = matches!(key.vk, 0xa0..=0xa5);
-        if (swallow || modifier) && !deliver(event) {
+        // Ordinary events are ordering barriers, translated by winit before
+        // later hook modifiers can be published. Every event has bounded delivery.
+        if !deliver(Event {
+            captured: swallow,
+            ..event
+        }) {
             return false;
         }
-        *consumed = key.down && swallow;
+        if let Some(consumed) = self.consumed.get_mut(usize::from(key.vk)) {
+            *consumed = key.down && swallow;
+        }
         swallow
     }
 
@@ -118,6 +130,12 @@ pub fn take_ready(
                 _ => {}
             }
         }
+        if !event.captured && !matches!(event.key.vk, 0xa0..=0xa5) {
+            if native == Some(event.key) {
+                pending.pop_front();
+            }
+            break;
+        }
         pending.pop_front();
         events.push(event);
     }
@@ -133,6 +151,8 @@ mod tests {
             alt: true,
             time: 1,
             altgr: false,
+            captured: matches!(vk, 0x5b | 0x5c),
+            queued_at: 0,
         }
     }
 
@@ -174,6 +194,31 @@ mod tests {
         );
         assert!(pending.is_empty());
         assert!(Capture::new(true).altgr);
+    }
+
+    #[test]
+    fn ordinary_winit_keys_are_barriers_between_hook_modifiers() {
+        let mut pending = std::collections::VecDeque::from([
+            event(0xa0, true),
+            event(0x41, true),
+            event(0xa0, false),
+            event(0x5b, true),
+        ]);
+        assert_eq!(take_ready(&mut pending, None), [event(0xa0, true)]);
+        assert!(take_ready(&mut pending, None).is_empty());
+        assert!(take_ready(&mut pending, Some(event(0x41, true).key)).is_empty());
+        assert_eq!(
+            take_ready(&mut pending, None),
+            [event(0xa0, false), event(0x5b, true)]
+        );
+        assert!(pending.is_empty());
+        let mut capture = Capture::new(false);
+        let mut queued = Vec::new();
+        assert!(!capture.consume(event(0x41, true), |e| {
+            queued.push(e);
+            true
+        }));
+        assert_eq!(queued, [event(0x41, true)]);
     }
 
     #[test]

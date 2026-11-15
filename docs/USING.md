@@ -147,11 +147,14 @@ another OS-supported administration mechanism.
 
 The Windows hook has its own message loop and a 256-event bounded queue.
 Its callback performs fixed-size state updates and nonblocking queue sends.
-All sided modifiers share its ordering before Win. AltGr's synthetic Control
+All sided modifiers share its ordering before Win. Ordinary keys form
+queue barriers until winit has translated them, preserving their position
+between modifiers. AltGr's synthetic Control
 is filtered using the active layout and the adjacent right-Alt event, with
 winit confirming an otherwise lone real Control. Focus loss, capture end,
 window destruction, app teardown and worker unwinding uninstall the hook.
-A 250 ms UI heartbeat lease, a full or disconnected queue, or lost foreground
+A 250 ms UI heartbeat lease, an event waiting 250 ms for translation, a full
+or disconnected queue, or lost foreground
 ownership makes it pass keys through and uninstall. The UI releases remote
 held input when it resumes. A worker wake requests repaint after publication.
 

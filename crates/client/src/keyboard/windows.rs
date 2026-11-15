@@ -116,14 +116,29 @@ pub fn drain(native: Option<&egui_winit::winit::event::WindowEvent>) {
         let Some(worker) = worker else {
             return (Vec::new(), false);
         };
-        let failed = !worker.lease.active(worker.lease.elapsed());
+        let now = worker.lease.elapsed();
+        let failed = !worker.lease.active(now)
+            || worker
+                .thread
+                .as_ref()
+                .is_some_and(|thread| thread.is_finished());
         if failed {
+            worker.lease.fail();
             return (Vec::new(), true);
         }
         worker.lease.renew();
         worker
             .pending
             .extend(worker.events.try_iter().take(QUEUE_SIZE));
+        if worker.pending.len() > QUEUE_SIZE
+            || worker
+                .pending
+                .front()
+                .is_some_and(|e| now.saturating_sub(e.queued_at) >= super::hook::LEASE_MS)
+        {
+            worker.lease.fail();
+            return (Vec::new(), true);
+        }
         let events = super::hook::take_ready(&mut worker.pending, native_key);
         worker.forwarded.extend(
             events
@@ -275,14 +290,29 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
                 h.lease.fail();
                 return false;
             }
+            use egui_winit::winit::{
+                keyboard::PhysicalKey, platform::scancode::PhysicalKeyExtScancode,
+            };
+            let scan = raw.scanCode
+                | if raw.flags.contains(LLKHF_EXTENDED) {
+                    0xe000
+                } else {
+                    0
+                };
+            let vk = match PhysicalKey::from_scancode(scan) {
+                PhysicalKey::Code(code) => super::vk(code).unwrap_or(raw.vkCode as u16),
+                _ => raw.vkCode as u16,
+            };
             let event = Event {
                 key: Key {
-                    vk: raw.vkCode as u16,
+                    vk,
                     down: !raw.flags.contains(LLKHF_UP),
                 },
                 alt: raw.flags.contains(LLKHF_ALTDOWN),
                 time: raw.time,
                 altgr: h.capture.altgr,
+                captured: false,
+                queued_at: h.lease.elapsed(),
             };
             h.capture.consume(event, |e| {
                 h.dirty = true;

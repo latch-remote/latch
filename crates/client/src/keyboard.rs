@@ -425,6 +425,12 @@ impl State {
             }
             return;
         }
+        // egui also swallows command-V when the clipboard has no text.
+        // Leave that down absent so the stream's existing release-time
+        // fallback can paste the host's clipboard with its expected modifier.
+        if down && code == KeyCode::KeyV && mods.command && events.is_empty() {
+            return;
+        }
         // egui translates clipboard shortcuts into Copy/Cut/Paste events.
         // Their existing ordering with clipboard transport must be retained.
         if events
