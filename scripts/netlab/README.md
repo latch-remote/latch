@@ -1,10 +1,28 @@
 # Hostile-network lab
 
 This Linux/root harness runs the real `serve`, `view`, and `latch-relay`
-binaries. It uses the software H.264 encoder/decoder, a 320 × 192 moving
-test pattern at 30 fps (640 × 360 random noise in d1 and d2), synthetic quarter-second audio clicks played into
-a private PulseAudio null sink, and one synthetic key press per second.
-Input timing measures the decoded square changing on the viewer's clock.
+binaries. It uses the software H.264 encoder/decoder and full-frame,
+independent grayscale noise at 30 fps, at 320 × 192 (640 × 360 in d1/d2).
+Every scenario selects `LATCH_TEST_PATTERN=entropy`. The harness plays
+synthetic quarter-second audio clicks into a private PulseAudio null sink
+and sends one synthetic key press per second. Input timing measures the
+decoded square changing on the viewer's clock.
+
+The noise is real picture data through capture, conversion, encoding,
+packetization and decoding. The 64 × 64 input square remains readable.
+The former sweep and small noise patch were content-limited at the encoder's
+minimum QP of 18. In d1/d2 the patch produced about 4.52 Mbps even with a
+5.65–5.67 Mbps encoder target, putting the unchanged 4.5 Mbps delivered-rate
+gate within measurement noise. Full-frame noise keeps quantization above
+that floor, so the rate controller bounds the encoded bitrate.
+
+Host debug diagnostics record each encoded picture's average macroblock QP,
+size and encoder target. The summary prints minimum/mean QP and mean target
+from the measured session's final six seconds, excluding d1's qualification
+session. JSON also records the encoded tail rate and frame count. These
+columns expose a future content-limited fixture. UDP targets additionally
+reserve parity and packetization overhead. Relay targets reserve priority
+traffic, leaving about 5.65 Mbps from the 6 Mbps wire request.
 
 ## Topology
 
@@ -235,19 +253,24 @@ for expected-failure cases. Test probes are excluded from relay SYN counts.
 fix reference. The comparison requires the recorded failure signature and the recorded
 error pattern where supplied.
 
-CI run 43729254333 passed 16 of 18 joined scenarios. d1 missed the delivered
-video-rate bound and l2 missed the post-sign-in first-frame deadline.
-`expected-failures.json` remains empty, so both failures require resolution.
-The joined behavior, including portal waiting and recovery in l/l2, remains
-subject to the Linux `netlab` job's unchanged assertions.
+Two complete Linux/arm64 runs on 2026-11-15 passed all 18 scenarios in
+294.85 s and 294.43 s, including i2, l2 and m2.
+Both used a privileged container limited to four CPUs, two scenario workers,
+the joined tree containing main `fa8d6f1c`, and `expected-failures.json = {}`.
+The old-picture column comes from CI run 43729254333. The noise columns
+come from these local runs. Rates are delivered video in the final six seconds.
 
-Previously, d1 and d2 required the recorded requested-video-bitrate failure. Their
-`related_failures` list names accompanying quality failures observed across
-stochastic runs. FPS, audio and stall counts vary, and d2 can also remain on
-UDP with delayed input. Every numeric assertion still runs and is
-reported. A repaired bitrate with a different remaining failure is FAIL.
-Control, sampler, termination, path-counter and middlebox failures always
-remain outside this quality signature.
+| Case | Old picture Mbps | Noise run 1 Mbps | Noise run 2 Mbps | Encoder target Mbps, run 1 / 2 | QP min/mean, run 1 | QP min/mean, run 2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| a, clean UDP | 0.29487 | 3.668 | 3.644 | 3.656 / 3.656 | 41/44.0 | 42/44.0 |
+| b, clean relay after denied UDP | 0.29065 | 5.743 | 5.725 | 5.636 / 5.639 | 27/37.3 | 27/37.2 |
+| d1, bursty UDP loss | 4.49993 | 5.563 | 5.707 | 5.643 / 5.669 | 45/49.4 | 46/49.1 |
+| d2, UDP policer | 4.53297 | 5.730 | 5.685 | 5.664 / 5.647 | 46/49.5 | 47/49.9 |
+
+Clean relay b encoded 5.637 and 5.637 Mbps against
+5.636 and 5.639 Mbps encoder targets. Its minimum tail QP was 27 in both runs.
+All streaming cases had minimum tail QP at least 27. The QP floor is 18.
+These runs exercised the existing scenario definitions, impairments and quality gates.
 
 - A passing scenario with a failed assertion makes CI fail.
 - A listed scenario must fail exactly its recorded assertions. Additional
@@ -266,9 +289,8 @@ its assertions unchanged.
 The current per-scenario table is generated into `summary.md` and the GitHub
 job summary. It includes final decoded fps, stalls, longest freeze, delivered
 and requested video bitrate, input RTT, played clicks, active path, measured
-loss and policer drops. `results.json` retains every individual assertion,
-kernel traffic sample and failure. The expected-failure entries record the
-observed product gaps and their source revision.
+loss, policer drops, encoder target and tail QP. `results.json` retains every individual assertion,
+kernel traffic sample and failure. `expected-failures.json` is empty for these measurements.
 
 The earlier combined d case measured about 4.4% effective loss and zero TBF
 drops. d1 and d2 replace that case with separately verified impairments.

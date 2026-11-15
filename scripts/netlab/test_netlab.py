@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from middlebox import alpns
-from netlab import Lab, classify, evaluate, main, run_scenario
+from netlab import Lab, classify, encoder_tail, evaluate, main, run_scenario, summary
 from stage_artifacts import stage
 
 
@@ -23,6 +23,21 @@ def healthy_events():
 
 
 class VerdictTests(unittest.TestCase):
+    def test_encoder_diagnostics_use_only_the_measured_tail(self):
+        log = "\n".join(
+            f"2026-11-15T00:00:{second:02d}Z DEBUG latch_engine::software: "
+            f"software encoder output qp={qp} bytes=23000 target_kbps=5650"
+            for second, qp in [(1, 18), (11, 19), (12, 30), (17, 32), (19, 18)])
+        result = encoder_tail(log, 1794700800, 18)
+        self.assertEqual(result["tail_encoder_frames"], 2)
+        self.assertEqual(result["tail_encoder_qp_min"], 30)
+        self.assertEqual(result["tail_encoder_qp_mean"], 31)
+        self.assertEqual(result["tail_encoder_target_mbps"], 5.65)
+        self.assertEqual(encoder_tail("", 0, 18), {})
+        table = summary([{**result, "scenario": "a", "name": "clean UDP", "status": "PASS"}])
+        self.assertIn("QP min/mean", table)
+        self.assertIn("30/31.0", table)
+
     def test_loss_qualification_requires_real_decode_and_disables_relay(self):
         with tempfile.TemporaryDirectory() as directory:
             lab = Lab("d1", Path(directory))

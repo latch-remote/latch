@@ -176,7 +176,11 @@ fn available_workers() -> usize {
 }
 
 /// `latch-codec`'s H.264 Constrained Baseline encoder.
-pub struct LatchEncoder(Encoder, (u64, Option<u64>));
+pub struct LatchEncoder {
+    encoder: Encoder,
+    last_picture: (u64, Option<u64>),
+    target_kbps: u32,
+}
 
 impl LatchEncoder {
     pub fn open(width: u32, height: u32, config: &VideoConfig) -> anyhow::Result<Self> {
@@ -202,11 +206,21 @@ impl LatchEncoder {
             threads: workers,
         })?;
         encoder.set_recovery_depth(recovery_depth(width, height, config.fps));
-        Ok(Self(encoder, (0, None)))
+        Ok(Self {
+            encoder,
+            last_picture: (0, None),
+            target_kbps: config.bitrate_kbps,
+        })
     }
 
     fn keep(&mut self, info: latch_codec::h264::EncodedInfo) -> bool {
-        self.1 = (info.picture, info.recovery);
+        self.last_picture = (info.picture, info.recovery);
+        tracing::debug!(
+            qp = info.qp,
+            bytes = info.bytes,
+            target_kbps = self.target_kbps,
+            "software encoder output"
+        );
         info.keyframe
     }
 }
@@ -237,7 +251,7 @@ impl PictureEncoder for LatchEncoder {
         keyframe: bool,
         out: &mut Vec<u8>,
     ) -> anyhow::Result<bool> {
-        let info = self.0.encode(picture, keyframe, out)?;
+        let info = self.encoder.encode(picture, keyframe, out)?;
         Ok(self.keep(info))
     }
     fn encode_changed(
@@ -247,20 +261,23 @@ impl PictureEncoder for LatchEncoder {
         keyframe: bool,
         out: &mut Vec<u8>,
     ) -> anyhow::Result<bool> {
-        let info = self.0.encode_changed(picture, changed, keyframe, out)?;
+        let info = self
+            .encoder
+            .encode_changed(picture, changed, keyframe, out)?;
         Ok(self.keep(info))
     }
     fn set_bitrate(&mut self, kbps: u32) {
-        self.0.set_bitrate(kbps);
+        self.target_kbps = kbps.max(1);
+        self.encoder.set_bitrate(kbps);
     }
     fn recovers(&self) -> bool {
         true
     }
     fn recover_from(&mut self, picture: u64) -> bool {
-        self.0.recover_from(picture)
+        self.encoder.recover_from(picture)
     }
     fn last_picture(&self) -> (u64, Option<u64>) {
-        self.1
+        self.last_picture
     }
 }
 

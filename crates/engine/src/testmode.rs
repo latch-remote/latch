@@ -1,4 +1,4 @@
-//! `LATCH_TEST_PATTERN=still|sweep|noise|load` makes the engine stream the
+//! `LATCH_TEST_PATTERN=still|sweep|noise|entropy|load` makes the engine stream the
 //! synthetic desktop of [`crate::pattern`] instead of the screen, and feed
 //! it the viewer's input. A host in this mode needs no screen, permission
 //! or GPU, so a whole session can be checked anywhere: known pixels arrive,
@@ -48,6 +48,7 @@ pub fn motion() -> Option<Motion> {
         "still" => Some(Motion::Still),
         "sweep" => Some(Motion::Sweep),
         "noise" => Some(Motion::Noise),
+        "entropy" => Some(Motion::Entropy),
         "load" => Some(Motion::Still),
         _ => None,
     }

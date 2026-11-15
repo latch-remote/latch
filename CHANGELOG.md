@@ -95,11 +95,6 @@ GitHub release notes, so each version gets a heading of the form
   offload, descriptor and memory tuning, with bounded before/after measurements,
   bundle and transfer cost estimates, IPv6 findings and completed EC2 teardown.
 
-- Consolidate the Seoul native TCP/TLS and Tailscale UDP peer relays on the
-  existing Lightsail instance. Add reproducible socket, queue, forwarding
-  offload, descriptor and memory tuning, with bounded before/after measurements,
-  bundle and transfer cost estimates, IPv6 findings and completed EC2 teardown.
-
 ### Relay connectivity
 
 - Keep relay connections usable when local wake notifications are unavailable,
