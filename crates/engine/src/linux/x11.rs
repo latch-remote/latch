@@ -3,6 +3,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use x11rb::reexports::x11rb_protocol::{parse_display::ConnectAddress, xauth::Family};
 use x11rb::rust_connection::{DefaultStream, PollMode, RustConnection, Stream};
 use x11rb::utils::RawFdContainer;
 
@@ -148,7 +149,7 @@ fn helper() -> anyhow::Result<()> {
     let (ipc, _) = DefaultStream::from_unix_stream(ipc)?;
     let display = parse_display(None)?;
     for address in display.connect_instruction() {
-        if let Ok((stream, (family, peer))) = DefaultStream::connect(&address) {
+        if let Ok((stream, (family, peer))) = connect_address(&address) {
             // Preserve x11rb's authority selection and absent-file behavior.
             let (name, data) = get_auth(family, &peer, display.display)
                 .ok()
@@ -191,6 +192,21 @@ fn helper() -> anyhow::Result<()> {
         }
     }
     anyhow::bail!("cannot connect to X11")
+}
+
+/// Preserve x11rb 0.13's Linux connection order: try the abstract Unix
+/// socket before falling back to the filesystem socket.
+fn connect_address(address: &ConnectAddress<'_>) -> io::Result<(DefaultStream, (Family, Vec<u8>))> {
+    #[cfg(target_os = "linux")]
+    if let ConnectAddress::Socket(path) = address {
+        use std::os::linux::net::SocketAddrExt;
+        let abstract_socket = std::os::unix::net::SocketAddr::from_abstract_name(path.as_bytes())
+            .and_then(|address| UnixStream::connect_addr(&address));
+        if let Ok(stream) = abstract_socket {
+            return DefaultStream::from_unix_stream(stream);
+        }
+    }
+    DefaultStream::connect(address)
 }
 
 // A killed process in uninterruptible kernel I/O may not exit immediately.
