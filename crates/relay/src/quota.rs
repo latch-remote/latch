@@ -3,21 +3,162 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
+    sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
+    thread::{self, JoinHandle},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 const MAGIC: &[u8; 8] = b"LATCHQ01";
 const LEASE: u64 = 64 * 1024;
+// Refill at half a batch. The pool and its pending reservation total at most 6 MiB.
+const BATCH: u64 = 4 * 1024 * 1024;
+
+/// Nonblocking leases from a bounded pool of durably reserved bytes.
+pub(crate) struct Quota {
+    requests: Option<SyncSender<u64>>,
+    replies: Receiver<io::Result<Reservation>>,
+    worker: Option<JoinHandle<()>>,
+    month: u64,
+    reserved: u64,
+    available: u64,
+    pending: bool,
+    exhausted: bool,
+    failed: bool,
+}
+#[derive(Debug)]
+enum Reservation {
+    Credit {
+        month: u64,
+        reserved: u64,
+        bytes: u64,
+    },
+    Exhausted {
+        month: u64,
+    },
+}
+impl Quota {
+    pub fn open(path: &Path, budget: u64, initialize: bool) -> io::Result<Self> {
+        let mut ledger = Ledger::open(path, budget, initialize)?;
+        let month = ledger.month;
+        let reserved = ledger.reserved;
+        let (requests, incoming) = mpsc::sync_channel(1);
+        let (replies, completed) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("relay-quota".into())
+            .spawn(move || {
+                while let Ok(month) = incoming.recv() {
+                    let result = ledger.reserve(month);
+                    if replies.send(result).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            requests: Some(requests),
+            replies: completed,
+            worker: Some(worker),
+            month,
+            reserved,
+            available: 0,
+            pending: false,
+            exhausted: false,
+            failed: false,
+        })
+    }
+    pub fn credit(&mut self, credit: &mut u64, epoch: &mut u64) -> io::Result<()> {
+        self.check()?;
+        let now = month_now()?;
+        if now > self.month {
+            self.month = now;
+            self.available = 0;
+            self.exhausted = false;
+        }
+        if *epoch != self.month {
+            *credit = 0;
+        }
+        if *credit < 2 * 16 * 1024 && self.available >= LEASE {
+            self.available -= LEASE;
+            *credit += LEASE;
+            *epoch = self.month;
+        }
+        if self.available <= BATCH / 2 && !self.pending && !self.exhausted {
+            self.requests
+                .as_ref()
+                .unwrap()
+                .try_send(self.month)
+                .map_err(|_| io::Error::other("quota worker stopped"))?;
+            self.pending = true;
+        }
+        if *credit < 2 * 16 * 1024 {
+            return Err(if self.exhausted {
+                denied()
+            } else {
+                io::ErrorKind::WouldBlock.into()
+            });
+        }
+        Ok(())
+    }
+    pub fn check(&mut self) -> io::Result<()> {
+        if self.failed {
+            return Err(io::Error::other("quota persistence failed, relay stopped"));
+        }
+        match self.replies.try_recv() {
+            Ok(result) => {
+                self.pending = false;
+                match result {
+                    Ok(Reservation::Credit {
+                        month,
+                        reserved,
+                        bytes,
+                    }) => {
+                        // A completion from before a month rollover remains
+                        // charged to that ledger epoch but cannot fund new I/O.
+                        if month == self.month {
+                            self.available += bytes;
+                        }
+                        self.reserved = reserved;
+                    }
+                    Ok(Reservation::Exhausted { month }) => {
+                        if month == self.month {
+                            self.exhausted = true;
+                        }
+                    }
+                    Err(error) => {
+                        self.failed = true;
+                        return Err(error);
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => (),
+            Err(TryRecvError::Disconnected) => {
+                self.failed = true;
+                return Err(io::Error::other("quota worker stopped"));
+            }
+        }
+        Ok(())
+    }
+    pub fn reserved(&self) -> u64 {
+        self.reserved
+    }
+}
+impl Drop for Quota {
+    fn drop(&mut self) {
+        drop(self.requests.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
 
 /// A locked, fixed-size durable reservation ledger. Unspent leases are charged.
-pub(crate) struct Quota {
+struct Ledger {
     file: File,
     month: u64,
     reserved: u64,
     budget: u64,
     failed: bool,
 }
-impl Quota {
+impl Ledger {
     pub fn open(path: &Path, budget: u64, initialize: bool) -> io::Result<Self> {
         if budget < LEASE {
             return Err(invalid(
@@ -94,7 +235,7 @@ impl Quota {
         }
         result
     }
-    fn reserve_at(&mut self, month: u64) -> io::Result<()> {
+    fn reserve_at(&mut self, month: u64, bytes: u64) -> io::Result<()> {
         if self.failed {
             return Err(io::Error::other("quota persistence failed, relay stopped"));
         }
@@ -103,35 +244,27 @@ impl Quota {
             self.month = month;
             self.reserved = 0;
         }
-        if LEASE > self.budget.saturating_sub(self.reserved) {
+        if bytes > self.budget.saturating_sub(self.reserved) {
             return Err(denied());
         }
-        self.reserved += LEASE;
+        self.reserved += bytes;
         self.persist()
     }
-    pub fn credit(&mut self, credit: &mut u64, epoch: &mut u64) -> io::Result<()> {
-        self.check()?;
-        let now = month_now()?;
-        // Leases from earlier months expire, including still-open connections.
-        if *epoch != self.month.max(now) {
-            *credit = 0;
-        }
-        if *credit < 2 * 16 * 1024 {
-            self.reserve_at(now)?;
-            *credit += LEASE;
-            *epoch = self.month;
-        }
-        Ok(())
-    }
-    pub fn check(&self) -> io::Result<()> {
+    fn reserve(&mut self, month: u64) -> io::Result<Reservation> {
         if self.failed {
-            Err(io::Error::other("quota persistence failed, relay stopped"))
-        } else {
-            Ok(())
+            return Err(io::Error::other("quota persistence failed, relay stopped"));
         }
-    }
-    pub fn reserved(&self) -> u64 {
-        self.reserved
+        let reserved = if month > self.month { 0 } else { self.reserved };
+        let bytes = self.budget.saturating_sub(reserved).min(BATCH) / LEASE * LEASE;
+        if bytes == 0 {
+            return Ok(Reservation::Exhausted { month: self.month });
+        }
+        self.reserve_at(month, bytes)?;
+        Ok(Reservation::Credit {
+            month: self.month,
+            reserved: self.reserved,
+            bytes,
+        })
     }
 }
 fn checksum(month: u64, reserved: u64) -> u64 {
@@ -176,52 +309,202 @@ mod tests {
         let path = path();
         let month;
         {
-            let mut q = Quota::open(&path, LEASE * 2, true).unwrap();
+            let mut q = Ledger::open(&path, LEASE * 2, true).unwrap();
             month = q.month;
-            q.reserve_at(month).unwrap();
-            q.reserve_at(month).unwrap();
-            assert!(q.reserve_at(month).is_err());
-            assert!(Quota::open(&path, LEASE * 2, false).is_err());
+            q.reserve_at(month, LEASE).unwrap();
+            q.reserve_at(month, LEASE).unwrap();
+            assert!(q.reserve_at(month, LEASE).is_err());
+            assert!(Ledger::open(&path, LEASE * 2, false).is_err());
         }
         {
-            let mut q = Quota::open(&path, LEASE * 2, false).unwrap();
-            assert!(q.reserve_at(month).is_err());
-            assert!(q.reserve_at(month - 1).is_err());
-            q.reserve_at(month + 1).unwrap();
-            q.reserve_at(month).unwrap();
-            assert!(q.reserve_at(month + 1).is_err());
+            let mut q = Ledger::open(&path, LEASE * 2, false).unwrap();
+            assert!(q.reserve_at(month, LEASE).is_err());
+            assert!(q.reserve_at(month - 1, LEASE).is_err());
+            q.reserve_at(month + 1, LEASE).unwrap();
+            q.reserve_at(month, LEASE).unwrap();
+            assert!(q.reserve_at(month + 1, LEASE).is_err());
         }
-        assert!(Quota::open(&path, LEASE * 2, true).is_err());
+        assert!(Ledger::open(&path, LEASE * 2, true).is_err());
         std::fs::write(&path, b"torn").unwrap();
-        assert!(Quota::open(&path, LEASE * 2, false).is_err());
+        assert!(Ledger::open(&path, LEASE * 2, false).is_err());
         std::fs::remove_file(path).unwrap();
     }
     #[test]
     fn failed_persistence_is_sticky() {
         let path = path();
-        let mut q = Quota::open(&path, LEASE * 2, true).unwrap();
+        let mut q = Ledger::open(&path, LEASE * 2, true).unwrap();
         q.file = File::open(&path).unwrap();
-        assert!(q.reserve_at(q.month).is_err());
+        assert!(q.reserve_at(q.month, LEASE).is_err());
         assert!(q.failed);
-        assert!(q.reserve_at(q.month + 1).is_err());
+        assert!(q.reserve_at(q.month + 1, LEASE).is_err());
         drop(q);
         std::fs::remove_file(path).unwrap();
     }
+    fn controlled_quota(
+        month: u64,
+        available: u64,
+    ) -> (Quota, Receiver<u64>, SyncSender<io::Result<Reservation>>) {
+        let (requests, incoming) = mpsc::sync_channel(1);
+        let (replies, completed) = mpsc::sync_channel(1);
+        (
+            Quota {
+                requests: Some(requests),
+                replies: completed,
+                worker: None,
+                month,
+                reserved: available,
+                available,
+                pending: false,
+                exhausted: false,
+                failed: false,
+            },
+            incoming,
+            replies,
+        )
+    }
     #[test]
-    fn month_rollover_invalidates_live_socket_credit() {
-        let path = path();
-        let mut quota = Quota::open(&path, LEASE * 2, true).unwrap();
-        let now = quota.month;
-        quota.month = now - 1;
-        quota.reserved = LEASE;
-        quota.persist().unwrap();
+    fn pending_reservations_do_not_block_or_lend_uncommitted_bytes() {
+        let month = month_now().unwrap();
+        let (mut quota, requests, replies) = controlled_quota(month, 0);
+        let mut credit = 0;
+        let mut epoch = 0;
+        assert_eq!(
+            quota.credit(&mut credit, &mut epoch).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        requests.try_recv().unwrap();
+        assert_eq!(credit, 0);
+        assert_eq!(quota.reserved(), 0);
+        let mut existing = LEASE;
+        let mut existing_epoch = month;
+        quota.credit(&mut existing, &mut existing_epoch).unwrap();
+        assert_eq!(existing, LEASE);
+        assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+        replies
+            .send(Ok(Reservation::Credit {
+                month,
+                reserved: BATCH,
+                bytes: BATCH,
+            }))
+            .unwrap();
+        quota.credit(&mut credit, &mut epoch).unwrap();
+        assert_eq!(credit, LEASE);
+        assert_eq!(epoch, month);
+        assert_eq!(quota.reserved(), BATCH);
+        assert_eq!(quota.available, BATCH - LEASE);
+    }
+    #[test]
+    fn exhaustion_preserves_existing_credit_and_persistence_failure_is_sticky() {
+        let month = month_now().unwrap();
+        let (mut quota, requests, replies) = controlled_quota(month, LEASE);
+        let mut credit = 0;
+        let mut epoch = 0;
+        quota.credit(&mut credit, &mut epoch).unwrap();
+        requests.try_recv().unwrap();
+        replies.send(Ok(Reservation::Exhausted { month })).unwrap();
+        quota.credit(&mut credit, &mut epoch).unwrap();
+        assert_eq!(credit, LEASE);
+        let mut empty_credit = 0;
+        let mut empty_epoch = 0;
+        assert_eq!(
+            quota
+                .credit(&mut empty_credit, &mut empty_epoch)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let (mut quota, requests, replies) = controlled_quota(month, 0);
+        assert!(quota.credit(&mut empty_credit, &mut empty_epoch).is_err());
+        requests.try_recv().unwrap();
+        replies
+            .send(Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "disk failed",
+            )))
+            .unwrap();
+        assert!(quota.check().is_err());
+        assert!(quota.credit(&mut empty_credit, &mut empty_epoch).is_err());
+        assert!(quota.failed);
+    }
+    #[test]
+    fn month_rollover_invalidates_live_socket_and_pooled_credit() {
+        let now = month_now().unwrap();
+        let (mut quota, requests, replies) = controlled_quota(now - 1, LEASE);
+        quota.exhausted = true;
         let mut credit = LEASE - 1;
         let mut epoch = now - 1;
+        assert_eq!(
+            quota.credit(&mut credit, &mut epoch).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(credit, 0);
+        assert_eq!(quota.available, 0);
+        requests.try_recv().unwrap();
+        replies
+            .send(Ok(Reservation::Credit {
+                month: now,
+                reserved: LEASE,
+                bytes: LEASE,
+            }))
+            .unwrap();
         quota.credit(&mut credit, &mut epoch).unwrap();
         assert_eq!(epoch, now);
         assert_eq!(credit, LEASE);
-        assert_eq!(quota.reserved, LEASE);
-        drop(quota);
+        assert_eq!(quota.reserved(), LEASE);
+    }
+    #[test]
+    fn late_completions_cannot_reopen_an_old_month_or_exhaust_a_new_one() {
+        let month = month_now().unwrap();
+        for completion in [
+            Reservation::Credit {
+                month,
+                reserved: LEASE,
+                bytes: LEASE,
+            },
+            Reservation::Exhausted { month },
+        ] {
+            let (mut quota, requests, replies) = controlled_quota(month, 0);
+            let mut credit = 0;
+            let mut epoch = 0;
+            assert!(quota.credit(&mut credit, &mut epoch).is_err());
+            assert_eq!(requests.try_recv().unwrap(), month);
+            // The network loop observed the next month while persistence was
+            // pending, followed by a backwards clock adjustment.
+            quota.month = month + 1;
+            replies.send(Ok(completion)).unwrap();
+            assert_eq!(
+                quota.credit(&mut credit, &mut epoch).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(credit, 0);
+            assert_eq!(quota.available, 0);
+            assert!(!quota.exhausted);
+            assert_eq!(requests.try_recv().unwrap(), month + 1);
+        }
+    }
+    #[test]
+    fn reservations_batch_without_crossing_the_budget() {
+        let path = path();
+        let budget = BATCH + LEASE + 17;
+        let mut ledger = Ledger::open(&path, budget, true).unwrap();
+        assert!(matches!(
+            ledger.reserve(ledger.month).unwrap(),
+            Reservation::Credit { bytes: BATCH, .. }
+        ));
+        assert!(matches!(
+            ledger.reserve(ledger.month).unwrap(),
+            Reservation::Credit { bytes: LEASE, .. }
+        ));
+        assert!(matches!(
+            ledger.reserve(ledger.month).unwrap(),
+            Reservation::Exhausted { .. }
+        ));
+        drop(ledger);
+        assert_eq!(
+            Ledger::open(&path, budget, false).unwrap().reserved,
+            BATCH + LEASE
+        );
         std::fs::remove_file(path).unwrap();
     }
 }
