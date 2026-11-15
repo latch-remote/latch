@@ -1763,6 +1763,44 @@ fn play_mic(session: &Session, packet: Option<&latch_proto::wire::AudioPacket<'_
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CursorWireState {
+    visible: bool,
+    serial: u32,
+}
+/// Latest cursor state with pending shapes retained across coalesced moves.
+/// The capture worker never waits for a socket write or an encoded picture.
+#[derive(Default)]
+struct CursorMailbox {
+    pending: Mutex<Option<control::Cursor>>,
+    ready: Condvar,
+    last: Mutex<Option<CursorWireState>>,
+}
+impl CursorMailbox {
+    fn publish(&self, mut cursor: control::Cursor) {
+        let mut last = self.last.lock();
+        // Compare the shared wire state by serial without retaining pixels.
+        let serial = cursor.shape.as_ref().map_or_else(
+            || last.as_ref().map_or(0, |state| state.serial),
+            |shape| shape.serial,
+        );
+        let state = CursorWireState {
+            visible: cursor.visible,
+            serial,
+        };
+        if *last == Some(state) {
+            return;
+        }
+        *last = Some(state);
+        let mut pending = self.pending.lock();
+        if cursor.shape.is_none() {
+            cursor.shape = pending.as_mut().and_then(|old| old.shape.take());
+        }
+        *pending = Some(cursor);
+        self.ready.notify_one();
+    }
+}
+
 fn send_video(
     server: &Server,
     session: &Session,
@@ -1770,10 +1808,40 @@ fn send_video(
     config: VideoConfig,
     mut reopen: impl FnMut(&VideoConfig) -> anyhow::Result<Box<dyn VideoPipeline>>,
 ) {
+    let mailbox = Arc::new(CursorMailbox::default());
+    let done = AtomicBool::new(false);
     std::thread::scope(|scope| {
+        let sink: video::CursorSink = {
+            let mailbox = mailbox.clone();
+            Arc::new(move |cursor| mailbox.publish(cursor))
+        };
+        let mailbox = &mailbox;
+        let done = &done;
+        if session.cursor_supported {
+            scope.spawn(move || {
+                while !done.load(Ordering::Acquire) && !session.stopping() {
+                    let mut pending = mailbox.pending.lock();
+                    if pending.is_none() {
+                        mailbox
+                            .ready
+                            .wait_for(&mut pending, Duration::from_millis(100));
+                    }
+                    let cursor = pending.take();
+                    drop(pending);
+                    if let Some(cursor) = cursor {
+                        if !session.send_control(&Message::Cursor(cursor)) {
+                            session.end(end::TRANSPORT_FAILED, "Cursor control connection failed.");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
         let (tx, rx) = mpsc::sync_channel(2);
         scope.spawn(move || paced_video(server, session, rx));
-        encode_video(server, session, pipeline, config, &mut reopen, tx);
+        encode_video(server, session, pipeline, config, &mut reopen, tx, sink);
+        done.store(true, Ordering::Release);
+        mailbox.ready.notify_one();
     });
 }
 
@@ -1789,8 +1857,12 @@ fn encode_video(
     mut config: VideoConfig,
     mut reopen: impl FnMut(&VideoConfig) -> anyhow::Result<Box<dyn VideoPipeline>>,
     tx: mpsc::SyncSender<(video::EncodedVideo, Instant)>,
+    cursor_sink: video::CursorSink,
 ) {
     crate::priority::media_thread();
+    if session.cursor_supported {
+        pipeline.set_cursor_sink(cursor_sink.clone());
+    }
     let mut generation = 0;
     let mut last_keyframe: Option<Instant> = None;
     let mut info = pipeline.info();
@@ -1880,6 +1952,9 @@ fn encode_video(
                     match reopen(&config) {
                         Ok(p) => {
                             pipeline = p;
+                            if session.cursor_supported {
+                                pipeline.set_cursor_sink(cursor_sink.clone());
+                            }
                             // Queued frames can still arrive from the old pipeline.
                             generation += 1;
                             session.recovery.sent.lock().clear();

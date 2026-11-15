@@ -8,6 +8,29 @@ GitHub release notes, so each version gets a heading of the form
 
 - Add Linux Wayland screen sharing through the desktop portal and runtime-loaded PipeWire, with linear DMA-BUF capture, shared-memory fallback, RemoteDesktop input, and persisted portal approvals in Sharing setup.
 
+### Windows streaming
+
+- Windows hosts send the pointer's shape and visibility apart from the video,
+  and a focused viewer in free-mouse mode draws the pointer itself at its own
+  mouse position, so the pointer no longer waits for a video frame, including
+  on a static desktop. Colour, monochrome and masked-colour pointers are
+  converted, with an outline where a pointer inverts what is under it.
+  Live Windows capture of the separate plane is unverified.
+- The pointer stays in the video, as in 6.0.0, when the viewer does not
+  support the separate pointer, in captured mouse mode for games, and whenever
+  Windows cannot supply a readable pointer shape. Video continues if every
+  shape read fails. If Windows never supplies a readable shape, the pointer
+  stays absent until one becomes readable.
+- While the focused viewer drives the pointer, its own position wins: when an
+  application or another mouse moves the host pointer, the drawn pointer stays
+  put until the viewer's mouse next moves. A viewer that loses focus while its
+  pointer is over the stream shows no host pointer until it is focused again.
+- Pointer shapes survive resolution changes and capture restarts, and reset
+  when the viewer reconnects or chooses another display. Windows reports the
+  display it actually captures to the display chooser, including after a
+  missing display falls back to the default.
+- Windows and Mac hosts share one pointer tracker and the same wire messages.
+
 ### Deployment
 
 - Upgrade the single Seoul relay to native TLS and HTTPS WebSocket on TCP 443,
@@ -22,6 +45,10 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Relay connectivity
 
+- Add a repeatable native TLS/WebSocket/CONNECT carrier comparison at four
+  emulated path conditions, plus a cross-platform 20-Mbps delayed-path
+  regression test. Preserve whole-run probe latency distributions and report
+  cumulative and post-warm-up payload rates.
 - Add HTTPS WebSocket relay fallback on TCP 443 alongside native
   `latch-relay/1` TLS, with shared admission, durable quotas and bounded queues.
 - Add explicit HTTP CONNECT proxies with redacted Basic credentials and a
@@ -65,6 +92,27 @@ GitHub release notes, so each version gets a heading of the form
 - Add runtime-loaded Linux VA-API H.264 and HEVC/Main10 viewer decoding,
   profile and resolution probing, EGL DMA-BUF presentation with readback
   fallback, and automatic software recovery after hardware failures.
+
+### Mac hosts
+
+- Send system cursor shapes and visibility through the existing local cursor
+  plane when the viewer negotiates it. ScreenCaptureKit omits the pointer in
+  free mouse mode and restores composition for captured mode, hidden/off-display
+  readings and older viewers. Return after 1 s of stable visible/on-display
+  readings and at least 3 s in composition, bounding switches to two per 3 s.
+  Latch unreadable shapes, stale/stalled sampling and configuration failures
+  until capture restarts. Retry failed configuration at most once per 3 s.
+  Check shapes at most 30 Hz, skip bitmap copying for reused immutable CGImages,
+  and cache rasterized Retina artwork. Scale images and hotspots to the captured
+  display and encoded picture. Cross-application hide/unhide and cross-machine
+  cursor handoff remain unverified on real hardware.
+- Check virtual-HID signing and cache a single inactive capability probe
+  before advertising lazy gamepad slots. Current ad-hoc builds explain Apple's
+  virtual-HID entitlement restriction in the viewer. Add entitlement-gated
+  IOHIDUserDevice lifecycle, Xbox-style/DS4 report conversion and output-feedback handling, with tests.
+  Cancel every pad before waiting against one shared 2 s teardown deadline.
+  The entitled gamepad path, native enumeration and rumble remain unverified
+  on real hardware and blocked by signing in current ad-hoc builds.
 
 ### Testing
 

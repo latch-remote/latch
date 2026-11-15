@@ -1549,6 +1549,10 @@ impl View {
             .iter()
             .map(|t| (t.tone, t.text.clone()))
             .collect();
+        let pad_problem = env.live.session.pad_problem();
+        if !pad_problem.is_empty() && !env.live.pads.connected().is_empty() {
+            lines.push((Tone::Warning, pad_problem));
+        }
         if let Some(h) = &env.handover {
             lines.push((Tone::Neutral, h.clone()));
         }
@@ -1669,6 +1673,8 @@ impl View {
         // its pointer in the picture. The last session's reset left this
         // true, and a captured reconnect would then never ask for it.
         self.host_cursor_drawn = false;
+        // Shape serials belong to the host session. A reconnect may reuse one.
+        self.cursor_texture = None;
         live.session.set_volume(if self.muted {
             0.0
         } else {
@@ -1730,6 +1736,118 @@ impl View {
         );
         if let Some(gate) = gate {
             self.early.arm(gate.with(Rc::new(live.input.clone())));
+        }
+    }
+
+    fn paint_cursor(
+        &mut self,
+        link: &Link<'_, impl Sink + ?Sized>,
+        pointer: Option<Pos2>,
+        focused: bool,
+        over_stream: bool,
+    ) {
+        let Link {
+            ctx,
+            live,
+            video,
+            connected,
+            ..
+        } = *link;
+        let cursor = live.session.cursor();
+        let Some(host_should_draw) = host_cursor_drawn(self.captured, focused, over_stream) else {
+            return;
+        };
+        if live.session.cursor_supported()
+            && connected
+            && self.host_cursor_drawn != host_should_draw
+        {
+            self.host_cursor_drawn = host_should_draw;
+            live.session.draw_cursor(host_should_draw);
+        }
+        if local_cursor_hidden(focused, over_stream, self.captured, connected) {
+            ctx.set_cursor_icon(CursorIcon::None);
+        }
+        let stats = live.session.stats();
+        let size = if stats.width > 0 && stats.height > 0 {
+            (stats.width, stats.height)
+        } else {
+            (live.requested.0, live.requested.1)
+        };
+        self.paint_cursor_image(
+            ctx,
+            cursor.filter(|_| connected),
+            pointer,
+            focused,
+            over_stream,
+            video,
+            size,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_cursor_image(
+        &mut self,
+        ctx: &egui::Context,
+        cursor: Option<latch_stream::session::CursorState>,
+        pointer: Option<Pos2>,
+        focused: bool,
+        over_stream: bool,
+        video: Rect,
+        size: (u32, u32),
+    ) {
+        if self.captured {
+            return;
+        }
+        let Some(cursor) = cursor.filter(|state| state.visible) else {
+            return;
+        };
+        let Some(pos) = cursor_pointer(pointer, focused, over_stream, video, size) else {
+            return;
+        };
+        let Some(shape) = cursor.shape else {
+            return;
+        };
+        let texture = match &self.cursor_texture {
+            Some((serial, handle)) if *serial == shape.serial => Some(handle.clone()),
+            _ => {
+                if let Ok(rgba) = latch_proto::base64::decode(&shape.rgba) {
+                    if rgba.len() == (shape.width as usize) * (shape.height as usize) * 4 {
+                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                            [shape.width as usize, shape.height as usize],
+                            &rgba,
+                        );
+                        let handle =
+                            ctx.load_texture("host-cursor", image, egui::TextureOptions::LINEAR);
+                        self.cursor_texture = Some((shape.serial, handle.clone()));
+                        Some(handle)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(texture) = texture {
+            let rect = host_cursor_rect(
+                pos,
+                video,
+                size.0,
+                shape.hot_x,
+                shape.hot_y,
+                shape.width,
+                shape.height,
+            );
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Middle,
+                egui::Id::new(video::PAINTED_OVERLAYS[1]),
+            ));
+            painter.image(
+                texture.id(),
+                rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
         }
     }
 
@@ -1891,83 +2009,7 @@ impl View {
             self.held.release_all(out);
         }
 
-        if live.session.cursor_supported() && connected {
-            let host_should_draw = self.captured || !over_stream;
-            if self.host_cursor_drawn != host_should_draw {
-                self.host_cursor_drawn = host_should_draw;
-                live.session.draw_cursor(host_should_draw);
-            }
-        }
-
-        if (over_stream || self.captured) && connected {
-            ctx.set_cursor_icon(CursorIcon::None);
-        }
-
-        if live.session.cursor_supported() && !self.captured && over_stream && connected {
-            if let Some(pos) = pointer {
-                if let Some(cursor_state) = live.session.cursor() {
-                    if cursor_state.visible {
-                        if let Some(shape) = cursor_state.shape {
-                            let texture = match &self.cursor_texture {
-                                Some((s, h)) if *s == shape.serial => Some(h.clone()),
-                                _ => {
-                                    if let Ok(rgba) = latch_proto::base64::decode(&shape.rgba) {
-                                        if rgba.len()
-                                            == (shape.width as usize) * (shape.height as usize) * 4
-                                        {
-                                            let img = egui::ColorImage::from_rgba_unmultiplied(
-                                                [shape.width as usize, shape.height as usize],
-                                                &rgba,
-                                            );
-                                            let handle = ctx.load_texture(
-                                                "host-cursor",
-                                                img,
-                                                egui::TextureOptions::LINEAR,
-                                            );
-                                            self.cursor_texture =
-                                                Some((shape.serial, handle.clone()));
-                                            Some(handle)
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                }
-                            };
-                            if let Some(tex) = texture {
-                                let stats = live.session.stats();
-                                let vw = if stats.width > 0 {
-                                    stats.width
-                                } else {
-                                    live.requested.0
-                                };
-                                let cursor_rect = host_cursor_rect(
-                                    pos,
-                                    video,
-                                    vw,
-                                    shape.hot_x,
-                                    shape.hot_y,
-                                    shape.width,
-                                    shape.height,
-                                );
-                                let painter = ctx.layer_painter(egui::LayerId::new(
-                                    egui::Order::Middle,
-                                    egui::Id::new(video::PAINTED_OVERLAYS[1]),
-                                ));
-                                painter.image(
-                                    tex.id(),
-                                    cursor_rect,
-                                    Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
-                                    Color32::WHITE,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
+        self.paint_cursor(&link, pointer, focused, over_stream);
         let at = At {
             keys_to_pc,
             over_stream,
@@ -2429,6 +2471,26 @@ pub(crate) fn wheel_to_host(unit: egui::MouseWheelUnit, delta: Vec2) -> (f32, f3
     (-delta.x * scale, delta.y * scale)
 }
 
+fn local_cursor_hidden(focused: bool, over_stream: bool, captured: bool, connected: bool) -> bool {
+    focused && (over_stream || captured) && connected
+}
+
+fn host_cursor_drawn(captured: bool, focused: bool, over_stream: bool) -> Option<bool> {
+    focused.then_some(captured || !over_stream)
+}
+
+/// Free-mouse placement uses local input, independently of video and control.
+/// Unfocused viewers keep their OS pointer and do not paint a second one.
+fn cursor_pointer(
+    local: Option<Pos2>,
+    focused: bool,
+    over_stream: bool,
+    video: Rect,
+    size: (u32, u32),
+) -> Option<Pos2> {
+    local.filter(|pos| focused && over_stream && size.0 > 0 && size.1 > 0 && video.contains(*pos))
+}
+
 /// Position and bounding rectangle for the host cursor rendered locally in free mouse mode.
 fn host_cursor_rect(
     pointer: Pos2,
@@ -2715,22 +2777,11 @@ fn question(ctx: &egui::Context, id: &str, bar: Rect, w: f32, add: impl FnOnce(&
 /// hover which, or why the host takes none.
 fn pads_tag(ui: &mut egui::Ui, live: &Live) {
     let pads = live.pads.connected();
-    if pads.is_empty() {
-        return;
-    }
     let problem = live.session.pad_problem();
+    let Some((tone, label)) = pad_tag(pads.len(), &problem, live.session.connected()) else {
+        return;
+    };
     let taken = live.input.pad_slots();
-    let tone = if !problem.is_empty() {
-        Tone::Warning
-    } else if !live.session.connected() {
-        Tone::Accent
-    } else {
-        Tone::Success
-    };
-    let label = match pads.len() {
-        1 => "1 gamepad".to_string(),
-        n => format!("{n} gamepads"),
-    };
     let mut lines: Vec<String> = pads
         .iter()
         .map(|p| {
@@ -2748,6 +2799,28 @@ fn pads_tag(ui: &mut egui::Ui, live: &Live) {
     ui::tag(ui, Some(tone), &label).on_hover_text(lines.join("\n"));
 }
 
+fn pad_tag(count: usize, problem: &str, connected: bool) -> Option<(Tone, String)> {
+    if count == 0 {
+        return None;
+    }
+    let tone = if !problem.is_empty() {
+        Tone::Warning
+    } else if !connected {
+        Tone::Accent
+    } else {
+        Tone::Success
+    };
+    let label = if !problem.is_empty() {
+        "Controllers unavailable".to_string()
+    } else {
+        match count {
+            1 => "1 gamepad".to_string(),
+            n => format!("{n} gamepads"),
+        }
+    };
+    Some((tone, label))
+}
+
 /// A short vertical hairline between groups of toolbar controls.
 fn toolbar_rule(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 16.0), egui::Sense::hover());
@@ -2760,6 +2833,31 @@ fn toolbar_rule(ui: &mut egui::Ui) {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn controller_warning_tracks_connections_and_accepts_old_host_reasons() {
+        use super::*;
+        for problem in [
+            "Mac host controllers unavailable. Apple requires entitlement com.apple.developer.hid.virtual.device",
+            "the ViGEmBus gamepad driver is not installed",
+            "/dev/uinput is missing (the uinput kernel module is not loaded)",
+            "the host takes no gamepads", // Older Accept without gamepad_problem.
+        ] {
+            assert!(pad_tag(0, problem, true).is_none());
+            let (tone, label) = pad_tag(1, problem, true).unwrap();
+            assert_eq!(tone, Tone::Warning);
+            assert_eq!(label, "Controllers unavailable");
+            assert!(pad_tag(0, problem, true).is_none());
+        }
+        assert_eq!(
+            pad_tag(1, "", true),
+            Some((Tone::Success, "1 gamepad".into()))
+        );
+        assert_eq!(
+            pad_tag(2, "", false),
+            Some((Tone::Accent, "2 gamepads".into()))
+        );
+        assert!(pad_tag(0, "", true).is_none());
+    }
     pub fn hold_test_key(view: &mut super::View, input: &latch_stream::Input) {
         view.held.key(input, 0x41, true);
         assert!(view.held.any_down());
@@ -2803,6 +2901,207 @@ pub(crate) mod tests {
             .iter()
             .position(|c| matches!(c, ViewportCommand::CursorGrab(_)));
         assert!(warp.is_some() && warp < grab, "{off:?}");
+    }
+
+    #[test]
+    fn free_cursor_drawing_rule_covers_focus_and_local_pointer() {
+        let video = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(960.0, 540.0));
+        // All host platforms use these same local placements, even while
+        // video is blocked and the host has sent no new control updates.
+        for local in [None, Some(Pos2::new(111.0, 222.0)), Some(video.center())] {
+            for focused in [false, true] {
+                for inside in [false, true] {
+                    let expected = local.filter(|_| focused && inside);
+                    assert_eq!(
+                        cursor_pointer(local, focused, inside, video, (1920, 1080)),
+                        expected
+                    );
+                    assert_eq!(
+                        host_cursor_drawn(false, focused, inside),
+                        focused.then_some(!inside)
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn no_position_hosts_keep_main_cursor_controls_byte_for_byte() {
+        use latch_proto::control::{self, DrawCursor, Message};
+        for focused in [false, true] {
+            for inside in [false, true] {
+                for captured in [false, true] {
+                    for was_drawn in [false, true] {
+                        let mut actual = Vec::new();
+                        let mut main = Vec::new();
+                        if let Some(draw) = host_cursor_drawn(captured, focused, inside) {
+                            if draw != was_drawn {
+                                control::write_message(
+                                    &mut actual,
+                                    &Message::DrawCursor(DrawCursor { draw }),
+                                )
+                                .unwrap();
+                            }
+                        }
+                        // Main returns on focus loss before it handles cursors.
+                        // Its focused path uses this exact draw condition.
+                        let draw = captured || !inside;
+                        if focused && draw != was_drawn {
+                            control::write_message(
+                                &mut main,
+                                &Message::DrawCursor(DrawCursor { draw }),
+                            )
+                            .unwrap();
+                        }
+                        assert_eq!(actual, main);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_waits_for_geometry_and_uses_local_motion_without_video_updates() {
+        let video = Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 540.0));
+        for size in [(0, 0), (1920, 0), (0, 1080)] {
+            assert_eq!(
+                cursor_pointer(Some(video.center()), true, true, video, size),
+                None
+            );
+        }
+        for local in [video.min, video.center(), Pos2::new(900.0, 500.0)] {
+            assert_eq!(
+                cursor_pointer(Some(local), true, true, video, (1920, 1080)),
+                Some(local)
+            );
+        }
+    }
+    #[test]
+    fn viewer_paints_one_cursor_across_host_and_viewer_states() {
+        use latch_stream::session::CursorState;
+        use std::sync::Arc;
+        let video = Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 540.0));
+        for focused in [false, true] {
+            for size in [(1920, 1080), (960, 540)] {
+                for inside in [false, true] {
+                    for captured in [false, true] {
+                        // Hidden, host-composited/embedded, and separately visible.
+                        for host_state in ["hidden", "composited", "plane"] {
+                            let host_draws = host_state == "composited";
+                            let plane_visible = host_state == "plane";
+                            let local = inside.then_some(Pos2::new(100.0, 200.0));
+                            let shape =
+                                latch_proto::control::CursorShape::new(1, 2, 2, 0, 0, &[255; 16]);
+                            let cursor = CursorState {
+                                visible: plane_visible,
+                                shape: Some(Arc::new(shape)),
+                            };
+                            let ctx = egui::Context::default();
+                            let mut view = View {
+                                captured,
+                                ..Default::default()
+                            };
+                            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                                view.paint_cursor_image(
+                                    ctx,
+                                    Some(cursor.clone()),
+                                    local,
+                                    focused,
+                                    inside,
+                                    video,
+                                    size,
+                                );
+                            });
+                            let meshes: Vec<_> = output
+                                .shapes
+                                .iter()
+                                .filter_map(|shape| {
+                                    if let egui::Shape::Mesh(mesh) = &shape.shape {
+                                        Some(mesh)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            let viewer_should_draw =
+                                plane_visible && !captured && focused && inside;
+                            assert_eq!(meshes.len(), usize::from(viewer_should_draw),
+                                "focused={focused}, size={size:?}, inside={inside}, captured={captured}, host={host_state}");
+                            assert!(meshes.is_empty() || !host_draws);
+                            if let Some(mesh) = meshes.first() {
+                                let expected = local.unwrap();
+                                assert_eq!(mesh.calc_bounds().min, expected);
+                            }
+                            // In the steady separate-plane state, exactly one
+                            // of the viewer plane and local OS arrow is visible
+                            // over the stream. Captured/outside focused states
+                            // ask the host for composition instead.
+                            let request = host_cursor_drawn(captured, focused, inside);
+                            if plane_visible && request == Some(false) {
+                                let local_arrow =
+                                    inside && !local_cursor_hidden(focused, inside, captured, true);
+                                assert_eq!(meshes.len() + usize::from(local_arrow), 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn viewer_cursor_requires_decodable_shape_and_valid_geometry() {
+        use latch_stream::session::CursorState;
+        use std::sync::Arc;
+        let video = Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 540.0));
+        for invalid in [
+            "base64",
+            "length",
+            "missing",
+            "geometry",
+            "off-output",
+            "disconnected",
+        ] {
+            let mut shape = latch_proto::control::CursorShape::new(1, 2, 2, 0, 0, &[255; 16]);
+            if invalid == "base64" {
+                shape.rgba = "?".into();
+            }
+            if invalid == "length" {
+                shape.rgba.clear();
+            }
+            let cursor = CursorState {
+                visible: true,
+                shape: (invalid != "missing").then(|| Arc::new(shape)),
+            };
+            let size = if invalid == "geometry" {
+                (0, 0)
+            } else {
+                (1920, 1080)
+            };
+            let ctx = egui::Context::default();
+            let mut view = View::default();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                view.paint_cursor_image(
+                    ctx,
+                    (invalid != "disconnected").then_some(cursor.clone()),
+                    Some(if invalid == "off-output" {
+                        Pos2::new(961.0, 541.0)
+                    } else {
+                        video.center()
+                    }),
+                    true,
+                    true,
+                    video,
+                    size,
+                );
+            });
+            assert!(
+                !output
+                    .shapes
+                    .iter()
+                    .any(|shape| matches!(&shape.shape, egui::Shape::Mesh(_))),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
@@ -5503,17 +5802,29 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn each_session_starts_with_the_host_pointer_off() {
+    fn each_session_resets_host_pointer_and_cached_cursor_texture() {
         // The last session's reset leaves the host drawing; a new session
         // starts with it off, so a captured reconnect must ask again.
         let ctx = egui::Context::default();
         let live = dummy_live(&ctx);
         let mut view = View {
             host_cursor_drawn: true,
+            cursor_texture: Some((
+                1,
+                ctx.load_texture(
+                    "old-host-cursor",
+                    egui::ColorImage::new([1, 1], Color32::RED),
+                    egui::TextureOptions::LINEAR,
+                ),
+            )),
             ..Default::default()
         };
         view.stream_started(&ctx, &live, false);
         assert!(!view.host_cursor_drawn);
+        assert!(
+            view.cursor_texture.is_none(),
+            "a restarted host can reuse serial 1 for different pixels"
+        );
     }
 
     #[test]

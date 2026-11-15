@@ -76,7 +76,13 @@ pub struct CursorUpdate {
     pub shape: Option<latch_proto::control::CursorShape>,
 }
 
+/// A non-blocking sink for cursor updates independent of encoded frames.
+pub type CursorSink = std::sync::Arc<dyn Fn(latch_proto::control::Cursor) + Send + Sync>;
+
 pub trait VideoPipeline: Send {
+    /// Capture paths with pointer-only events publish them before encoding.
+    fn set_cursor_sink(&mut self, _sink: CursorSink) {}
+
     fn info(&self) -> VideoInfo;
 
     /// The next encoded frame: as soon as the screen changes (at most `fps`
