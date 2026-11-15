@@ -14,6 +14,17 @@ pub struct DisplayRect {
 }
 
 impl DisplayRect {
+    /// Keep a desktop position inside this display's last addressable pixel.
+    pub fn clamp(&self, x: i32, y: i32) -> (i32, i32) {
+        let axis = |p: i32, start: i32, size: u32| {
+            i64::from(p).clamp(
+                i64::from(start),
+                i64::from(start) + i64::from(size.saturating_sub(1)),
+            ) as i32
+        };
+        (axis(x, self.x, self.width), axis(y, self.y, self.height))
+    }
+
     /// The centred content rectangle when this display is fitted into a picture.
     /// Capture and injection share this rounding so bars never shift a click.
     pub fn fitted(&self, pw: u32, ph: u32) -> Self {
@@ -50,10 +61,34 @@ pub trait InputSink: Send {
     /// Select negotiated physical positions while preserving legacy injection.
     fn set_key_positions(&mut self, _accepted: bool) {}
 
+    /// An explicit monitor choice can fill one X screen on a multi-screen host.
+    fn set_display_selected(&mut self, _selected: bool) {}
+
     /// Stream dimensions for platforms whose cursor uses logical display points.
     fn set_stream_size(&mut self, _width: u32, _height: u32) {}
 
-    /// Applies one event. `display` is where absolute positions land.
+    /// Move into a newly captured display before relative input resumes.
+    fn start_display(
+        &mut self,
+        display: DisplayRect,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<()> {
+        self.set_stream_size(width, height);
+        let width = width.clamp(1, u32::from(u16::MAX)) as u16;
+        let height = height.clamp(1, u32::from(u16::MAX)) as u16;
+        self.apply(
+            &Event::MousePosition {
+                x: width / 2,
+                y: height / 2,
+                width,
+                height,
+            },
+            display,
+        )
+    }
+
+    /// Applies one event, keeping absolute and relative positions in `display`.
     fn apply(&mut self, event: &Event, display: DisplayRect) -> anyhow::Result<()>;
 
     /// Releases every key and button this sink pressed and has not
@@ -718,6 +753,48 @@ mod mapping_tests {
     use super::*;
 
     #[test]
+    fn relative_destinations_and_absolute_bar_clicks_stay_in_the_shared_display() {
+        for display in [
+            DisplayRect {
+                x: -3840,
+                y: -2160,
+                width: 3840,
+                height: 2160,
+            },
+            DisplayRect {
+                x: 1920,
+                y: 500,
+                width: 2560,
+                height: 1440,
+            },
+            DisplayRect {
+                x: -1,
+                y: 200,
+                width: 1,
+                height: 1,
+            },
+        ] {
+            let last = (
+                display.x + display.width as i32 - 1,
+                display.y + display.height as i32 - 1,
+            );
+            let mut point = (display.x, display.y);
+            for _ in 0..3 {
+                point = display.clamp(point.0 - 32768, point.1 - 32768);
+                assert_eq!(point, (display.x, display.y));
+            }
+            for _ in 0..3 {
+                point = display.clamp(point.0 + 32767, point.1 + 32767);
+                assert_eq!(point, last);
+            }
+            assert_eq!(display.map(0, 0, 1920, 1080), (display.x, display.y));
+            assert_eq!(display.map(u16::MAX, u16::MAX, 1920, 1080), last);
+            // A local cursor moved to another monitor returns to this display.
+            assert_eq!(display.clamp(i32::MIN, i32::MAX), (display.x, last.1));
+        }
+    }
+
+    #[test]
     fn aspect_fit_and_bar_clicks() {
         let display = DisplayRect {
             x: -1512,
@@ -750,5 +827,76 @@ mod mapping_tests {
         assert_eq!(display.map(960, 600, 1920, 1200), (990, 440));
         assert_eq!(display.map(0, 0, 0, 0), (30, -100));
         assert_eq!(DisplayRect::default().map(u16::MAX, u16::MAX, 0, 0), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod display_start_tests {
+    use super::*;
+
+    #[test]
+    fn starting_another_display_places_relative_input_inside_its_picture() {
+        #[derive(Default)]
+        struct Pointer {
+            point: (i32, i32),
+            size: (u32, u32),
+        }
+        impl InputSink for Pointer {
+            fn set_stream_size(&mut self, width: u32, height: u32) {
+                self.size = (width, height);
+            }
+            fn apply(&mut self, event: &Event, display: DisplayRect) -> anyhow::Result<()> {
+                match *event {
+                    Event::MousePosition {
+                        x,
+                        y,
+                        width,
+                        height,
+                    } => self.point = display.map(x, y, width, height),
+                    Event::MouseMove { dx, dy } => {
+                        self.point.0 += i32::from(dx);
+                        self.point.1 += i32::from(dy);
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+            fn release_all(&mut self) {}
+        }
+        let mut pointer = Pointer::default();
+        for display in [
+            DisplayRect {
+                x: 1920,
+                y: -200,
+                width: 1920,
+                height: 1080,
+            },
+            DisplayRect {
+                x: -2560,
+                y: 500,
+                width: 2560,
+                height: 1440,
+            },
+        ] {
+            pointer.start_display(display, 1280, 720).unwrap();
+            assert_eq!(pointer.size, (1280, 720));
+            assert_eq!(
+                pointer.point,
+                (
+                    display.x + display.width as i32 / 2,
+                    display.y + display.height as i32 / 2
+                )
+            );
+            pointer
+                .apply(&Event::MouseMove { dx: 5, dy: -3 }, display)
+                .unwrap();
+            assert_eq!(
+                pointer.point,
+                (
+                    display.x + display.width as i32 / 2 + 5,
+                    display.y + display.height as i32 / 2 - 3
+                )
+            );
+        }
     }
 }

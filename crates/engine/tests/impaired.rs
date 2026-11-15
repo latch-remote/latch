@@ -108,6 +108,7 @@ fn session() -> Option<String> {
             cursor: false,
             gamepads: false,
             mic: false,
+            display: None,
         },
         frames.clone(),
         tx,

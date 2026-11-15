@@ -297,6 +297,7 @@ pub(super) fn simulate(
         bitrate_kbps: env("LATCH_VT_SIM_KBPS", 3000),
         codec,
         color: Default::default(),
+        display: None,
     };
     let mut encoder = Encoder::open(&config, true, Depth::Eight, true).unwrap();
     if !encoder.recovers() {
@@ -443,6 +444,7 @@ fn a_low_latency_session_that_misses_its_pace_reopens_ordinary() {
         bitrate_kbps: 3000,
         codec: Codec::Hevc,
         color: Default::default(),
+        display: None,
     };
     let mut encoder = Encoder::open(&config, true, Depth::Eight, true).unwrap();
     if !encoder.low_latency() {
@@ -497,6 +499,7 @@ fn h264_3024x1964_low_latency_failure_stays_in_hardware() {
         bitrate_kbps: 100_000,
         codec: Codec::H264High,
         color: Default::default(),
+        display: None,
     };
     let mut encoder = Encoder::open(&config, true, Depth::Eight, true).unwrap();
     let (w, h) = (width as usize, height as usize);
@@ -570,6 +573,7 @@ fn a_session_that_gives_nothing_back_is_replaced_without_waiting() {
         bitrate_kbps: 3000,
         codec: Codec::Hevc,
         color: Default::default(),
+        display: None,
     };
     let mut encoder = Encoder::open(&config, true, Depth::Eight, true).unwrap();
     let pool = pool();

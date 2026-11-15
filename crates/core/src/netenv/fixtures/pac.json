@@ -1,0 +1,8 @@
+[
+ ["PROXY first.test:8080; PROXY second.test:3128; DIRECT",["http://first.test:8080","http://second.test:3128","direct"],0],
+ ["SOCKS5 socks.test:1080; HTTPS tls.test:443; DIRECT",["direct"],2],
+ ["HTTP [2001:db8::1]:8080; DIRECT",["http://[2001:db8::1]:8080","direct"],0],
+ ["PROXY invalid:bad; nonsense",[],2],
+ [" direct ; proxy proxy.test:80 ; ",["direct","http://proxy.test:80"],0],
+ ["",[],0]
+]

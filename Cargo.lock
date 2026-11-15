@@ -2102,6 +2102,7 @@ dependencies = [
  "image",
  "latch-proto",
  "libc",
+ "percent-encoding",
  "rustls",
  "rustls-graviola",
  "semver",
@@ -2111,7 +2112,9 @@ dependencies = [
  "socket2",
  "toml 0.8.23",
  "tracing",
+ "url",
  "webpki-roots",
+ "windows 0.58.0",
  "windows-sys 0.61.2",
 ]
 

@@ -1,6 +1,9 @@
-//! The desktop's size, for a host whose desktop follows its viewer (a
-//! headless Linux X server, Windows' virtual display): set it to the
-//! viewer's size for a session and put it back afterwards.
+//! The host's displays: which ones a viewer can choose to share
+//! ([`list`]), and the desktop's size, for a host whose desktop follows its
+//! viewer (a headless Linux X server, Windows' virtual display): set it to
+//! the viewer's size for a session and put it back afterwards.
+
+pub use latch_proto::control::HostDisplay;
 
 /// What [`restore`] needs.
 #[derive(Debug, Clone, PartialEq)]
@@ -10,17 +13,37 @@ pub struct Previous {
     pub refresh_hz: u32,
 }
 
-/// Sets the captured display to `width × height` at `fps` Hz or the
-/// nearest rate it offers. `Ok(None)` when this host does not resize (a
-/// Mac, a PC with a real monitor) or already has that size.
-pub fn prepare(width: u32, height: u32, fps: u32) -> anyhow::Result<Option<Previous>> {
+/// The displays this host can share, each with the id a stream request
+/// names it by. At most one is the `default`, which a request naming no
+/// display (or one that has gone) shares; on Linux none is, and such a
+/// request shares the whole X screen.
+pub fn list() -> anyhow::Result<Vec<HostDisplay>> {
     #[cfg(target_os = "linux")]
-    return crate::linux::prepare_display(width, height, fps);
+    return crate::linux::displays();
     #[cfg(windows)]
-    return crate::windows::prepare_display(width, height, fps);
+    return crate::windows::displays();
+    #[cfg(target_os = "macos")]
+    return Ok(crate::mac::displays());
+}
+
+/// Sets the captured display to `width × height` at `fps` Hz or the
+/// nearest rate it offers. `display` is the one the viewer chose, as
+/// [`list`] names it. `Ok(None)` when this host does not resize (a Mac, a
+/// PC with a real monitor, a chosen display that is not the one it would
+/// resize) or already has that size.
+pub fn prepare(
+    width: u32,
+    height: u32,
+    fps: u32,
+    display: Option<&str>,
+) -> anyhow::Result<Option<Previous>> {
+    #[cfg(target_os = "linux")]
+    return crate::linux::prepare_display(width, height, fps, display);
+    #[cfg(windows)]
+    return crate::windows::prepare_display(width, height, fps, display);
     #[cfg(target_os = "macos")]
     {
-        let _ = (width, height, fps);
+        let _ = (width, height, fps, display);
         Ok(None)
     }
 }
@@ -34,5 +57,26 @@ pub fn restore(previous: &Previous) -> anyhow::Result<()> {
     {
         let _ = previous;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Whatever this machine has (a CI runner may have none it can read),
+    /// the list is well formed: unique ids, at most one default.
+    #[test]
+    fn the_list_names_each_display_once_and_has_at_most_one_default() {
+        let Ok(displays) = super::list() else {
+            return;
+        };
+        eprintln!("{displays:#?}");
+        let mut ids: Vec<_> = displays.iter().map(|d| d.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), displays.len(), "ids are unique");
+        assert!(displays.iter().filter(|d| d.default).count() <= 1);
+        assert!(displays
+            .iter()
+            .all(|d| !d.id.is_empty() && !d.name.is_empty()));
     }
 }

@@ -118,6 +118,38 @@ Ctrl+Alt releases the mouse. Windows secure attention cannot be synthesized
 by SendInput or the elevated helper. It requires local trusted input or
 another OS-supported administration mechanism.
 
+## Choosing a display
+
+A machine with more than one display shares the one it picks: a Windows
+PC its virtual display (or else its main monitor), a Mac its main display
+(or the one named in `LATCH_MAC_DISPLAY`), a Linux machine its whole X
+screen, every monitor together. To share another, open the machine's
+more menu (**⋯**) in **Machines** and pick it under **Display to share** before
+you connect, or pick it in the stream toolbar's PC (or Mac, or Machine)
+menu while you watch; the stream starts again on it in a second or two.
+**Automatic** (**All displays** on Linux) goes back to the machine's own
+choice.
+
+The choice is remembered for that machine in `client.toml`:
+
+```toml
+# client.toml
+[displays]
+"<Tailscale node id>" = "<display id>"
+```
+
+If the display is no longer there (a monitor unplugged, a Windows display
+renumbered after a restart), the machine shares its own choice again until
+you pick another. The menu appears only when the machine lists two or more
+displays; a machine running an older Latch lists none and has no choice to
+offer.
+
+Choosing a monitor other than a Windows PC's virtual display shares it as
+it is: the virtual display is not resized and the other monitors stay on.
+On Linux one monitor of several is shared at its own size, and the
+desktop is not resized for the viewer. Clicks and the pointer land on the
+chosen display.
+
 ## Linux hardware decoding
 
 The viewer tries VA-API H.264 and HEVC decoders using the installed system
