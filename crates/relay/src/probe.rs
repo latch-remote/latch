@@ -411,6 +411,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (stream, _) = listener.accept().unwrap();
+        // Set this before the server can reset the connection. macOS refuses
+        // socket options on a connection its peer has already reset.
+        peer.set_read_timeout(Some(TIMEOUT)).unwrap();
         (stream, peer)
     }
     #[test]
@@ -437,7 +440,6 @@ mod tests {
         assert_eq!(stream.peek(&mut [0]).unwrap(), 1);
         server.accept_stream(stream, "2001:db8:9::1".parse().unwrap(), now);
         let mut reply = String::new();
-        peer.set_read_timeout(Some(TIMEOUT)).unwrap();
         peer.read_to_string(&mut reply).unwrap();
         assert!(reply.starts_with("HTTP/1.1 200"));
         assert!(reply.ends_with("proof"));
@@ -485,7 +487,6 @@ mod tests {
                 .count(),
             RESERVED_CONNECTIONS
         );
-        peer.set_read_timeout(Some(TIMEOUT)).unwrap();
         match peer.read(&mut [0]) {
             Ok(0) => {}
             Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
