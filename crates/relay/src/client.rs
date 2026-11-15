@@ -163,6 +163,7 @@ impl ClientConfig {
     pub fn with_tls_roots(mut self, roots: rustls::RootCertStore) -> io::Result<Self> {
         let replacement = Self::with_roots(self.endpoint.clone(), roots)?;
         self.tls = replacement.tls;
+        // Certificates are checked by this verifier, not by the roots inside `tls`.
         self.verifier = replacement.verifier;
         Ok(self)
     }
@@ -1708,18 +1709,19 @@ mod tests {
     }
     #[test]
     fn production_resolution_rejects_tailnet_and_private_addresses() {
-        use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName, UnixTime};
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
 
         let mut config =
             ClientConfig::production(Endpoint::new("relay.example", 443).unwrap()).unwrap();
         config.limits.max_frame_bytes = 12345;
-        let certificate =
-            CertificateDer::from_pem_slice(include_bytes!("../tests/certs/server.pem")).unwrap();
-        let name = ServerName::try_from("localhost").unwrap();
-        assert!(config
-            .verifier
-            .verify_server_cert(&certificate, &[], &name, &[], UnixTime::now())
-            .is_err());
+        assert_eq!(
+            config
+                .clone()
+                .with_tls_roots(rustls::RootCertStore::empty())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
         let mut roots = rustls::RootCertStore::empty();
         roots
             .add(CertificateDer::from_pem_slice(include_bytes!("../tests/certs/ca.pem")).unwrap())
@@ -1727,10 +1729,6 @@ mod tests {
         let config = config.with_tls_roots(roots).unwrap();
         assert!(config.public_only);
         assert_eq!(config.limits.max_frame_bytes, 12345);
-        assert!(config
-            .verifier
-            .verify_server_cert(&certificate, &[], &name, &[], UnixTime::now())
-            .is_ok());
         for address in [
             "100.64.0.1",
             "100.127.255.255",
@@ -2095,6 +2093,30 @@ mod tests {
             "2001:4860:122:344::a00:808".parse().unwrap(),
             &discovery
         ));
+    }
+    #[test]
+    fn replaced_tls_roots_also_replace_the_certificate_verifier() {
+        use rustls::pki_types::{pem::PemObject, CertificateDer, UnixTime};
+
+        let server =
+            CertificateDer::from_pem_slice(include_bytes!("../tests/certs/server.pem")).unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+        let verify = |config: &ClientConfig| {
+            config
+                .verifier
+                .verify_server_cert(&server, &[], &name, &[], UnixTime::now())
+                .is_ok()
+        };
+        let production =
+            ClientConfig::production(Endpoint::new("localhost", 443).unwrap()).unwrap();
+        assert!(!verify(&production));
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(include_bytes!("../tests/certs/ca.pem")).unwrap())
+            .unwrap();
+        let private = production.with_tls_roots(roots).unwrap();
+        assert!(private.public_only);
+        assert!(verify(&private));
     }
     #[test]
     fn cached_path_is_invalidated_when_local_route_source_changes() {
