@@ -247,7 +247,7 @@ recovery and atomically renames the new executable over the install path.
 When the service runs in `latch.service`, a transient systemd user unit keeps
 the supervisor alive across `systemctl --user restart latch.service`. An
 unsupervised service is stopped through a pinned process handle and started
-again. The new service must report the expected version continuously for 15
+again. Process handles use `pidfd_open`, requiring Linux 5.3 or later. The new service must report the expected version continuously for 15
 seconds within 60 seconds. A restart or health-check failure restores the old
 binary atomically and restarts it. Failure details are in `update.log`. If
 restoring the file itself fails, the private staging directory and recovery
