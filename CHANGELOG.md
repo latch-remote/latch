@@ -28,6 +28,13 @@ GitHub release notes, so each version gets a heading of the form
   evidence, verification scope, all six streaming directions and in-flight
   work. Correct platform and cursor claims.
 
+### Deployment
+
+- Consolidate the Seoul native TCP/TLS and Tailscale UDP peer relays on the
+  existing Lightsail instance. Add reproducible socket, queue, forwarding
+  offload, descriptor and memory tuning, with bounded before/after measurements,
+  bundle and transfer cost estimates, IPv6 findings and completed EC2 teardown.
+
 ## 6.0.0 (2026-11-14)
 
 ### Streaming and recovery

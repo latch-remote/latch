@@ -1,0 +1,6 @@
+{
+  "utc": "2026-11-15T04:29:48.178595+00:00",
+  "command": "paired_probe relay.latch.rune.foo 25 50 60 5",
+  "exit_code": 1,
+  "stderr": "paired probe failed (TimedOut): host transport closed\n"
+}

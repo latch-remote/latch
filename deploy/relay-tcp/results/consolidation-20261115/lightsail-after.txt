@@ -1,0 +1,162 @@
+Linux 7.0.0-1014-aws x86_64 GNU/Linux
+Architecture:                            x86_64
+CPU(s):                                  2
+Model name:                              Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz
+Hypervisor vendor:                       KVM
+Virtualization type:                     full
+{"crypto_cpu_features": {"aes": true, "pclmulqdq": true, "bmi1": true, "adx": true, "avx": true, "avx2": true, "asimd": false, "pmull": false, "sha2": false}}
+               total        used        free      shared  buff/cache   available
+Mem:            1905         400         368           2        1308        1505
+Swap:              0           0           0
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/root      ext4   58G  4.2G   53G   8% /
+/dev/root      ext4   58G  4.2G   53G   8% /
+NAME          SIZE TYPE FSTYPE   MOUNTPOINTS
+loop0        28.4M loop squashfs /snap/amazon-ssm-agent/13349
+loop1          74M loop squashfs /snap/core22/2987
+loop2        32.5M loop squashfs /snap/snapd/28332
+nvme0n1        60G disk          
+├─nvme0n1p1    59G part ext4     /
+├─nvme0n1p14    4M part          
+├─nvme0n1p15  106M part vfat     /boot/efi
+└─nvme0n1p16  913M part ext4     /boot
+ 04:34:44 up 18:24,  1 user,  load average: 0.09, 0.08, 0.06
+acpid.service active running
+chrony.service active running
+cron.service active running
+dbus.service active running
+getty@tty1.service active running
+irqbalance.service active running
+latch-relay.service active running
+networkd-dispatcher.service active running
+polkit.service active running
+rsyslog.service active running
+serial-getty@ttyS0.service active running
+snap.amazon-ssm-agent.amazon-ssm-agent.service active running
+snapd.service active running
+ssh.service active running
+systemd-journald.service active running
+systemd-logind.service active running
+systemd-networkd.service active running
+systemd-resolved.service active running
+systemd-udevd.service active running
+tailscaled.service active running
+unattended-upgrades.service active running
+user@1000.service active running
+    PID COMMAND         %CPU %MEM   RSS
+  12197 systemd          2.0  0.5 11504
+   6541 latch-relay      0.9  0.2  4912
+  10234 tailscaled       0.7  2.3 46008
+  12266 sshd             0.6  0.5 10548
+     16 rcu_sched        0.4  0.0     0
+      1 systemd          0.0  0.7 13988
+   8627 kworker/1:0-cgr  0.0  0.0     0
+  12114 kworker/0:0-cgr  0.0  0.0     0
+     82 jbd2/nvme0n1p1-  0.0  0.0     0
+  10584 kworker/0:1-mm_  0.0  0.0     0
+  10205 kworker/u8:3-fl  0.0  0.0     0
+   8557 kworker/u8:0-fl  0.0  0.0     0
+    540 amazon-ssm-agen  0.0  1.0 21356
+   8973 kworker/u8:2-ex  0.0  0.0     0
+    125 systemd-journal  0.0  1.0 21276
+udp UNCONN 0      0                                    0.0.0.0:41641 0.0.0.0:* users:(("tailscaled",pid=10234,fd=20))               
+udp UNCONN 0      0                                 127.0.0.54:53    0.0.0.0:* users:(("systemd-resolve",pid=326,fd=16))            
+udp UNCONN 0      0                              127.0.0.53%lo:53    0.0.0.0:* users:(("systemd-resolve",pid=326,fd=14))            
+udp UNCONN 0      0                                  127.0.0.1:323   0.0.0.0:* users:(("chronyd",pid=645,fd=5))                     
+udp UNCONN 0      0                                    0.0.0.0:443   0.0.0.0:* users:(("tailscaled",pid=10234,fd=23))               
+udp UNCONN 0      0                                    0.0.0.0:443   0.0.0.0:* users:(("tailscaled",pid=10234,fd=22))               
+udp UNCONN 0      0                                       [::]:41641    [::]:* users:(("tailscaled",pid=10234,fd=19))               
+udp UNCONN 0      0                                      [::1]:323      [::]:* users:(("chronyd",pid=645,fd=6))                     
+udp UNCONN 0      0                                       [::]:443      [::]:* users:(("tailscaled",pid=10234,fd=24))               
+udp UNCONN 0      0                                       [::]:443      [::]:* users:(("tailscaled",pid=10234,fd=25))               
+tcp LISTEN 0      4096                                 0.0.0.0:22    0.0.0.0:* users:(("sshd",pid=869,fd=3),("systemd",pid=1,fd=80))
+tcp LISTEN 0      128                                  0.0.0.0:443   0.0.0.0:* users:(("latch-relay",pid=6541,fd=4))                
+tcp LISTEN 0      4096                              127.0.0.54:53    0.0.0.0:* users:(("systemd-resolve",pid=326,fd=17))            
+tcp LISTEN 0      4096                           127.0.0.53%lo:53    0.0.0.0:* users:(("systemd-resolve",pid=326,fd=15))            
+tcp LISTEN 0      4096                                    [::]:22       [::]:* users:(("sshd",pid=869,fd=4),("systemd",pid=1,fd=81))
+established_tcp_local_port 22 1
+established_tcp_local_port 34720 1
+established_tcp_local_port 37802 1
+established_tcp_local_port 43930 1
+established_tcp_local_port 59654 1
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_available_congestion_control = reno cubic bbr
+qdisc noqueue 0: dev lo root refcnt 2 
+qdisc mq 0: dev ens5 root 
+qdisc fq 0: dev ens5 parent :2 limit 10000p flow_limit 100p buckets 1024 orphan_mask 1023 quantum 3028b initial_quantum 15140b low_rate_threshold 550Kbit refill_delay 40ms timer_slack 10us horizon 10s horizon_drop 
+qdisc fq 0: dev ens5 parent :1 limit 10000p flow_limit 100p buckets 1024 orphan_mask 1023 quantum 3028b initial_quantum 15140b low_rate_threshold 550Kbit refill_delay 40ms timer_slack 10us horizon 10s horizon_drop 
+qdisc fq 0: dev tailscale0 root refcnt 2 limit 10000p flow_limit 100p buckets 1024 orphan_mask 1023 quantum 2560b initial_quantum 12800b low_rate_threshold 550Kbit refill_delay 40ms timer_slack 10us horizon 10s horizon_drop 
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    RX:  bytes packets errors dropped  missed   mcast           
+       5942675    5726      0       0       0       0 
+    TX:  bytes packets errors dropped carrier collsns           
+       5942675    5726      0       0       0       0 
+2: ens5: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 9001 qdisc mq state UP mode DEFAULT group default qlen 1000
+    RX:  bytes packets errors dropped  missed   mcast           
+    2924319112 3397995      0       0       0       0 
+    TX:  bytes packets errors dropped carrier collsns           
+    2675049419 2942128      0       0       0       0 
+4: tailscale0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1280 qdisc fq state UNKNOWN mode DEFAULT group default qlen 500
+    link/none 
+    RX:  bytes packets errors dropped  missed   mcast           
+         14806     231      0       0       0       0 
+    TX:  bytes packets errors dropped carrier collsns           
+          9584     238      0       0       0       0 
+     bw_in_allowance_exceeded: 0
+     bw_out_allowance_exceeded: 0
+     pps_allowance_exceeded: 0
+     conntrack_allowance_exceeded: 0
+     linklocal_allowance_exceeded: 0
+1.104.7
+{"tailscale_relay_port": 443, "tailscale_wanted_running": true}
+{"tailscale_relay_metric_totals": {"magicsock_recv_data_bytes_peer_relay_ipv4": 0.0, "magicsock_recv_data_bytes_peer_relay_ipv6": 0.0, "magicsock_recv_data_peer_relay_ipv4": 0.0, "magicsock_recv_data_peer_relay_ipv6": 0.0, "magicsock_send_data_bytes_peer_relay_ipv4": 0.0, "magicsock_send_data_bytes_peer_relay_ipv6": 0.0, "magicsock_send_data_peer_relay_ipv4": 0.0, "magicsock_send_data_peer_relay_ipv6": 0.0, "magicsock_send_peer_relay": 0.0, "magicsock_send_peer_relay_error": 0.0}}
+procs -----------memory---------- ---swap-- -----io---- -system-- -------cpu-------
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st gu
+ 1  0      0 378840  85468 1255124    0    0    17    67 2517   10  0  0 99  0  0  0
+ 0  0      0 379348  85468 1255140    0    0     0     0 2583 2210  0  1 99  0  0  0
+ 0  0      0 379280  85468 1255140    0    0     0     0 2517 2099  0  0 100  0  0  0
+ 0  0      0 379280  85468 1255140    0    0     0     0 2529 2117  0  0 100  0  0  0
+ 0  0      0 379532  85468 1255140    0    0     0     0 2585 2210  1  1 99  0  0  0
+ 0  0      0 379532  85468 1255140    0    0     0     0 2516 2092  0  1 99  0  0  0
+MainPID=6541
+MemoryHigh=402653184
+MemoryMax=536870912
+LimitNOFILE=65536
+ActiveState=active
+
+MainPID=10234
+MemoryHigh=402653184
+MemoryMax=536870912
+LimitNOFILE=65536
+ActiveState=active
+0b2b3f500cf5c9a42b49fd361dc443be309b9f92b9b7049c99e41781302c02a7  /usr/local/bin/latch-relay
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+# Ceilings are per socket. TCP autotuning retains modest initial allocations.
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 131072 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_notsent_lowat = 131072
+net.ipv4.tcp_slow_start_after_idle = 0
+# About 40 MiB of entries at saturation, instead of a million-entry ceiling.
+net.netfilter.nf_conntrack_max = 131072
+generic-segmentation-offload: on
+tx-udp-segmentation: off [fixed]
+rx-gro-list: off
+rx-udp-gro-forwarding: on
+masked
+masked
+masked
+masked
+masked
+masked
+masked
+enabled
+enabled
+enabled

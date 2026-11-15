@@ -1,0 +1,3 @@
+Redacted path summary, 2026-11-15 UTC
+Mac to Windows: peer-relay 54.116.93.176:443, RTT 150, 148, 147 ms.
+Windows to Mac: peer-relay 54.116.93.176:443, RTT 142, 144, 136 ms.

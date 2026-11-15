@@ -148,6 +148,10 @@ operator can see public IP addresses, connection timing and traffic volume.
 Session media and input are end-to-end encrypted. Tailscale-authenticated
 control must remain reachable throughout the session.
 
+The same Seoul instance also runs a Tailscale UDP peer relay for the operator's
+tailnet. Deployment settings, measurements, transfer costs and IPv6 plans are
+recorded in the [relay operations guide](deploy/relay-tcp/LIGHTSAIL.md).
+
 In **Settings → Stream relay**, turn off **Recover automatically through
 the Latch relay** to opt out on the viewer. **Relay hostname** selects the
 endpoint, which must also match the host's configuration. Host changes
