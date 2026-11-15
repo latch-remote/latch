@@ -1,0 +1,79 @@
+{
+  "h": {
+    "reason": "Datagram MTU probing and fast media path policy are being implemented in the media-path-policy PR.",
+    "fix": "https://github.com/latch-remote/latch/compare/main...t3/media-path-policy",
+    "failures": [
+      "MTU_safe_UDP_recovered"
+    ],
+    "observed": "First decode 1104 ms, 29.9 decoded fps on relay, zero terminations, no recovered UDP with datagrams limited to 600 bytes.",
+    "base_revision": "bf5da0d"
+  },
+  "i": {
+    "reason": "Native TLS does not use an explicit CONNECT proxy. Relay carriers and environment wiring are pending.",
+    "fix": "https://github.com/latch-remote/latch/pull/95",
+    "failures": [
+      "first_frame_deadline",
+      "no_decoded_stall_over_5s",
+      "no_session_termination",
+      "relay_active",
+      "tail_audio_clicks",
+      "tail_decoded_fps_at_least_15",
+      "tail_input_round_trips"
+    ],
+    "observed": "No decoded frames, no relay activation, media watchdog ends the session at about 8 seconds.",
+    "base_revision": "bf5da0d",
+    "error_pattern": "no picture arrived"
+  },
+  "j": {
+    "reason": "Native latch-relay/1 ALPN is reset by the HTTPS-only inspector. HTTPS carrier wiring is pending.",
+    "fix": "https://github.com/latch-remote/latch/pull/95",
+    "failures": [
+      "first_frame_deadline",
+      "no_decoded_stall_over_5s",
+      "no_session_termination",
+      "relay_active",
+      "tail_audio_clicks",
+      "tail_decoded_fps_at_least_15",
+      "tail_input_round_trips"
+    ],
+    "observed": "No decoded frames, no relay activation, media watchdog ends the session at about 8 seconds.",
+    "base_revision": "bf5da0d",
+    "error_pattern": "no picture arrived"
+  },
+  "k": {
+    "reason": "Certificate verification rejects interception, but the viewer does not surface the certificate error.",
+    "fix": "https://github.com/latch-remote/latch/compare/main...t3/network-resilient-streaming",
+    "failures": [
+      "clear_security_error_under_8s"
+    ],
+    "observed": "No decoded frames. Viewer reports a generic first-picture timeout after 8 seconds, without the specific security diagnosis.",
+    "base_revision": "bf5da0d",
+    "error_pattern": "no picture arrived"
+  },
+  "l": {
+    "reason": "Captive-portal detection and viewer reporting are pending in environment and wiring PRs.",
+    "fix": "https://github.com/latch-remote/latch/compare/main...t3/network-environment",
+    "failures": [
+      "clear_security_error_under_8s"
+    ],
+    "observed": "No decoded frames. Viewer reports a generic first-picture timeout after 8 seconds, without the specific security diagnosis.",
+    "base_revision": "bf5da0d",
+    "error_pattern": "no picture arrived"
+  },
+  "n": {
+    "reason": "Relay-path MSS/MTU recovery and media-path wiring are pending.",
+    "fix": "https://github.com/latch-remote/latch/compare/main...t3/media-path-policy",
+    "failures": [
+      "first_frame_deadline",
+      "no_decoded_stall_over_5s",
+      "no_session_termination",
+      "relay_active",
+      "tail_audio_clicks",
+      "tail_decoded_fps_at_least_15",
+      "tail_input_round_trips"
+    ],
+    "observed": "No decoded frames, no relay activation, media watchdog ends the session at about 8 seconds.",
+    "base_revision": "bf5da0d",
+    "error_pattern": "no picture arrived"
+  }
+}

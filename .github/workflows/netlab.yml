@@ -1,0 +1,48 @@
+name: hostile networks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: netlab-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  netlab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_JOBS: 4
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Install namespace and middlebox tools
+        run: sudo bash scripts/netlab/install.sh
+      - name: Check harness
+        run: |
+          shellcheck scripts/netlab/*.sh
+          python3 -m unittest discover -s scripts/netlab -p 'test_*.py' -v
+      - name: Build real relay, host and viewer
+        run: bash scripts/netlab/build.sh
+      - name: Run isolated hostile networks
+        run: sudo --preserve-env=GITHUB_STEP_SUMMARY python3 scripts/netlab/netlab.py --jobs 2 --output "$RUNNER_TEMP/netlab"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: netlab-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/netlab/
+            !${{ runner.temp }}/netlab/**/*-key.pem
+          if-no-files-found: error
+          retention-days: 7

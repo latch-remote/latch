@@ -4,6 +4,15 @@ The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
 `## X.Y.Z (date)`.
 
+## Unreleased
+
+### Testing
+
+- Add a Linux network-namespace harness and privileged Docker runner for
+  real headless streams through blocked, lossy, proxy, TLS-inspecting,
+  captive-portal and MTU-limited networks. Record decoded video, sound,
+  input and path recovery in CI, with strict expected-failure tracking.
+
 ## 6.0.0 (2026-11-14)
 
 ### Streaming and recovery

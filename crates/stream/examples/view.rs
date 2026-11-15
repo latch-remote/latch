@@ -19,10 +19,17 @@
 //!          [--pad-kind xbox|playstation] [--pad-hz 250]
 //!          [--mute]        (play sound at zero volume)
 //!
+//! `--relay-host HOST --relay-port PORT --relay-ca PEM` selects private test PKI.
+//! `--events PATH` runs the netlab JSONL sampler and synthetic input for the whole run.
+//!
 //! With `LATCH_AUDIO_PROBE=1` against a host run with
 //! `LATCH_TEST_AUDIO=clicks`, the summary's `audio_click_ms` is how long
 //! after the host made each click it reached this machine's speaker (both
 //! wall clocks; on two machines, their offset is in it).
+
+#[path = "../../relay/examples/support/mod.rs"]
+mod measurement_relay;
+mod netlab;
 
 use latch_proto::gamepad::{button, PadKind, PadState};
 use latch_stream::{Event, Frame, FrameSlot, Session, Settings};
@@ -156,7 +163,8 @@ fn main() -> anyhow::Result<()> {
 
     let frames = Arc::new(FrameSlot::default());
     let (tx, rx) = mpsc::channel();
-    let session = Session::start(
+    let asked = Instant::now();
+    let session = Session::start_with_relay(
         latch_stream::Server {
             address: host,
             port,
@@ -183,8 +191,14 @@ fn main() -> anyhow::Result<()> {
         frames.clone(),
         tx,
         || {},
+        measurement_relay::relay(&args)?,
     );
-    let asked = Instant::now();
+    if let Some(path) = args.windows(2).find(|pair| pair[0] == "--events") {
+        if flag("--mute") {
+            session.set_volume(0.0);
+        }
+        return netlab::run(&session, &frames, &rx, asked, seconds, &path[1]);
+    }
     loop {
         match rx.recv_timeout(Duration::from_secs(20)) {
             Ok(Event::Connected) => {
