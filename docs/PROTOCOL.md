@@ -294,6 +294,36 @@ sends a parity packet with `seq = 4k`: the XOR of the four packets'
 `u16 length | payload`, each zero-padded to the longest. It rebuilds any
 one lost packet of the four.
 
+The receiver delivers intact frames immediately. When `pop` first finds a
+missing frame with later data or group parity already received, it starts a
+bounded repair wait. For each group it remembers the most recent data
+packet's arrival and zero-based position `p`. Expected parity arrival is
+`arrival + (3 - p) * spacing`. Spacing starts at `frame_samples / rate` and
+keeps the largest observed interval between forward-sequence data arrivals,
+capped at the 60 ms hard bound. Zero intervals within a capture burst
+preserve this estimate.
+Losses and silence can enlarge it conservatively. Each new data arrival
+updates its group's estimate, and spacing changes also apply to pending groups.
+
+The repair deadline is the earlier of expected parity arrival plus 20 ms
+and gap detection plus 60 ms. Once parity is present, only reordered data
+can help, so allow 20 ms from its actual arrival, within the same hard cap.
+One hard-bound timer covers a consecutive run of missing frames and resets
+when a frame is delivered. A 64-packet discontinuity still resynchronizes
+immediately. Later groups within that window allow pending parity to arrive
+until the deadline. A caller must drain `pop` on arrivals and wake at
+`next_deadline` even during silence.
+
+For steady 5 ms data at 0, 5, 10 and 15 ms, parity is due at 15 ms.
+With one data loss and lost parity, continued steady data gives deadlines
+of 35, 35, 35 and 40 ms for loss positions one through four. The fourth
+position's estimate includes the observed 10 ms interval over the loss.
+The receiver adds zero latency without loss and at most 60 ms of repair
+waiting from detection under loss. The playback queue has its separate
+120 ms cap described in [ENGINE.md](ENGINE.md#audio). Wire bytes and
+negotiation are unchanged, preserving protocol-1 and 6.0.0 interoperability
+in both directions.
+
 Each coded audio frame is at most `MAX_DATAGRAM - 18` (1 182) bytes,
 leaving room for the 16-byte audio header and the parity packet's two-byte
 length. The host picks `frame_samples` and announces it in `Accept`: 240

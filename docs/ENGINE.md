@@ -405,6 +405,22 @@ lets tests check audio bit for bit. Opus is gone.
   period holds it. WASAPI loopback runs at the endpoint's engine period
   (10 ms on most drivers, and low-latency `IAudioClient3` streams refuse
   the loopback flag), so a Windows host sends two packets every 10 ms.
+* **Repair waits for the group's parity.** Each four-packet group repairs
+  one loss. The receiver estimates when parity is due from the group's
+  observed data position and the largest forward-arrival interval, starting
+  at the negotiated packet duration and capped at 60 ms. It allows another
+  20 ms for reordering after that estimate, with a hard limit of 60 ms from
+  gap detection. Intact audio incurs zero repair delay. The 60 ms ceiling
+  is half the documented 120 ms playback-buffer cap,
+  allowing two remaining 20 ms capture intervals plus the 20 ms allowance.
+  Typical documented playback targets of 11–15 ms on a quiet path and
+  about 27 ms on the jittery simulation put repair plus buffering at
+  71–75 ms and 87 ms at this ceiling. Playback buffering retains its own
+  120 ms cap, so simultaneous maximum repair and playback buffering can
+  total 180 ms before capture, network and device-output time. Recovery
+  releases earlier as soon as parity rebuilds the frame. The host keeps
+  sending captures immediately, avoiding a pacing queue on intact audio.
+  [Deadline details](PROTOCOL.md#audio-3)
 * **Surround when both ends have it.** A viewer whose output device has
   more than two channels asks for them (`StreamRequest.audio_channels`);
   the host captures the device's own layout up to that (WASAPI channel

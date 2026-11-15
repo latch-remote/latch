@@ -428,6 +428,15 @@ fn audio_resynchronizes_across_sequence_wrap() {
             output = Some(out);
         }
         if seq == 5 {
+            // Later groups no longer expire a repairable gap immediately.
+            // Advance the injected clock to its bounded deadline, preserving
+            // the wraparound/resynchronization assertion below.
+            assert_eq!(output, None);
+            let deadline = receiver.next_deadline().unwrap();
+            assert_eq!(receiver.pop(deadline - Duration::from_nanos(1)), None);
+            while let Some(out) = receiver.pop(deadline) {
+                output = Some(out);
+            }
             assert!(matches!(output, Some(AudioOut::Frame { seq: 5, .. })));
         }
     }
