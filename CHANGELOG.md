@@ -51,6 +51,10 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Relay connectivity
 
+- Add a repeatable native TLS/WebSocket/CONNECT carrier comparison at four
+  emulated path conditions, plus a cross-platform 20-Mbps delayed-path
+  regression test. Preserve whole-run probe latency distributions and report
+  cumulative and post-warm-up payload rates.
 - Add HTTPS WebSocket relay fallback on TCP 443 alongside native
   `latch-relay/1` TLS, with shared admission, durable quotas and bounded queues.
 - Add explicit HTTP CONNECT proxies with redacted Basic credentials and a
