@@ -20,7 +20,7 @@ written in Rust.
 [Download](https://github.com/latch-remote/latch-releases/releases/latest) ·
 [Docs](docs/README.md) ·
 [Roadmap](docs/ROADMAP.md) ·
-[Source](https://github.com/latch-remote/latch)
+[Development (access required)](https://github.com/latch-remote/latch)
 
 <br>
 
@@ -198,11 +198,12 @@ has not met real hardware is listed in
 Rust stable and the platform's linker are all it takes; on Linux, also the
 `-dev` packages listed in [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Development happens in the public
-[source repository](https://github.com/latch-remote/latch). Each public release
-includes a corresponding GPL source snapshot
+Development happens in the private
+[source repository](https://github.com/latch-remote/latch), which requires
+access. Each public release includes a corresponding GPL source snapshot
 named `latch-<version>-source.tar.gz`, with build scripts and license
-notices. Download and extract that snapshot to build the released version. Downloads and the version 6 updater need no GitHub credentials.
+notices. Download and extract that snapshot to build without repository
+access. Downloads and the version 6 updater need no GitHub credentials.
 
 ```bash
 cargo run --release -p latch-host        # the app
@@ -223,6 +224,7 @@ cargo test --workspace                   # the tests
 ## Contributing
 
 Bug reports and measurements from hardware we do not have are welcome.
+Development issues and pull requests require source-repository access.
 Start with [CONTRIBUTING.md](CONTRIBUTING.md) and
 [SUPPORT.md](SUPPORT.md).
 Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).

@@ -13,8 +13,8 @@
 Latch is a volunteer project. There is no support contract and no
 guaranteed response time.
 
-Development issues and discussions are in the public source repository.
-Include versions, operating systems, the toolbar's route and
+Development issues and discussions require access to the private source
+repository. Include versions, operating systems, the toolbar's route and
 stats, and steps to reproduce when contacting a maintainer. Public releases
 and corresponding source snapshots are available without a GitHub login.
 [Releases](https://github.com/latch-remote/latch-releases/releases) ·

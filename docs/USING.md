@@ -150,8 +150,8 @@ switch and a **Check now** button.
 
 Version 6 downloads and update checks need no GitHub login. Legacy
 `github_token` and `LATCH_GITHUB_TOKEN` settings are ignored by this public
-distribution path. Development source is in the public source repository.
-Each public release also includes its corresponding source snapshot.
+distribution path. Development source requires repository access, or you
+can build the corresponding source snapshot attached to each public release.
 Hosts installed before 3.1 need a local or
 SSH installation of a current release: a Latch 5 viewer cannot stream the
 retired protocol to upgrade them. Mac builds are ad-hoc signed, so macOS may

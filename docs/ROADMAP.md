@@ -126,7 +126,7 @@ game catalogue or application launch/resume API.
 | 3.x (retired) | Embedded GameStream viewer, wake and updates |
 | 4.x (retired) | Unified sharing/viewing app and Linux deployment kits |
 | 5.x | In-process Rust engine, protocol 1, platform codecs and colour negotiation |
-| 6.x | Public native TLS relay extension and credential-free release distribution |
+| 6.x | Public native TLS relay extension, private development and public credential-free release distribution |
 
 The [changelog](../CHANGELOG.md) records individual releases.
 

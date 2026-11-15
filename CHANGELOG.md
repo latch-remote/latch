@@ -17,9 +17,11 @@ GitHub release notes, so each version gets a heading of the form
 - `install-host.ps1` creates the per-user Run key when a Windows profile
   has none, instead of failing.
 
+### Documentation
+
 - Document host and viewer support on Windows, macOS and Linux, with code
   evidence, verification scope, all six streaming directions and in-flight
-  work. Correct platform, cursor and source-access claims.
+  work. Correct platform and cursor claims.
 
 ## 6.0.0 (2026-11-14)
 

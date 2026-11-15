@@ -11,13 +11,12 @@ all on Linux, an HDR monitor), moves it further than most patches.
 - **Security problems:** privately, as [SECURITY.md](SECURITY.md) says.
 - **Code:** read on.
 
-Development issues, discussions and pull requests live in the public source
-repository. Public releases contain the corresponding GPL
+Development issues, discussions and pull requests require access to the
+private source repository. Public releases contain the corresponding GPL
 source snapshot `latch-<version>-source.tar.gz`, including build inputs and
 license notices. Private measurement dumps and account-specific deployment
-records are excluded; deployment scripts remain included. Download and
-extract that archive to build the released source snapshot. The public
-distribution repository holds releases.
+records are excluded; deployment scripts remain included. Download and extract that archive to build without source
+repository access. The public distribution repository holds releases.
 [Public releases](https://github.com/latch-remote/latch-releases/releases)
 
 Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
