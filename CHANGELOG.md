@@ -41,6 +41,13 @@ GitHub release notes, so each version gets a heading of the form
   profile and resolution probing, EGL DMA-BUF presentation with readback
   fallback, and automatic software recovery after hardware failures.
 
+### Testing
+
+- Add a Linux network-namespace harness and privileged Docker runner for
+  real headless streams through blocked, lossy, proxy, TLS-inspecting,
+  captive-portal and MTU-limited networks. Record decoded video, sound,
+  input and path recovery in CI, with strict expected-failure tracking.
+
 ### Packaging
 
 - Add a Scoop manifest, AUR packages (`latch-remote-bin` from the release
