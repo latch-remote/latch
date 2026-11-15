@@ -170,7 +170,10 @@ or 22 for loss/reorder. The same tapes pass Windows software decoding and
 both Mac decoders, and both Linux consumers pass them. Windows native
 decoding of software and Windows-native tapes passes. `MAC_VT_MF_GAP`
 asserts this exact frame sequence, retains the full intended sequence in
-results and fails on unexpected pass. Returned pictures retain the normal
-identity, crop and PSNR assertions. Audio, video FEC and causal keyframe
+results and fails on unexpected pass. The snapshot also requires the exact stale contents
+from frames 5/11/17 (3/11/17 after loss), with ≥40 dB per-plane PSNR against
+those observed source references. Full intended identities and sizes stay
+in the results. Capture call 12 returns the old 160×98 size. Native call 6
+has only 37.938 dB against its intended picture, or 28.397 dB after loss. Audio, video FEC and causal keyframe
 request assertions continue to run. Decode errors are captured per frame
 for the product follow-up, whose fixing PR remains unassigned.

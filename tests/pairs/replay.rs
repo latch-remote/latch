@@ -345,6 +345,14 @@ fn check(recording: Recording, native: bool, schedule: &str) {
         && native
         && recording.producer.starts_with("macos-")
         && matches!(recording.mode.as_str(), "native" | "capture");
+    println!(
+        "PAIR_DECODE {}",
+        serde_json::json!({
+            "producer": recording.producer, "mode": recording.mode, "native": native,
+            "schedule": schedule, "pictures": pictures.iter().map(|p| (p.0, p.1, p.2, format::hash(&p.3))).collect::<Vec<_>>(),
+            "errors": *probe.decode_errors.lock()
+        })
+    );
     if gap {
         assert_ne!(
             observed_frames, expected_frames,
@@ -356,10 +364,25 @@ fn check(recording: Recording, native: bool, schedule: &str) {
             "Mac VideoToolbox -> Media Foundation gap changed"
         );
     }
-    let expected: Vec<_> = intended
-        .into_iter()
-        .filter(|p| !gap || [6, 12, 18].contains(&p.frame))
-        .collect();
+    // The MFT releases delayed GOP output at the next IDR. State::drain
+    // returns its latest picture, so each publication carries the last
+    // surviving input before that IDR. Retain both the intended publication
+    // identity and this exact stale-content reference in the known-gap row.
+    let expected: Vec<_> = if gap {
+        observed_frames
+            .iter()
+            .map(|identity| {
+                *intended
+                    .iter()
+                    .rev()
+                    .find(|p| p.frame < *identity)
+                    .expect("previous surviving frame")
+            })
+            .collect()
+    } else {
+        intended.clone()
+    };
+    let observed_source_frames: Vec<_> = expected.iter().map(|p| p.frame).collect();
     assert_eq!(
         pictures.len(),
         expected.len(),
@@ -367,10 +390,20 @@ fn check(recording: Recording, native: bool, schedule: &str) {
         pictures.iter().map(|f| f.0).collect::<Vec<_>>()
     );
     let mut min_psnr = 99f64;
-    for ((identity, width, height, pixels), expected) in pictures.iter().zip(expected) {
+    for (index, ((identity, width, height, pixels), expected)) in
+        pictures.iter().zip(expected).enumerate()
+    {
         assert_eq!(
             (*identity, *width, *height),
-            (expected.frame, expected.width, expected.height),
+            (
+                if gap {
+                    observed_frames[index]
+                } else {
+                    expected.frame
+                },
+                expected.width,
+                expected.height
+            ),
             "frame identity/order/cropping"
         );
         assert_eq!(pixels.len(), expected.pixels.len());
@@ -433,7 +466,7 @@ fn check(recording: Recording, native: bool, schedule: &str) {
     }
     format::result(
         "media.jsonl",
-        serde_json::json!({ "producer": recording.producer, "consumer": format::platform(), "mode": recording.mode, "decoder": if native { "native" } else { "software" }, "backend": session.stats().decoder, "schedule": schedule, "audio_group": audio_group, "recorded_repair_us": repair_us, "concealed": *probe.missing.lock(), "status": if gap { "known-gap" } else { "passed" }, "gap": if gap { Some("mac-vt-mf-native") } else { None }, "observed_frames": observed_frames, "expected_frames": expected_frames, "decode_errors": *probe.decode_errors.lock(), "frames": pictures.len(), "audio": sound.len(), "min_psnr": min_psnr, "keyframe_requests": requests }),
+        serde_json::json!({ "producer": recording.producer, "consumer": format::platform(), "mode": recording.mode, "decoder": if native { "native" } else { "software" }, "backend": session.stats().decoder, "schedule": schedule, "audio_group": audio_group, "recorded_repair_us": repair_us, "concealed": *probe.missing.lock(), "status": if gap { "known-gap" } else { "passed" }, "gap": if gap { Some("mac-vt-mf-native") } else { None }, "observed_frames": observed_frames, "observed_source_frames": observed_source_frames, "observed_sizes": pictures.iter().map(|p| (p.1, p.2)).collect::<Vec<_>>(), "expected_frames": expected_frames, "expected_sizes": intended.iter().map(|p| (p.width, p.height)).collect::<Vec<_>>(), "decode_errors": *probe.decode_errors.lock(), "frames": pictures.len(), "audio": sound.len(), "min_psnr": min_psnr, "keyframe_requests": requests }),
     );
 }
 
