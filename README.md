@@ -81,6 +81,52 @@ there are [systemd units](deploy/native/README.md) and a
 Then open Latch and click **Connect** beside another machine. The
 [user guide](docs/USING.md) covers the rest.
 
+### Package managers
+
+This repository has package definitions for Scoop, the AUR and Nix, in
+[packaging/](packaging/README.md). They install the same releases. None is
+in a public bucket, the AUR or nixpkgs yet, so for now they install from
+this repository.
+
+**Scoop (Windows).**
+
+```powershell
+scoop install https://raw.githubusercontent.com/latch-remote/latch/main/packaging/scoop/latch.json
+```
+
+Scoop runs the release's `install-host.ps1`, which installs Latch to
+`%LOCALAPPDATA%\Latch` as the zip does. Latch then updates itself.
+`scoop update` installs a release only if it is newer than that copy.
+`scoop uninstall` leaves the copy in place; remove it from Settings > Apps.
+
+**Arch Linux.** `latch-remote-bin` packages the release binary and
+`latch-remote` builds the release's source. (`latch` on the AUR is another
+program.)
+
+```sh
+sudo pacman -S --needed git base-devel tailscale
+git clone https://github.com/latch-remote/latch
+cd latch/packaging/aur/latch-remote-bin
+makepkg -si
+```
+
+**Nix (x86_64 and aarch64 Linux).** The flake builds from source. Its
+`latch-bin` package is the release binary.
+
+```sh
+nix run github:latch-remote/latch
+nix profile add github:latch-remote/latch           # older Nix: nix profile install
+nix profile add github:latch-remote/latch#latch-bin
+```
+
+The packages are also in `overlays.default`. Tailscale comes separately
+(`services.tailscale.enable = true` on NixOS). Sharing setup records the
+program's `/nix/store` path in `~/.config/systemd/user/latch.service`;
+after an upgrade, run setup again from the **Sharing** tab.
+
+Each package installs `latch-host` with a desktop entry. For a headless
+server, follow the [native guide](deploy/native/README.md) instead.
+
 ### Moving from 5.x
 
 Older binaries can still look for updates in the former repository. If
