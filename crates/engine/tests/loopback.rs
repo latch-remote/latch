@@ -367,17 +367,20 @@ fn local_cursor_negotiated_and_host_omits_pointer_when_asked() {
     // 4. Request host to draw cursor
     session.draw_cursor(true);
 
-    // Wait for frame with cursor drawn (at synthetic position 100, 100)
+    // Startup places input in the middle of the captured display.
+    let cursor_x = W as usize / 2;
+    let cursor_y = H as usize / 2;
+    // Wait for a frame with the cursor drawn at that position.
     let mut seq = seq1;
     let start = Instant::now();
     let mut cursor_drawn_seen = false;
     while start.elapsed() < Duration::from_secs(3) {
         if let Some((s, f)) = next_frame(&frames, seq, Duration::from_millis(100)) {
             seq = s;
-            // Compare around (100, 100) where synthetic arrow is composited
+            // Compare around the centered synthetic arrow.
             let mut diff = 0u64;
-            for y in 95..125 {
-                for x in 95..125 {
+            for y in cursor_y - 5..cursor_y + 25 {
+                for x in cursor_x - 5..cursor_x + 25 {
                     let idx = y * f.y_stride + x;
                     if idx < f.y.len() && idx < luma_omitted.len() {
                         let d = f.y[idx].abs_diff(luma_omitted[idx]);
@@ -406,8 +409,8 @@ fn local_cursor_negotiated_and_host_omits_pointer_when_asked() {
         if let Some((s, f)) = next_frame(&frames, seq, Duration::from_millis(100)) {
             seq = s;
             let mut diff = 0u64;
-            for y in 95..125 {
-                for x in 95..125 {
+            for y in cursor_y - 5..cursor_y + 25 {
+                for x in cursor_x - 5..cursor_x + 25 {
                     let idx = y * f.y_stride + x;
                     if idx < f.y.len() && idx < luma_omitted.len() {
                         let d = f.y[idx].abs_diff(luma_omitted[idx]);
