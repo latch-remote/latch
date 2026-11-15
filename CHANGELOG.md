@@ -242,6 +242,12 @@ GitHub release notes, so each version gets a heading of the form
   send deadline, and report offered, accepted, refused and delivered frames
   plus gateway deadline lateness and local wake/timeout timing for native TLS
   and WebSocket carriers.
+- Time the relay daemon's low-credit wake test from the peer's write, so a
+  late-starting helper thread on a loaded runner no longer fails it. Only a
+  wait that returns with a ready socket within the bound ends the test.
+- Repeat the relay probe's delayed-header test only when its own sleeps
+  overran the header deadline before the headers were sent. Every attempt
+  that sends its headers in time must be answered.
 
 ### Networking
 

@@ -46,6 +46,9 @@ struct Timing {
 pub(crate) struct Wake {
     sockets: Option<(UdpSocket, UdpSocket)>,
     failed: AtomicBool,
+    /// Whether the latest wait returned with a ready socket.
+    #[cfg(test)]
+    pub(crate) last_wait_ready: AtomicBool,
     timing: Mutex<Timing>,
 }
 fn warn(error: &io::Error) {
@@ -75,6 +78,8 @@ impl Wake {
         Self {
             sockets,
             failed: AtomicBool::new(false),
+            #[cfg(test)]
+            last_wait_ready: AtomicBool::new(false),
             timing: Mutex::new(Timing::default()),
         }
     }
@@ -124,6 +129,8 @@ impl Wake {
         };
         let start = Instant::now();
         let ready = wait_sockets(&sockets, timeout)?;
+        #[cfg(test)]
+        self.last_wait_ready.store(ready != 0, Ordering::Relaxed);
         let elapsed = start.elapsed();
         let mut timing = self.timing.lock().unwrap();
         timing.stats.waits += 1;
