@@ -29,6 +29,12 @@ docker run --name "$container" --privileged --cpus 4 --memory 6g \
       shellcheck scripts/netlab/*.sh
       python3 -m unittest discover -s scripts/netlab -p "test_*.py" -v
     fi
-    bash scripts/netlab/build.sh
-    python3 scripts/netlab/netlab.py --output "/results/$NETLAB_RESULTS_RUN" "$@"
+    if [[ "${1:-}" == --carrier-comparison ]]; then
+      shift
+      cargo build --locked --release -j 4 -p latch-relay --bin latch-relay --example paired_probe
+      python3 scripts/netlab/carrier_comparison.py --output "/results/$NETLAB_RESULTS_RUN" "$@"
+    else
+      bash scripts/netlab/build.sh
+      python3 scripts/netlab/netlab.py --output "/results/$NETLAB_RESULTS_RUN" "$@"
+    fi
   ' bash "$@"

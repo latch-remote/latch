@@ -700,6 +700,17 @@ mod tests {
     }
 
     #[test]
+    fn cursor_uses_main_wire_format_and_ignores_unrecognized_position_fields() {
+        let cursor: Cursor =
+            serde_json::from_str(r#"{"visible":true,"shape":null,"position":[-10,20]}"#).unwrap();
+        assert!(cursor.visible && cursor.shape.is_none());
+        assert_eq!(
+            serde_json::to_string(&cursor).unwrap(),
+            r#"{"visible":true,"shape":null}"#
+        );
+    }
+
+    #[test]
     fn cursor_max_shape_fits_max_message() {
         let raw_pixels = vec![255u8; 96 * 96 * 4];
         let shape = CursorShape::new(1, 96, 96, 10, 10, &raw_pixels);

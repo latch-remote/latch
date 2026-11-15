@@ -10,7 +10,7 @@
 pub mod audio;
 mod bitstream;
 mod congestion;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 mod cursor;
 pub mod display;
 pub mod gamepad;
@@ -23,6 +23,8 @@ pub mod server;
 pub mod software;
 pub mod testmode;
 pub mod video;
+#[cfg(any(windows, test))]
+mod windows_cursor;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
