@@ -1,6 +1,7 @@
 # Libraries latch-host loads at run time rather than links: the window
-# (X11 or Wayland, through EGL or Vulkan) and VA-API encoding. NVENC comes
-# from the graphics driver, which addDriverRunpath points at.
+# (X11 or Wayland, through EGL or Vulkan), VA-API encoding and PipeWire for
+# Wayland screen capture. NVENC comes from the graphics driver, which
+# addDriverRunpath points at.
 {
   libGL,
   libva,
@@ -8,6 +9,7 @@
   libxcursor,
   libxi,
   libxkbcommon,
+  pipewire,
   vulkan-loader,
   wayland,
 }:
@@ -18,6 +20,7 @@
   libxcursor
   libxi
   libxkbcommon
+  pipewire
   vulkan-loader
   wayland
 ]

@@ -40,3 +40,16 @@ mod x11_bootstrap_tests;
 #[cfg(test)]
 #[path = "../../../tests/pairs/format.rs"]
 pub(crate) mod pair_format;
+
+/// The platform-free parts of the Wayland backend (backend choice, the
+/// PipeWire format negotiation, restore tokens, damage), tested on every
+/// build machine rather than only on Linux.
+#[cfg(all(test, not(target_os = "linux")))]
+#[path = "linux/wayland"]
+#[allow(dead_code)]
+mod wayland_tests {
+    mod backend;
+    mod frame;
+    mod pod;
+    mod token;
+}
