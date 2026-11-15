@@ -124,6 +124,7 @@ pub fn take_ready(
     pending: &mut std::collections::VecDeque<Event>,
     native: Option<Key>,
     now: u64,
+    keyboard_pending: bool,
 ) -> Vec<Event> {
     let mut events = Vec::new();
     while let Some(event) = pending.front().copied() {
@@ -134,7 +135,7 @@ pub fn take_ready(
                     continue;
                 }
                 None if native != Some(event.key) => {
-                    if now.saturating_sub(event.queued_at) < BARRIER_MS {
+                    if keyboard_pending || now.saturating_sub(event.queued_at) < BARRIER_MS {
                         break;
                     }
                     // An unconfirmed lone Control can be an AltGr synthetic event.
@@ -149,7 +150,7 @@ pub fn take_ready(
                 pending.pop_front();
                 break;
             }
-            if now.saturating_sub(event.queued_at) < BARRIER_MS {
+            if keyboard_pending || now.saturating_sub(event.queued_at) < BARRIER_MS {
                 break;
             }
             pending.pop_front();
@@ -186,6 +187,54 @@ mod tests {
     }
 
     #[test]
+    fn stalled_ui_keeps_barriers_while_keyboard_messages_are_queued() {
+        let mut pending = std::collections::VecDeque::from([
+            event(0x41, true),
+            event(0x41, false),
+            event(0xa0, true),
+            event(0x42, true),
+        ]);
+        assert!(take_ready(&mut pending, None, 150, true).is_empty());
+        assert_eq!(pending.len(), 4);
+        assert!(take_ready(&mut pending, Some(event(0x41, true).key), 150, true).is_empty());
+        assert!(take_ready(&mut pending, Some(event(0x41, false).key), 150, true).is_empty());
+        assert_eq!(
+            take_ready(&mut pending, None, 150, true),
+            [event(0xa0, true)]
+        );
+        assert_eq!(pending.front(), Some(&event(0x42, true)));
+    }
+
+    #[test]
+    fn whole_control_chord_survives_a_ui_stall_in_order() {
+        let chord = [
+            event(0xa2, true),
+            event(0x43, true),
+            event(0x43, false),
+            event(0xa2, false),
+        ];
+        let mut pending = std::collections::VecDeque::from(chord);
+        let mut received = Vec::new();
+        for native in chord {
+            received.extend(
+                take_ready(&mut pending, Some(native.key), 150, true)
+                    .into_iter()
+                    .map(|e| e.key),
+            );
+            if native.key.vk == 0x43 {
+                received.push(native.key);
+            }
+        }
+        received.extend(
+            take_ready(&mut pending, None, 150, false)
+                .into_iter()
+                .map(|e| e.key),
+        );
+        assert_eq!(received, chord.map(|e| e.key));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
     fn queue_handoff_is_immediate_and_full_or_disconnected_queues_fail_open() {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let lease = Lease::default();
@@ -215,8 +264,8 @@ mod tests {
             event(0xa2, true),
             event(0x5b, true),
         ]);
-        assert!(take_ready(&mut pending, None, BARRIER_MS - 1).is_empty());
-        let ready = take_ready(&mut pending, None, BARRIER_MS);
+        assert!(take_ready(&mut pending, None, BARRIER_MS - 1, false).is_empty());
+        let ready = take_ready(&mut pending, None, BARRIER_MS, false);
         assert_eq!(ready, [event(0xa2, true), event(0x5b, true)]);
         for event in ready {
             held.physical_key(&out, event.key.vk, event.key.down, event.key.vk);
@@ -239,9 +288,9 @@ mod tests {
                 ..event(modifier, true)
             };
             let mut pending = VecDeque::from([first]);
-            let before = take_ready(&mut pending, None, 0);
+            let before = take_ready(&mut pending, None, 0, false);
             pending.push_back(event(0x5b, true));
-            let after = take_ready(&mut pending, None, 0);
+            let after = take_ready(&mut pending, None, 0, false);
             assert_eq!(
                 [before, after]
                     .concat()
@@ -256,11 +305,14 @@ mod tests {
             ..event(0xa2, true)
         };
         let mut pending = VecDeque::from([control]);
-        assert!(take_ready(&mut pending, None, 0).is_empty());
-        assert_eq!(take_ready(&mut pending, Some(control.key), 0), [control]);
+        assert!(take_ready(&mut pending, None, 0, false).is_empty());
+        assert_eq!(
+            take_ready(&mut pending, Some(control.key), 0, false),
+            [control]
+        );
         pending.extend([control, event(0xa5, true), event(0x5b, true)]);
         assert_eq!(
-            take_ready(&mut pending, None, 0)
+            take_ready(&mut pending, None, 0, false)
                 .iter()
                 .map(|e| e.key.vk)
                 .collect::<Vec<_>>(),
@@ -278,11 +330,14 @@ mod tests {
             event(0xa0, false),
             event(0x5b, true),
         ]);
-        assert_eq!(take_ready(&mut pending, None, 0), [event(0xa0, true)]);
-        assert!(take_ready(&mut pending, None, 0).is_empty());
-        assert!(take_ready(&mut pending, Some(event(0x41, true).key), 0).is_empty());
         assert_eq!(
-            take_ready(&mut pending, None, 0),
+            take_ready(&mut pending, None, 0, false),
+            [event(0xa0, true)]
+        );
+        assert!(take_ready(&mut pending, None, 0, false).is_empty());
+        assert!(take_ready(&mut pending, Some(event(0x41, true).key), 0, false).is_empty());
+        assert_eq!(
+            take_ready(&mut pending, None, 0, false),
             [event(0xa0, false), event(0x5b, true)]
         );
         assert!(pending.is_empty());

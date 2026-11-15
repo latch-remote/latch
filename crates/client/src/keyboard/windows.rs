@@ -6,7 +6,7 @@ use super::{
     Key, STATE,
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::VecDeque,
     sync::{
         atomic::Ordering,
@@ -16,7 +16,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 use windows::Win32::{
-    Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM},
+    Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
     System::{
         LibraryLoader::GetModuleHandleW,
         Threading::{GetCurrentProcessId, GetCurrentThreadId},
@@ -48,7 +48,7 @@ struct Hook {
     lease: Arc<Lease>,
     events: SyncSender<Event>,
     capture: Capture,
-    repaint: egui::Context,
+    window: usize,
     dirty: bool,
 }
 impl Drop for Hook {
@@ -61,10 +61,20 @@ impl Drop for Hook {
 }
 thread_local! {
     static WORKER: RefCell<Option<Worker>> = const { RefCell::new(None) };
+    static WINDOW: Cell<usize> = const { Cell::new(0) };
     static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
 }
 
-pub fn owns_keys(owned: bool, ctx: &egui::Context) {
+pub fn install(cc: &eframe::CreationContext<'_>) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    if let Ok(handle) = cc.window_handle() {
+        if let RawWindowHandle::Win32(window) = handle.as_raw() {
+            WINDOW.set(window.hwnd.get() as usize);
+        }
+    }
+}
+
+pub fn owns_keys(owned: bool) {
     if !owned {
         WORKER.with_borrow_mut(|worker| *worker = None);
         return;
@@ -85,10 +95,10 @@ pub fn owns_keys(owned: bool, ctx: &egui::Context) {
         let (tx, rx) = mpsc::sync_channel(QUEUE_SIZE);
         let (started, ready) = mpsc::sync_channel(1);
         let thread_lease = lease.clone();
-        let ctx = ctx.clone();
+        let window = WINDOW.get();
         match thread::Builder::new()
             .name("keyboard-capture".into())
-            .spawn(move || run(thread_lease, tx, ctx, started))
+            .spawn(move || run(thread_lease, tx, window, started))
         {
             Ok(thread) => {
                 let Ok(thread_id) = ready.recv() else {
@@ -146,7 +156,12 @@ pub fn drain(native: Option<&egui_winit::winit::event::WindowEvent>) {
             worker.lease.fail();
             return (Vec::new(), true);
         }
-        let events = super::hook::take_ready(&mut worker.pending, native_key, now);
+        // A native callback may precede later messages already buffered by
+        // winit. Only a frame/idle drain may discard a lost-key hint, and
+        // then only if Windows has no keyboard messages waiting either.
+        let keyboard_pending = native.is_some() || unsafe { GetQueueStatus(QS_KEY) >> 16 != 0 };
+        let events =
+            super::hook::take_ready(&mut worker.pending, native_key, now, keyboard_pending);
         if !worker.pending.is_empty() {
             // Ordering hints need their own wake even when video has stopped.
             STATE.with_borrow(|s| {
@@ -214,7 +229,7 @@ fn has_altgr(layout: HKL) -> bool {
     })
 }
 
-fn run(lease: Arc<Lease>, events: SyncSender<Event>, ctx: egui::Context, started: SyncSender<u32>) {
+fn run(lease: Arc<Lease>, events: SyncSender<Event>, window: usize, started: SyncSender<u32>) {
     // Create the queue before publishing its ID, so teardown can always post quit.
     unsafe {
         let mut msg = MSG::default();
@@ -229,7 +244,7 @@ fn run(lease: Arc<Lease>, events: SyncSender<Event>, ctx: egui::Context, started
         lease: lease.clone(),
         events,
         capture: Capture::new(has_altgr(layout)),
-        repaint: ctx,
+        window,
         dirty: false,
     };
     // SAFETY: callback and module remain valid until the thread unhooks.
@@ -281,7 +296,11 @@ fn run(lease: Arc<Lease>, events: SyncSender<Event>, ctx: egui::Context, started
         HOOK.with_borrow_mut(|slot| {
             if let Some(h) = slot {
                 if std::mem::take(&mut h.dirty) {
-                    h.repaint.request_repaint();
+                    // Post a redraw directly. This thread never takes egui's
+                    // context lock or waits for the UI to handle the message.
+                    let _ = unsafe {
+                        PostMessageW(HWND(h.window as *mut _), WM_PAINT, WPARAM(0), LPARAM(0))
+                    };
                 }
             }
         });
@@ -337,7 +356,7 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
             h.capture.consume(event, |e| {
                 h.dirty = true;
                 let delivered = super::hook::deliver(&h.events, &h.lease, e);
-                // Wake only this message loop. Repaint runs outside the callback.
+                // Wake only this message loop. UI redraw is posted outside the callback.
                 let _ = unsafe {
                     PostThreadMessageW(GetCurrentThreadId(), WM_APP, WPARAM(0), LPARAM(0))
                 };
@@ -391,6 +410,30 @@ fn publish(event: Event) {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn drain_renews_the_real_worker_lease_without_a_desktop_hook() {
+        let lease = Arc::new(Lease::default());
+        let (_tx, events) = mpsc::sync_channel(QUEUE_SIZE);
+        WORKER.with_borrow_mut(|worker| {
+            *worker = Some(Worker {
+                lease: lease.clone(),
+                thread_id: 0,
+                events,
+                thread: None,
+                forwarded: VecDeque::new(),
+                pending: VecDeque::new(),
+            });
+        });
+        // Advance the real clock once. Queue delivery itself has no timed wait.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drain(None);
+        assert!(
+            lease.active(super::super::hook::LEASE_MS),
+            "drain extends the original deadline"
+        );
+        WORKER.with_borrow_mut(|worker| *worker = None);
+    }
 
     #[test]
     fn capture_owner_joins_its_worker_on_drop_and_unwind() {

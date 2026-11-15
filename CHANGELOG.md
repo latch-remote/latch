@@ -13,21 +13,30 @@ GitHub release notes, so each version gets a heading of the form
   by default. Add an off-by-default **Control key acts as Windows key** choice
   beside **Send keys as pressed**, mapping Control to Win/Super with a free
   mouse and back to Ctrl during game capture. Re-target held modifiers on
-  capture changes. Keep Send keys as pressed as the explicit all-mode opt-out. Restore the Mac Quit
+  capture changes. Disable the Control-key choice for older hosts and while
+  Send keys as pressed is selected, with an explanation. Keep Send keys as
+  pressed as the explicit all-mode opt-out. Restore the Mac Quit
   and Hide menu override in windowed free-mouse streams. Preserve native
   paste fallback when the viewer clipboard contains an image or no text.
 - Move Windows keyboard capture to a dedicated message-loop thread with a
   bounded queue, all-modifier ordering and a 250 ms UI watchdog. Pump Windows
   messages with GetMessageW and stop with a posted WM_QUIT. Renew capture
   every 83 ms independently of video. Drop unmatched ordering barriers after
-  8 ms without releasing held input. Release X11 grabs after a 250 ms UI stall and replay grabbed media controls locally.
-  Leave the X11 watchdog idle without a grab and log then abort if native
-  grab recovery stalls for two seconds.
+  8 ms once the UI keyboard queue is idle, preserving stalled chords without
+  releasing held input. Release X11 grabs after a 250 ms UI stall and replay grabbed media controls locally.
+  Leave the X11 watchdog idle without a grab. After a two-second lock stall,
+  probe the X server on a separate connection and log then abort only if it
+  answers while the display lock remains stuck. Wait for a slow server to recover.
   Constructed-event tests cover every viewer/host pair and default mouse
   state, with exact native event sequences and previous-release byte recordings.
-  Linux CI runs isolated Xvfb tests for local media replay, grab expiry and
-  stuck-display recovery. Real keyboards, Windows hook latency and timeouts
-  remain unverified.
+  The Linux CI Xvfb step requires exactly one passing isolated test for local
+  media replay, real UI-heartbeat renewal, grab expiry, slow-server recovery
+  and stuck-display recovery.
+  Real-hardware verification remains open for Windows hook latency and timeout
+  recovery, remappers such as AutoHotkey and PowerToys, global hotkeys,
+  media-key daemons, non-US layouts and IMEs. The capture-click sequence
+  Win↓ … Ctrl↓ Win↑ against Windows also awaits hardware verification,
+  with the Start menu expected to stay closed.
 
 - Restore legacy keyboard compatibility, negotiate elevated helper positions,
   and acknowledge unknown future positions without blocking input. Recover

@@ -79,7 +79,9 @@ The **Keys** menu also offers **Control key acts as Windows key** on a Mac
 viewer connected to a Windows or Linux host. It is off by default. When
 it is on and Command/Ctrl mapping is enabled, Control becomes Win on
 Windows or Super on Linux while the mouse is free. During game capture,
-Control returns to Ctrl. A modifier held across a capture change is
+Control returns to Ctrl. The option is greyed out with an explanation for
+older hosts and while **Send keys as pressed** is selected.
+A modifier held across a capture change is
 re-targeted immediately. The replacement Ctrl press precedes a Win release
 to avoid turning the change into a Windows-key tap. Selecting the game
 mouse setting alone keeps the free-mouse mapping until capture engages.
@@ -157,7 +159,8 @@ Its callback performs fixed-size state updates and nonblocking queue sends.
 All sided modifiers share its ordering before Win. Ordinary keys form
 queue barriers until the window has translated them, preserving their position
 between modifiers. A barrier without a matching window event is dropped
-after 8 ms, allowing later events through without releasing held input. AltGr's synthetic Control
+after 8 ms only when the UI keyboard queue is idle. Queued keys retain
+their ordering through a UI stall, and lost-key hints release no held input. AltGr's synthetic Control
 is filtered using the active layout and the adjacent right-Alt event, with
 winit confirming an otherwise lone real Control. Focus loss, capture end,
 window destruction, app teardown and worker unwinding uninstall the hook.
@@ -167,21 +170,27 @@ capture is active, Latch schedules a UI repaint every 83 ms independently
 of video arrival. A video freeze therefore preserves held keys and mouse
 buttons. A dead UI, full or disconnected queue, or lost foreground ownership
 ends capture. Lost capture releases remote held input when the UI resumes.
-Queue publication posts a message to wake the worker for repaint.
+Queue publication wakes the worker, which posts a Windows paint message
+to the viewer window. The hook thread takes no egui context lock.
 
 The X11 watchdog uses winit's thread-enabled Xlib connection because X11
 allows only the grabbing client to ungrab its keyboard. Teardown joins the
 helper before eframe closes the display. It can release a stalled UI's grab
 while the X server and Xlib connection remain responsive. An Xlib display
-lock held by a stuck native call or an unresponsive X server triggers a
-logged process abort after two seconds of failed grab recovery. Process exit
-lets the server release the grab. The watchdog leaves the display alone
+lock held by a stuck native call triggers a separate server probe after
+two seconds. Latch logs and aborts only if the server answers while the
+lock remains stuck, letting the server release the grab. A slow or
+unresponsive server keeps recovery waiting until it answers. The watchdog leaves the display alone
 while nothing is grabbed. Process-wide suspension can prevent timely recovery.
 Windows process-wide suspension or a stalled hook thread can still encounter
 Windows' `LowLevelHooksTimeout`. These recovery mechanisms have constructed
-state-machine coverage. Linux CI runs isolated Xvfb tests for local media
-delivery, timed grab release and stuck-display recovery. Real keyboard, desktop media-daemon and Windows
-hook-timeout behaviour have never been tried in this change.
+state-machine coverage. The Linux CI Xvfb step requires exactly one passing
+isolated test for local media delivery, real heartbeat renewal, timed grab
+release, slow-server recovery and stuck-display recovery. Real-hardware
+verification remains open for remappers such as AutoHotkey and PowerToys,
+global hotkeys, media-key daemons, non-US layouts, IMEs and Windows hook
+latency and timeout recovery. The Win↓ … Ctrl↓ Win↑ capture-click retarget
+against Windows awaits hardware verification, with Start expected to stay closed.
 
 
 ## Choosing a display

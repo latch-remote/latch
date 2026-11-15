@@ -148,8 +148,10 @@ keyboard/mouse/gamepad/clipboard/audio/HDR acceptance record.[^negotiation]
    Windows hook callbacks run on a dedicated message-loop thread with fixed
    state and bounded nonblocking queue delivery. All modifiers precede Win,
    with AltGr filtering. Unconfirmed ordering barriers expire after 8 ms
-   without releasing held input. The loop blocks in GetMessageW and stops
-   through a posted WM_QUIT. UI repaints every 83 ms renew capture independently
+   only during an idle/frame drain with no queued keyboard messages. Stalled
+   chords keep their order, and lost hints release no held input. The loop blocks in GetMessageW and stops
+   through a posted WM_QUIT. Worker redraws use posted Windows paint messages
+   and take no egui context lock. UI repaints every 83 ms renew capture independently
    of video frames. Loss of the 250 ms UI lease, queue delivery or
    foreground ownership ends capture. Focus loss and teardown join the
    worker, and RAII unhooks on unwind. Portable tests cover queue failure,
@@ -157,14 +159,19 @@ keyboard/mouse/gamepad/clipboard/audio/HDR acceptance record.[^negotiation]
    X11 retries refused grabs. A helper on winit's thread-enabled Xlib
    connection releases grabs after 250 ms without a UI heartbeat, sampled
    every 10 ms. Media presses release capture and replay locally through
-   XTest. Linux CI runs isolated Xvfb tests for passive media bindings,
-   timed ungrab and a stuck display lock. The watchdog is idle without a grab.
-   If native grab recovery stalls for two seconds it logs and aborts the
-   process so the server releases the grab. Process suspension can delay
-   recovery. Windows hook latency, scheduling, timeout recovery and physical
-   desktop media bindings remain unverified on real hardware.
-   German Mac ISO keyboards, Korean Windows IME toggling, native
-   window-manager chords and mixed-layout hardware remain unverified.
+   XTest. The Linux CI Xvfb step requires exactly one passing isolated test
+   covering passive media bindings, real owns_keys heartbeat renewal, timed
+   ungrab, a stuck display lock and a slow server. The watchdog is idle
+   without a grab. After a two-second lock stall it probes the server on a
+   separate connection, logging and aborting only if the server answers while
+   the display lock remains stuck. A slow server keeps recovery waiting.
+   Process suspension can delay recovery. Real-hardware verification remains
+   open for Windows hook latency, scheduling and timeout recovery, remappers
+   such as AutoHotkey and PowerToys, global hotkeys, media-key daemons,
+   non-US layouts and IMEs, including German Mac ISO and Korean Windows IME
+   toggling. The Win↓ … Ctrl↓ Win↑ capture-click retarget against a Windows
+   host awaits hardware verification, with Start expected to stay closed.
+   Native window-manager chords and mixed-layout hardware remain unverified.
    Mac F21–F24/media Stop have no injector equivalent. Kana/Eisu
    approximations depend on the Mac input source. Mac Clear stays local.
    Dead-key and explicit Unicode text are unit-tested. The stream window's

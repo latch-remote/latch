@@ -1489,11 +1489,27 @@ impl View {
                 actions.push(Action::ToggleCmd);
             }
         }
-        if self.viewer_mac
-            && !self.host_mac
-            && ui::menu_choice(ui, "Control key acts as Windows key", cfg.control_as_meta).clicked()
-        {
-            actions.push(Action::ToggleControlAsMeta);
+        if self.viewer_mac && !self.host_mac {
+            let reason = if !crate::keyboard::available() {
+                Some("Requires Latch Host newer than 6.0.0.")
+            } else if !cfg.cmd_is_ctrl {
+                Some("Enable Command/Ctrl mapping to use this.")
+            } else {
+                None
+            };
+            if ui::menu_choice_enabled(
+                ui,
+                reason.is_none(),
+                "Control key acts as Windows key",
+                cfg.control_as_meta,
+            )
+            .clicked()
+            {
+                actions.push(Action::ToggleControlAsMeta);
+            }
+            if let Some(reason) = reason {
+                ui::menu_note(ui, reason);
+            }
         }
         ui::menu_note(
             ui,
@@ -4361,6 +4377,58 @@ pub(crate) mod tests {
     const LAST_POWER_ITEM: &str = "Update Latch Host… (runs 3.0.0)";
 
     #[test]
+    fn control_key_option_is_disabled_with_a_reason_and_fits_the_menu() {
+        for (positions, mapped) in [(false, true), (true, false), (true, true)] {
+            for (size, trigger) in [
+                (Vec2::new(640.0, 420.0), "More"),
+                (Vec2::new(OVERFLOW_BELOW, 420.0), "Keys"),
+            ] {
+                crate::keyboard::test_install(positions);
+                let mut view = view_with_bar();
+                view.viewer_mac = true;
+                let mut f = fixture(view, windows_old_host());
+                f.cfg.cmd_is_ctrl = mapped;
+                let mut h = harness_with(size, 1.0, false, f);
+                h.get_by_label(trigger).simulate_click();
+                h.run_steps(3);
+                let menu = latch_ui::open_menu_rect(&h.ctx).unwrap();
+                let bounds = node_rect(&h.get_by_label("Control key acts as Windows key"));
+                if bounds.bottom() > menu.bottom() {
+                    h.input_mut().events.extend([
+                        Event::PointerMoved(menu.center()),
+                        Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: Vec2::new(0.0, menu.bottom() - bounds.bottom() - 48.0),
+                            modifiers: Modifiers::NONE,
+                        },
+                    ]);
+                    h.run_steps(10);
+                }
+                let choice = h.get_by_label("Control key acts as Windows key");
+                assert_eq!(choice.is_disabled(), !(positions && mapped));
+                let menu = latch_ui::open_menu_rect(&h.ctx).unwrap();
+                assert_inside("Control option", node_rect(&choice), menu);
+                if !positions {
+                    h.get_by_label("Requires Latch Host newer than 6.0.0.");
+                } else if !mapped {
+                    h.get_by_label("Enable Command/Ctrl mapping to use this.");
+                }
+                choice.simulate_click();
+                h.run_steps(2);
+                assert_eq!(
+                    h.state().actions,
+                    if positions && mapped {
+                        vec![Action::ToggleControlAsMeta]
+                    } else {
+                        vec![]
+                    }
+                );
+                crate::keyboard::test_install(false);
+            }
+        }
+    }
+
+    #[test]
     fn every_toolbar_menu_fits_the_smallest_window_and_scrolls_to_its_end() {
         let min = Vec2::new(640.0, 420.0);
         let mut h = harness_with(
@@ -4373,11 +4441,7 @@ pub(crate) mod tests {
         // The separate menus exist from this width up; at the minimum
         // height they must fit too.
         let short = Vec2::new(OVERFLOW_BELOW, 420.0);
-        let last_key = if cfg!(target_os = "macos") {
-            "Control key acts as Windows key"
-        } else {
-            "Map Command ↔ Ctrl"
-        };
+        let last_key = "Map Command ↔ Ctrl";
         for (trigger, last) in [
             ("Keys", last_key),
             ("Mouse", "Free, for desktops (follows this cursor)"),
@@ -4470,11 +4534,7 @@ pub(crate) mod tests {
         use crate::app::snapshots::{file_name, save};
         let min = Vec2::new(640.0, 420.0);
         let short = Vec2::new(OVERFLOW_BELOW, 420.0);
-        let last_key = if cfg!(target_os = "macos") {
-            "Control key acts as Windows key"
-        } else {
-            "Map Command ↔ Ctrl"
-        };
+        let last_key = "Map Command ↔ Ctrl";
         for ppp in [1.0, 2.0] {
             for (name, size, trigger, last) in [
                 ("more-end", min, "More", LAST_POWER_ITEM),

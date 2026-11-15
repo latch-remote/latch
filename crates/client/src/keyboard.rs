@@ -173,6 +173,8 @@ pub fn install(cc: &eframe::CreationContext<'_>) {
             },
         )
     });
+    #[cfg(windows)]
+    windows::install(cc);
     #[cfg(target_os = "linux")]
     linux::install(cc);
 }
@@ -317,7 +319,7 @@ pub fn owns_keys(owned: bool) {
     // Constructed stream tests exercise capture state without acquiring a
     // machine-wide native hook or grab. The isolated Xvfb test calls Linux directly.
     #[cfg(all(windows, not(test)))]
-    windows::owns_keys(owned, &STATE.with_borrow(|s| s.ctx.clone()));
+    windows::owns_keys(owned);
     #[cfg(all(target_os = "linux", not(test)))]
     linux::owns_keys(owned);
     #[cfg(target_os = "macos")]
@@ -333,7 +335,7 @@ impl State {
             )
         ) {
             #[cfg(windows)]
-            windows::owns_keys(false, &self.ctx);
+            windows::owns_keys(false);
             #[cfg(target_os = "linux")]
             linux::owns_keys(false);
             self.alt_gr = false;

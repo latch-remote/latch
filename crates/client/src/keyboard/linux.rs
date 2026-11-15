@@ -119,6 +119,11 @@ fn start_watchdog(
     grabbed: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) -> std::io::Result<Watchdog> {
+    // Copy the immutable display name on the owner thread before starting recovery.
+    let display_name =
+        unsafe { std::ffi::CStr::from_ptr((calls.XDisplayString)(display as *mut xlib::Display)) }
+            .to_string_lossy()
+            .into_owned();
     let worker_calls = calls;
     let worker_lease = lease;
     let worker_grabbed = grabbed;
@@ -134,6 +139,8 @@ fn start_watchdog(
                     let calls = worker_calls.clone();
                     let lease = worker_lease.clone();
                     let grabbed = worker_grabbed.clone();
+                    let waiting_for_lock = Arc::new(AtomicBool::new(true));
+                    let release_waiting = waiting_for_lock.clone();
                     let (done, completed) = std::sync::mpsc::sync_channel(1);
                     // Xlib has no try-lock API. Supervise the potentially stuck
                     // native call from this watchdog, with a bounded deadline.
@@ -143,6 +150,7 @@ fn start_watchdog(
                         // this watchdog before eframe destroys its display.
                         unsafe {
                             (calls.XLockDisplay)(display);
+                            release_waiting.store(false, Ordering::Release);
                             if !lease.active(lease.elapsed())
                                 && grabbed.swap(false, Ordering::AcqRel)
                             {
@@ -153,9 +161,51 @@ fn start_watchdog(
                         }
                         let _ = done.send(());
                     });
-                    if completed.recv_timeout(Duration::from_secs(2)).is_err() {
-                        tracing::error!("X11 keyboard grab recovery stalled on the display connection for two seconds, aborting to release the keyboard");
-                        std::process::abort();
+                    let mut probe = None;
+                    loop {
+                        let wait = if probe.is_some() {
+                            Duration::from_millis(100)
+                        } else {
+                            Duration::from_secs(2)
+                        };
+                        match completed.recv_timeout(wait) {
+                            Ok(()) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                tracing::error!("X11 keyboard grab recovery worker stopped unexpectedly");
+                                break;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                        if !waiting_for_lock.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        if probe.is_none() {
+                            let name = display_name.clone();
+                            let (answer, result) = std::sync::mpsc::sync_channel(1);
+                            // This connection owns its resources and closes after a
+                            // reply. Keep only one probe in flight while a slow or
+                            // stopped server cannot even complete X11 setup.
+                            thread::spawn(move || {
+                                let response = (|| -> anyhow::Result<()> {
+                                    let (conn, _) = x11rb::connect(Some(&name))?;
+                                    xproto::get_input_focus(&conn)?.reply()?;
+                                    Ok(())
+                                })();
+                                let _ = answer.send(response.is_ok());
+                            });
+                            probe = Some(result);
+                        }
+                        match probe.as_ref().unwrap().try_recv() {
+                            Ok(responsive) => {
+                                probe = None;
+                                if responsive && waiting_for_lock.load(Ordering::Acquire) {
+                                    tracing::error!("X11 server answers a separate connection while keyboard grab recovery remains stuck on the display lock, aborting to release the keyboard");
+                                    std::process::abort();
+                                }
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => probe = None,
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        }
                     }
                     let _ = release.join();
                 }
@@ -294,7 +344,8 @@ mod tests {
     fn watchdog_and_media_replay_restore_local_x11_delivery() {
         // A subprocess can wedge Xlib and verify the last-resort abort without
         // terminating the test runner. It uses this isolated server only.
-        if std::env::var_os("LATCH_TEST_STUCK_X11").is_some() {
+        if let Some(mode) = std::env::var_os("LATCH_TEST_STUCK_X11") {
+            let slow_server = mode == "slow-server";
             let _ = tracing_subscriber::fmt().with_test_writer().try_init();
             let calls = Arc::new(xlib::Xlib::open().unwrap());
             unsafe {
@@ -314,8 +365,18 @@ mod tests {
                     xlib::GrabSuccess
                 );
                 (calls.XSync)(display, 0);
+                let daemon = if slow_server {
+                    (calls.XOpenDisplay)(std::ptr::null())
+                } else {
+                    std::ptr::null_mut()
+                };
+                if slow_server {
+                    assert!(!daemon.is_null());
+                    (calls.XGrabServer)(daemon);
+                    (calls.XSync)(daemon, 0);
+                }
                 (calls.XLockDisplay)(display);
-                let _watchdog = start_watchdog(
+                let watchdog = start_watchdog(
                     display as usize,
                     calls.clone(),
                     Arc::new(Lease::default()),
@@ -324,6 +385,40 @@ mod tests {
                 )
                 .unwrap();
                 let (_tx, rx) = std::sync::mpsc::channel::<()>();
+                if slow_server {
+                    let _ = rx.recv_timeout(Duration::from_secs(3));
+                    // A server-side stall has outlasted the abort deadline.
+                    // Release the lock and server, then wait for real recovery.
+                    (calls.XUnlockDisplay)(display);
+                    (calls.XUngrabServer)(daemon);
+                    (calls.XSync)(daemon, 0);
+                    let until = std::time::Instant::now() + Duration::from_secs(1);
+                    let mut recovered = false;
+                    while !watchdog.thread.as_ref().unwrap().is_finished()
+                        && std::time::Instant::now() < until
+                    {
+                        // Drop signals stop once the native release has completed.
+                        if (calls.XGrabKeyboard)(
+                            daemon,
+                            root,
+                            0,
+                            xlib::GrabModeAsync,
+                            xlib::GrabModeAsync,
+                            xlib::CurrentTime,
+                        ) == xlib::GrabSuccess
+                        {
+                            (calls.XUngrabKeyboard)(daemon, xlib::CurrentTime);
+                            recovered = true;
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    assert!(recovered, "capture releases after the slow server recovers");
+                    drop(watchdog);
+                    (calls.XCloseDisplay)(daemon);
+                    (calls.XCloseDisplay)(display);
+                    std::process::exit(0);
+                }
                 let _ = rx.recv_timeout(Duration::from_secs(4));
                 eprintln!("a stuck display lock did not abort grab recovery");
                 std::process::exit(1);
@@ -345,6 +440,20 @@ mod tests {
             String::from_utf8_lossy(&child.stdout).contains("aborting to release the keyboard"),
             "{:?}",
             child
+        );
+        let slow = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "keyboard::linux::tests::watchdog_and_media_replay_restore_local_x11_delivery",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("LATCH_TEST_STUCK_X11", "slow-server")
+            .output()
+            .unwrap();
+        assert!(
+            slow.status.success(),
+            "a slow server must recover without aborting: {slow:?}"
         );
         let calls = Arc::new(xlib::Xlib::open().unwrap());
         let (media_connection, _) = x11rb::connect(None).unwrap();
@@ -383,6 +492,18 @@ mod tests {
                 grabbed: grabbed.clone(),
                 media: Cell::new(None),
             }));
+            let heartbeat_started = std::time::Instant::now();
+            for _ in 0..12 {
+                owns_keys(true);
+                thread::sleep(Duration::from_millis(50));
+                assert!(
+                    grabbed.load(Ordering::Acquire),
+                    "real owns_keys heartbeats keep capture alive without video"
+                );
+            }
+            assert!(
+                heartbeat_started.elapsed() > Duration::from_millis(super::super::hook::LEASE_MS)
+            );
             for code in [
                 KeyCode::AudioVolumeMute,
                 KeyCode::AudioVolumeDown,
