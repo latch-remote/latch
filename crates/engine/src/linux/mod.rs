@@ -30,6 +30,46 @@ pub fn capture_size() -> anyhow::Result<[u32; 2]> {
     Ok([root.width_in_pixels.into(), root.height_in_pixels.into()])
 }
 
+/// The X screen's monitors (RandR 1.5), each named as RandR names it
+/// (`DP-1`, `HDMI-0`). None is the default: a request naming no monitor
+/// shares the whole screen, as it always has.
+pub fn displays() -> anyhow::Result<Vec<crate::display::HostDisplay>> {
+    use x11rb::connection::Connection;
+    let (conn, screen) = connect(X11_SILENCE)?;
+    let root = conn.setup().roots[screen].root;
+    monitors(&conn, root)
+}
+
+/// [`displays`] on an open connection; empty when the server's RandR is
+/// older than 1.5 and cannot say.
+fn monitors(conn: &X11, root: u32) -> anyhow::Result<Vec<crate::display::HostDisplay>> {
+    use x11rb::protocol::randr;
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    let Ok(version) = randr::query_version(conn, 1, 5)?.reply() else {
+        return Ok(Vec::new());
+    };
+    if (version.major_version, version.minor_version) < (1, 5) {
+        return Ok(Vec::new());
+    }
+    let reply = randr::get_monitors(conn, root, true)?.reply()?;
+    let mut out = Vec::with_capacity(reply.monitors.len());
+    for monitor in reply.monitors {
+        let name =
+            String::from_utf8_lossy(&conn.get_atom_name(monitor.name)?.reply()?.name).into_owned();
+        out.push(crate::display::HostDisplay {
+            id: name.clone(),
+            name,
+            x: monitor.x.into(),
+            y: monitor.y.into(),
+            width: monitor.width.into(),
+            height: monitor.height.into(),
+            primary: monitor.primary,
+            default: false,
+        });
+    }
+    Ok(out)
+}
+
 /// What this host encodes: hardware codecs found by [`hardware`], and
 /// `latch-codec`'s Constrained Baseline.
 pub fn encodable() -> Vec<crate::video::Codec> {
@@ -74,7 +114,10 @@ pub fn open_video(config: &VideoConfig) -> anyhow::Result<Box<dyn VideoPipeline>
             h264,
             Unencodable(format!("this host has no {} encoder", codec.name()))
         );
-        return Ok(Box::new(SoftwarePipeline::new(X11Capture::new()?, config)?));
+        return Ok(Box::new(SoftwarePipeline::new(
+            X11Capture::with_display(config.display.as_deref())?,
+            config,
+        )?));
     };
     // Opens the hardware encoder for the negotiated output size; for
     // H.264, the software one where that fails.
@@ -101,7 +144,7 @@ pub fn open_video(config: &VideoConfig) -> anyhow::Result<Box<dyn VideoPipeline>
             Ok(Box::new(LatchEncoder::open(width, height, config)?))
         };
     Ok(Box::new(SoftwarePipeline::with_encoder(
-        X11Capture::new()?,
+        X11Capture::with_display(config.display.as_deref())?,
         config,
         Box::new(open),
     )?))
@@ -122,7 +165,16 @@ pub fn prepare_display(
     width: u32,
     height: u32,
     fps: u32,
+    wanted: Option<&str>,
 ) -> anyhow::Result<Option<crate::display::Previous>> {
+    // One monitor of several is shared at its own size: resizing would
+    // change a monitor that may not be the chosen one.
+    if wanted.is_some()
+        && displays()
+            .is_ok_and(|d| d.len() > 1 && crate::display::HostDisplay::find(&d, wanted).is_some())
+    {
+        return Ok(None);
+    }
     display::prepare(width, height, fps)
 }
 pub fn restore_display(previous: &crate::display::Previous) -> anyhow::Result<()> {

@@ -76,6 +76,7 @@ fn main() -> anyhow::Result<()> {
                 fps: 60,
                 bitrate_kbps: 12000,
                 codec: Codec::H264Baseline,
+                display: None,
             },
         )?;
         while start.elapsed().as_secs_f64() < seconds {

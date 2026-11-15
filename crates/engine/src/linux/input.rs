@@ -14,6 +14,8 @@ use x11rb::protocol::{xkb, xproto, xtest, Event as XEvent};
 pub(super) struct X11Input {
     conn: X11,
     root: u32,
+    screen: DisplayRect,
+    selected: bool,
     mapping: xproto::GetKeyboardMappingReply,
     min_keycode: u8,
     key_names: xkb::GetNamesReply,
@@ -38,13 +40,26 @@ impl X11Input {
         .reply()?;
         let setup = conn.setup();
         let root = setup.roots[screen].root;
+        let screen = DisplayRect {
+            width: setup.roots[screen].width_in_pixels.into(),
+            height: setup.roots[screen].height_in_pixels.into(),
+            ..Default::default()
+        };
         let min_keycode = setup.min_keycode;
         let mapping = conn
             .get_keyboard_mapping(min_keycode, setup.max_keycode - min_keycode + 1)?
             .reply()?;
+        conn.change_window_attributes(
+            root,
+            &xproto::ChangeWindowAttributesAux::new()
+                .event_mask(xproto::EventMask::STRUCTURE_NOTIFY),
+        )?
+        .check()?;
         Ok(Self {
             conn,
             root,
+            screen,
+            selected: false,
             mapping,
             min_keycode,
             key_names,
@@ -58,6 +73,10 @@ impl X11Input {
         while let Some(event) = self.conn.poll_for_event()? {
             match event {
                 XEvent::MappingNotify(_) => changed = true,
+                XEvent::ConfigureNotify(event) if event.window == self.root => {
+                    self.screen.width = event.width.into();
+                    self.screen.height = event.height.into();
+                }
                 XEvent::Error(error) => anyhow::bail!("X11 input error: {error:?}"),
                 _ => {}
             }
@@ -169,6 +188,10 @@ fn notches(remainder: &mut i32, delta: i16) -> i32 {
     count
 }
 impl InputSink for X11Input {
+    fn set_display_selected(&mut self, selected: bool) {
+        self.selected = selected;
+    }
+
     fn apply(&mut self, event: &Event, display: DisplayRect) -> anyhow::Result<()> {
         self.refresh()?;
         match event {
@@ -223,18 +246,27 @@ impl InputSink for X11Input {
                 )?;
             }
             Event::MouseMove { dx, dy } => {
-                // XTest MotionNotify detail=1 interprets x/y as relative deltas.
-                // Drop the void cookie: errors are handled by refresh, without a round trip.
-                drop(xtest::fake_input(
-                    &self.conn,
-                    xproto::MOTION_NOTIFY_EVENT,
-                    1,
-                    x11rb::CURRENT_TIME,
-                    x11rb::NONE,
-                    *dx,
-                    *dy,
-                    0,
-                )?);
+                let position =
+                    relative_position(display, self.screen, self.selected, *dx, *dy, || {
+                        let pointer = self.conn.query_pointer(self.root)?.reply()?;
+                        Ok((pointer.root_x, pointer.root_y))
+                    })?;
+                if let Some((x, y)) = position {
+                    self.fake(xproto::MOTION_NOTIFY_EVENT, 0, x, y)?;
+                } else {
+                    // XTest MotionNotify detail=1 interprets x/y as relative deltas.
+                    // Drop the void cookie: errors are handled by refresh, without a round trip.
+                    drop(xtest::fake_input(
+                        &self.conn,
+                        xproto::MOTION_NOTIFY_EVENT,
+                        1,
+                        x11rb::CURRENT_TIME,
+                        x11rb::NONE,
+                        *dx,
+                        *dy,
+                        0,
+                    )?);
+                }
             }
             Event::MouseButton { button, down } => {
                 let code = button_code(*button)?;
@@ -294,6 +326,26 @@ impl InputSink for X11Input {
         let _ = self.conn.flush();
     }
 }
+
+/// Query after preceding XTest requests have run, then move absolutely so X
+/// acceleration cannot carry us past an edge. Whole-screen sharing keeps the
+/// existing relative XTest path, including acceleration and no round trip.
+fn relative_position(
+    display: DisplayRect,
+    screen: DisplayRect,
+    selected: bool,
+    dx: i16,
+    dy: i16,
+    pointer: impl FnOnce() -> anyhow::Result<(i16, i16)>,
+) -> anyhow::Result<Option<(i16, i16)>> {
+    if display == screen && !selected {
+        return Ok(None);
+    }
+    let (x, y) = pointer()?;
+    let (x, y) = display.clamp(i32::from(x) + i32::from(dx), i32::from(y) + i32::from(dy));
+    Ok(Some((i16::try_from(x)?, i16::try_from(y)?)))
+}
+
 impl Drop for X11Input {
     fn drop(&mut self) {
         self.release_all();
@@ -521,6 +573,8 @@ mod timeout_tests {
         let input = X11Input {
             conn,
             root: 0,
+            screen: Default::default(),
+            selected: false,
             mapping: Default::default(),
             min_keycode: 8,
             key_names: Default::default(),
@@ -531,5 +585,58 @@ mod timeout_tests {
         assert!(input.fake(xproto::KEY_PRESS_EVENT, 8, 0, 0).is_err());
         drop(input);
         worker.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod display_motion_tests {
+    use super::*;
+
+    #[test]
+    fn selected_monitor_clamps_each_edge_and_whole_screen_keeps_relative_input() {
+        let screen = DisplayRect {
+            width: 4480,
+            height: 1440,
+            ..Default::default()
+        };
+        let monitor = DisplayRect {
+            x: 1920,
+            y: 100,
+            width: 2560,
+            height: 1340,
+        };
+        for (dx, dy, expected) in [
+            (i16::MIN, i16::MIN, (1920, 100)),
+            (i16::MAX, i16::MAX, (4479, 1439)),
+            (10, -5, (2010, 195)),
+        ] {
+            assert_eq!(
+                relative_position(monitor, screen, true, dx, dy, || Ok((2000, 200))).unwrap(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            relative_position(screen, screen, false, 123, -456, || panic!(
+                "whole screen must stay asynchronous"
+            ))
+            .unwrap(),
+            None
+        );
+        // Switching back to a left-hand monitor also clamps a stale position.
+        let left = DisplayRect {
+            x: 0,
+            width: 1920,
+            ..screen
+        };
+        assert_eq!(
+            relative_position(left, screen, true, 1, 1, || Ok((3000, 200))).unwrap(),
+            Some((1919, 201))
+        );
+        // A selected monitor filling this root still uses absolute XTest on
+        // this root, even when the pointer has crossed to another X screen.
+        assert_eq!(
+            relative_position(screen, screen, true, i16::MAX, i16::MIN, || Ok((100, 200))).unwrap(),
+            Some((4479, 0))
+        );
     }
 }

@@ -25,9 +25,87 @@ const GEOMETRY_CHECK: Duration = Duration::from_millis(250);
 /// than one frame's encode time keeps its rate; more would only queue.
 const IN_FLIGHT: usize = 2;
 /// `LATCH_MAC_DISPLAY=<CGDirectDisplayID>` shares that display instead of
-/// the main one; the stream request does not name a display yet.
-fn wanted_display() -> Option<u32> {
+/// the main one when the viewer names none.
+fn owner_display() -> Option<u32> {
     std::env::var("LATCH_MAC_DISPLAY").ok()?.trim().parse().ok()
+}
+
+/// The display a session shares: the viewer's choice, else the owner's,
+/// else (in capture) the main one. A choice naming a display that has
+/// gone falls through.
+fn wanted_display(chosen: Option<u32>, owner: Option<u32>, available: &[u32]) -> Option<u32> {
+    chosen
+        .filter(|id| available.contains(id))
+        .or_else(|| owner.filter(|id| available.contains(id)))
+}
+
+/// Every online display, including sleeping ones, named by its
+/// CGDirectDisplayID. The default is the owner's `LATCH_MAC_DISPLAY`
+/// while it is online, else the main one.
+pub fn displays() -> Vec<crate::display::HostDisplay> {
+    let mut ids = [0u32; 32];
+    let mut count = 0u32;
+    // SAFETY: the buffer holds `ids.len()` IDs and `count` is a valid out pointer.
+    let status =
+        unsafe { ffi::CGGetOnlineDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+    if status != 0 {
+        return Vec::new();
+    }
+    let ids = &ids[..(count as usize).min(ids.len())];
+    // SAFETY: reads the window server's display configuration only.
+    let main = unsafe { ffi::CGMainDisplayID() };
+    let default = owner_display()
+        .filter(|id| ids.contains(id))
+        .unwrap_or(main);
+    let mut external = 0;
+    let externals = ids
+        .iter()
+        // SAFETY: as above.
+        .filter(|&&id| unsafe { ffi::CGDisplayIsBuiltin(id) } == 0)
+        .count();
+    ids.iter()
+        .map(|&id| {
+            // SAFETY: CGDisplayBounds and the copied mode only read the
+            // display configuration; the mode is released after use.
+            let (bounds, pixels, builtin) = unsafe {
+                let bounds = ffi::CGDisplayBounds(id);
+                let mode = ffi::CGDisplayCopyDisplayMode(id);
+                let pixels = if mode.is_null() {
+                    None
+                } else {
+                    let size = (
+                        ffi::CGDisplayModeGetPixelWidth(mode) as u32,
+                        ffi::CGDisplayModeGetPixelHeight(mode) as u32,
+                    );
+                    ffi::CGDisplayModeRelease(mode);
+                    Some(size)
+                };
+                (bounds, pixels, ffi::CGDisplayIsBuiltin(id) != 0)
+            };
+            let (width, height) =
+                pixels.unwrap_or((bounds.size.width as u32, bounds.size.height as u32));
+            let name = if builtin {
+                "Built-in display".to_string()
+            } else {
+                external += 1;
+                if externals > 1 {
+                    format!("External display {external}")
+                } else {
+                    "External display".to_string()
+                }
+            };
+            crate::display::HostDisplay {
+                id: id.to_string(),
+                name,
+                x: bounds.origin.x as i32,
+                y: bounds.origin.y as i32,
+                width,
+                height,
+                primary: id == main,
+                default: id == default,
+            }
+        })
+        .collect()
 }
 
 pub fn open_video(config: &VideoConfig) -> Result<Box<dyn VideoPipeline>> {
@@ -57,7 +135,10 @@ fn open_video_color(config: &VideoConfig) -> Result<Box<dyn VideoPipeline>> {
         width: config.width,
         height: config.height,
         fps: config.fps,
-        display: wanted_display(),
+        display: config
+            .display
+            .as_deref()
+            .and_then(|id| id.trim().parse().ok()),
         pixel_format: depth.pixel_format(),
         hdr: config.color.is_hdr(),
     };
@@ -138,6 +219,7 @@ pub fn encodable() -> Vec<Codec> {
                     fps: 60,
                     bitrate_kbps: 10_000,
                     codec: *codec,
+                    display: None,
                 },
                 Depth::Eight,
             )
@@ -196,6 +278,7 @@ impl Video {
 impl VideoPipeline for Video {
     fn info(&self) -> VideoInfo {
         VideoInfo {
+            captured_display: Some(self.capture.id.to_string()),
             color: self.config.color,
             encoder: format!(
                 "VideoToolbox {}",
@@ -367,5 +450,49 @@ impl AudioCapture for Audio {
     }
     fn describe(&self) -> String {
         "ScreenCaptureKit system audio · 48 kHz stereo".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wanted_display;
+
+    #[test]
+    fn the_viewers_choice_comes_before_the_owners_override() {
+        let available = [1, 2, 69733382];
+        assert_eq!(
+            wanted_display(Some(69733382), Some(1), &available),
+            Some(69733382)
+        );
+        assert_eq!(wanted_display(None, Some(1), &available), Some(1));
+        assert_eq!(
+            wanted_display(None, None, &available),
+            None,
+            "the main display"
+        );
+        // A disconnected choice falls back to the owner's override first.
+        assert_eq!(wanted_display(Some(9), Some(2), &available), Some(2));
+        assert_eq!(wanted_display(Some(9), Some(8), &available), None);
+        assert_eq!(wanted_display(Some(1), Some(2), &[]), None);
+    }
+
+    #[test]
+    fn the_main_display_is_listed_as_primary() {
+        let displays = super::displays();
+        eprintln!("{displays:#?}");
+        // SAFETY: reads the window server's configuration only.
+        let main = unsafe { super::ffi::CGMainDisplayID() };
+        // A sleeping main display remains online and must remain selectable.
+        // SAFETY: reads the window server's configuration only.
+        if unsafe { super::ffi::CGDisplayIsOnline(main) } != 0 {
+            assert!(displays.iter().any(|d| d.id == main.to_string()));
+        }
+        if displays.is_empty() {
+            return;
+        }
+        let primary: Vec<_> = displays.iter().filter(|d| d.primary).collect();
+        assert_eq!(primary.len(), 1);
+        assert_eq!(primary[0].id, main.to_string());
+        assert!(displays.iter().all(|d| d.width > 0 && d.height > 0));
     }
 }

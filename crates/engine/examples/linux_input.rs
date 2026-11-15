@@ -50,7 +50,7 @@ fn main() -> anyhow::Result<()> {
     let mut resized_capture = latch_engine::linux::X11Capture::new()?;
     let mut resized_frame = Bgra::default();
     resized_capture.capture_now(&mut resized_frame)?;
-    let previous = latch_engine::linux::prepare_display(1280, 720, 60)?;
+    let previous = latch_engine::linux::prepare_display(1280, 720, 60, None)?;
     let window = conn.generate_id()?;
     let mut cleanup = Cleanup {
         conn,
@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
         (resized_frame.width, resized_frame.height) == (1280, 720),
         "capture missed shrink"
     );
-    latch_engine::linux::prepare_display(3024, 1964, 60)?;
+    latch_engine::linux::prepare_display(3024, 1964, 60, None)?;
     resized_capture.capture_now(&mut resized_frame)?;
     ensure!(
         (resized_frame.width, resized_frame.height) == (3024, 1964),

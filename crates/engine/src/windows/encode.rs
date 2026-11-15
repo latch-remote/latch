@@ -1,14 +1,11 @@
 use super::capture::Gpu;
-use super::{display, mf};
+use super::mf;
 use crate::bitstream::{vbv_bits, Format, Sequence};
 use crate::video::{Codec, VideoConfig};
 use anyhow::{bail, Context, Result};
 use std::{
     mem::ManuallyDrop,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::mpsc,
     time::{Duration, Instant},
 };
 use windows::{
@@ -48,27 +45,35 @@ impl IMFAsyncCallback_Impl for EventCallback_Impl {
         Ok(())
     }
 }
-// A codec that failed at runtime stays off until restart. Each hardware-only
-// codec is offered only after a real keyframe has passed through its MFT.
-static HEVC_FAILED: AtomicBool = AtomicBool::new(false);
-static HEVC_PROVEN: AtomicBool = AtomicBool::new(false);
-static AV1_FAILED: AtomicBool = AtomicBool::new(false);
-static AV1_PROVEN: AtomicBool = AtomicBool::new(false);
-pub(super) fn codec_failed(codec: Codec, why: &anyhow::Error) {
-    tracing::warn!(?codec, "encoder is not used again: {why:#}");
-    match codec {
-        Codec::Hevc => &HEVC_FAILED,
-        Codec::Av1 => &AV1_FAILED,
-        _ => return,
+/// Each adapter proves its own hardware codecs. A failure on one GPU
+/// leaves the other GPUs' negotiated capabilities intact.
+#[derive(Default)]
+struct Capabilities(Vec<((i32, u32), Codec, bool)>);
+impl Capabilities {
+    fn get(&self, adapter: (i32, u32), codec: Codec) -> Option<bool> {
+        self.0
+            .iter()
+            .find(|(a, c, _)| *a == adapter && *c == codec)
+            .map(|(_, _, available)| *available)
     }
-    .store(true, Ordering::Relaxed);
+    fn set(&mut self, adapter: (i32, u32), codec: Codec, available: bool) {
+        if let Some(entry) = self
+            .0
+            .iter_mut()
+            .find(|(a, c, _)| *a == adapter && *c == codec)
+        {
+            entry.2 = available;
+        } else {
+            self.0.push((adapter, codec, available));
+        }
+    }
 }
-pub(super) fn codec_allowed(codec: Codec) -> bool {
-    match codec {
-        Codec::Hevc => !HEVC_FAILED.load(Ordering::Relaxed),
-        Codec::Av1 => !AV1_FAILED.load(Ordering::Relaxed),
-        _ => true,
-    }
+static CAPABILITIES: parking_lot::Mutex<Capabilities> =
+    parking_lot::Mutex::new(Capabilities(Vec::new()));
+
+pub(super) fn codec_failed(codec: Codec, gpu: &Gpu, why: &anyhow::Error) {
+    tracing::warn!(?codec, adapter = ?gpu.adapter, "encoder is not used again on this adapter: {why:#}");
+    CAPABILITIES.lock().set(gpu.adapter, codec, false);
 }
 
 pub(super) fn media_type(subtype: &GUID, config: &VideoConfig) -> Result<IMFMediaType> {
@@ -213,31 +218,26 @@ pub(super) fn available() -> bool {
             .is_ok()
     }
 }
-pub(super) fn codec_available(codec: Codec) -> bool {
+pub(super) fn codec_available(
+    codec: Codec,
+    device: &windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
+) -> bool {
     if matches!(codec, Codec::H264High | Codec::H264Baseline) {
         return available();
     }
-    if !codec_allowed(codec) {
+    // SAFETY: The caller owns this adapter interface.
+    let Ok(desc) = (unsafe { device.GetDesc1() }) else {
         return false;
-    }
-    let proven = if codec == Codec::Hevc {
-        &HEVC_PROVEN
-    } else {
-        &AV1_PROVEN
     };
-    if proven.load(Ordering::Relaxed) {
-        return true;
+    let adapter = (desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart);
+    if let Some(available) = CAPABILITIES.lock().get(adapter, codec) {
+        return available;
     }
     if !hardware(codec).is_ok_and(|v| !v.is_empty()) {
         return false;
     }
-    let _dpi = display::DpiAwareness::physical();
-    // No display or device now says nothing about the encoder: try again at
-    // the next connection.
-    let Ok(output) = display::select() else {
-        return false;
-    };
-    let Ok(gpu) = Gpu::new(&output.adapter) else {
+    // No device now says nothing about the encoder: try again next connection.
+    let Ok(gpu) = Gpu::new(device) else {
         return false;
     };
     let config = VideoConfig {
@@ -247,14 +247,15 @@ pub(super) fn codec_available(codec: Codec) -> bool {
         fps: 60,
         bitrate_kbps: 10_000,
         codec,
+        display: None,
     };
     match probe_keyframe(&config, &gpu) {
         Ok(()) => {
-            proven.store(true, Ordering::Relaxed);
+            CAPABILITIES.lock().set(adapter, codec, true);
             true
         }
         Err(e) => {
-            codec_failed(codec, &e);
+            codec_failed(codec, &gpu, &e);
             false
         }
     }
@@ -938,6 +939,7 @@ mod tests {
             fps: 30,
             bitrate_kbps: 4000,
             codec: Codec::H264High,
+            display: None,
         };
         let mut encoder = match Encoder::software(&config) {
             Ok(e) => e,
@@ -970,6 +972,22 @@ mod tests {
 #[cfg(test)]
 mod output_tests {
     #[test]
+    fn codec_proofs_and_failures_are_scoped_to_the_selected_adapter() {
+        use super::*;
+        let mut caps = Capabilities::default();
+        let primary = (1, 10);
+        let secondary = (2, 20);
+        caps.set(primary, Codec::Av1, true);
+        assert_eq!(caps.get(secondary, Codec::Av1), None);
+        caps.set(secondary, Codec::Av1, false);
+        assert_eq!(caps.get(primary, Codec::Av1), Some(true));
+        assert_eq!(caps.get(secondary, Codec::Av1), Some(false));
+        assert_eq!(caps.get(secondary, Codec::Hevc), None);
+        caps.set(primary, Codec::Av1, false);
+        assert_eq!(caps.get(primary, Codec::Av1), Some(false));
+    }
+
+    #[test]
     fn short_output_buffer_grows_even_if_driver_size_is_stale() -> anyhow::Result<()> {
         assert_eq!(super::grown_output_capacity(1024, 8192)?, 8192);
         assert_eq!(super::grown_output_capacity(1024, 1024)?, 2048);
@@ -980,6 +998,7 @@ mod output_tests {
 
 #[cfg(test)]
 mod hardware_tests {
+    use super::super::display;
     use super::*;
 
     /// Run in the signed-in desktop; never run hardware probes in CI/session 0.
@@ -996,6 +1015,7 @@ mod hardware_tests {
                 fps: 60,
                 bitrate_kbps: 50_000,
                 codec,
+                display: None,
             };
             for (activation, name) in hardware(codec)? {
                 // SAFETY: the test owns a COM/MF runtime on this thread.
@@ -1042,7 +1062,8 @@ mod hardware_tests {
                 }
                 eprintln!("{name}");
             }
-            let proven = codec_available(codec);
+            let output = display::select()?;
+            let proven = codec_available(codec, &output.adapter);
             eprintln!("{codec:?} proven: {proven}");
             if codec == Codec::Av1 && hardware(codec)?.is_empty() {
                 assert!(!proven);

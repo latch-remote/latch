@@ -2,12 +2,15 @@ use super::elevated::{self, Client};
 use crate::input::{DisplayRect, Event, Held, InputSink};
 use anyhow::{bail, Result};
 use std::sync::mpsc::{self, TryRecvError};
+use windows::Win32::Foundation::RECT;
 use windows::Win32::UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*};
 
 /// SendInput from this process. The elevated helper injects with one too.
 #[derive(Default)]
 pub(super) struct Local {
     held: Held,
+    previous_clip: Option<RECT>,
+    restore_unconfined: bool,
 }
 
 /// The host's injector: through the elevated helper once it answers, so
@@ -246,6 +249,29 @@ fn post(inputs: &[INPUT]) -> Result<()> {
     Ok(())
 }
 impl Local {
+    fn confine(&mut self, display: DisplayRect) -> Result<()> {
+        let _dpi = super::display::DpiAwareness::physical();
+        // Keep SendInput relative, including Windows acceleration and raw game
+        // input. The OS clips the resulting cursor position in physical pixels.
+        let rect = clip_rect(display)?;
+        // SAFETY: Both rectangles are initialized and valid for these calls.
+        unsafe {
+            if self.previous_clip.is_none() {
+                let mut previous = RECT::default();
+                GetClipCursor(&mut previous)?;
+                ClipCursor(Some(&rect))?;
+                self.restore_unconfined = previous.left == GetSystemMetrics(SM_XVIRTUALSCREEN)
+                    && previous.top == GetSystemMetrics(SM_YVIRTUALSCREEN)
+                    && previous.right - previous.left == GetSystemMetrics(SM_CXVIRTUALSCREEN)
+                    && previous.bottom - previous.top == GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                self.previous_clip = Some(previous);
+            } else {
+                ClipCursor(Some(&rect))?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn apply(&mut self, event: &Event, display: DisplayRect) -> Result<()> {
         if matches!(event, Event::ReleaseAll) {
             self.release_all();
@@ -254,6 +280,9 @@ impl Local {
                 "input releases still pending"
             );
             return Ok(());
+        }
+        if matches!(event, Event::MouseMove { .. } | Event::MousePosition { .. }) {
+            self.confine(display)?;
         }
         let inputs = construct(event, display)?;
         post(&inputs)?;
@@ -273,6 +302,26 @@ impl Local {
                     }
                     _ => {}
                 }
+            }
+        }
+        self.restore_clip();
+    }
+
+    fn restore_clip(&mut self) {
+        if let Some(previous) = self.previous_clip {
+            let _dpi = super::display::DpiAwareness::physical();
+            // An unrestricted cursor must stay unrestricted when session cleanup
+            // restores a larger desktop after the injector has been dropped.
+            let previous = if self.restore_unconfined {
+                None
+            } else {
+                Some(std::ptr::from_ref(&previous))
+            };
+            // SAFETY: This rectangle came from GetClipCursor in this session.
+            if let Err(e) = unsafe { ClipCursor(previous) } {
+                tracing::warn!("restore cursor confinement: {e:#}");
+            } else {
+                self.previous_clip = None;
             }
         }
     }
@@ -296,6 +345,7 @@ impl Injector {
         if let Helper::Connecting(started) = &self.helper {
             match started.try_recv() {
                 Ok(client) => {
+                    self.local.restore_clip();
                     tracing::info!("input goes through the elevated helper, so windows that run as administrator follow the viewer too");
                     self.helper = Helper::Connected(client);
                 }
@@ -337,6 +387,19 @@ impl Injector {
         }
     }
 }
+
+fn clip_rect(display: DisplayRect) -> Result<RECT> {
+    anyhow::ensure!(
+        display.width > 0 && display.height > 0,
+        "empty input display"
+    );
+    Ok(RECT {
+        left: display.x,
+        top: display.y,
+        right: i32::try_from(i64::from(display.x) + i64::from(display.width))?,
+        bottom: i32::try_from(i64::from(display.y) + i64::from(display.height))?,
+    })
+}
 impl InputSink for Injector {
     fn apply(&mut self, event: &Event, display: DisplayRect) -> Result<()> {
         if matches!(event, Event::ReleaseAll) {
@@ -344,6 +407,12 @@ impl InputSink for Injector {
             let remote = self.remote(event, display).unwrap_or(Ok(()));
             let local = self.local.apply(event, display);
             return remote.and(local);
+        }
+        if matches!(event, Event::MouseMove { .. } | Event::MousePosition { .. }) {
+            // Finish a helper handoff before acquiring the host's clip. The
+            // host also confines input forwarded to an older installed helper.
+            let _ = self.client();
+            self.local.confine(display)?;
         }
         if let Some(result) = self.remote(event, display) {
             return result;
@@ -367,6 +436,96 @@ impl Drop for Injector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn confinement_uses_the_full_physical_display_rectangle() -> Result<()> {
+        for display in [
+            DisplayRect {
+                x: -3840,
+                y: -2160,
+                width: 3840,
+                height: 2160,
+            },
+            DisplayRect {
+                x: 1920,
+                y: 500,
+                width: 2560,
+                height: 1440,
+            },
+        ] {
+            let rect = clip_rect(display)?;
+            assert_eq!((rect.left, rect.top), (display.x, display.y));
+            assert_eq!(
+                (rect.right, rect.bottom),
+                (
+                    display.x + display.width as i32,
+                    display.y + display.height as i32
+                )
+            );
+        }
+        assert!(clip_rect(DisplayRect::default()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn injected_motion_updates_confinement_and_release_restores_it() -> Result<()> {
+        let _dpi = super::super::display::DpiAwareness::physical();
+        let mut previous = RECT::default();
+        // SAFETY: The writable output rectangle remains live for the query.
+        if let Err(e) = unsafe { GetClipCursor(&mut previous) } {
+            eprintln!("cursor desktop unavailable: {e}");
+            return Ok(());
+        }
+        let width = (previous.right - previous.left) / 2;
+        let height = previous.bottom - previous.top;
+        if width < 1 || height < 1 {
+            return Ok(());
+        }
+        let mut input = Local::default();
+        for x in [previous.left, previous.left + width] {
+            let display = DisplayRect {
+                x,
+                y: previous.top,
+                width: width as u32,
+                height: height as u32,
+            };
+            for event in [
+                Event::MousePosition {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                },
+                Event::MouseMove {
+                    dx: i16::MAX,
+                    dy: i16::MIN,
+                },
+            ] {
+                input.apply(&event, display)?;
+                let mut actual = RECT::default();
+                // SAFETY: The writable output rectangle remains live for the query.
+                unsafe {
+                    GetClipCursor(&mut actual)?;
+                }
+                let expected = clip_rect(display)?;
+                assert_eq!(
+                    (actual.left, actual.top, actual.right, actual.bottom),
+                    (expected.left, expected.top, expected.right, expected.bottom)
+                );
+            }
+        }
+        input.release_all();
+        let mut actual = RECT::default();
+        // SAFETY: The writable output rectangle remains live for the query.
+        unsafe {
+            GetClipCursor(&mut actual)?;
+        }
+        assert_eq!(
+            (actual.left, actual.top, actual.right, actual.bottom),
+            (previous.left, previous.top, previous.right, previous.bottom)
+        );
+        Ok(())
+    }
+
     #[test]
     fn absolute_coordinates_reconstruct_every_pixel() {
         for size in [1, 1920, 3840, 7680] {

@@ -942,6 +942,9 @@ pub struct Settings {
     pub gamepads: bool,
     /// Send this machine's microphone, where the host can play it.
     pub mic: bool,
+    /// The host display to share, by the id its status listed; `None`
+    /// leaves the choice to the host.
+    pub display: Option<String>,
 }
 
 /// Where a session sends the host's rumble and lights: slot and feedback.
@@ -1834,6 +1837,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         reference_invalidation: recovery_wanted(),
         mic: settings.mic,
         probe_trains: true,
+        display: settings.display.clone(),
         // 5.1 or 7.1 when this machine's speakers have them; stereo is the
         // field's absence, which every host understands.
         audio_channels,
@@ -4145,6 +4149,7 @@ mod tests {
             av1: false,
             audio: true,
             name: "test".into(),
+            display: None,
         };
         assert!(!offer(&s).contains(&Codec::Hevc));
         assert!(offer(&s).contains(&Codec::H264Baseline));
@@ -4178,6 +4183,7 @@ mod tests {
                 av1: false,
                 audio: false,
                 name: "test".into(),
+                display: None,
             },
             Arc::new(FrameSlot::default()),
             std::sync::mpsc::channel().0,
