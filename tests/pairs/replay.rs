@@ -877,6 +877,7 @@ fn check_decoder_retirement(
     let (wake, wakes) = mpsc::channel();
     let wake_probe = probe.clone();
     let expected_pictures = expected.len();
+    let expects_errors = steps.iter().any(|step| matches!(step, DecoderStep::Error));
     let mut inner = Inner::new(
         events,
         Arc::new(FrameSlot::default()),
@@ -937,6 +938,25 @@ fn check_decoder_retirement(
     assert_eq!(stats.decoder_pending_frames, 0);
     assert_eq!(stats.decoder_discarded_frames, discarded);
     assert_eq!(inner.queue.lock().want_keyframe, want_keyframe);
+    if !expects_errors {
+        assert!(probe.decode_errors.lock().is_empty());
+    }
+}
+
+#[test]
+fn decoder_retains_one_picture_delayed_identities_without_recovery() {
+    check_decoder_retirement(
+        vec![
+            DecoderStep::Hold,
+            DecoderStep::Output(vec![-1]),
+            DecoderStep::Output(vec![-1]),
+            // Drain the final two pictures at end-of-stream.
+            DecoderStep::Output(vec![-1, 0]),
+        ],
+        &[0, 1, 2, 3],
+        0,
+        false,
+    );
 }
 
 #[test]

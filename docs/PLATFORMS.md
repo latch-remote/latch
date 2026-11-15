@@ -141,12 +141,18 @@ Linux tape checks all 24 timestamps and picture contents. Returning every
 ready output fixes intermittent picture loss. Windows CI subsequently observed
 intermittent first-picture withholding with this Linux fixture. Short Windows
 repetitions have not reproduced that condition. For explicit zero-reorder
-sequences, the wrapper now polls a temporarily empty decoder within the
-one-second access-unit deadline, reserving 20 ms for the worker reply. The per-call assertion requires
-the picture before the next input is submitted. A missing picture reports a
-decode error. Iteration and time bounds cover repeated stream changes and
-event-only results, and timeout
-diagnostics identify the active phase and recent output HRESULT/status pairs.
+sequences, the wrapper polls temporarily empty output for at most 50 ms,
+including output type negotiation. On expiry it warns once, disables polling
+for that decoder instance and preserves timestamped delayed output with the
+decoder's normal pipeline latency. The same fallback applies on hardware.
+Polling stress tests exercised only the software decoder. A short 24-picture
+H.264 DXVA replay returned every picture immediately, with zero late deliveries
+and polling still enabled. Hardware polling and switch-off remain unverified.
+Software polls reuse an empty
+sample until a picture or type change. The strict per-call CI assertion
+still requires the picture before the next input is submitted. Iteration
+and time bounds cover repeated stream changes and event-only results, and
+timeout diagnostics identify the active phase and recent output HRESULT/status pairs.
 
 Decode-only Windows software H.264 repetitions completed 200 iterations of
 each reported test serially and another 200 with four concurrent processes,

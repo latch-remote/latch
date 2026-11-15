@@ -107,6 +107,9 @@ impl Drop for SharedSurface {
     }
 }
 type Pictures = Vec<(i64, DecodedNv12)>;
+// No delayed output was observed in the software-MFT stress runs. Give a
+// scheduling delay 50 ms, then retain the decoder's normal pipeline latency.
+const PICTURE_WAIT: Duration = Duration::from_millis(50);
 enum Output<T> {
     Picture(i64, T),
     NeedInput,
@@ -157,28 +160,47 @@ fn drain_output<T>(
     pictures: &mut Vec<(i64, T)>,
     budget: &mut OutputBudget,
     expected: Option<i64>,
-    mut next: impl FnMut() -> Result<Output<T>>,
+    wait_enabled: &mut bool,
+    on_wait_expired: impl FnOnce(),
+    mut next: impl FnMut(Instant) -> Result<Output<T>>,
 ) -> Result<()> {
-    // A known zero-reorder picture is awaited within this access unit's
-    // existing deadline. Ready output takes this path without sleeping.
+    let mut expected =
+        expected.filter(|time| *wait_enabled && !pictures.iter().any(|picture| picture.0 == *time));
+    let wait_deadline = budget.deadline.min(Instant::now() + PICTURE_WAIT);
     loop {
+        if expected.is_some() && Instant::now() >= wait_deadline {
+            *wait_enabled = false;
+            on_wait_expired();
+            return Ok(());
+        }
         budget.check()?;
-        match next()? {
+        let deadline = if expected.is_some() {
+            wait_deadline
+        } else {
+            budget.deadline
+        };
+        match next(deadline)? {
             Output::Picture(time, picture) => {
                 ensure!(
                     pictures.len() < 64,
                     "decoder produced too many outputs without needing input"
                 );
                 pictures.push((time, picture));
+                if expected == Some(time) {
+                    expected = None;
+                }
             }
             Output::StreamChange => budget.stream_changes += 1,
             Output::Events => budget.events += 1,
             Output::NeedInput => {
-                if expected.is_none_or(|time| pictures.iter().any(|p| p.0 == time)) {
+                if expected.is_none() {
                     return Ok(());
                 }
                 budget.waits += 1;
-                thread::sleep(Duration::from_millis(1));
+                thread::sleep(
+                    Duration::from_millis(1)
+                        .min(wait_deadline.saturating_duration_since(Instant::now())),
+                );
             }
         }
     }
@@ -1035,10 +1057,12 @@ struct State {
     transform: IMFTransform,
     gpu: Option<Gpu>,
     output_type: Option<IMFMediaType>,
+    output_sample: Option<IMFSample>,
     pictures: Pictures,
     codec: Codec,
     dxva_used: bool,
     zero_reorder: [bool; 2],
+    wait_for_picture: bool,
     progress: Arc<Progress>,
 }
 impl State {
@@ -1142,10 +1166,12 @@ impl State {
                 transform,
                 gpu,
                 output_type: None,
+                output_sample: None,
                 pictures: Vec::new(),
                 codec,
                 dxva_used: dxva,
                 zero_reorder: [false; 2],
+                wait_for_picture: true,
                 progress,
             };
             match state.output_type(Instant::now() + worker_deadline::STARTUP) {
@@ -1158,7 +1184,7 @@ impl State {
                                 | MF_E_INVALIDMEDIATYPE
                         )
                     }) => {}
-                other => other?,
+                other => ensure!(other?, "decoder startup output type deadline exceeded"),
             }
             state.progress.phase("BEGIN_STREAMING");
             state
@@ -1201,7 +1227,8 @@ impl State {
             (mf, api)
         }
     }
-    fn output_type(&mut self, deadline: Instant) -> Result<()> {
+    // False leaves negotiation pending when the caller's polling cap expires.
+    fn output_type(&mut self, deadline: Instant) -> Result<bool> {
         // SAFETY: Type negotiation is serialized with ProcessInput/Output.
         unsafe {
             // Eight bits take the first NV12 or P010 type. A ten-bit stream
@@ -1211,10 +1238,9 @@ impl State {
             let mut stand_in = None;
             let mut chosen = None;
             for index in 0..256 {
-                ensure!(
-                    Instant::now() < deadline,
-                    "decoder output type negotiation deadline exceeded at type {index}"
-                );
+                if Instant::now() >= deadline {
+                    return Ok(false);
+                }
                 self.progress.phase("GetOutputAvailableType");
                 let ty = match self.transform.GetOutputAvailableType(0, index) {
                     Ok(ty) => ty,
@@ -1235,6 +1261,9 @@ impl State {
             let ty = chosen
                 .or(stand_in)
                 .context("decoder offers no NV12 output")?;
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
             self.progress.phase("SetOutputType");
             match self.transform.SetOutputType(0, &ty, 0) {
                 Err(e) if e.code() == MF_E_UNSUPPORTED_D3D_TYPE && self.gpu.is_some() => {
@@ -1252,7 +1281,7 @@ impl State {
                 result => result.context("set decoder NV12 output type")?,
             }
             self.output_type = Some(ty);
-            Ok(())
+            Ok(true)
         }
     }
     fn decode(&mut self, annexb: &[u8], time: i64) -> Result<Pictures> {
@@ -1320,7 +1349,7 @@ impl State {
             }
         }
         self.drain(&mut budget, expected)?;
-        if expected.is_some() && budget.waits > 0 {
+        if expected.is_some() && budget.waits > 0 && self.pictures.iter().any(|p| p.0 == time) {
             self.progress.late_output();
             tracing::debug!(
                 sample_time = time,
@@ -1334,15 +1363,34 @@ impl State {
     }
     fn drain(&mut self, budget: &mut OutputBudget, expected: Option<i64>) -> Result<()> {
         let mut pictures = std::mem::take(&mut self.pictures);
-        let deadline = budget.deadline;
-        let result = drain_output(&mut pictures, budget, expected, || {
-            self.read_output(deadline)
-        })
+        let mut wait_enabled = self.wait_for_picture;
+        let name = self.name();
+        let progress = self.progress.clone();
+        let result = drain_output(
+            &mut pictures,
+            budget,
+            expected,
+            &mut wait_enabled,
+            || {
+                progress.disable_picture_wait();
+                tracing::warn!(
+                    decoder = name,
+                    wait_cap_ms = PICTURE_WAIT.as_millis(),
+                    diagnostics = %progress.describe(),
+                    "MF current-picture wait expired; disabling polling for this decoder instance and retaining timestamped delayed output"
+                );
+            },
+            |deadline| self.read_output(deadline),
+        )
         .with_context(|| format!("drain decoder output, expected sample time {expected:?}"));
+        self.wait_for_picture = wait_enabled;
         self.pictures = pictures;
         result
     }
     fn read_output(&mut self, deadline: Instant) -> Result<Output<DecodedNv12>> {
+        if Instant::now() >= deadline {
+            return Ok(Output::NeedInput);
+        }
         if self.output_type.is_none() {
             match self.output_type(deadline) {
                 Err(error)
@@ -1353,7 +1401,10 @@ impl State {
                     self.progress.phase("waiting for decoder output type");
                     return Ok(Output::NeedInput);
                 }
-                result => result?,
+                Ok(false) => return Ok(Output::NeedInput),
+                result => {
+                    result?;
+                }
             }
             let settings = self.low_latency();
             self.progress.configure(format!(
@@ -1369,25 +1420,27 @@ impl State {
             let info = self.transform.GetOutputStreamInfo(0)?;
             self.progress.phase("allocate decoder output sample");
             let sample = if info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 == 0 {
-                let sample = mf::MFCreateSample()?;
-                sample.AddBuffer(&mf::MFCreateAlignedMemoryBuffer(
-                    info.cbSize.max(1),
-                    info.cbAlignment.saturating_sub(1),
-                )?)?;
-                Some(sample)
+                if self.output_sample.is_none() {
+                    let sample = mf::MFCreateSample()?;
+                    sample.AddBuffer(&mf::MFCreateAlignedMemoryBuffer(
+                        info.cbSize.max(1),
+                        info.cbAlignment.saturating_sub(1),
+                    )?)?;
+                    self.output_sample = Some(sample);
+                }
+                self.output_sample.clone()
             } else {
                 None
             };
+            if Instant::now() >= deadline {
+                return Ok(Output::NeedInput);
+            }
             let mut output = MFT_OUTPUT_DATA_BUFFER {
                 dwStreamID: 0,
                 pSample: ManuallyDrop::new(sample),
                 ..Default::default()
             };
             let mut status = 0;
-            ensure!(
-                Instant::now() < deadline,
-                "decoder output deadline exceeded before ProcessOutput"
-            );
             self.progress.phase("ProcessOutput");
             let result =
                 self.transform
@@ -1402,7 +1455,8 @@ impl State {
             ManuallyDrop::drop(&mut output.pEvents);
             match result {
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
-                    self.progress.phase("release unused output sample");
+                    // Keep the unused caller-owned sample for the next poll.
+                    self.progress.phase("retain unused output sample");
                     drop(sample);
                     self.progress.phase("waiting for zero-reorder output");
                     return Ok(Output::NeedInput);
@@ -1412,9 +1466,15 @@ impl State {
                     drop(sample);
                     self.progress.phase("release stream-change output type");
                     self.output_type = None;
+                    self.output_sample = None;
                     return Ok(Output::StreamChange);
                 }
-                result => result.context("decoder ProcessOutput")?,
+                result => {
+                    // A produced sample or an error must not leave a stale
+                    // timestamp or buffer contents in the next output request.
+                    self.output_sample = None;
+                    result.context("decoder ProcessOutput")?;
+                }
             }
             if output.dwStatus & MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0 as u32
                 == MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0 as u32
@@ -1528,6 +1588,7 @@ mod tests {
     use super::*;
     #[test]
     fn one_drain_returns_every_ready_picture_in_order() -> Result<()> {
+        let mut wait_enabled = true;
         // Reproduce the missing Linux capture identities 2..5: all five
         // pictures become ready before the next ProcessInput. The source
         // is deterministic and uses the collector State::drain calls.
@@ -1536,12 +1597,19 @@ mod tests {
             .collect();
         let mut pictures = Vec::new();
         let mut budget = OutputBudget::new(Instant::now() + worker_deadline::DECODE);
-        drain_output(&mut pictures, &mut budget, None, || {
-            Ok(match ready.pop_front() {
-                Some((time, picture)) => Output::Picture(time, picture),
-                None => Output::NeedInput,
-            })
-        })?;
+        drain_output(
+            &mut pictures,
+            &mut budget,
+            None,
+            &mut wait_enabled,
+            || panic!("unexpected wait fallback"),
+            |_deadline| {
+                Ok(match ready.pop_front() {
+                    Some((time, picture)) => Output::Picture(time, picture),
+                    None => Output::NeedInput,
+                })
+            },
+        )?;
         assert!(ready.is_empty());
         assert_eq!(
             pictures,
@@ -1550,12 +1618,20 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         // A later drain leaves the returned batch intact.
-        drain_output(&mut pictures, &mut budget, None, || Ok(Output::NeedInput))?;
+        drain_output(
+            &mut pictures,
+            &mut budget,
+            None,
+            &mut wait_enabled,
+            || panic!("unexpected wait fallback"),
+            |_deadline| Ok(Output::NeedInput),
+        )?;
         assert_eq!(pictures.len(), 5);
         Ok(())
     }
     #[test]
     fn a_partial_drain_keeps_output_across_an_error_and_retry() -> Result<()> {
+        let mut wait_enabled = true;
         let mut pictures = Vec::new();
         let mut outputs = [
             Ok(Output::Picture(2, 2)),
@@ -1564,22 +1640,36 @@ mod tests {
         ]
         .into_iter();
         let mut budget = OutputBudget::new(Instant::now() + worker_deadline::DECODE);
-        assert!(
-            drain_output(&mut pictures, &mut budget, None, || outputs.next().unwrap()).is_err()
-        );
+        assert!(drain_output(
+            &mut pictures,
+            &mut budget,
+            None,
+            &mut wait_enabled,
+            || panic!("unexpected wait fallback"),
+            |_deadline| outputs.next().unwrap()
+        )
+        .is_err());
         assert_eq!(pictures, [(2, 2), (3, 3)]);
         let mut ready = [4, 5, 6].into_iter();
-        drain_output(&mut pictures, &mut budget, None, || {
-            Ok(match ready.next() {
-                Some(picture) => Output::Picture(picture, picture),
-                None => Output::NeedInput,
-            })
-        })?;
+        drain_output(
+            &mut pictures,
+            &mut budget,
+            None,
+            &mut wait_enabled,
+            || panic!("unexpected wait fallback"),
+            |_deadline| {
+                Ok(match ready.next() {
+                    Some(picture) => Output::Picture(picture, picture),
+                    None => Output::NeedInput,
+                })
+            },
+        )?;
         assert_eq!(pictures, [(2, 2), (3, 3), (4, 4), (5, 5), (6, 6)]);
         Ok(())
     }
     #[test]
     fn late_picture_after_stream_change_arrives_before_another_input() -> Result<()> {
+        let mut wait_enabled = true;
         let mut outputs = [
             Output::NeedInput,
             Output::StreamChange,
@@ -1593,14 +1683,21 @@ mod tests {
         let mut budget = OutputBudget::new(Instant::now() + worker_deadline::DECODE);
         let mut pictures = Vec::new();
         let submitted_inputs = std::cell::Cell::new(1);
-        drain_output(&mut pictures, &mut budget, Some(0), || {
-            assert_eq!(
-                submitted_inputs.get(),
-                1,
-                "output must precede the next input"
-            );
-            Ok(outputs.next().unwrap())
-        })?;
+        drain_output(
+            &mut pictures,
+            &mut budget,
+            Some(0),
+            &mut wait_enabled,
+            || panic!("unexpected wait fallback"),
+            |_deadline| {
+                assert_eq!(
+                    submitted_inputs.get(),
+                    1,
+                    "output must precede the next input"
+                );
+                Ok(outputs.next().unwrap())
+            },
+        )?;
         assert_eq!(pictures, [(0, vec![32; 6])]);
         assert_eq!(
             (
@@ -1611,22 +1708,50 @@ mod tests {
             ),
             (7, 1, 1, 3)
         );
+        assert!(
+            wait_enabled,
+            "a picture inside the cap keeps polling enabled"
+        );
         submitted_inputs.set(2);
+        let mut second = [
+            Output::NeedInput,
+            Output::Picture(1, vec![40; 6]),
+            Output::NeedInput,
+        ]
+        .into_iter();
+        drain_output(
+            &mut pictures,
+            &mut budget,
+            Some(1),
+            &mut wait_enabled,
+            || panic!("a transient delay must not switch off polling"),
+            |_| Ok(second.next().unwrap()),
+        )?;
+        assert!(wait_enabled);
+        assert_eq!(pictures, [(0, vec![32; 6]), (1, vec![40; 6])]);
         Ok(())
     }
     #[test]
     fn repeated_stream_changes_and_event_only_outputs_share_one_call_limit() {
+        let mut wait_enabled = true;
         let mut budget = OutputBudget::new(Instant::now() + worker_deadline::DECODE);
         let mut pictures: Vec<(i64, ())> = Vec::new();
         let mut calls = 0;
-        let error = drain_output(&mut pictures, &mut budget, None, || {
-            calls += 1;
-            Ok(if calls % 2 == 0 {
-                Output::StreamChange
-            } else {
-                Output::Events
-            })
-        })
+        let error = drain_output(
+            &mut pictures,
+            &mut budget,
+            None,
+            &mut wait_enabled,
+            || panic!("unexpected wait fallback"),
+            |_deadline| {
+                calls += 1;
+                Ok(if calls % 2 == 0 {
+                    Output::StreamChange
+                } else {
+                    Output::Events
+                })
+            },
+        )
         .unwrap_err();
         assert_eq!(calls, 64);
         assert_eq!((budget.stream_changes, budget.events), (32, 32));
@@ -1639,49 +1764,153 @@ mod tests {
     }
     #[test]
     fn output_call_and_picture_counts_are_bounded() {
+        let mut wait_enabled = true;
         let mut pictures: Vec<(i64, ())> = Vec::new();
         let mut budget = OutputBudget::new(Instant::now() + worker_deadline::DECODE);
         budget.calls = 2048;
-        let error = drain_output(&mut pictures, &mut budget, None, || {
-            panic!("exhausted call budget must stop before another call")
-        })
+        let error = drain_output(
+            &mut pictures,
+            &mut budget,
+            None,
+            &mut wait_enabled,
+            || panic!("unexpected wait fallback"),
+            |_deadline| panic!("exhausted call budget must stop before another call"),
+        )
         .unwrap_err();
         assert!(
             error.to_string().contains("exceeded 2048 calls"),
             "{error:#}"
         );
         let mut budget = OutputBudget::new(Instant::now() + worker_deadline::DECODE);
-        let error = drain_output(&mut pictures, &mut budget, None, || {
-            Ok(Output::Picture(0, ()))
-        })
+        let error = drain_output(
+            &mut pictures,
+            &mut budget,
+            None,
+            &mut wait_enabled,
+            || panic!("unexpected wait fallback"),
+            |_deadline| Ok(Output::Picture(0, ())),
+        )
         .unwrap_err();
         assert!(error.to_string().contains("too many outputs"), "{error:#}");
         assert_eq!(pictures.len(), 64);
     }
     #[test]
-    fn output_deadline_stops_calls_and_missing_zero_reorder_pictures_fail() {
+    fn output_deadline_stops_calls_without_waiting() {
         let mut pictures: Vec<(i64, ())> = Vec::new();
         let mut budget = OutputBudget::new(Instant::now());
-        let error = drain_output(&mut pictures, &mut budget, None, || {
-            panic!("expired budget must not call the transform")
-        })
+        let error = drain_output(
+            &mut pictures,
+            &mut budget,
+            None,
+            &mut true,
+            || panic!("no picture was expected"),
+            |_| panic!("expired budget must not call the transform"),
+        )
         .unwrap_err();
         assert!(error.to_string().contains("deadline exceeded"), "{error:#}");
+    }
+    #[test]
+    fn permanent_picture_delay_disables_wait_once_and_preserves_every_identity() -> Result<()> {
+        let mut wait_enabled = true;
+        let warnings = std::cell::Cell::new(0);
         let started = Instant::now();
-        let mut budget = OutputBudget::new(started + Duration::from_millis(100));
-        let error = drain_output(&mut pictures, &mut budget, Some(0), || {
-            Ok(Output::NeedInput)
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("deadline exceeded"), "{error:#}");
+        let mut pending = None;
+        let mut published = Vec::new();
+        let mut total_waits = 0;
+        for time in 0..8 {
+            // The transform exposes the previous picture only after this
+            // input, regardless of how often ProcessOutput is polled.
+            let mut ready = pending.replace(time);
+            let mut pictures = Vec::new();
+            let mut budget = OutputBudget::new(Instant::now() + worker_deadline::DECODE);
+            drain_output(
+                &mut pictures,
+                &mut budget,
+                Some(time),
+                &mut wait_enabled,
+                || warnings.set(warnings.get() + 1),
+                |deadline| {
+                    if time == 0 {
+                        assert!(deadline.saturating_duration_since(Instant::now()) <= PICTURE_WAIT);
+                    }
+                    Ok(ready
+                        .take()
+                        .map_or(Output::NeedInput, |time| Output::Picture(time, time)))
+                },
+            )?;
+            if time == 0 {
+                assert!(pictures.is_empty());
+                assert!(budget.waits > 0);
+            } else {
+                assert_eq!(pictures, [(time - 1, time - 1)]);
+                assert_eq!(budget.waits, 0, "fallback must persist for this instance");
+            }
+            total_waits += budget.waits;
+            published.extend(pictures);
+        }
+        // End-of-stream releases the final delayed picture under its own time.
+        let mut budget = OutputBudget::new(Instant::now() + worker_deadline::DECODE);
+        drain_output(
+            &mut published,
+            &mut budget,
+            None,
+            &mut wait_enabled,
+            || warnings.set(warnings.get() + 1),
+            |_| {
+                Ok(pending
+                    .take()
+                    .map_or(Output::NeedInput, |time| Output::Picture(time, time)))
+            },
+        )?;
+        assert_eq!(
+            published,
+            (0..8).map(|time| (time, time)).collect::<Vec<_>>()
+        );
+        assert!(!wait_enabled);
+        assert_eq!(warnings.get(), 1);
+        assert!(total_waits > 0);
         assert!(started.elapsed() < worker_deadline::DECODE);
-        assert!(budget.waits > 0);
+        Ok(())
+    }
+    #[test]
+    fn unavailable_output_type_uses_the_same_short_wait_cap() -> Result<()> {
+        let mut wait_enabled = true;
+        let mut warnings = 0;
+        let started = Instant::now();
+        let mut pictures: Vec<(i64, ())> = Vec::new();
+        let mut budget = OutputBudget::new(started + worker_deadline::DECODE);
+        drain_output(
+            &mut pictures,
+            &mut budget,
+            Some(0),
+            &mut wait_enabled,
+            || warnings += 1,
+            |deadline| {
+                assert!(deadline.saturating_duration_since(Instant::now()) <= PICTURE_WAIT);
+                // Model GetOutputAvailableType returning TYPE_NOT_SET without
+                // any ProcessOutput call. It shares the picture wait's cap.
+                Ok(Output::NeedInput)
+            },
+        )?;
+        assert!(pictures.is_empty());
+        assert!(!wait_enabled);
+        assert_eq!(warnings, 1);
+        assert!(started.elapsed() < worker_deadline::DECODE);
+        Ok(())
     }
     #[test]
     fn an_unqualified_or_reordered_stream_can_still_need_more_input() -> Result<()> {
+        let mut wait_enabled = true;
         let mut pictures: Vec<(i64, ())> = Vec::new();
         let mut budget = OutputBudget::new(Instant::now() + worker_deadline::DECODE);
-        drain_output(&mut pictures, &mut budget, None, || Ok(Output::NeedInput))?;
+        drain_output(
+            &mut pictures,
+            &mut budget,
+            None,
+            &mut wait_enabled,
+            || panic!("unexpected wait fallback"),
+            |_deadline| Ok(Output::NeedInput),
+        )?;
         assert_eq!((budget.calls, budget.waits), (1, 0));
         Ok(())
     }
@@ -1762,6 +1991,34 @@ mod tests {
             assert!(frame.y[192 * frame.y_stride + 128] <= 20);
             assert_eq!(decoder.name(), "Media Foundation (DXVA)");
         }
+    }
+    #[test]
+    fn software_output_polls_reuse_one_empty_sample() -> Result<()> {
+        let _runtime = Runtime::new()?;
+        let mut state = State::new(Codec::H264Baseline, false, None, 160, 98, 8)?;
+        let bytes = include_bytes!("../../tests/fixtures/linux-aarch64-capture.h264");
+        let units = latch_codec::h264::nal::access_units(bytes);
+        assert_eq!(state.decode(units[0], 0)?.len(), 1);
+        let sample = state
+            .output_sample
+            .clone()
+            .context("software output sample")?;
+        let deadline = Instant::now() + worker_deadline::DECODE;
+        for _ in 0..4 {
+            assert!(matches!(state.read_output(deadline)?, Output::NeedInput));
+            assert_eq!(
+                state.output_sample.as_ref().unwrap().as_raw(),
+                sample.as_raw()
+            );
+        }
+        // Reuse must not keep an old output timestamp or pixel buffer.
+        let pictures = state.decode(units[1], 166667)?;
+        assert_eq!(pictures.iter().map(|p| p.0).collect::<Vec<_>>(), [166667]);
+        assert_ne!(
+            state.output_sample.as_ref().unwrap().as_raw(),
+            sample.as_raw()
+        );
+        Ok(())
     }
     #[test]
     fn linux_capture_outputs_keep_their_sample_times_and_pixels() -> Result<()> {

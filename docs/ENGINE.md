@@ -281,12 +281,16 @@ H.264 restriction. POC, colour, timing, crop and scaling lists are preserved.
 
 Media Foundation also normalizes incoming parameter sets for 6.0.0 hosts.
 It drains every output and reads the output sample time. For a successfully
-parsed, explicitly zero-reorder H.264/HEVC sequence, a complete picture must
-return before the next access unit is submitted. If `ProcessOutput` first
-reports `MF_E_TRANSFORM_NEED_MORE_INPUT`, the worker polls the same input
-within its one-second deadline, reserving 20 ms for the worker reply. A missing
-picture is a decode error. Ready pictures incur no polling wait. Sequences
-with unknown or nonzero ordering may require further inputs. The session keeps
+parsed, explicitly zero-reorder H.264/HEVC sequence, the worker tries to
+return the current picture before the next access unit is submitted. If
+`ProcessOutput` first reports `MF_E_TRANSFORM_NEED_MORE_INPUT`, it polls the
+same input for at most 50 ms, including output type negotiation. Expiry logs
+one warning and disables this wait for the decoder instance's remaining life.
+The decoder then retains its pipeline delay and returns every ready picture
+under its original sample time, including on hardware decoders. Expiry
+succeeds with any pictures already drained and needs no keyframe or codec
+recovery. Ready pictures incur no polling wait. Sequences with unknown or
+nonzero ordering may require further inputs. The session keeps
 bounded submitted-frame metadata and matches each picture to its original
 identity, route and latency measurements. Held, pending and discarded
 pictures appear in viewer statistics. VideoToolbox disables asynchronous
@@ -300,8 +304,15 @@ on each submitted access unit for every available host/viewer combination.
 Returning every ready MF output fixes the intermittent picture loss with
 Linux-encoded streams. Windows CI subsequently observed intermittent first-picture
 withholding with the Linux capture fixture. Local short Windows repetitions
-have not reproduced it. The strict per-call assertion verifies delivery
-before the following input, including bounded polling of the current input.
+have not reproduced it. Polling stress tests exercised only the software
+decoder. A short 24-picture H.264 DXVA replay returned every picture on its
+own submission, with zero late deliveries and polling still enabled. Its
+hardware wait and switch-off remain unverified.
+The 50 ms cap is the smallest chosen allowance for a scheduling delay because
+600 iterations of each software test recorded no late deliveries. The strict
+per-call CI assertion still requires delivery before the following input.
+Software polls reuse one empty output sample until it produces a picture or
+the output type changes.
 
 A local 60-picture H.264 High recording with `LATCH_MAC_LTR=1` declares
 `max_num_ref_frames=15` and `max_dec_frame_buffering=15` both before and
