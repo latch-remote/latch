@@ -208,6 +208,11 @@ fn main() -> anyhow::Result<()> {
                 break;
             }
             Ok(Event::Failed { stage, message }) => anyhow::bail!("failed at {stage}: {message}"),
+            Ok(Event::Network(status)) => {
+                for message in status.messages {
+                    eprintln!("{message}");
+                }
+            }
             Ok(other) => eprintln!("{other:?}"),
             Err(_) => anyhow::bail!("no stream after 20 s"),
         }
@@ -387,7 +392,14 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(sample_ms));
         let second = t0.elapsed().as_secs_f64();
         while let Ok(e) = rx.try_recv() {
-            eprintln!("elapsed_ms={} {e:?}", t0.elapsed().as_millis());
+            match e {
+                Event::Network(status) => {
+                    for message in status.messages {
+                        eprintln!("elapsed_ms={} {message}", t0.elapsed().as_millis());
+                    }
+                }
+                other => eprintln!("elapsed_ms={} {other:?}", t0.elapsed().as_millis()),
+            }
         }
         let s = session.stats();
         let probe = latch_stream::audio::take_probe();
