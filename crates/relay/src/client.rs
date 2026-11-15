@@ -11,7 +11,7 @@ use std::{
     collections::VecDeque,
     fmt,
     io::{self, Write},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
     sync::{mpsc, Arc, Condvar, Mutex, OnceLock},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -199,11 +199,13 @@ struct WinningPath {
     proxy: Option<(String, u16)>,
     address: Option<SocketAddr>,
     carrier: Carrier,
+    local_ip: Option<IpAddr>,
     expires: Instant,
 }
 impl WinningPath {
     fn matches(&self, config: &ClientConfig) -> bool {
         self.expires > Instant::now()
+            && self.local_ip == self.address.and_then(route_source)
             && self.host == config.endpoint.host()
             && self.port == config.endpoint.port()
             && self
@@ -213,16 +215,19 @@ impl WinningPath {
                 == config.proxy.as_ref().map(|p| (p.host(), p.port()))
     }
 }
+// UDP connect selects a route without sending packets or doing DNS.
+fn route_source(address: SocketAddr) -> Option<IpAddr> {
+    let bind = if address.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind).ok()?;
+    socket.connect(address).ok()?;
+    socket.local_addr().ok().map(|a| a.ip())
+}
 fn mss_stall(error: &io::Error) -> Option<MssReason> {
-    if error.kind() != io::ErrorKind::TimedOut {
-        return None;
-    }
-    match error.to_string().as_str() {
-        "TLS write deadline expired" => Some(MssReason::WriteStall),
-        "TLS record deadline expired" => Some(MssReason::RecordStall),
-        "TLS handshake stalled after ClientHello" => Some(MssReason::TlsHandshakeStall),
-        _ => None,
-    }
+    error.get_ref()?.downcast_ref::<wire::Stall>()?.mss_reason
 }
 
 struct Resolve {
@@ -231,6 +236,7 @@ struct Resolve {
     cancel: Cancel,
     deadline: Instant,
     reply: mpsc::SyncSender<io::Result<Vec<SocketAddr>>>,
+    refresh: bool,
 }
 fn enqueue_resolve(resolver: &mpsc::SyncSender<Resolve>, mut request: Resolve) -> io::Result<()> {
     loop {
@@ -251,30 +257,36 @@ fn enqueue_resolve(resolver: &mpsc::SyncSender<Resolve>, mut request: Resolve) -
         }
     }
 }
-fn resolve(
-    host: &str,
-    port: u16,
-    cancel: &Cancel,
-    deadline: Instant,
-) -> io::Result<Vec<SocketAddr>> {
-    // ponytail: one process-wide resolver bounds stuck OS DNS to one worker.
+fn dns_worker(discovery: bool) -> io::Result<&'static mpsc::SyncSender<Resolve>> {
+    // ponytail: one relay worker plus one discovery worker bound stuck OS DNS.
     // Caller cancellation never joins this OS-owned blocking operation.
+    static DISCOVERY: OnceLock<io::Result<mpsc::SyncSender<Resolve>>> = OnceLock::new();
     static RESOLVER: OnceLock<io::Result<mpsc::SyncSender<Resolve>>> = OnceLock::new();
-    let resolver = RESOLVER
+    let worker = if discovery { &DISCOVERY } else { &RESOLVER };
+    worker
         .get_or_init(|| {
             let (tx, rx) = mpsc::sync_channel::<Resolve>(16);
             thread::Builder::new()
-                .name("relay-dns".into())
+                .name(
+                    if discovery {
+                        "relay-dns64"
+                    } else {
+                        "relay-dns"
+                    }
+                    .into(),
+                )
                 .spawn(move || {
-                    // Reuse successful hostname lookups briefly across lanes and ports.
-                    // The bounded cache expires quickly so DNS changes remain visible.
+                    // Reuse relay answers for one second across lanes/ports. Optional
+                    // translation discovery has a separate five-minute cache.
                     let mut cache: VecDeque<(String, Instant, Vec<SocketAddr>)> = VecDeque::new();
                     for r in rx {
                         let now = Instant::now();
                         if r.cancel.is_cancelled() || now >= r.deadline {
                             continue;
                         }
-                        cache.retain(|(_, expires, _)| *expires > now);
+                        cache.retain(|(host, expires, _)| {
+                            *expires > now && !(r.refresh && host == &r.host)
+                        });
                         let addrs = match cache.iter().find(|(host, _, _)| host == &r.host) {
                             Some((_, _, addresses)) => Ok(addresses.clone()),
                             None => {
@@ -288,7 +300,12 @@ fn resolve(
                                         }
                                         cache.push_back((
                                             r.host,
-                                            Instant::now() + Duration::from_secs(1),
+                                            Instant::now()
+                                                + if discovery {
+                                                    Duration::from_secs(300)
+                                                } else {
+                                                    Duration::from_secs(1)
+                                                },
                                             addresses.clone(),
                                         ));
                                     }
@@ -308,7 +325,32 @@ fn resolve(
             Ok(tx)
         })
         .as_ref()
-        .map_err(|e| io::Error::new(e.kind(), "relay DNS worker creation failed"))?;
+        .map_err(|e| io::Error::new(e.kind(), "relay DNS worker creation failed"))
+}
+fn resolve(
+    host: &str,
+    port: u16,
+    cancel: &Cancel,
+    deadline: Instant,
+    refresh: bool,
+) -> io::Result<Vec<SocketAddr>> {
+    resolve_on(
+        dns_worker(host == "ipv4only.arpa")?,
+        host,
+        port,
+        cancel,
+        deadline,
+        refresh,
+    )
+}
+fn resolve_on(
+    resolver: &mpsc::SyncSender<Resolve>,
+    host: &str,
+    port: u16,
+    cancel: &Cancel,
+    deadline: Instant,
+    refresh: bool,
+) -> io::Result<Vec<SocketAddr>> {
     cancel.check()?;
     let (reply, rx) = mpsc::sync_channel(1);
     enqueue_resolve(
@@ -319,6 +361,7 @@ fn resolve(
             cancel: cancel.clone(),
             deadline,
             reply,
+            refresh,
         },
     )?;
     loop {
@@ -387,7 +430,7 @@ fn translated_v4(ip: Ipv6Addr, prefix_len: usize) -> Option<Ipv4Addr> {
         bytes[positions[3]],
     ))
 }
-fn allowed_address(ip: IpAddr, discovery: &[SocketAddr], relay_v4: &[Ipv4Addr]) -> bool {
+fn allowed_address(ip: IpAddr, discovery: &[SocketAddr]) -> bool {
     let IpAddr::V6(v6) = ip else {
         return public_address(ip);
     };
@@ -398,13 +441,12 @@ fn allowed_address(ip: IpAddr, discovery: &[SocketAddr], relay_v4: &[Ipv4Addr]) 
     // This also denies Tailscale's fd7a:115c:a1e0::/48 and 4via6 /64.
     let s = v6.segments();
     let well_known = s[..6] == [0x64, 0xff9b, 0, 0, 0, 0];
-    let local_translation = s[..3] == [0x64, 0xff9b, 1];
-    if !public_address(ip) && !well_known && !local_translation {
+    if !public_address(ip) {
         return false;
     }
-    let relay_public_v4 = |v4: Ipv4Addr| public_address(v4.into()) && relay_v4.contains(&v4);
+    let public_v4 = |v4: Ipv4Addr| public_address(v4.into());
     if well_known {
-        return translated_v4(v6, 96).is_some_and(relay_public_v4);
+        return translated_v4(v6, 96).is_some_and(public_v4);
     }
     for answer in discovery {
         let IpAddr::V6(first) = answer.ip() else {
@@ -437,10 +479,30 @@ fn allowed_address(ip: IpAddr, discovery: &[SocketAddr], relay_v4: &[Ipv4Addr]) 
                 if second.octets()[..length / 8] == *prefix
                     && translated_v4(second, length) == Some(other))
             });
-            return paired && translated_v4(v6, length).is_some_and(relay_public_v4);
+            // /96 embedding has fixed IPv4 positions. Shorter layouts must be
+            // safe under every RFC 6052 interpretation, independent of DNS claims.
+            if !paired {
+                continue;
+            }
+            return if length == 96 {
+                translated_v4(v6, 96).is_some_and(public_v4)
+            } else {
+                [32, 40, 48, 56, 64, 96]
+                    .into_iter()
+                    .all(|layout| translated_v4(v6, layout).is_some_and(public_v4))
+            };
         }
     }
-    public_address(ip) && !local_translation
+    public_address(ip)
+}
+// A UDP route probe is local and sends no traffic. Well-known translations
+// are self-validating. Only IPv6-only routes with other global answers need discovery.
+fn needs_dns64(addresses: &[SocketAddr], ipv4_route: bool) -> bool {
+    !ipv4_route
+        && addresses.iter().any(|a| {
+            matches!(a.ip(), IpAddr::V6(ip)
+        if public_address(ip.into()) && ip.segments()[..6] != [0x64, 0xff9b, 0, 0, 0, 0])
+        })
 }
 fn connect_tcp(
     config: &ClientConfig,
@@ -448,6 +510,7 @@ fn connect_tcp(
     deadline: Instant,
     reduced_mss: bool,
     preferred: Option<SocketAddr>,
+    refresh: bool,
 ) -> io::Result<(TcpStream, bool)> {
     let (host, port) = config
         .proxy
@@ -459,34 +522,27 @@ fn connect_tcp(
     let mut addresses = if let Some(address) = preferred {
         vec![address]
     } else {
-        resolve(host, port, cancel, deadline)?
+        resolve(host, port, cancel, deadline, refresh)?
     };
     if preferred.is_none() && config.proxy.is_none() && config.public_only {
-        let relay_v4: Vec<_> = addresses
-            .iter()
-            .filter_map(|a| match a.ip() {
-                IpAddr::V4(ip) => Some(ip),
-                _ => None,
-            })
-            .collect();
-        // Discover global and RFC 8215 prefixes too, so embedded private IPv4 is checked.
-        let needs_dns64 = addresses.iter().any(|a| {
-            a.is_ipv6()
-                && (public_address(a.ip())
-                    || matches!(a.ip(), IpAddr::V6(ip) if ip.segments()[..3] == [0x64, 0xff9b, 1]))
-        });
-        let discovery = if needs_dns64 {
+        let ipv4_route = matches!(route_source(SocketAddr::from(([192, 0, 0, 170], 9))),
+            Some(IpAddr::V4(ip)) if !ip.is_link_local() && !ip.is_unspecified() && !ip.is_loopback());
+        let discovery = if needs_dns64(&addresses, ipv4_route) {
+            // The separate bounded worker cannot hold up normal relay DNS or its
+            // cache hits, even if getaddrinfo never returns. Missing discovery
+            // never overrides an address's independent public-address check.
             resolve(
                 "ipv4only.arpa",
                 0,
                 cancel,
                 deadline.min(Instant::now() + Duration::from_millis(150)),
+                false,
             )
             .unwrap_or_default()
         } else {
             Vec::new()
         };
-        addresses.retain(|addr| allowed_address(addr.ip(), &discovery, &relay_v4));
+        addresses.retain(|addr| allowed_address(addr.ip(), &discovery));
     }
     if addresses.is_empty() {
         return Err(io::Error::new(
@@ -611,29 +667,34 @@ fn open(
             }
         }
     };
-    let end = deadline.min(Instant::now() + Duration::from_secs(2));
-    let winning = config
-        .hints
-        .lock()
-        .unwrap()
-        .winning
-        .clone()
-        .filter(|p| p.matches(config));
-    let first = winning.as_ref().map_or(Carrier::Native, |p| p.carrier);
-    let second = if first == Carrier::Native {
-        Carrier::WebSocket
-    } else {
-        Carrier::Native
+    let mut end = deadline.min(Instant::now() + Duration::from_secs(2));
+    let (winning, mut refresh_dns) = {
+        let mut hints = config.hints.lock().unwrap();
+        let changed = hints.winning.as_ref().is_some_and(|p| !p.matches(config));
+        if changed {
+            hints.winning = None;
+        }
+        (hints.winning.clone(), changed)
     };
+    let mut rungs = VecDeque::new();
+    if let Some(path) = &winning {
+        rungs.push_back((
+            path.carrier,
+            path.address,
+            if path.carrier == Carrier::Native {
+                750
+            } else {
+                1250
+            },
+        ));
+    }
+    rungs.push_back((Carrier::Native, None, 750));
+    rungs.push_back((Carrier::WebSocket, None, 2000));
     let mut attempts = Vec::new();
     let mut retry_mss = None;
-    for (index, carrier) in [first, second].into_iter().enumerate() {
-        let rung_end = if index == 0 {
-            let budget = if winning.is_some() { 1250 } else { 750 };
-            end.min(Instant::now() + Duration::from_millis(budget))
-        } else {
-            end
-        };
+    let mut cached_probe = winning.is_some();
+    while let Some((carrier, preferred, budget)) = rungs.pop_front() {
+        let rung_end = end.min(Instant::now() + Duration::from_millis(budget));
         let mss_reason = config
             .hints
             .lock()
@@ -643,11 +704,15 @@ fn open(
             .map(|(_, reason)| reason)
             .or(retry_mss);
         let reduced_mss = mss_reason.is_some();
-        let preferred = winning
-            .as_ref()
-            .filter(|_| index == 0)
-            .and_then(|p| p.address);
-        match open_carrier(config, cancel, rung_end, carrier, reduced_mss, preferred) {
+        match open_carrier(
+            config,
+            cancel,
+            rung_end,
+            carrier,
+            reduced_mss,
+            preferred,
+            refresh_dns,
+        ) {
             Ok((socket, mss)) => {
                 config.hints.lock().unwrap().winning = Some(WinningPath {
                     host: config.endpoint.host().to_owned(),
@@ -658,6 +723,7 @@ fn open(
                         .map(|p| (p.host().to_owned(), p.port())),
                     address: Some(socket.tcp.peer_addr()?),
                     carrier,
+                    local_ip: route_source(socket.tcp.peer_addr()?),
                     expires: Instant::now() + Duration::from_secs(30),
                 });
                 return Ok((
@@ -693,7 +759,14 @@ fn open(
                     via_proxy: config.proxy.is_some(),
                     failure: failure.clone(),
                 });
-                if !terminal && index == 0 && _initial_open.is_some() {
+                if cached_probe && !terminal {
+                    // A stale shortcut gets its own bounded probe. Restart with fresh
+                    // DNS and both cold rungs under the remaining caller deadline.
+                    end = deadline.min(Instant::now() + Duration::from_secs(2));
+                    cached_probe = false;
+                    refresh_dns = true;
+                }
+                if !terminal && carrier == Carrier::Native && _initial_open.is_some() {
                     // Waiting lanes can start fallback together as soon as native fails.
                     // This short-lived scheduling hint grants no address/TLS exception.
                     config.hints.lock().unwrap().winning = Some(WinningPath {
@@ -704,11 +777,12 @@ fn open(
                             .as_ref()
                             .map(|p| (p.host().to_owned(), p.port())),
                         address: None,
-                        carrier: second,
+                        carrier: Carrier::WebSocket,
+                        local_ip: None,
                         expires: end,
                     });
                 }
-                if terminal || index == 1 {
+                if terminal || rungs.is_empty() {
                     // Preserve the original I/O kind for existing callers.
                     return Err(io::Error::new(
                         error.kind(),
@@ -764,8 +838,9 @@ fn open_carrier(
     carrier: Carrier,
     reduced_mss: bool,
     preferred: Option<SocketAddr>,
+    refresh: bool,
 ) -> io::Result<(TlsSocket, bool)> {
-    let (mut tcp, mss) = connect_tcp(config, cancel, deadline, reduced_mss, preferred)?;
+    let (mut tcp, mss) = connect_tcp(config, cancel, deadline, reduced_mss, preferred, refresh)?;
     proxy_connect(&mut tcp, config, cancel, deadline)?;
     let name = ServerName::try_from(config.endpoint.host.clone())
         .map_err(|_| invalid("invalid TLS hostname"))?;
@@ -792,10 +867,7 @@ fn open_carrier(
         cancel.check()?;
         if Instant::now() >= deadline {
             return Err(if socket.conn.is_handshaking() && socket.transferred > 0 {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "TLS handshake stalled after ClientHello",
-                )
+                Failure::ConnectionBlocked.error()
             } else {
                 timeout()
             });
@@ -1442,6 +1514,7 @@ mod tests {
             cancel,
             deadline,
             reply,
+            refresh: false,
         }
     }
 
@@ -1502,6 +1575,7 @@ mod tests {
                 endpoint.port(),
                 &cancel,
                 Instant::now() + Duration::from_secs(5),
+                false,
             )
             .unwrap();
             assert!(!addresses.is_empty());
@@ -1703,7 +1777,6 @@ mod tests {
                 "2001:4860:122:344::a01:203",
             ),
         ];
-        let relay = [Ipv4Addr::new(8, 8, 8, 8)];
         for (length, first, second, public, private) in prefixes {
             let discovery = [
                 SocketAddr::new(first.parse().unwrap(), 0),
@@ -1715,19 +1788,19 @@ mod tests {
                     .octets(),
                 [192, 0, 0, 170]
             );
-            assert!(
-                allowed_address(public.parse().unwrap(), &discovery, &relay),
+            assert_eq!(
+                allowed_address(public.parse().unwrap(), &discovery),
+                length == 96
+                    || [32, 40, 48, 56, 64, 96]
+                        .into_iter()
+                        .all(|layout| translated_v4(public.parse().unwrap(), layout)
+                            .is_some_and(|v4| public_address(v4.into()))),
                 "{length}"
             );
             assert!(
-                !allowed_address(private.parse().unwrap(), &discovery, &relay),
+                !allowed_address(private.parse().unwrap(), &discovery),
                 "{length}"
             );
-            assert!(!allowed_address(
-                public.parse().unwrap(),
-                &discovery,
-                &[Ipv4Addr::new(1, 1, 1, 1)]
-            ));
             let positions = match length {
                 32 => [4, 5, 6, 7],
                 40 => [5, 6, 7, 9],
@@ -1747,34 +1820,26 @@ mod tests {
                 for (position, byte) in positions.into_iter().zip(embedded) {
                     bytes[position] = byte;
                 }
-                assert!(!allowed_address(
-                    Ipv6Addr::from(bytes).into(),
-                    &discovery,
-                    &[Ipv4Addr::from(embedded)]
-                ));
+                assert!(!allowed_address(Ipv6Addr::from(bytes).into(), &discovery));
             }
             if length < 96 {
                 // RFC 6052 receivers ignore reserved suffix bits, while enforcing the u octet.
                 let mut bytes = public.parse::<Ipv6Addr>().unwrap().octets();
                 bytes[15] = 1;
-                assert!(allowed_address(
-                    Ipv6Addr::from(bytes).into(),
-                    &discovery,
-                    &relay
-                ));
+                let address = Ipv6Addr::from(bytes);
+                let all_public = [32, 40, 48, 56, 64, 96].into_iter().all(|layout| {
+                    translated_v4(address, layout).is_some_and(|v4| public_address(v4.into()))
+                });
+                assert_eq!(allowed_address(address.into(), &discovery), all_public);
             }
             let mut invalid = public.parse::<Ipv6Addr>().unwrap().octets();
             invalid[8] = 1;
             assert_eq!(translated_v4(Ipv6Addr::from(invalid), length), None);
             if length < 96 {
-                assert!(!allowed_address(
-                    Ipv6Addr::from(invalid).into(),
-                    &discovery,
-                    &relay
-                ));
+                assert!(!allowed_address(Ipv6Addr::from(invalid).into(), &discovery));
             }
         }
-        // RFC 8215 permits subprefixes of /48. Use discovered layout, never guess /48.
+        // Every RFC 8215 local-use layout remains denied, including public embeddings.
         for (length, first, second, public, private) in
             prefixes.into_iter().filter(|(length, ..)| *length >= 48)
         {
@@ -1788,36 +1853,22 @@ mod tests {
                 SocketAddr::new(substitute(second).into(), 0),
             ];
             assert!(
-                allowed_address(substitute(public).into(), &discovery, &relay),
+                !allowed_address(substitute(public).into(), &discovery),
                 "{length}"
             );
-            assert!(!allowed_address(
-                substitute(private).into(),
-                &discovery,
-                &relay
-            ));
-            assert!(!allowed_address(
-                substitute(public).into(),
-                &discovery[..1],
-                &relay
-            ));
-            assert!(!allowed_address(substitute(public).into(), &[], &relay));
+            assert!(!allowed_address(substitute(private).into(), &discovery));
+            assert!(!allowed_address(substitute(public).into(), &discovery[..1]));
+            assert!(!allowed_address(substitute(public).into(), &[]));
         }
         for address in ["64:ff9b::808:808", "::ffff:8.8.8.8"] {
-            assert!(allowed_address(address.parse().unwrap(), &[], &relay));
+            assert!(allowed_address(address.parse().unwrap(), &[]));
         }
-        for address in [
-            "64:ff9b::a01:203",
-            "64:ff9b::6440:1",
-            "64:ff9b::7f00:1",
-            "64:ff9b::101:101",
-        ] {
-            assert!(!allowed_address(address.parse().unwrap(), &[], &relay));
+        for address in ["64:ff9b::a01:203", "64:ff9b::6440:1", "64:ff9b::7f00:1"] {
+            assert!(!allowed_address(address.parse().unwrap(), &[]));
         }
     }
     #[test]
     fn hostile_dns64_discovery_never_opens_private_or_tailnet_destinations() {
-        let relay = [Ipv4Addr::new(161, 224, 171, 18), Ipv4Addr::new(8, 8, 8, 8)];
         for prefix in [
             "fd7a:115c:c000:aa::",
             "fd7a:115c:c000:ab::",
@@ -1835,11 +1886,7 @@ mod tests {
                 "100.64.0.1",
                 "10.1.2.3",
             ] {
-                assert!(!allowed_address(
-                    destination.parse().unwrap(),
-                    &discovery,
-                    &relay
-                ));
+                assert!(!allowed_address(destination.parse().unwrap(), &discovery));
             }
         }
         // Even a consistent pair under ULA cannot override the destination filter.
@@ -1847,8 +1894,7 @@ mod tests {
             .map(|s| SocketAddr::new(s.parse().unwrap(), 0));
         assert!(!allowed_address(
             "fd12:3456:808:808::".parse().unwrap(),
-            &discovery,
-            &relay
+            &discovery
         ));
         // Single answers, mismatched prefixes, nonzero u octets and illegal layouts fail closed.
         for answers in [
@@ -1859,10 +1905,188 @@ mod tests {
             let discovery = answers.map(|s| SocketAddr::new(s.parse().unwrap(), 0));
             assert!(!allowed_address(
                 "64:ff9b:1::808:808".parse().unwrap(),
-                &discovery,
-                &relay
+                &discovery
             ));
         }
+    }
+    #[test]
+    fn local_use_nat64_is_denied_under_every_layout_and_suffix() {
+        use std::net::Ipv6Addr;
+        // N1's forged /96 discovery decodes 8.8.8.8 while /48 routes to 10.0.8.8.
+        assert!(!public_address(
+            "64:ff9b:1:a00:8:800:808:808".parse().unwrap()
+        ));
+        for positions in [
+            [4, 5, 6, 7],
+            [5, 6, 7, 9],
+            [6, 7, 9, 10],
+            [7, 9, 10, 11],
+            [9, 10, 11, 12],
+            [12, 13, 14, 15],
+        ] {
+            for embedded in [
+                [8, 8, 8, 8],
+                [10, 0, 8, 8],
+                [127, 0, 0, 1],
+                [100, 64, 0, 1],
+                [169, 254, 1, 1],
+                [192, 168, 1, 1],
+            ] {
+                for suffix in [0, 1, 255] {
+                    let mut bytes = [suffix; 16];
+                    for (position, byte) in positions.into_iter().zip(embedded) {
+                        bytes[position] = byte;
+                    }
+                    bytes[..6].copy_from_slice(&[0, 0x64, 0xff, 0x9b, 0, 1]);
+                    assert!(!public_address(Ipv6Addr::from(bytes).into()));
+                }
+            }
+        }
+    }
+    #[test]
+    fn dns64_answers_work_without_a_records_or_discovery() {
+        // Even when discovery is absent (or times out), standalone public
+        // addresses remain usable without relay A answers.
+        for answers in [
+            vec!["8.8.8.8"],                         // IPv4-only
+            vec!["8.8.8.8", "2606:4700:4700::1111"], // dual-stack
+            vec!["64:ff9b::808:808"],                // IPv6-only, well-known /96
+            vec!["2001:4860:122:344::808:808"],      // global network-specific /96
+        ] {
+            let addresses: Vec<_> = answers
+                .iter()
+                .map(|a| SocketAddr::new(a.parse().unwrap(), 443))
+                .collect();
+            assert!(
+                !needs_dns64(&addresses, true),
+                "IPv4 route must skip discovery"
+            );
+            assert!(addresses.iter().all(|a| allowed_address(a.ip(), &[])));
+            let expected = answers.last().unwrap().starts_with("2001:");
+            // Ordinary global IPv6 also benefits from optional discovery on IPv6-only hosts.
+            assert_eq!(
+                needs_dns64(&addresses, false),
+                expected || answers.last().unwrap().starts_with("2606:")
+            );
+        }
+        for address in [
+            "64:ff9b::a01:203",
+            "64:ff9b::6440:1",
+            "64:ff9b::7f00:1",
+            "fd7a:115c:a1e0:ab12:4843:cd96:6258:b240",
+            "fd7a:115c:a1e0:b1a::808:808",
+            "fd12:3456:808:808::",
+            "fc00::808:808",
+            "::1",
+            "fe80::808:808",
+            "100.64.0.1",
+            "10.1.2.3",
+        ] {
+            assert!(!public_address(address.parse().unwrap()), "{address}");
+        }
+    }
+    #[test]
+    fn unresponsive_discovery_is_bounded_and_cannot_block_relay_dns() {
+        assert!(!std::ptr::eq(
+            dns_worker(false).unwrap(),
+            dns_worker(true).unwrap()
+        ));
+        let (blocked, requests) = mpsc::sync_channel(1);
+        let started = Instant::now();
+        let worker = thread::spawn(move || {
+            resolve_on(
+                &blocked,
+                "ipv4only.arpa",
+                0,
+                &Cancel::new(),
+                Instant::now() + Duration::from_millis(150),
+                false,
+            )
+        });
+        // Keep the reply alive without answering, just like a stuck OS resolver.
+        let _request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        let addresses = resolve(
+            "localhost",
+            443,
+            &Cancel::new(),
+            Instant::now() + Duration::from_secs(1),
+            false,
+        )
+        .unwrap();
+        assert!(!addresses.is_empty());
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(allowed_address("64:ff9b::808:808".parse().unwrap(), &[]));
+    }
+    #[test]
+    fn shorter_discovered_layout_requires_public_ipv4_under_all_six_interpretations() {
+        let discovery = ["2001:4860:c000:aa::", "2001:4860:c000:ab::"]
+            .map(|a| SocketAddr::new(a.parse().unwrap(), 0));
+        assert!(allowed_address(
+            "2001:4860:808:808:8:808:808:808".parse().unwrap(),
+            &discovery
+        ));
+        assert!(!allowed_address(
+            "2001:4860:808:808::a00:808".parse().unwrap(),
+            &discovery
+        ));
+        // Exact N1 forged /96 pair remains denied independently of its claim.
+        let forged = ["64:ff9b:1:a00:8:800:c000:aa", "64:ff9b:1:a00:8:800:c000:ab"]
+            .map(|a| SocketAddr::new(a.parse().unwrap(), 0));
+        assert!(!allowed_address(
+            "64:ff9b:1:a00:8:800:808:808".parse().unwrap(),
+            &forged
+        ));
+    }
+    #[test]
+    fn absent_discovery_never_rejects_independently_public_addresses() {
+        for address in [
+            "64:ff9b::808:808",
+            "2001:4860:122:344::808:808",
+            "2606:4700:4700::1111",
+        ] {
+            assert!(allowed_address(address.parse().unwrap(), &[]));
+        }
+        let discovery = ["2001:4860:122:344::c000:aa", "2001:4860:122:344::c000:ab"]
+            .map(|a| SocketAddr::new(a.parse().unwrap(), 0));
+        assert!(allowed_address(
+            "2001:4860:122:344::808:808".parse().unwrap(),
+            &discovery
+        ));
+        assert!(allowed_address(
+            "2001:4860:122:344::808:808".parse().unwrap(),
+            &discovery[..1]
+        ));
+        assert!(!allowed_address(
+            "2001:4860:122:344::a00:808".parse().unwrap(),
+            &discovery
+        ));
+    }
+    #[test]
+    fn cached_path_is_invalidated_when_local_route_source_changes() {
+        let mut roots = rustls::RootCertStore::empty();
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
+        roots
+            .add(CertificateDer::from_pem_slice(include_bytes!("../tests/certs/ca.pem")).unwrap())
+            .unwrap();
+        let config =
+            ClientConfig::with_roots(Endpoint::new("localhost", 443).unwrap(), roots).unwrap();
+        let address = "127.0.0.1:443".parse().unwrap();
+        let mut path = WinningPath {
+            host: "localhost".into(),
+            port: 443,
+            proxy: None,
+            address: Some(address),
+            local_ip: route_source(address),
+            carrier: Carrier::Native,
+            expires: Instant::now() + Duration::from_secs(30),
+        };
+        assert!(path.matches(&config));
+        path.local_ip = Some("192.0.2.1".parse().unwrap());
+        assert!(!path.matches(&config));
     }
     #[test]
     fn mss_hints_expire_and_ignore_unrelated_timeouts() {
@@ -1877,20 +2101,28 @@ mod tests {
                 None
             );
         }
-        assert_eq!(
-            mss_stall(&io::Error::new(
-                io::ErrorKind::TimedOut,
-                "TLS write deadline expired"
-            )),
-            Some(MssReason::WriteStall)
-        );
-        assert_eq!(
-            mss_stall(&io::Error::new(
-                io::ErrorKind::TimedOut,
-                "TLS record deadline expired"
-            )),
-            Some(MssReason::RecordStall)
-        );
+        for reason in [MssReason::WriteStall, MssReason::RecordStall] {
+            assert_eq!(
+                mss_stall(
+                    &wire::Stall {
+                        mss_reason: Some(reason),
+                        write: true
+                    }
+                    .error()
+                ),
+                Some(reason)
+            );
+            assert_eq!(
+                mss_stall(
+                    &wire::Stall {
+                        mss_reason: None,
+                        write: true
+                    }
+                    .error()
+                ),
+                None
+            );
+        }
         let mut roots = rustls::RootCertStore::empty();
         use rustls::pki_types::{pem::PemObject, CertificateDer};
         roots

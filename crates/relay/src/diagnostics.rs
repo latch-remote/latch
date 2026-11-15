@@ -96,6 +96,7 @@ pub struct AttemptFailure {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MssReason {
     ExplicitStall,
+    /// Retained for source compatibility. Silent ClientHello drops are classified as blocked.
     TlsHandshakeStall,
     WriteStall,
     RecordStall,

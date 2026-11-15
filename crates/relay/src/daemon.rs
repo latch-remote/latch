@@ -835,12 +835,37 @@ mod tests {
         drop(daemon);
         std::fs::remove_file(path).unwrap();
     }
+    fn accept_until(daemon: &mut Daemon, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while daemon.connections.iter().flatten().count() < count {
+            daemon.accept().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "connections did not reach listener"
+            );
+            thread::sleep(TICK);
+        }
+    }
+    #[test]
+    fn rotating_ipv6_subnets_still_obey_global_admission() {
+        let (mut daemon, path) = test_daemon();
+        daemon.config.limits.max_rate_entries = 2;
+        daemon.config.limits.accepts_per_minute = 12;
+        for subnet in 0..20 {
+            let address = format!("2606:4700:1234:{subnet:x}::1").parse().unwrap();
+            assert_eq!(daemon.rate_allowed(normalize_ip(address)), subnet < 12);
+        }
+        assert_eq!(daemon.accepts, 12);
+        assert!(daemon.rates.len() <= 2);
+        drop(daemon);
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn connection_error_retires_one_slot_and_decoys_preserve_diagnostic_budget() {
         use std::net::TcpStream;
         let (mut daemon, path) = test_daemon();
         let tcp = TcpStream::connect(daemon.local_addr().unwrap()).unwrap();
-        daemon.accept().unwrap();
+        accept_until(&mut daemon, 1);
         for _ in 0..20 {
             daemon.connections[0].as_mut().unwrap().socket.carrier = crate::carrier::State::Closing;
             // step counts the HTTP response once, including when the write fails.
@@ -851,12 +876,12 @@ mod tests {
         assert_eq!(daemon.diagnostics, 0);
         assert!(daemon.metrics.snapshot().contains("http_responses=1"));
         let second = TcpStream::connect(daemon.local_addr().unwrap()).unwrap();
-        daemon.accept().unwrap();
+        accept_until(&mut daemon, 1);
         daemon.connection_error(0, &denied());
         assert!(daemon.connections[0].is_none());
         assert_eq!(daemon.diagnostics, 1);
         let third = TcpStream::connect(daemon.local_addr().unwrap()).unwrap();
-        daemon.accept().unwrap();
+        accept_until(&mut daemon, 1);
         assert!(daemon.connections[0].is_some());
         drop((tcp, second, third, daemon));
         std::fs::remove_file(path).unwrap();
@@ -1023,7 +1048,7 @@ mod tests {
         let port = daemon.local_addr().unwrap().port();
         let v4 = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
         let v6 = TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port)).unwrap();
-        daemon.accept().unwrap();
+        accept_until(&mut daemon, 2);
         assert_eq!(daemon.connections.iter().flatten().count(), 2);
         for ip in ["::ffff:192.0.2.1", "64:ff9b::c000:201"] {
             assert_eq!(

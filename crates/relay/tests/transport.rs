@@ -680,6 +680,7 @@ enum GatewayMode {
     HttpAlpnOnly,
     StallNative,
     StallNativeSlow,
+    CachedNativeThenStall,
     Connect {
         auth: bool,
         status: u16,
@@ -758,11 +759,13 @@ fn run_gateway_connection(
     client.set_nonblocking(false)?;
     client.set_read_timeout(Some(Duration::from_secs(1)))?;
     client.set_write_timeout(Some(Duration::from_secs(1)))?;
-    let recovered = recovered.load(Ordering::Acquire);
+    let changed = recovered.load(Ordering::Acquire);
+    let recovered = changed && !matches!(mode, GatewayMode::CachedNativeThenStall);
     let mut http_only = matches!(
         mode,
         GatewayMode::HttpAlpnOnly | GatewayMode::StallNative | GatewayMode::StallNativeSlow
-    ) && !recovered;
+    ) && !recovered
+        || matches!(mode, GatewayMode::CachedNativeThenStall) && changed;
     if let GatewayMode::Connect {
         auth,
         status,
@@ -879,7 +882,9 @@ fn run_gateway_connection(
         if !is_http && http_only {
             if matches!(
                 mode,
-                GatewayMode::StallNative | GatewayMode::StallNativeSlow
+                GatewayMode::StallNative
+                    | GatewayMode::StallNativeSlow
+                    | GatewayMode::CachedNativeThenStall
             ) {
                 let until = Instant::now() + Duration::from_secs(1);
                 while Instant::now() < until && !stopped.load(Ordering::Acquire) {
@@ -890,9 +895,13 @@ fn run_gateway_connection(
         }
     }
     let mut server = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, destination))?;
-    if matches!(mode, GatewayMode::StallNativeSlow) {
-        thread::sleep(Duration::from_millis(100));
-    }
+    let delay = match mode {
+        GatewayMode::StallNativeSlow => Duration::from_millis(100),
+        GatewayMode::CachedNativeThenStall if changed => Duration::from_millis(140),
+        _ => Duration::ZERO,
+    };
+    // Delay the ClientHello already consumed for ALPN inspection as well.
+    thread::sleep(delay);
     server.write_all(&hello)?;
     server.set_nonblocking(true)?;
     client.set_nonblocking(true)?;
@@ -901,26 +910,47 @@ fn run_gateway_connection(
     let mut to_server = VecDeque::new();
     let mut to_client = VecDeque::new();
     while !stopped.load(Ordering::Acquire) {
-        if matches!(mode, GatewayMode::StallNativeSlow) {
-            delay_readable(&client)?;
-        }
-        forward(&client, &server, &mut to_server, false)?;
-        if matches!(mode, GatewayMode::StallNativeSlow) {
-            delay_readable(&server)?;
-        }
-        forward(&server, &client, &mut to_client, false)?;
+        delayed_forward(&client, &server, &mut to_server, delay)?;
+        delayed_forward(&server, &client, &mut to_client, delay)?;
         thread::sleep(Duration::from_millis(1));
     }
     Ok(())
 }
 
-// Delay each readable TCP burst by 100 ms, modeling a 200 ms relay RTT.
-fn delay_readable(socket: &TcpStream) -> io::Result<()> {
-    match socket.peek(&mut [0]) {
-        Ok(n) if n > 0 => thread::sleep(Duration::from_millis(100)),
-        Ok(_) => (),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
-        Err(error) => return Err(error),
+// Independently schedule each direction so a 140 ms one-way delay models
+// 280 ms RTT, including TLS, HTTP upgrade and the subsequent relay exchanges.
+fn delayed_forward(
+    mut source: &TcpStream,
+    mut destination: &TcpStream,
+    pending: &mut VecDeque<(Instant, Vec<u8>)>,
+    delay: Duration,
+) -> io::Result<()> {
+    if pending.len() < 16 {
+        let mut bytes = vec![0; 16 * 1024];
+        match source.read(&mut bytes) {
+            Ok(0) if pending.is_empty() => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(0) => (),
+            Ok(n) => {
+                bytes.truncate(n);
+                pending.push_back((Instant::now() + delay, bytes));
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+            Err(e) => return Err(e),
+        }
+    }
+    if let Some((ready, bytes)) = pending.front_mut() {
+        if Instant::now() >= *ready {
+            match destination.write(bytes) {
+                Ok(n) => {
+                    bytes.drain(..n);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+                Err(e) => return Err(e),
+            }
+            if bytes.is_empty() {
+                pending.pop_front();
+            }
+        }
     }
     Ok(())
 }
@@ -1193,7 +1223,7 @@ fn upgrade_redirect_rejection_and_wrong_hostname_have_distinct_failures() {
 }
 
 #[test]
-fn silent_native_handshake_uses_bounded_fallback_and_reduced_mss_retry() {
+fn silent_native_handshake_is_blocked_and_fallback_preserves_mss() {
     let pilot = Pilot::start();
     let gateway = Gateway::start(pilot.config.endpoint.port(), GatewayMode::StallNativeSlow);
     let started = Instant::now();
@@ -1204,16 +1234,10 @@ fn silent_native_handshake_uses_bounded_fallback_and_reduced_mss_retry() {
     assert_eq!(info.carrier, latch_relay::Carrier::WebSocket);
     assert_eq!(
         info.earlier_failures[0].failure,
-        latch_relay::Failure::Timeout
+        latch_relay::Failure::ConnectionBlocked
     );
-    #[cfg(unix)]
-    {
-        assert!(info.reduced_mss);
-        assert_eq!(
-            info.reduced_mss_reason,
-            Some(latch_relay::MssReason::TlsHandshakeStall)
-        );
-    }
+    assert!(!info.reduced_mss);
+    assert_eq!(info.reduced_mss_reason, None);
     let keys = SessionKeys::generate().unwrap();
     let host = Transport::connect(config.clone(), grant.host, keys.clone()).unwrap();
     let viewer = Transport::connect(config.clone(), grant.viewer, keys).unwrap();
@@ -1427,6 +1451,31 @@ fn cached_websocket_upgrade_redirect_continues_to_recovered_native_carrier() {
         recovered.earlier_failures[0].failure,
         latch_relay::Failure::UpgradeRejected { status: 302 }
     );
+}
+
+#[test]
+fn stale_cached_native_recovers_with_full_ladder_at_280_ms_rtt() {
+    let pilot = Pilot::start();
+    let gateway = Gateway::start(
+        pilot.config.endpoint.port(),
+        GatewayMode::CachedNativeThenStall,
+    );
+    let config = test_config(gateway.port);
+    let (_, initial) = latch_relay::create_grant_with_info(&config, &Cancel::new()).unwrap();
+    assert_eq!(initial.carrier, latch_relay::Carrier::Native);
+    gateway.recover_native.store(true, Ordering::Release);
+    let started = Instant::now();
+    let (_, recovered) = latch_relay::create_grant_with_info(&config, &Cancel::new()).unwrap();
+    assert_eq!(recovered.carrier, latch_relay::Carrier::WebSocket);
+    // The cached native probe fails, then fresh native and WebSocket both run.
+    assert_eq!(recovered.earlier_failures.len(), 2);
+    assert!(recovered
+        .earlier_failures
+        .iter()
+        .all(|a| a.failure == latch_relay::Failure::ConnectionBlocked));
+    assert!(!recovered.reduced_mss);
+    assert!(started.elapsed() >= Duration::from_millis(2300));
+    assert!(started.elapsed() < Duration::from_millis(3500));
 }
 
 #[test]

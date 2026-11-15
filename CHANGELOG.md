@@ -20,13 +20,19 @@ GitHub release notes, so each version gets a heading of the form
   TCP MTU probing in the deployment kit.
 - Harden DNS64 discovery and embedded-IPv4 validation while always denying
   private and tailnet destinations. Aggregate IPv6 admission by /64 and evict
-  old rate windows so new sources can compete for capacity.
+  old rate windows so new sources can compete for capacity. Deny RFC 8215
+  local-use destinations across every layout, keep optional DNS64 discovery on
+  its own bounded worker for IPv6-only routes, and accept public well-known
+  NAT64 answers without relay A records.
 - Report early TLS closes as blocked or relay busy, keep verified HTTPS upgrade
   rejection retryable, wipe proxy credential buffers, sanitize certificate issuer
   text, and aggregate decoy traffic without consuming failure diagnostics.
 - Reuse successful carrier/address selections across lanes and grants. Expire
   reduced-MSS hints after 30 seconds and report their stall cause. Cover malformed
-  WebSocket frames and control floods over real daemon sockets.
+  WebSocket frames and control floods over real daemon sockets. Restart the full
+  ladder with fresh DNS after stale cached paths, invalidate shortcuts on local
+  source changes, and require large-segment loss evidence for automatic MSS hints.
+  Cover 280 ms RTT recovery and retry non-blocking test accepts with deadlines.
 
 ### Packaging
 

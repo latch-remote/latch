@@ -95,37 +95,48 @@ hostname against the configured roots. Production uses public WebPKI roots.
 The caller supplies system/PAC discovery results.
 
 An explicit proxy is authoritative for both carriers. A cold connection has a
-two-second ladder, with at most 750 ms for native DNS/TCP/TLS and the remainder
-for WebSocket DNS/TCP/TLS/upgrade. Cloned configurations remember the winning
-carrier and TCP address for 30 seconds, scoped to the relay and proxy endpoint.
-Initial discovery is shared across simultaneous lanes. Both concurrent attach
-lanes and later grants try that path first, within 1.25 s. A failed cached path clears the hint and tries the other carrier within
-the original two-second total budget. Refusal, reset, timeout, ALPN rejection
-and upgrade rejection advance the ladder. Untrusted-issuer, portal and proxy
-failures finish immediately. The caller's earlier setup deadline always wins.
+two-second ladder, with at most 750 ms for native DNS/TCP/TLS. WebSocket gets
+the remaining time, including at least 1.25 s after a full native timeout.
+Cloned configurations remember the winning carrier and TCP address for 30
+seconds, scoped to relay/proxy endpoints and the locally selected source
+address. A local UDP route probe sends no packets and invalidates the shortcut
+when the source changes. Route changes retaining the same source are detected by
+a failed connection attempt. Concurrent lanes share initial fallback selection.
 
-For a stable winning path, cold grant open plus concurrent warm attach opens
-consume at most 2 s + 1.25 s. At 200 ms RTT, the grant exchange, attach reply,
-end-to-end confirmation and one control hop add 0.8 s, totaling 4.05 s.
-The timing regression asserts below 4.75 s, leaving 1.25 s of headroom under the
-application's six-second negotiation deadline. This estimate assumes successful
-warm paths and 200 ms RTT. The warm budget includes room for CONNECT and
-TLS 1.2 handshakes. Changed routes can use the full second ladder.
-For a fresh host configuration, lanes share the fallback selection immediately
-after native fails and open WebSocket concurrently. Cold grant plus cold attach
-cohort plus four 200 ms exchanges total 2 s + 2 s + 0.8 s = 4.8 s. That regression
-asserts below 5.5 s with scheduler headroom.
-The ten-second default setup limit still covers relay request/pairing and
-end-to-end confirmation. Applications cancel attempts at their own deadline.
+Cached native probes get 750 ms and cached WebSocket probes get 1.25 s. Failure
+clears the shortcut and restarts both cold rungs with fresh DNS and their full
+two-second budget. An open therefore takes at most 2 s cold, 750 ms cached
+native, 1.25 s cached WebSocket, 2.75 s after stale native or 3.25 s after stale
+WebSocket. The caller's earlier deadline bounds every probe and fallback.
+Refusal, reset, timeout, ALPN and upgrade rejection advance the ladder.
+Untrusted-issuer, portal and proxy failures finish immediately.
+
+With stable caching and 200 ms RTT, cold grant open plus concurrent warm attach
+opens and four request/confirmation/control exchanges total at most 2 s + 1.25 s
++ 0.8 s = 4.05 s. Fresh attach configurations share the fallback selection and
+total 2 s + 2 s + 0.8 s = 4.8 s. After native consumes 750 ms, the remaining
+1.25 s WebSocket budget supports roughly 400 ms RTT direct and 300 ms through
+CONNECT, allowing little DNS or scheduling delay at that edge. Grant, attach and
+four exchanges then take about 5.2–5.6 s, leaving about 0.4–0.8 s under the
+application's six-second negotiation deadline. These estimates assume working
+routes, TLS 1.3 and no failed-family stagger. DNS delays, TLS 1.2, a 250 ms
+address-family stagger or a stale path consume further time. The application
+must cancel at its six-second deadline. An earlier native failure leaves more
+time for WebSocket. Budgets stay fixed. Tests independently delay both gateway
+directions by 100 ms and exercise stale-native recovery at 140 ms each way (280
+ms RTT). The ten-second default setup limit covers request/pairing and
+confirmation.
 
 `create_grant_with_info(&config, &cancel)` returns `(Grant, ConnectionInfo)`.
 `Transport::connection_info(Lane)` returns the chosen path once its connection
 is established. `ConnectionInfo` contains `carrier`, `via_proxy`, `reduced_mss`,
 `reduced_mss_reason` and `earlier_failures`. `MssReason` identifies explicit,
-TLS-handshake, write or partial-record stalls. Each `AttemptFailure` contains
-its carrier, proxy use and `Failure`. `ConnectError::from_io(&error)` recovers
-typed failures from the existing `io::Result` API. `Transport::failure()` retains
-the terminal typed failure while `Event::Closed` keeps its existing shape.
+write or partial-record stalls. The existing `TlsHandshakeStall` enum variant is
+retained for source compatibility and is no longer emitted automatically. Each
+`AttemptFailure` contains its carrier, proxy use and `Failure`.
+`ConnectError::from_io(&error)` recovers typed failures from the existing
+`io::Result` API. `Transport::failure()` retains the terminal typed failure
+while `Event::Closed` keeps its existing shape.
 
 `Failure` distinguishes connection blocked/disconnected, `ClosedBeforeHandshake`
 with the message "blocked or relay busy", timeout, untrusted or incomplete TLS
@@ -139,28 +150,46 @@ when existing TLS credit can deliver it. Exhausted pre-TLS admission closes
 cheaply. This has the same observable result as a network-induced early close,
 so `ClosedBeforeHandshake` preserves that ambiguity.
 
-IPv4 and IPv6 race with a 250 ms stagger. Production always filters private,
-loopback, link-local, ULA and tailnet destinations, including Tailscale CGNAT,
-ULA and 4via6 ranges. RFC 7050 `ipv4only.arpa` discovery requires both
-192.0.0.170 and .171 under a consistent /32, /40, /48, /56, /64 or /96 prefix,
-using the RFC 6052 layout and zero reserved u octet. Reserved suffix bits
-are ignored per RFC 6052. Matching network-specific and RFC 8215 translation
-addresses must embed a public IPv4
-from the relay's A answers. The well-known `64:ff9b::/96` receives the same
-embedded-public-relay check. RFC 8215 subprefix lengths come from discovery.
-ULA discovery never creates an exception to filtering. A missing relay A answer
-or unvalidated RFC 8215 prefix fails closed. Ordinary global IPv6 remains usable.
-Explicit proxies may reside on local networks.
+Production clients verify the relay hostname using public WebPKI roots. Private,
+loopback, link-local, ULA and tailnet destinations remain filtered, including
+100.64.0.0/10, fd7a:115c:a1e0::/48 and its 4via6 range. IPv4-mapped addresses
+and the well-known `64:ff9b::/96` require a public embedded IPv4, independently
+of relay A answers or discovery. The entire RFC 8215 local-use `64:ff9b:1::/48`
+range is denied, including all subprefixes and suffixes.
 
-A stalled TLS handshake after sending ClientHello requests a 1200-byte MSS on
-the next carrier. TLS write and partial-record stalls retain that hint for
-30 seconds in cloned configurations. DNS, connect, idle, application ACK and
-session lifetime timeouts leave the hint untouched. Call
-`config.reduce_mss_after_stall()` for an externally detected path-MTU stall.
-Linux applies the clamp before connect and macOS before TLS after connect.
-`ConnectionInfo::reduced_mss` reports successful application and
-`reduced_mss_reason` reports its cause. Windows uses its OS TCP behavior.
-Server TCP MTU probing covers the server's sending direction.
+RFC 7050 discovery is optional and runs only when a local route probe finds no
+usable IPv4 source and relay answers include other public global IPv6 addresses.
+IPv4-only and dual-stack routes issue no discovery. The dedicated bounded worker
+runs independently of relay DNS, caches answers for five minutes and gives
+callers at most 150 ms. A missing or unanswered `ipv4only.arpa` lookup never
+rejects an address that independently passes public-address filtering.
+Identified global network-specific /96 prefixes require a public embedded IPv4
+and a zero reserved u octet. Identified shorter RFC 6052 prefixes require public
+IPv4 under all six legal layouts. Discovery requires both 192.0.0.170 and .171
+at one prefix length. Resolver assertions cannot authorize local-use, private or
+tailnet addresses. Global network-specific translators remain a limit of this
+filter. An undisclosed prefix is indistinguishable from native global IPv6, and
+discovery cannot prove a translator's actual prefix/layout or bind it to a relay
+A answer. Such global addresses retain ordinary IPv6 filtering when discovery is
+absent. TLS hostname verification still applies after connecting.
+
+IPv4 and IPv6 race with a 250 ms stagger and Windows socket readiness checks.
+Explicit proxies may reside on local networks. The supplied systemd unit binds
+`[::]:443` with IPv4-mapped connections enabled. Admission aggregates native
+IPv6 by /64 and normalizes mapped IPv4 and well-known NAT64 /96 to IPv4.
+Translators normally present a gateway IPv4. Other translated IPv6 sources share
+a /64 bucket.
+
+A silent drop after ClientHello is classified as blocked. Automatic 1200-byte
+MSS hints require small-record receive progress followed by a stalled large
+write or partial large record. Typed private timeout payloads carry this
+evidence. Hints expire after 30 seconds and are shared by cloned configurations.
+DNS, connect, handshake-only, idle, ACK and session-lifetime timeouts leave the
+hint untouched. `reduce_mss_after_stall()` records an externally detected
+path-MTU stall. Linux applies the clamp before connect and macOS before TLS
+after connect. `ConnectionInfo::reduced_mss` and `reduced_mss_reason` report
+application and cause. Windows uses OS TCP behavior. Server TCP MTU probing
+covers its sending direction.
 
 WebSocket binary messages contain one existing length-prefixed record, at most
 16 KiB plus four bytes, including fragments. Masking, ping/pong and close follow
@@ -230,7 +259,10 @@ per-event diagnostic lines.
 The rate table evicts its oldest window when full, allowing a new source to
 compete for global capacity. Per-source rate refusals consume no global accept
 credit. IPv6 address rotation within a /64 shares all connection, session and
-rate limits. Global limits remain shared by every source.
+rate limits. A /48 holder can cycle 65,536 /64 keys, evict per-key windows and
+consume the global accept allowance. A campus sharing one /64 shares its eight
+connections and two sessions. The global 120 accepts/minute, 24 connections,
+four sessions and byte quotas still bound total daemon load.
 
 Admission is an anonymous bounded pilot with separate random server-issued host
 and viewer capabilities. Each role carries independent single-use priority and

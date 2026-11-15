@@ -177,6 +177,28 @@ impl Framer {
     }
 }
 
+/// Private timeout payload, so MSS decisions never depend on display strings.
+#[derive(Debug)]
+pub(crate) struct Stall {
+    pub mss_reason: Option<crate::MssReason>,
+    pub write: bool,
+}
+impl fmt::Display for Stall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.write {
+            "TLS write deadline expired"
+        } else {
+            "TLS record deadline expired"
+        })
+    }
+}
+impl std::error::Error for Stall {}
+impl Stall {
+    pub fn error(self) -> io::Error {
+        io::Error::new(io::ErrorKind::TimedOut, self)
+    }
+}
+
 /// Owns the entire TLS state and a single pending framed write.
 pub(crate) struct TlsSocket {
     pub conn: rustls::Connection,
@@ -193,6 +215,8 @@ pub(crate) struct TlsSocket {
     pub credit_epoch: u64,
     pub transferred: u64,
     handshake_bytes: usize,
+    small_record_received: bool,
+    large_write_after_small: bool,
 }
 impl TlsSocket {
     pub fn new(conn: rustls::Connection, tcp: TcpStream) -> io::Result<Self> {
@@ -213,6 +237,8 @@ impl TlsSocket {
             credit_epoch: 0,
             transferred: 0,
             handshake_bytes: 0,
+            small_record_received: false,
+            large_write_after_small: false,
         };
         result.conn.set_buffer_limit(Some(TLS_BUFFER));
         Ok(result)
@@ -228,6 +254,7 @@ impl TlsSocket {
             return Err(invalid("invalid outbound relay record"));
         }
         self.carrier.encode(record, &mut self.pending)?;
+        self.large_write_after_small = self.small_record_received && record.len() > 1200;
         self.written = 0;
         self.sending = Some(Instant::now());
         Ok(())
@@ -365,29 +392,42 @@ impl TlsSocket {
         if self.conn.is_handshaking() || self.control.is_some() || self.closing {
             return Ok(None);
         }
-        match &mut self.carrier {
-            crate::carrier::State::Native => self.framer.read(&mut self.conn.reader()),
+        let record = match &mut self.carrier {
+            crate::carrier::State::Native => self.framer.read(&mut self.conn.reader())?,
             crate::carrier::State::WebSocket(ws) => {
                 let result = ws.read(&mut self.conn.reader())?;
                 self.control = result.response;
                 self.closing = result.close;
-                Ok(result.record)
+                result.record
             }
-            _ => Ok(None),
+            _ => None,
+        };
+        if let Some(bytes) = &record {
+            self.small_record_received |= bytes.len() <= 1200;
         }
+        Ok(record)
     }
+
     pub fn check_deadlines(&self, stall: Duration, idle: Duration) -> io::Result<()> {
         if self.sending.is_some_and(|t| t.elapsed() >= stall) {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "TLS write deadline expired",
-            ));
+            return Err(Stall {
+                mss_reason: self
+                    .large_write_after_small
+                    .then_some(crate::MssReason::WriteStall),
+                write: true,
+            }
+            .error());
         }
         if self.framer.expired(stall) || self.carrier.expired(stall) {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "TLS record deadline expired",
-            ));
+            let large_partial_record = self.small_record_received
+                && self.framer.body.len() > 1200
+                && self.framer.body_read > 0;
+            return Err(Stall {
+                mss_reason: (self.large_write_after_small || large_partial_record)
+                    .then_some(crate::MssReason::RecordStall),
+                write: false,
+            }
+            .error());
         }
         if self.last_io.elapsed() >= idle {
             return Err(io::Error::new(
@@ -462,6 +502,54 @@ mod tests {
         let mut f = Framer::default();
         assert!(f.read(&mut &[0, 0][..]).unwrap().is_none());
         assert!(f.read(&mut &[][..]).is_err());
+    }
+    #[test]
+    fn mss_requires_small_record_progress_before_large_segment_stall() {
+        let (mut client, mut server) = tls_pair("localhost").unwrap();
+        server.queue(b"small reply").unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            server.pump(None).unwrap();
+            client.pump(None).unwrap();
+            if client.read_record().unwrap().is_some() {
+                break;
+            }
+            assert!(Instant::now() < until);
+            std::thread::sleep(TICK);
+        }
+        for (size, expected) in [(10, None), (2400, Some(crate::MssReason::WriteStall))] {
+            client.queue(&vec![1; size]).unwrap();
+            client.sending = Some(Instant::now() - Duration::from_secs(1));
+            let error = client
+                .check_deadlines(Duration::from_millis(10), Duration::from_secs(5))
+                .unwrap_err();
+            assert_eq!(
+                error
+                    .get_ref()
+                    .unwrap()
+                    .downcast_ref::<Stall>()
+                    .unwrap()
+                    .mss_reason,
+                expected
+            );
+            client.pending.clear();
+        }
+        // A large first write alone gives no evidence that small records flowed.
+        client.small_record_received = false;
+        client.queue(&vec![1; 2400]).unwrap();
+        client.sending = Some(Instant::now() - Duration::from_secs(1));
+        let error = client
+            .check_deadlines(Duration::from_millis(10), Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<Stall>()
+                .unwrap()
+                .mss_reason,
+            None
+        );
     }
     fn tls_pair(name: &'static str) -> io::Result<(TlsSocket, TlsSocket)> {
         use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName};
