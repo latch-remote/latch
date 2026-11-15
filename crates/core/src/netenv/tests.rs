@@ -438,6 +438,7 @@ fn cache_never_returns_another_network_or_options() {
     };
     assert!(cache.get(1, &options).is_none());
     tx.send(NetworkDiagnosis::default()).unwrap();
+    drop(tx);
     cache.poll();
     assert!(cache.get(1, &options).is_some());
     assert!(cache.get(2, &options).is_none());
@@ -767,6 +768,7 @@ fn cache_restarts_the_latest_generation_from_poll() {
     assert_eq!(cache.request(2, options.clone()), RequestStatus::Pending);
     assert_eq!(cache.request(3, options.clone()), RequestStatus::Pending);
     tx.send(NetworkDiagnosis::default()).unwrap();
+    drop(tx);
     cache.poll();
     assert_eq!(cache.pending.as_ref().unwrap().0, 3);
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -866,4 +868,37 @@ fn desktop_commands_prefer_the_system_executable() {
         command_program("/usr/sbin/scutil"),
         std::path::Path::new("/usr/sbin/scutil")
     );
+}
+
+#[test]
+fn partial_proxy_result_is_usable_while_portal_check_continues() {
+    let options = Options::new("relay.test");
+    let (tx, rx) = mpsc::channel();
+    let mut cache = NetworkEnvironment {
+        pending: Some((1, options.clone(), rx)),
+        ..Default::default()
+    };
+    let partial = NetworkDiagnosis {
+        proxies: proxy::pac_result("PROXY proxy.test:3128", ProxySource::MacPac),
+        ..Default::default()
+    };
+    tx.send(partial).unwrap();
+    cache.poll();
+    assert_eq!(cache.get(1, &options).unwrap().proxies.candidates.len(), 1);
+    assert!(cache.pending.is_some());
+    drop(tx);
+    cache.poll();
+    assert!(cache.pending.is_none());
+}
+
+#[test]
+fn empty_proxy_observation_is_distinct_from_pending_discovery() {
+    let (tx, rx) = mpsc::channel();
+    tx.send(Observation::Proxy(ProxyDiscovery::default()))
+        .unwrap();
+    drop(tx);
+    let result = collect(rx, 1, Instant::now() + Duration::from_secs(1));
+    assert!(result.proxy_observed);
+    assert!(result.proxies.candidates.is_empty());
+    assert!(!NetworkDiagnosis::default().proxy_observed);
 }

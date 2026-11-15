@@ -16,6 +16,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Unit/UI tests use local probe fixtures. Keep them off the production relay.
+  LATCH_NETENV_PROBE: "0"
   RUSTFLAGS: "-D warnings"
 
 jobs:

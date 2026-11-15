@@ -96,7 +96,7 @@ pub struct AttemptFailure {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MssReason {
     ExplicitStall,
-    /// Retained for source compatibility. Silent ClientHello drops are classified as blocked.
+    /// Both carrier TLS handshakes stalled after TCP connected.
     TlsHandshakeStall,
     WriteStall,
     RecordStall,
@@ -108,6 +108,7 @@ pub struct ConnectionInfo {
     /// TCP_MAXSEG was applied before TLS on this socket.
     pub reduced_mss: bool,
     pub reduced_mss_reason: Option<MssReason>,
+    pub reduced_mss_value: Option<u32>,
     pub earlier_failures: Vec<AttemptFailure>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
