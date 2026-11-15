@@ -6,6 +6,12 @@ GitHub release notes, so each version gets a heading of the form
 
 ## Unreleased
 
+### Networking
+
+- Add core network-environment discovery for system proxies, captive portals,
+  Tailscale reachability and IPv4/IPv6/NAT64, with bounded worker calls,
+  credential redaction and a standalone diagnostic example.
+
 ### Packaging
 
 - Add a Scoop manifest, AUR packages (`latch-remote-bin` from the release

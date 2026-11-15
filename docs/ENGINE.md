@@ -29,6 +29,93 @@ No crate in the build may compile C, C++ or assembler with `cc`, `cmake`
 or `nasm`. `scripts/audit-native.sh` checks the resolved build graph and
 CI runs it.
 
+## Local network diagnosis
+
+`latch_core::netenv` exposes independent network observations through
+`NetworkDiagnosis`. `discover(&Options)` is a blocking worker entry point.
+UI callers use `NetworkEnvironment::request`, `poll` and `get`, passing a
+network generation that they increment after route, DNS or proxy changes
+and wake, for changed Tailscale health/peer status, or for an explicit
+retry. Changed options also invalidate cached results. A refresh already
+in flight finishes first. Request again for the new generation afterward.
+The default six-second deadline is clamped to 100 ms–15 s. Partial results
+retain unknown states. Eight process-wide OS jobs bound outstanding work
+when a resolver or synchronous WPAD call outlives its caller's deadline.
+
+Proxy discovery targets an HTTPS host on port 443. An explicit
+`Options::proxy_override`, parsed with `Proxy::parse`, takes precedence over
+all system settings and bypass rules. Parse failures must be shown by the
+caller. Each ordered candidate carries a `ProxySource`. HTTP CONNECT proxy
+credentials have explicit accessors and redacted Debug/Display output.
+Unsupported proxy protocols produce warnings. Credential stores such as
+macOS Keychain and Windows Credential Manager are outside this module.
+
+- macOS reads CFNetwork system settings, including scoped settings and
+  bypass rules, and evaluates PAC with CFNetwork on a private worker run
+  loop. If CFNetwork settings are unavailable, a static `scutil --proxy`
+  fallback reports its limits. WPAD reads DHCP option 252 for the primary
+  service, then tries `http://wpad/wpad.dat`. PAC cancellation invalidates its run-loop source.
+- Windows evaluates the calling account's Internet settings with WinHTTP,
+  using explicit PAC before DHCP/DNS WPAD, then static settings. Machine
+  WinHTTP defaults provide a fallback. Automatic proxy authentication is
+  disabled during discovery. A service sees its own account's settings
+  and the machine defaults. The signed-in desktop's configuration may
+  differ, so a service can need an explicit override.
+- Linux checks nonempty `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`, then
+  `all_proxy`, with `NO_PROXY`/`no_proxy` bypasses. Uppercase takes
+  precedence. Bypasses support domain label boundaries, optional ports,
+  IP literals, IPv6 and CIDR without DNS lookups. It then reads GNOME
+  through `gsettings` and KDE's XDG `kioslaverc` layers, preferring the
+  current desktop. The commands read the process's desktop session. PAC/WPAD
+  configuration is reported as unevaluated with no candidate because
+  Linux has no shared system PAC evaluator. Set an explicit proxy to
+  resolve that case. Shell and service environments can differ.
+
+`ProbeTarget::new` makes the HTTP destination, expected status and body
+explicit. No external HTTP probe is enabled by default. Windows uses its
+native connectivity profile and Linux uses NetworkManager's cached
+connectivity signal when available. macOS has no public, general-purpose
+portal-status API, so it needs a probe. Probes use direct cleartext HTTP
+with no credentials, cookies, redirects or device identifiers, and bounded
+headers/body/time. A redirect, HTTP 511 or replacement HTML indicates a
+sign-in portal. Filters and authentication failures have a separate
+restricted state. Sign-in URLs omit userinfo. `PortalUrl::as_str` exposes
+the complete query/fragment for opening a sign-in page, with redacted Debug/Display.
+All failed direct probes mean those targets were unreachable. A proxy-only
+network or a failed endpoint can produce the same observation. An ordered
+fallback target can reduce that ambiguity. These checks cannot authenticate
+a cleartext response or prove every internet service is reachable.
+
+A project-controlled primary probe would require
+`http://relay.latch.rune.foo/netenv/probe` on port 80 to return HTTP 204,
+an empty body, `Content-Length: 0` and `Cache-Control: no-store`, without
+redirecting to HTTPS or requiring authentication. An HTTP front end can
+serve it. The existing native TLS relay on 443 does not serve this endpoint.
+The wiring layer chooses and supplies any fallback explicitly. Probe
+operators see public source IP and timing. DNS64 discovery queries only
+`ipv4only.arpa` through the system resolver, following RFC 7050 and RFC 6052.
+Either well-known IPv4 constant identifies a supported prefix length, with
+ambiguous records discarded. Resolver order is preserved.
+Interface families describe operational local addresses. They do not prove
+internet access. DNS64 absence is inconclusive, and CLAT/VPN interfaces can
+change the apparent family of an IPv6-only access network.
+
+Tailscale diagnosis reuses core's status and netcheck parsers. Stable
+`TailscaleReason::code()` values accompany short actionable messages,
+DERP region and peer-relay details. An idle peer's home DERP never establishes
+an active relay path. Only explicit daemon health evidence establishes a
+control/DERP reachability failure. UDP failure alone cannot establish it.
+Unknown or future health formats stay unknown. Netcheck itself probes
+Tailscale infrastructure. No network result is added to the control API or
+used to select a stream transport in this module.
+
+Run `cargo run -p latch-core --example netenv -j 4` for local facts. An
+optional HTTP probe URL and peer ID are positional arguments. `LATCH_PROXY`
+is an example-only override. The macOS run during implementation reported
+a direct system candidate, connected Tailscale via home region `lax`,
+working UDP and both IP families, with no discovered NAT64 prefix. Portal
+state was unknown because no HTTP target was supplied.
+
 ## Shape
 
 ```

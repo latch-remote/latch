@@ -1,0 +1,5 @@
+{
+ "UDP":false,"IPv4":true,"IPv6":false,
+ "MappingVariesByDestIP":null,"UPnP":false,"PMP":false,"PCP":false,
+ "PreferredDERP":17,"DERPLatency":{"17-v4":0.012},"GlobalV4":"192.0.2.1:42"
+}

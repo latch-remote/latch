@@ -392,7 +392,7 @@ pub fn whois_addr(addr: std::net::SocketAddr) -> Result<Option<WhoIs>> {
 }
 
 /// The CLI's answers when tailscaled is not running, on each platform.
-fn daemon_not_running(err: &str) -> bool {
+pub(crate) fn daemon_not_running(err: &str) -> bool {
     let err = err.to_ascii_lowercase();
     err.contains("doesn't appear to be running")
         || err.contains("failed to connect to local tailscaled")
@@ -593,7 +593,7 @@ fn run(cmd: &mut Command) -> Result<String> {
     run_limited(cmd, Duration::from_secs(10))
 }
 
-fn run_limited(cmd: &mut Command, limit: Duration) -> Result<String> {
+pub(crate) fn run_limited(cmd: &mut Command, limit: Duration) -> Result<String> {
     prepare(cmd);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
