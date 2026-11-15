@@ -417,6 +417,9 @@ lets tests check audio bit for bit. Opus is gone.
   rechecks the full range under the queue lock. This adds zero playback
   delay, including under loss. Unbudgeted receivers use the original rule.
   The encoded repair cache has at most 64 entries and 378,368 payload bytes.
+  Boundaries between repaired and neighbouring concealed frames are not
+  smoothed, so a step can occur as at main's own concealment edges.
+  Audible quality at these boundaries remains unmeasured.
   [Deadline details](PROTOCOL.md#audio-3)
 * **Queue adaptation follows the existing controller.** Concealment and
   intact packets enter the queue at their original release times, so repair

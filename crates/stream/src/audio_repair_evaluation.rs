@@ -758,3 +758,203 @@ fn single_stall_and_stall_starting_during_a_repair_wait_match_main() {
         }
     }
 }
+
+#[test]
+fn distinct_burst_frames_play_in_their_original_slots_after_late_repair() {
+    const LOST: usize = 32;
+    let frames: Vec<Vec<i16>> = (0..48)
+        .map(|seq| {
+            (0..480)
+                .map(|i| (seq * 512 + i * 2 - 16_000) as i16)
+                .collect()
+        })
+        .collect();
+    let original: Vec<f32> = frames
+        .iter()
+        .flatten()
+        .map(|&s| f32::from(s) / 32768.0)
+        .collect();
+    let mut packetizer = AudioPacketizer::new(1);
+    let mut tape = Vec::new();
+    for (seq, frame) in frames.iter().enumerate() {
+        let mut coded = Vec::new();
+        latch_codec::audio::encode(frame, &mut coded);
+        // The modeled 1024-sample callbacks put packets 32/33 in one
+        // burst and 34/35 plus parity in the next, 21.333 ms later.
+        let at = ((seq + 1) * 240).div_ceil(1024) as u64 * 21_333 + 5000;
+        assert!(packetizer.packetize(seq as u32 * 5000, &coded, |bytes| tape
+            .push((at, bytes.to_vec()))));
+    }
+    let mut concealed_playback = None;
+    // First establish the parity-lost reference, then repair, then deliver
+    // parity after the frame has already played and its bound has expired.
+    for parity_delay in [None, Some(0), Some(30_000)] {
+        let mut events: Vec<_> = tape
+            .iter()
+            .filter_map(|(at, bytes)| {
+                let Datagram::Audio { packet, .. } = wire::parse(bytes).unwrap() else {
+                    panic!()
+                };
+                if !packet.parity && packet.seq == LOST as u32 {
+                    return None;
+                }
+                let at = if packet.parity && packet.seq == LOST as u32 {
+                    at + parity_delay?
+                } else {
+                    *at
+                };
+                Some((at, bytes.clone()))
+            })
+            .collect();
+        events.sort_by_key(|(at, _)| *at);
+        let mut events = events.iter().peekable();
+        let mut p = player();
+        let mut receiver = AudioReceiver::with_format(1, 240, 48_000);
+        let mut mixer = Mixer::new(
+            48_000,
+            2,
+            48_000,
+            2,
+            p.queue.clone(),
+            p.pulled.clone(),
+            Some(40 * 96),
+            p.gain.clone(),
+        )
+        .linked(p.link.clone());
+        let base = Instant::now();
+        let mut played = Vec::new();
+        let mut first_sample = None;
+        let mut reserved_start = None;
+        let mut reserved_at = None;
+        let mut out = [0.0; 240];
+        for us in (0..400_000).step_by(500) {
+            let now = base + Duration::from_micros(us);
+            while let Some((at, bytes)) = events.next_if(|(at, _)| *at <= us) {
+                let Datagram::Audio { packet, .. } = wire::parse(bytes).unwrap() else {
+                    panic!()
+                };
+                if packet.parity && packet.seq == LOST as u32 {
+                    if parity_delay == Some(0) {
+                        let reserved = &p.reservations[&(LOST as u32)];
+                        // The normal 20 ms cutoff already released the gap
+                        // on a previous tick, before this callback's parity.
+                        assert!(now > reserved_at.unwrap());
+                        assert!(now < reserved.deadline);
+                    } else {
+                        assert!(!p.reservations.contains_key(&(LOST as u32)));
+                        assert!(
+                            p.queued_end - p.queue.lock().len() as u64 > reserved_start.unwrap()
+                        );
+                    }
+                }
+                receiver.push(&packet, base + Duration::from_micros(*at));
+            }
+            p.receive(&mut receiver, now);
+            if let Some(reserved) = p.reservations.get(&(LOST as u32)) {
+                reserved_start = Some(reserved.start);
+                reserved_at.get_or_insert(now);
+            }
+            if us % 2500 == 0 {
+                mixer.fill_at(&mut out, now);
+                if first_sample.is_none() && mixer.started {
+                    // At unity rate the interpolation delays by one stereo
+                    // sample frame. All subsequent samples are bit-exact PCM.
+                    first_sample = Some(played.len() + 2);
+                }
+                played.extend_from_slice(&out);
+            }
+        }
+        assert!(reserved_start.is_some());
+        let start = first_sample.unwrap();
+        let actual = &played[start..start + original.len()];
+        let mut expected = original.clone();
+        if parity_delay != Some(0) {
+            for i in 0..480 {
+                expected[LOST * 480 + i] =
+                    original[(LOST - 1) * 480 + i] * (0.5 * (1.0 - i as f32 / 480.0));
+            }
+        }
+        let bits = |samples: &[f32]| samples.iter().map(|s| s.to_bits()).collect::<Vec<_>>();
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "parity delay {parity_delay:?}, played sample {index}"
+            );
+        }
+        // Pin both neighbours separately as well as the entire played stream.
+        for neighbour in [LOST - 1, LOST + 1] {
+            let range = neighbour * 480..(neighbour + 1) * 480;
+            assert_eq!(bits(&actual[range.clone()]), bits(&original[range]));
+        }
+        assert_eq!(p.lost, u64::from(parity_delay != Some(0)));
+        if parity_delay.is_none() {
+            concealed_playback = Some(bits(&played));
+        }
+        if parity_delay == Some(30_000) {
+            assert_eq!(bits(&played), *concealed_playback.as_ref().unwrap());
+        }
+    }
+}
+
+#[test]
+fn player_play_deadline_expires_even_when_the_device_keeps_the_full_range_queued() {
+    let base = Instant::now();
+    let mut p = player();
+    let mut receiver = AudioReceiver::with_format(1, 240, 48_000);
+    let mut coded = Vec::new();
+    latch_codec::audio::encode(&[12_345; 480], &mut coded);
+    // Ten milliseconds precede the missing frame. The device is then
+    // suspended, so elapsed time and sample-range validity are independent.
+    for _ in 0..2 {
+        p.push_at(&coded, base);
+    }
+    let mut packetizer = AudioPacketizer::new(1);
+    let mut packets = Vec::new();
+    for seq in 0..4 {
+        packetizer.packetize(seq * 5000, &coded, |bytes| packets.push(bytes.to_vec()));
+    }
+    for bytes in &packets[1..4] {
+        let Datagram::Audio { packet, .. } = wire::parse(bytes).unwrap() else {
+            panic!()
+        };
+        receiver.push(&packet, base);
+    }
+    p.receive(&mut receiver, base);
+    let release = base + Duration::from_millis(20);
+    p.receive(&mut receiver, release);
+    let reserved = &p.reservations[&0];
+    let deadline = reserved.deadline;
+    let arrival = base + Duration::from_millis(30);
+    assert!(
+        arrival < release + latch_proto::audio::AUDIO_REPAIR_EXTENSION,
+        "the hard cap must still allow repair"
+    );
+    let before: Vec<_> = p.queue.lock().iter().map(|s| s.to_bits()).collect();
+    let front = p.queued_end - before.len() as u64;
+    assert!(
+        reserved.start >= front + 97,
+        "the unchanged atomic range check must still allow repair"
+    );
+    assert!(reserved.end <= p.queued_end);
+    let Datagram::Audio { packet, .. } = wire::parse(packets.last().unwrap()).unwrap() else {
+        panic!()
+    };
+    receiver.push(&packet, arrival);
+    p.receive(&mut receiver, arrival);
+    assert_eq!(
+        p.lost, 1,
+        "the player-side time budget must reject this repair"
+    );
+    assert_eq!(
+        p.queue
+            .lock()
+            .iter()
+            .map(|s| s.to_bits())
+            .collect::<Vec<_>>(),
+        before
+    );
+    assert!(deadline < arrival);
+    assert!(p.reservations.is_empty());
+    assert_eq!(receiver.stats().2, 1);
+}

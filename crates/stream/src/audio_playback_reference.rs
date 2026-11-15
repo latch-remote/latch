@@ -133,6 +133,7 @@ impl Mixer {
         if steer {
             self.margin_ms = (self.margin_ms - MARGIN_DECAY_MS_PER_S * dt).max(MARGIN_MS);
         }
+        let mut discarded = Vec::new();
         let mut q = self.queue.lock();
         if !self.started {
             if let Some(dry) = self.dry_at.filter(|_| !q.is_empty()) {
@@ -156,11 +157,7 @@ impl Mixer {
                 // Out of silence, start from the newest cushion's worth: a
                 // backlog a stall left behind would stay as added delay.
                 let excess = (q.len() - cushion) / self.src_channels * self.src_channels;
-                self.link.discarded_samples.fetch_add(
-                    q.iter().take(excess).filter(|&&s| s == 0.5).count() as u64,
-                    Ordering::Relaxed,
-                );
-                q.drain(..excess);
+                discarded.extend(q.drain(..excess));
             }
             self.low = q.len() as f64 - need as f64;
             self.level = q.len() as f64;
@@ -229,6 +226,11 @@ impl Mixer {
             self.pos += step;
             frames += 1;
         }
+        drop(q);
+        self.link.discarded_samples.fetch_add(
+            discarded.iter().filter(|&&s| s == 0.5).count() as u64,
+            Ordering::Relaxed,
+        );
         self.pulled.fetch_add(frames, Ordering::Relaxed);
     }
 }

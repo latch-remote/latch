@@ -321,12 +321,12 @@ impl Player {
     }
 
     fn queue_samples(&mut self) {
+        #[cfg(test)]
+        let mut discarded = None;
         let mut q = self.queue.lock();
         q.extend(&self.last);
         self.queued_end += self.last.len() as u64;
         if q.len() > self.max_queued {
-            #[cfg(test)]
-            self.link.queue_cap_hits.fetch_add(1, Ordering::Relaxed);
             // Back to the mixer's cushion, in whole frames: dropping half a
             // frame would swap the channels.
             // Before the device's first pull there is no target yet: keep
@@ -338,11 +338,22 @@ impl Player {
             let keep = (target * self.rate as usize / 1_000_000).max(1) * self.channels;
             let drop = q.len().saturating_sub(keep);
             #[cfg(test)]
-            self.link.discarded_samples.fetch_add(
-                q.iter().take(drop).filter(|&&s| s == 0.5).count() as u64,
-                Ordering::Relaxed,
-            );
+            {
+                discarded = Some(q.drain(..drop).collect::<Vec<_>>());
+            }
+            #[cfg(not(test))]
             q.drain(..drop);
+        }
+        #[cfg(test)]
+        {
+            drop(q);
+            if let Some(discarded) = discarded {
+                self.link.queue_cap_hits.fetch_add(1, Ordering::Relaxed);
+                self.link.discarded_samples.fetch_add(
+                    discarded.iter().filter(|&&s| s == 0.5).count() as u64,
+                    Ordering::Relaxed,
+                );
+            }
         }
     }
 
@@ -406,8 +417,13 @@ impl Player {
                     *sample = f32::from(pcm) / 32768.0;
                 }
                 self.lost -= 1;
-                #[cfg(test)]
-                self.link.delivered.lock().push(seq);
+            }
+            #[cfg(test)]
+            {
+                drop(queue);
+                if usable {
+                    self.link.delivered.lock().push(seq);
+                }
             }
             receiver.finish_repair(seq, usable);
             false
@@ -1111,6 +1127,8 @@ impl Mixer {
         if steer {
             self.margin_ms = (self.margin_ms - MARGIN_DECAY_MS_PER_S * dt).max(MARGIN_MS);
         }
+        #[cfg(test)]
+        let mut discarded = Vec::new();
         let mut q = self.queue.lock();
         if !self.started {
             if let Some(dry) = self.dry_at.filter(|_| !q.is_empty()) {
@@ -1135,10 +1153,8 @@ impl Mixer {
                 // backlog a stall left behind would stay as added delay.
                 let excess = (q.len() - cushion) / self.src_channels * self.src_channels;
                 #[cfg(test)]
-                self.link.discarded_samples.fetch_add(
-                    q.iter().take(excess).filter(|&&s| s == 0.5).count() as u64,
-                    Ordering::Relaxed,
-                );
+                discarded.extend(q.drain(..excess));
+                #[cfg(not(test))]
                 q.drain(..excess);
             }
             self.low = q.len() as f64 - need as f64;
@@ -1207,6 +1223,14 @@ impl Mixer {
             }
             self.pos += step;
             frames += 1;
+        }
+        #[cfg(test)]
+        {
+            drop(q);
+            self.link.discarded_samples.fetch_add(
+                discarded.iter().filter(|&&s| s == 0.5).count() as u64,
+                Ordering::Relaxed,
+            );
         }
         self.pulled.fetch_add(frames, Ordering::Relaxed);
     }
