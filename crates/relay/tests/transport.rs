@@ -1618,3 +1618,18 @@ fn forced_native_does_not_fall_back_through_http_only_gateway() {
     assert_eq!(info.carrier, Carrier::WebSocket);
     assert!(info.earlier_failures.is_empty());
 }
+
+#[test]
+fn fresh_connections_report_the_applied_mss_step_down() {
+    let pilot = Pilot::start();
+    for expected in [1200, 512] {
+        pilot.config.reduce_mss_after_stall();
+        let (_, info) = latch_relay::create_grant_with_info(&pilot.config, &Cancel::new()).unwrap();
+        assert_eq!(info.reduced_mss, cfg!(unix));
+        assert_eq!(info.reduced_mss_value, cfg!(unix).then_some(expected));
+        assert_eq!(
+            info.reduced_mss_reason,
+            cfg!(unix).then_some(latch_relay::MssReason::ExplicitStall)
+        );
+    }
+}
