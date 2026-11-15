@@ -283,8 +283,7 @@ impl State {
             iso,
             self.key_positions,
         ) else {
-            self.pending
-                .extend(events.iter().cloned().map(|e| (e, None, false)));
+            self.fallback_key(&event.logical_key, events);
             return;
         };
         self.logical_modifier(code, &event.logical_key, event.state.is_pressed());
@@ -295,6 +294,18 @@ impl State {
             matches!(event.logical_key, egui_winit::winit::keyboard::Key::Dead(_)),
             events,
             mods,
+        );
+    }
+
+    fn fallback_key(&mut self, logical: &egui_winit::winit::keyboard::Key, events: &[Event]) {
+        let process = self.key_positions
+            && *logical == egui_winit::winit::keyboard::Key::Named(NamedKey::Process);
+        self.pending.extend(
+            events
+                .iter()
+                .filter(|event| !process || !matches!(event, Event::Key { .. }))
+                .cloned()
+                .map(|event| (event, None, false)),
         );
     }
 
@@ -428,6 +439,40 @@ mod windows;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_key_drops_egui_physical_fallback_and_preserves_commit_text() {
+        let logical = egui_winit::winit::keyboard::Key::Named(NamedKey::Process);
+        let events = [
+            Event::Key {
+                key: egui::Key::A,
+                physical_key: Some(egui::Key::A),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+            Event::Text("한".into()),
+        ];
+        let mut native = State {
+            key_positions: true,
+            ..State::default()
+        };
+        native.fallback_key(&logical, &events);
+        assert_eq!(
+            native.pending,
+            vec![(Event::Text("한".into()), None, false)]
+        );
+        let mut legacy = State::default();
+        legacy.fallback_key(&logical, &events);
+        assert_eq!(
+            legacy
+                .pending
+                .iter()
+                .map(|(event, _, _)| event.clone())
+                .collect::<Vec<_>>(),
+            events
+        );
+    }
 
     #[test]
     fn process_keys_stay_with_ime_and_altgr_requires_layout_identity() {
