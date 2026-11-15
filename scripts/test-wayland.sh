@@ -36,11 +36,15 @@ wait_for() {
     shift
     for ((i=0; i<100; i++)); do
         kill -0 "$pid" || return 1
-        if timeout 1 "$@" >> "$fixture/readiness.log" 2>&1; then return 0; fi
+        if "$@" >> "$fixture/readiness.log" 2>&1; then return 0; fi
         sleep 0.1
     done
     echo "timed out waiting for $*" >&2
     return 1
+}
+owns_bus_name() {
+    # Ask the bus daemon itself so the probe cannot activate a system portal.
+    dbus-send --session --print-reply --reply-timeout=1000 --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.GetConnectionUnixProcessID string:"$2" | grep -q "uint32 $1$"
 }
 cat > "$fixture/sway.conf" <<'CONFIG'
 output HEADLESS-1 mode 640x360
@@ -76,13 +80,13 @@ pipewire > "$fixture/pipewire.log" 2>&1 &
 pids+=("$!")
 # xdpw exits if PipeWire is still starting. The frontend would then
 # D-Bus-activate the system xdpw, losing the SHM fixture patch.
-wait_for "$!" pw-cli info 0
+wait_for "$!" timeout 1 pw-cli info 0
 wireplumber > "$fixture/wireplumber.log" 2>&1 &
 pids+=("$!")
 "${LATCH_TEST_PORTAL_WLR:-/usr/libexec/xdg-desktop-portal-wlr}" -l DEBUG > "$fixture/portal-wlr.log" 2>&1 &
 pids+=("$!")
-wait_for "$!" busctl --user --auto-start=no get-property org.freedesktop.impl.portal.desktop.wlr /org/freedesktop/portal/desktop org.freedesktop.impl.portal.ScreenCast version
+wait_for "$!" owns_bus_name "$!" org.freedesktop.impl.portal.desktop.wlr
 /usr/libexec/xdg-desktop-portal -v > "$fixture/portal.log" 2>&1 &
 pids+=("$!")
-wait_for "$!" busctl --user --auto-start=no get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.ScreenCast version
+wait_for "$!" owns_bus_name "$!" org.freedesktop.portal.Desktop
 timeout 45 "$binary"
