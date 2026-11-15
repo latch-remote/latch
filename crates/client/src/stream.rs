@@ -1551,6 +1551,10 @@ impl View {
             .iter()
             .map(|t| (t.tone, t.text.clone()))
             .collect();
+        let pad_problem = env.live.session.pad_problem();
+        if !pad_problem.is_empty() && !env.live.pads.connected().is_empty() {
+            lines.push((Tone::Warning, pad_problem));
+        }
         if let Some(h) = &env.handover {
             lines.push((Tone::Neutral, h.clone()));
         }
@@ -2812,22 +2816,11 @@ fn question(ctx: &egui::Context, id: &str, bar: Rect, w: f32, add: impl FnOnce(&
 /// hover which, or why the host takes none.
 fn pads_tag(ui: &mut egui::Ui, live: &Live) {
     let pads = live.pads.connected();
-    if pads.is_empty() {
-        return;
-    }
     let problem = live.session.pad_problem();
+    let Some((tone, label)) = pad_tag(pads.len(), &problem, live.session.connected()) else {
+        return;
+    };
     let taken = live.input.pad_slots();
-    let tone = if !problem.is_empty() {
-        Tone::Warning
-    } else if !live.session.connected() {
-        Tone::Accent
-    } else {
-        Tone::Success
-    };
-    let label = match pads.len() {
-        1 => "1 gamepad".to_string(),
-        n => format!("{n} gamepads"),
-    };
     let mut lines: Vec<String> = pads
         .iter()
         .map(|p| {
@@ -2845,6 +2838,28 @@ fn pads_tag(ui: &mut egui::Ui, live: &Live) {
     ui::tag(ui, Some(tone), &label).on_hover_text(lines.join("\n"));
 }
 
+fn pad_tag(count: usize, problem: &str, connected: bool) -> Option<(Tone, String)> {
+    if count == 0 {
+        return None;
+    }
+    let tone = if !problem.is_empty() {
+        Tone::Warning
+    } else if !connected {
+        Tone::Accent
+    } else {
+        Tone::Success
+    };
+    let label = if !problem.is_empty() {
+        "Controllers unavailable".to_string()
+    } else {
+        match count {
+            1 => "1 gamepad".to_string(),
+            n => format!("{n} gamepads"),
+        }
+    };
+    Some((tone, label))
+}
+
 /// A short vertical hairline between groups of toolbar controls.
 fn toolbar_rule(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 16.0), egui::Sense::hover());
@@ -2857,6 +2872,31 @@ fn toolbar_rule(ui: &mut egui::Ui) {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn controller_warning_tracks_connections_and_accepts_old_host_reasons() {
+        use super::*;
+        for problem in [
+            "Mac host controllers unavailable. Apple requires entitlement com.apple.developer.hid.virtual.device",
+            "the ViGEmBus gamepad driver is not installed",
+            "/dev/uinput is missing (the uinput kernel module is not loaded)",
+            "the host takes no gamepads", // Older Accept without gamepad_problem.
+        ] {
+            assert!(pad_tag(0, problem, true).is_none());
+            let (tone, label) = pad_tag(1, problem, true).unwrap();
+            assert_eq!(tone, Tone::Warning);
+            assert_eq!(label, "Controllers unavailable");
+            assert!(pad_tag(0, problem, true).is_none());
+        }
+        assert_eq!(
+            pad_tag(1, "", true),
+            Some((Tone::Success, "1 gamepad".into()))
+        );
+        assert_eq!(
+            pad_tag(2, "", false),
+            Some((Tone::Accent, "2 gamepads".into()))
+        );
+        assert!(pad_tag(0, "", true).is_none());
+    }
     pub fn hold_test_key(view: &mut super::View, input: &latch_stream::Input) {
         view.held.key(input, 0x41, true);
         assert!(view.held.any_down());
