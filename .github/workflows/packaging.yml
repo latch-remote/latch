@@ -169,6 +169,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # The runner's fresh profile has no Run key, which a desktop
+          # profile has; the 6.0.0 installer expects it.
+          $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          if (-not (Test-Path $runKey)) { New-Item -Path $runKey | Out-Null }
           scoop install .\packaging\scoop\latch.json
           if ($LASTEXITCODE -ne 0) { throw 'scoop install failed' }
           $version = (Get-Content packaging\scoop\latch.json -Raw | ConvertFrom-Json).version
@@ -189,6 +193,18 @@ jobs:
           $checkver = Join-Path (scoop prefix scoop) 'bin\checkver.ps1'
           & $checkver -App latch -Dir packaging\scoop -ForceUpdate
           git diff --exit-code -- packaging/scoop
+      # This tree's installer, on a profile without the key.
+      - name: installer creates a missing Run key
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          Remove-Item -Path $runKey -Recurse -Force
+          $exe = Join-Path (scoop prefix latch) 'latch-host.exe'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\install-host.ps1 -Exe $exe -NoStart
+          if ($LASTEXITCODE -ne 0) { throw 'install-host.ps1 failed' }
+          $installed = Join-Path $env:LOCALAPPDATA 'Latch\latch-host.exe'
+          if ((Get-ItemProperty $runKey).LatchHost -ne "`"$installed`" --background") { throw 'no Run entry' }
       - name: stop Latch
         if: always()
         shell: pwsh
