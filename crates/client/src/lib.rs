@@ -91,3 +91,5 @@ pub fn native_options() -> eframe::NativeOptions {
         ..Default::default()
     }
 }
+
+mod network;

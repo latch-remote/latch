@@ -29,9 +29,11 @@ SCENARIOS = {
     "g": ("relay black hole during stream", 32),
     "h": ("UDP MTU black hole", 25),
     "i": ("explicit CONNECT proxy only", 22),
+    "i2": ("CONNECT proxy requires unavailable credentials", 16),
     "j": ("HTTPS-only ALPN inspector", 22),
     "k": ("TLS interception", 16),
     "l": ("captive portal", 16),
+    "l2": ("captive portal opens during connection", 30),
     "m": ("both endpoints NAT64, well-known /96", 25),
     "m2": ("both endpoints NAT64, global-looking /96", 25),
     "n": ("relay TCP MSS black hole", 26),
@@ -85,16 +87,20 @@ def evaluate(scenario, events, duration, relay_connections):
                         (right["decoded_seq"] - left["decoded_seq"]) * 1000 / delta,
                         "path": right["path"]})
     require("connected_under_3s", bool(connected) and connected[0] <= 3000)
-    if scenario not in ("k", "l"):
+    if scenario not in ("k", "l", "i2"):
         require("no_session_termination", not terminations)
     require("sampler_completed", bool(samples) and samples[-1]["elapsed_ms"] >= (duration - 1) * 1000)
-    if scenario in ("k", "l"):
+    if scenario in ("k", "l", "i2"):
         require("no_untrusted_media", not first)
-        expression = r"certificate|unknown.?issuer|tls.{0,30}(trust|intercept)" if scenario == "k" else r"captive|portal|sign.in"
+        expression = r"certificate|unknown.?issuer|tls.{0,30}(trust|intercept)" if scenario == "k" else (r"proxy authentication required" if scenario == "i2" else r"captive|portal|sign.in")
         require("clear_security_error_under_8s", any(
             re.search(expression, e.get("message", ""), re.I) and e["elapsed_ms"] <= 8000 for e in events))
     else:
         first_limit = 3000 if scenario in ("a", "f") else 7000
+        if scenario == "l2":
+            first_limit = 14000
+            require("portal_reported_before_open", any("sign-in" in e.get("message", "") and e["elapsed_ms"] < 8000 for e in events))
+            require("stream_starts_after_portal_opens", bool(first) and first[0] >= 10000)
         if scenario in ("h", "n"):
             first_limit = 4000
         require("first_frame_deadline", bool(first) and first[0] <= first_limit)
@@ -139,7 +145,7 @@ def evaluate(scenario, events, duration, relay_connections):
         if scenario in ("a", "f"):
             require("UDP_only", all(p["path"] == "udp" for p in paths))
             require("zero_relay_connections", relay_connections == 0)
-        if scenario in ("b", "e", "i", "j", "m", "m2", "n"):
+        if scenario in ("b", "e", "i", "l2", "j", "m", "m2", "n"):
             require("relay_active", bool(tail) and all(e["path"] == "relay" for e in tail))
         if scenario == "h":
             require("MTU_safe_UDP_recovered", bool(tail) and all(e["path"] == "udp" for e in tail))
@@ -336,12 +342,12 @@ class Lab:
 
     def relay(self, prefix="relay"):
         return self.spawn("i", "relay", [ROOT / "target/debug/latch-relay", "--listen", "0.0.0.0:443",
-            "--cert", self.output / f"{prefix}.pem", "--key", self.output / f"{prefix}-key.pem",
+            "--http-listen", "0.0.0.0:80", "--cert", self.output / f"{prefix}.pem", "--key", self.output / f"{prefix}-key.pem",
             "--quota-file", self.output / "quota", "--monthly-bytes", str(4 * 1024**3), "--initialize-quota"])
 
     def configure(self):
         scenario = self.scenario
-        if scenario in ("b", "e", "g", "i", "j", "k", "l", "m", "m2", "n"):
+        if scenario in ("b", "e", "g", "i", "i2", "j", "k", "l", "l2", "m", "m2", "n"):
             self.block_udp()
         if scenario in ("d1", "d2"):
             # c/viewer egress is the actual host -> viewer media direction.
@@ -366,9 +372,12 @@ add rule inet lab impairment iifname "viewer" drop''')
             self.ns("i", "nft", "add", "rule", "inet", "lab", "input", "tcp", "dport", "443", "drop")
         if scenario == "h":
             self.nft("add rule inet lab impairment meta l4proto udp ip saddr 100.64.0.0/10 udp length > 600 counter name udp_drops drop")
-        if scenario == "i":
+        if scenario in ("i", "i2"):
             config = self.output / "tinyproxy.conf"
             config.write_text(f"Port 3128\nListen 10.77.2.1\nTimeout 30\nAllow 10.77.2.0/24\nConnectPort 443\nLogLevel Info\nLogFile \"{self.output}/proxy-access.log\"\nPidFile \"{self.output}/proxy.pid\"\n")
+            if scenario == "i2":
+                with config.open("a") as file:
+                    file.write("BasicAuth lab test\n")
             self.spawn("c", "proxy", ["tinyproxy", "-d", "-c", config])
             # Native attempts reach the same HTTP-only proxy and are rejected there.
             # This gives post-preflight evidence even before CONNECT wiring exists.
@@ -398,7 +407,7 @@ add rule inet lab impairment iifname "viewer" drop''')
  iifname "viewer" ip daddr 93.184.216.34 tcp dport 443 redirect to :8443
  }
 }''')
-        if scenario == "l":
+        if scenario in ("l", "l2"):
             directory = Path("/etc/netns") / self.names["v"]
             (directory / "resolv.conf").write_text("nameserver 10.77.2.1\noptions timeout:1 attempts:1\n")
             self.spawn("c", "dns", [sys.executable, HERE / "middlebox.py", "dns"])
@@ -510,7 +519,7 @@ add rule inet lab impairment iifname "viewer" drop''')
             {"LATCH_AUDIO_PROBE": "1", "PULSE_SERVER": "unix:" + str(pulse), "LATCH_AUDIO_BUFFER": "960",
              "ALSA_CONFIG_PATH": str(alsa), "RUST_LOG": "info",
              **({"HTTPS_PROXY": "http://10.77.2.1:3128", "https_proxy": "http://10.77.2.1:3128",
-                 "HTTP_PROXY": "http://10.77.2.1:3128", "NO_PROXY": "100.64.0.1"} if self.scenario == "i" else {})})
+                 "HTTP_PROXY": "http://10.77.2.1:3128", "NO_PROXY": "100.64.0.1"} if self.scenario in ("i", "i2") else {})})
         actions = [(6, "block_udp", lambda: self.block_udp()), (18, "restore_udp", lambda: self.block_udp(False))] if self.scenario == "c" else []
         if self.scenario == "g":
             actions = [(12, "restore_udp", lambda: self.block_udp(False)),
@@ -519,6 +528,8 @@ add rule inet lab impairment iifname "viewer" drop''')
                         "add rule inet lab input tcp dport 443 drop\n"
                         "add chain inet lab output { type filter hook output priority filter; policy accept; }\n"
                         "add rule inet lab output tcp sport 443 drop"))]
+        if self.scenario == "l2":
+            actions = [(10, "open_portal", lambda: self.nft("delete table ip dnatlab"))]
         next_counter = 0
         while viewer.poll() is None:
             elapsed = time.monotonic() - self.started
@@ -588,7 +599,7 @@ add rule inet lab impairment iifname "viewer" drop''')
             path = result["tail_path"]
             # Five seconds of media must exceed keepalive/handshake-sized traffic.
             require("claimed_tail_path_carried_media", delta["udp_media" if path == "udp" else "relay_data"] > 10000)
-        if self.scenario in ("b", "e", "g", "i", "j", "k", "l", "m", "m2", "n"):
+        if self.scenario in ("b", "e", "g", "i", "i2", "j", "k", "l", "l2", "m", "m2", "n"):
             require("UDP_attempted_and_blocked", counters.get("udp_drops", 0) > 0)
         if self.scenario in ("c", "g"):
             relay_window = [e for e in self.traffic if 9000 <= e["elapsed_ms"] <= 14000]
@@ -603,9 +614,9 @@ add rule inet lab impairment iifname "viewer" drop''')
         if self.scenario in ("a", "f"):
             require("zero_viewer_relay_attempts", attempts == 0)
             require("zero_campus_relay_dials", counters.get("relay_dials", 0) == 0)
-        if self.scenario in ("i", "j", "k", "l", "n"):
+        if self.scenario in ("i", "i2", "j", "k", "l", "l2", "n"):
             require("viewer_attempted_relay", attempts > 0)
-            if self.scenario == "i":
+            if self.scenario in ("i", "i2"):
                 log = self.measured_log("proxy-access.log")
                 reached = "Connect" in log or "CONNECT" in log
                 require("proxy_CONNECT_used", "CONNECT relay.netlab.test:443" in log)
@@ -615,7 +626,7 @@ add rule inet lab impairment iifname "viewer" drop''')
             elif self.scenario == "k":
                 reached = any(e.get("kind") in ("intercept_rejected", "intercept_accepted") for e in
                               map(json.loads, self.measured_log("interceptor.log").splitlines()))
-            elif self.scenario == "l":
+            elif self.scenario in ("l", "l2"):
                 reached = any(e.get("kind") in ("portal", "portal_connection") for e in
                               map(json.loads, self.measured_log("portal.log").splitlines()))
             else:

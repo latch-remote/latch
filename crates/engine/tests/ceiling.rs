@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 #[test]
 fn a_cold_software_host_does_not_take_4k_at_the_display_refresh_rate() {
     std::env::set_var("LATCH_TEST_PATTERN", "still");
+    std::env::set_var("LATCH_NETENV_PROBE", "0");
     let seen = Arc::new(Mutex::new(Vec::new()));
     let server = Server::bind(
         0,

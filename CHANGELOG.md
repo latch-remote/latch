@@ -93,6 +93,24 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Relay connectivity
 
+- Retain working PAC proxies across incomplete discovery, promptly recheck after
+  sign-in, and measure portal waiting from detection. Report host-labelled
+  network failures and preserve TLS interception evidence across routes.
+- Protect HTTP challenge capacity from missing-token requests and idle headers.
+  Document and test backup, rollback and renewal-timer handling for relay upgrades.
+
+- Discover OS and environment CONNECT proxies without delaying session start.
+  Explain proxy authentication, captive portals, TLS interception, HTTPS-only
+  fallback and restricted Tailscale paths in the viewer and examples. Open
+  network sign-in in the browser and resume a pending stream after sign-in.
+- Serve an anonymous HTTP connectivity probe and ACME webroot on the relay's
+  optional port-80 listener. Preserve compatibility with relays lacking it.
+- Retry TCP packet-size black holes with 1200- then 512-byte MSS and retain the
+  selected carrier, proxy and MSS reason in connection diagnostics. Linux applies
+  MSS before connect. macOS applies it after connect for outgoing data, and
+  macOS and Windows rely on relay TCP MTU probing for the certificate flight.
+  Windows skips client MSS recovery rungs.
+
 - Add a repeatable native TLS/WebSocket/CONNECT carrier comparison at four
   emulated path conditions, plus a cross-platform 20-Mbps delayed-path
   regression test. Preserve whole-run probe latency distributions and report
@@ -105,7 +123,7 @@ GitHub release notes, so each version gets a heading of the form
   authentication or refusal.
 - Listen on IPv4 and IPv6, accept DNS64/NAT64 destinations with public-address
   filtering, and retain address racing and Windows connect readiness checks.
-  Retry stalled Unix paths with a reduced TCP MSS and enable Linux server
+  Retry stalled Linux TCP paths with a reduced MSS and enable Linux server
   TCP MTU probing in the deployment kit.
 - Harden DNS64 discovery and embedded-IPv4 validation while always denying
   private and tailnet destinations. Aggregate IPv6 admission by /64 and evict
