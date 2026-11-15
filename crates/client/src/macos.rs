@@ -36,9 +36,9 @@ fn equivalent(item: Item, stream_owns_keys: bool) -> &'static str {
 #[cfg(target_os = "macos")]
 mod imp {
     use super::{equivalent, Item};
-    use objc2::sel;
+    use objc2::{sel, MainThreadMarker};
     use objc2_app_kit::{NSApplication, NSCursor, NSEvent, NSEventModifierFlags, NSPasteboard};
-    use objc2_foundation::{MainThreadMarker, NSString};
+    use objc2_foundation::NSString;
     use std::cell::Cell;
 
     thread_local! {
@@ -53,14 +53,12 @@ mod imp {
             return;
         }
         HIDDEN.set(hidden);
-        // SAFETY: class methods on the main thread; hide and unhide are
-        // counted, and HIDDEN keeps them paired.
-        unsafe {
-            if hidden {
-                NSCursor::hide();
-            } else {
-                NSCursor::unhide();
-            }
+        // Class methods on the main thread; hide and unhide are counted, and
+        // HIDDEN keeps them paired.
+        if hidden {
+            NSCursor::hide();
+        } else {
+            NSCursor::unhide();
         }
     }
 
@@ -74,38 +72,36 @@ mod imp {
         }
         OWNED.set(Some(owned));
         let app = NSApplication::sharedApplication(mtm);
-        // SAFETY: plain AppKit getters and setters on the main thread.
-        unsafe {
-            let Some(bar) = app.mainMenu() else { return };
-            let Some(menu) = bar.itemAtIndex(0).and_then(|i| i.submenu()) else {
-                return;
+        // Plain AppKit getters and setters on the main thread.
+        let Some(bar) = app.mainMenu() else { return };
+        let Some(menu) = bar.itemAtIndex(0).and_then(|i| i.submenu()) else {
+            return;
+        };
+        for i in 0..menu.numberOfItems() {
+            let Some(entry) = menu.itemAtIndex(i) else {
+                continue;
             };
-            for i in 0..menu.numberOfItems() {
-                let Some(entry) = menu.itemAtIndex(i) else {
-                    continue;
-                };
-                let item = match entry.action() {
-                    Some(a) if a == sel!(hide:) => Item::Hide,
-                    Some(a) if a == sel!(hideOtherApplications:) => Item::HideOthers,
-                    Some(a) if a == sel!(terminate:) => Item::Quit,
-                    _ => continue,
-                };
-                entry.setKeyEquivalent(&NSString::from_str(equivalent(item, owned)));
-            }
+            let item = match entry.action() {
+                Some(a) if a == sel!(hide:) => Item::Hide,
+                Some(a) if a == sel!(hideOtherApplications:) => Item::HideOthers,
+                Some(a) if a == sel!(terminate:) => Item::Quit,
+                _ => continue,
+            };
+            entry.setKeyEquivalent(&NSString::from_str(equivalent(item, owned)));
         }
     }
 
     pub fn pasteboard_changes() -> Option<isize> {
-        // SAFETY: NSPasteboard is usable from any thread; this only reads
-        // its change count.
-        Some(unsafe { NSPasteboard::generalPasteboard().changeCount() })
+        // NSPasteboard is usable from any thread; this only reads its change
+        // count.
+        Some(NSPasteboard::generalPasteboard().changeCount())
     }
 
     pub fn caps_lock() -> Option<bool> {
-        // SAFETY: a class getter for the modifier keys' state right now,
-        // usable from any thread.
-        let flags = unsafe { NSEvent::modifierFlags_class() };
-        Some(flags.contains(NSEventModifierFlags::NSEventModifierFlagCapsLock))
+        // A class getter for the modifier keys' state right now, usable from
+        // any thread.
+        let flags = NSEvent::modifierFlags_class();
+        Some(flags.contains(NSEventModifierFlags::CapsLock))
     }
 
     pub fn display_hz() -> Option<u32> {
@@ -135,7 +131,7 @@ mod imp {
             current.round() as isize
         } else {
             // Variable-refresh modes may report zero.
-            unsafe { screen.maximumFramesPerSecond() }
+            screen.maximumFramesPerSecond()
         };
         if fps > 0 {
             Some(fps as u32)

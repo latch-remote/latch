@@ -1,0 +1,125 @@
+{
+  "metricName": "BurstCapacityTime",
+  "metricData": [
+    {
+      "average": 10030.099595374999,
+      "minimum": 9744.819416,
+      "timestamp": "2026-11-14T18:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 1317.519642708333,
+      "minimum": 1032.9094129999999,
+      "timestamp": "2026-11-14T04:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 6921.574132166667,
+      "minimum": 6639.6279945,
+      "timestamp": "2026-11-14T13:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 3807.5540312916664,
+      "minimum": 3522.362299,
+      "timestamp": "2026-11-14T08:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 9407.793631916666,
+      "minimum": 9122.634879000001,
+      "timestamp": "2026-11-14T17:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 713.6868094166666,
+      "minimum": 466.967603,
+      "timestamp": "2026-11-14T03:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 6301.846735458333,
+      "minimum": 6016.1688890000005,
+      "timestamp": "2026-11-14T12:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 3185.310527,
+      "minimum": 2900.2355860000002,
+      "timestamp": "2026-11-14T07:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 171.134281625,
+      "minimum": 0.0,
+      "timestamp": "2026-11-14T02:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 8785.534367083332,
+      "minimum": 8500.611413999999,
+      "timestamp": "2026-11-14T16:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 5678.231235125,
+      "minimum": 5392.3445755,
+      "timestamp": "2026-11-14T11:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 11138.916274714285,
+      "minimum": 10988.6584835,
+      "timestamp": "2026-11-14T20:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 2562.8216568750004,
+      "minimum": 2277.4698565,
+      "timestamp": "2026-11-14T06:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 16.648856000000002,
+      "minimum": 16.648856000000002,
+      "timestamp": "2026-11-14T01:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 8163.401042041666,
+      "minimum": 7878.060697,
+      "timestamp": "2026-11-14T15:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 5054.537140999999,
+      "minimum": 4768.845374,
+      "timestamp": "2026-11-14T10:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 10651.411175916664,
+      "minimum": 10365.952272999999,
+      "timestamp": "2026-11-14T19:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 1939.8414945833333,
+      "minimum": 1654.4246985,
+      "timestamp": "2026-11-14T05:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 7540.869556,
+      "minimum": 7255.764738,
+      "timestamp": "2026-11-14T14:00:00-08:00",
+      "unit": "Seconds"
+    },
+    {
+      "average": 4430.847723166667,
+      "minimum": 4144.921295499999,
+      "timestamp": "2026-11-14T09:00:00-08:00",
+      "unit": "Seconds"
+    }
+  ]
+}
