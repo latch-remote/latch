@@ -5,6 +5,8 @@ is sitting at it. Platform details are in [MACOS.md](MACOS.md) and
 [WINDOWS.md](WINDOWS.md); Linux servers in
 [deploy/native/README.md](../deploy/native/README.md) and
 [deploy/node/NODE.md](../deploy/node/NODE.md).
+The [platform support matrix](PLATFORMS.md) lists capability and verification
+limits for every host/viewer direction.
 
 ## A session
 

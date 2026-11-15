@@ -1,0 +1,6 @@
+{
+  "utc": "2026-11-15T04:27:12.158227+00:00",
+  "command": "paired_probe relay.latch.rune.foo 25 50 60 5",
+  "exit_code": 1,
+  "stderr": "paired probe failed (Other): pair did not become ready\n"
+}

@@ -1,0 +1,4 @@
+Observed on UCLA Wi-Fi during 2026-11-15 04:13–04:22 UTC.
+Mac status for Windows: peer-relay 3.37.166.202:443:vni:20
+Windows status for Mac: peer-relay 3.37.166.202:443:vni:20
+Mac tailscale ping: 146, 146, 148 ms via peer-relay(3.37.166.202:443:vni:20).

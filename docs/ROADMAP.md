@@ -9,10 +9,13 @@ H.264 fallback and physical GPU verification pending. Mac hosts encode H.264/HEV
 Windows and Linux can offer AV1 where the encoder supports it. HEVC
 sessions negotiate ten-bit SDR or HDR from the viewer's capabilities.
 Mouse, keyboard, clipboard, audio and microphone forwarding are implemented;
-gamepads work from all three viewer platforms into Windows and Linux hosts.
+gamepad backends forward from all three viewer platforms into Windows and
+Linux hosts, with physical-controller pair qualification pending.
 Linux capture is X11-only. Request ceilings are 16384 pixels a side,
 500 fps and 1 Gbps, above what current hardware delivers; each session is
 fitted to the encoders, decoders and displays both machines report.
+The [platform audit](PLATFORMS.md) records implementation and verification
+for all six directions.
 
 Version 6 adds a native TCP/TLS relay for unusable UDP media, with
 end-to-end encryption, independent video and priority lanes, and bounded
@@ -69,8 +72,8 @@ date, and none of it is a tested capability until it leaves this list.
   when its window next draws, which is at once on input but still waits
   for the frame in progress. Gamepads already go straight from their own
   thread.
-- **A separate cursor plane on Mac hosts.** Windows and Linux hosts send
-  the pointer outside the video; a Mac host draws it into the picture.
+- **A separate cursor plane on Mac and Windows hosts.** Both composite the
+  pointer into video. Linux hosts can send shape and visibility separately.
 - Apple hardware AV1 encode when the hardware and platform APIs offer it;
   AV1 viewing already works on supported Macs.
 - Gamepad emulation on Mac hosts, and motion and touchpad data from pads

@@ -519,7 +519,7 @@ impl Resources {
             #[cfg(windows)]
             hdr10_active: false,
             #[cfg(target_os = "macos")]
-            edr: if objc2_foundation::MainThreadMarker::new().is_some() {
+            edr: if objc2::MainThreadMarker::new().is_some() {
                 edr::Edr::new().map_err(|e| tracing::warn!("EDR: {e}")).ok()
             } else {
                 None
