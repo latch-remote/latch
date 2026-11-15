@@ -86,6 +86,7 @@ fn main() -> anyhow::Result<()> {
             fps: 60,
             bitrate_kbps: 10000,
             codec: Codec::H264High,
+            display: None,
         }) {
             Ok(video) => video,
             Err(error) => {
