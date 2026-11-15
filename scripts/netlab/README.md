@@ -70,6 +70,48 @@ Python assertion/parser checks. Local output goes under a unique
 `target/netlab`. CI uses the runner's temporary directory to keep results
 outside the Rust build cache. Choose a fresh `--output PATH` for each invocation.
 
+### Carrier throughput comparison
+
+```sh
+scripts/netlab/run-in-docker.sh --carrier-comparison
+# Optional shorter selection, retaining the same topology and defaults.
+scripts/netlab/run-in-docker.sh --carrier-comparison --paths 150 --rates 5,20
+```
+
+This scenario builds the release relay and bounded paired probe. Both probe
+roles run in the viewer namespace and connect independently to the namespace
+relay, matching the public probe's two outbound legs. The existing tinyproxy
+handles the CONNECT variant for both roles. All namespace routes stay isolated
+from external networks. The container retains the four-CPU limit.
+
+Each path runs native TLS, WebSocket, and WebSocket through CONNECT at 5, 20,
+and 50 Mbps, with 60 fps frames. Default runs last 20 seconds including five
+seconds at one-quarter bitrate. `--warmup 0 --seconds 15` selects cold starts.
+Netem adds half the requested RTT to each direction of the viewer/campus link
+for 150 ms, 150 ms with independent 0.5% packet loss per direction, 300 ms,
+and 20 ms. Loss draws are stochastic. Veth MTU is 1280 and segmentation/receive
+offloads are disabled by the shared topology helper. The 20,000-packet queue
+avoids incidental netem queue drops in the loss-free cases.
+
+`summary.json` records whole-run payload Mbps and frame p50/p95/p99/max,
+source drops, completion status, and approximate client/relay CPU as percentages
+of one core. Client CPU combines host and viewer. CPU uses process ticks sampled
+every 100 ms, including connection setup. Raw probe logs and per-run qdisc
+statistics accompany the summary. Payload Mbps includes warm-up and final
+drain. The ideal offered average before drain is 81.25% of the target with
+the defaults. Fresh grants and processes retain the default transport deadlines
+and queue/byte bounds. Only disposable-daemon admission rate limits are raised
+to permit rapid comparisons after failures. A failed probe remains a result
+with its exit code and error log.
+
+`PAIRED_PROBE_CA` selects a disposable PEM trust store in the probe example.
+TLS hostname verification and production public-address filtering still apply.
+The cross-platform relay integration test
+`websocket_matches_native_video_through_a_delayed_path` uses a bounded loopback
+delay shim at 150 ms RTT, warms at 5 Mbps, then offers 20 Mbps at 60 fps. It
+requires WebSocket delivery of at least 85% of native, at least 10 Mbps on each
+carrier, frame p95 below 500 ms, maximum below 750 ms, and complete drain.
+
 The workflow has a 15-minute timeout and runs two scenarios concurrently
 inside the runner, with unique namespace names, interfaces, ports,
 certificates, quota ledgers and audio sockets. Each PulseAudio daemon runs
