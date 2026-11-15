@@ -161,7 +161,9 @@ impl ClientConfig {
     /// Replace trust anchors while preserving endpoint, address policy and transport settings.
     /// Private-PKI measurement callers can use the production configuration path.
     pub fn with_tls_roots(mut self, roots: rustls::RootCertStore) -> io::Result<Self> {
-        self.tls = Self::with_roots(self.endpoint.clone(), roots)?.tls;
+        let replacement = Self::with_roots(self.endpoint.clone(), roots)?;
+        self.tls = replacement.tls;
+        self.verifier = replacement.verifier;
         Ok(self)
     }
     /// Explicit trust anchors for private PKI and tests. Hostname verification remains enabled.
@@ -1704,6 +1706,30 @@ mod tests {
             Some(Event::Closed { .. })
         ));
     }
+    #[test]
+    fn replacing_tls_roots_updates_the_handshake_verifier() {
+        use rustls::pki_types::{pem::PemObject, CertificateDer, UnixTime};
+        let config = ClientConfig::production(Endpoint::new("localhost", 443).unwrap()).unwrap();
+        let certificate =
+            CertificateDer::from_pem_slice(include_bytes!("../tests/certs/server.pem")).unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+        let now = UnixTime::now();
+        assert!(config
+            .verifier
+            .verify_server_cert(&certificate, &[], &name, &[], now)
+            .is_err());
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(include_bytes!("../tests/certs/ca.pem")).unwrap())
+            .unwrap();
+        let config = config.with_tls_roots(roots).unwrap();
+        config
+            .verifier
+            .verify_server_cert(&certificate, &[], &name, &[], now)
+            .unwrap();
+        assert!(config.public_only);
+    }
+
     #[test]
     fn production_resolution_rejects_tailnet_and_private_addresses() {
         let mut config =
