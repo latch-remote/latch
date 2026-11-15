@@ -118,6 +118,41 @@ impl ProbeServer {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
     }
+    pub fn add_interests<'a>(
+        &'a self,
+        sockets: &mut Vec<latch_proto::transport::SocketInterest<'a>>,
+        now: Instant,
+    ) {
+        if self.accept_retry_at.is_none_or(|deadline| now >= deadline) {
+            sockets.push(latch_proto::transport::SocketInterest {
+                socket: socket2::SockRef::from(&self.listener),
+                readable: true,
+                writable: false,
+            });
+        }
+        sockets.extend(self.requests.iter().map(|request| {
+            latch_proto::transport::SocketInterest {
+                socket: socket2::SockRef::from(&request.stream),
+                readable: request.output.is_empty(),
+                writable: !request.output.is_empty(),
+            }
+        }));
+    }
+    pub fn next_deadline(&self) -> Instant {
+        self.requests
+            .iter()
+            .map(|request| {
+                if request.output.is_empty() {
+                    request.header_deadline.min(request.deadline)
+                } else {
+                    request.deadline
+                }
+            })
+            .chain(self.accept_retry_at)
+            .chain(std::iter::once(self.window + Duration::from_secs(60)))
+            .min()
+            .unwrap()
+    }
     pub fn poll(&mut self) {
         self.poll_at(Instant::now())
     }
@@ -131,6 +166,7 @@ impl ProbeServer {
         // Pending requests from one source cannot occupy every slot. The last
         // two slots and separate ACME credits remain available after probe caps.
         if self.accept_retry_at.is_none_or(|at| now >= at) {
+            self.accept_retry_at = None;
             for _ in 0..16 {
                 let (stream, address) = match self.listener.accept() {
                     Ok(pair) => pair,
@@ -493,6 +529,42 @@ mod tests {
             result => panic!("global cap must reject a ready challenge: {result:?}"),
         }
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn readiness_tracks_request_phase_and_every_housekeeping_deadline() {
+        let mut server = ProbeServer::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let now = server.window;
+        assert_eq!(server.next_deadline(), now + Duration::from_secs(60));
+        let (stream, _peer) = socket_pair();
+        server.accept_stream(stream, "192.0.2.1".parse().unwrap(), now);
+        assert_eq!(server.next_deadline(), now + HEADER_TIMEOUT);
+        let mut sockets = Vec::new();
+        server.add_interests(&mut sockets, now);
+        assert_eq!(sockets.len(), 2);
+        assert!(sockets
+            .iter()
+            .all(|socket| socket.readable && !socket.writable));
+        drop(sockets);
+
+        server.requests[0].output = b"response".to_vec();
+        assert_eq!(server.next_deadline(), now + TIMEOUT);
+        let mut sockets = Vec::new();
+        server.add_interests(&mut sockets, now);
+        assert!(sockets[0].readable && !sockets[0].writable);
+        assert!(!sockets[1].readable && sockets[1].writable);
+        drop(sockets);
+
+        server.accept_error(&io::Error::from(io::ErrorKind::Other), now);
+        assert_eq!(server.next_deadline(), now + Duration::from_secs(1));
+        let mut sockets = Vec::new();
+        server.add_interests(&mut sockets, now);
+        assert_eq!(sockets.len(), 1, "backoff suppresses listener readiness");
+        assert!(!sockets[0].readable && sockets[0].writable);
+        drop(sockets);
+        server.poll_at(now + Duration::from_secs(1));
+        assert!(server.accept_retry_at.is_none());
+        assert!(server.requests.is_empty());
+        assert_eq!(server.next_deadline(), now + Duration::from_secs(60));
     }
     #[test]
     fn accept_error_backs_off_without_stopping_service() {

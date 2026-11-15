@@ -43,6 +43,8 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --locked --workspace --all-targets
+      - name: relay carrier timing
+        run: cargo test --locked -p latch-relay --test carrier_throughput -j 4 -- --nocapture
       # The setup script is generated, so only a dump of it can be parsed.
       # Every plan shape, with names that need quoting, through the parser
       # of the Windows PowerShell that runs it; plus the shipped scripts.
