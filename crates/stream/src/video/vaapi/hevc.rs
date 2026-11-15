@@ -1579,7 +1579,7 @@ mod tests {
             bits.push('0');
         }
         au.extend_from_slice(&[0, 0, 0, 1, 0x28, 1]);
-        for byte in bits.as_bytes().chunks_exact(8) {
+        for byte in bits.as_bytes().as_chunks::<8>().0 {
             au.push(
                 byte.iter()
                     .fold(0, |value, bit| (value << 1) | (bit - b'0')),
