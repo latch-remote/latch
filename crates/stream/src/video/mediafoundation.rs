@@ -888,8 +888,9 @@ impl State {
             let transform = create_transform(subtype)?;
             // MF_LOW_LATENCY and CODECAPI_AVLowLatencyMode share one GUID.
             // Set the UINT32 transform attribute before types. The optional
-            // ICodecAPI interface takes VT_BOOL. Read both interfaces back
-            // after setup so diagnostics reflect the decoder actually in use.
+            // H.264 ICodecAPI takes VT_UI4, while HEVC/AV1 take VT_BOOL.
+            // Read both interfaces back after setup so diagnostics reflect
+            // the decoder actually in use.
             // A transform without attributes answers E_NOTIMPL and runs with
             // the bitstream's explicit reordering limits.
             match transform.GetAttributes() {
@@ -904,7 +905,11 @@ impl State {
                 Err(error) => return Err(error).context("decoder attributes"),
             }
             if let Ok(api) = transform.cast::<ICodecAPI>() {
-                if let Err(error) = api.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT::from(true)) {
+                let enabled = match codec {
+                    Codec::H264Baseline | Codec::H264High => VARIANT::from(1u32),
+                    _ => VARIANT::from(true),
+                };
+                if let Err(error) = api.SetValue(&CODECAPI_AVLowLatencyMode, &enabled) {
                     tracing::debug!("decoder ICodecAPI low-latency mode: {error}");
                 }
             }
@@ -1276,7 +1281,9 @@ mod tests {
             assert_eq!(
                 pictures.iter().map(|p| p.0).collect::<Vec<_>>(),
                 [time],
-                "Linux capture input {index}"
+                "Linux capture input {index}, low latency {:?}, output type set {}",
+                state.low_latency(),
+                state.output_type.is_some()
             );
             check_picture(
                 &pictures[0].1,
