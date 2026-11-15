@@ -383,7 +383,11 @@ fn mapping_layout(
         stride >= format.width as usize * 4,
         "short screencast stride"
     );
-    let offset = chunk.offset as usize;
+    let offset = if d.kind == pod::DATA_DMA_BUF {
+        chunk.offset as usize
+    } else {
+        chunk.offset as usize % d.maxsize.max(1) as usize
+    };
     let len = if d.kind == pod::DATA_DMA_BUF {
         stride
             .checked_mul(format.height as usize)
@@ -846,6 +850,34 @@ impl Drop for Consumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_memory_offsets_wrap_within_the_advertised_buffer() {
+        let pixels = [0x5a; 64];
+        let format = Negotiated {
+            format: PixelFormat::Bgrx,
+            width: 4,
+            height: 4,
+            modifier: None,
+        };
+        let mut chunk = SpaChunk {
+            offset: 128,
+            size: 64,
+            stride: 16,
+            flags: 0,
+        };
+        let data = SpaData {
+            kind: pod::DATA_MEM_PTR,
+            flags: 0,
+            fd: -1,
+            mapoffset: 0,
+            maxsize: 64,
+            data: pixels.as_ptr().cast_mut().cast(),
+            chunk: &mut chunk,
+        };
+        let mapped = unsafe { Mapped::new(&data, &format) }.unwrap();
+        assert_eq!(mapped.bytes(), &pixels);
+    }
 
     #[test]
     fn producer_removal_ends_capture_after_transient_pause_grace() {
