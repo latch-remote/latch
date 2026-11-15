@@ -875,11 +875,15 @@ fn check_decoder_retirement(
     });
     let (events, _) = mpsc::channel();
     let (wake, wakes) = mpsc::channel();
+    let wake_probe = probe.clone();
+    let expected_pictures = expected.len();
     let mut inner = Inner::new(
         events,
         Arc::new(FrameSlot::default()),
         Box::new(move || {
-            let _ = wake.send(());
+            if wake_probe.pictures.lock().len() == expected_pictures {
+                let _ = wake.send(());
+            }
         }),
     );
     inner.pair_probe = Some(probe.clone());
@@ -914,9 +918,9 @@ fn check_decoder_retirement(
             Default::default(),
         )
     });
-    for _ in expected {
-        wakes.recv_timeout(Duration::from_secs(5)).unwrap();
-    }
+    // Connected also wakes the UI. Wait for observed pictures, then join so
+    // the rest of the final batch and its counters finish before assertions.
+    wakes.recv_timeout(Duration::from_secs(5)).unwrap();
     inner.stop.store(true, Ordering::Release);
     inner.queue_cv.notify_all();
     worker.join().unwrap();

@@ -101,7 +101,9 @@ def xvfb(env):
     socket = Path("/tmp/.X11-unix/X9")
     if socket.exists():
         raise RuntimeError("DISPLAY :9 is already in use, pair tests require their own Xvfb")
-    proc = subprocess.Popen(["Xvfb", ":9", "-screen", "0", "640x360x24", "-nolisten", "tcp", "-ac"])
+    # Native input cells disconnect between cases. Keep the server available
+    # while the next cell connects instead of resetting after the last client.
+    proc = subprocess.Popen(["Xvfb", ":9", "-screen", "0", "640x360x24", "-nolisten", "tcp", "-ac", "-noreset"])
     try:
         deadline = time.monotonic() + 10
         while not socket.exists():

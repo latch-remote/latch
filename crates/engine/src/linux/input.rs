@@ -376,6 +376,35 @@ mod pair_interop {
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/pairs/native_input.rs"
     ));
+    fn text_from_keysym(symbol: u32) -> char {
+        #[link(name = "xkbcommon")]
+        unsafe extern "C" {
+            fn xkb_keysym_to_utf32(keysym: u32) -> u32;
+        }
+        // SAFETY: this pure conversion accepts any keysym value.
+        let codepoint = unsafe { xkb_keysym_to_utf32(symbol) };
+        assert_ne!(codepoint, 0, "scratch mapping expired before observation");
+        char::from_u32(codepoint).expect("scratch mapping must contain a Unicode character")
+    }
+
+    #[test]
+    fn text_observer_decodes_latin1_and_unicode_keysyms() {
+        for (symbol, expected) in [
+            (0xe9, 'é'),
+            (0x010003bb, 'λ'),
+            (0x01004f60, '你'),
+            (0x0101f600, '😀'),
+        ] {
+            assert_eq!(text_from_keysym(symbol), expected);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "scratch mapping expired before observation")]
+    fn text_observer_rejects_restored_scratch_mapping() {
+        text_from_keysym(0);
+    }
+
     fn native(events: &[Event]) -> Vec<Value> {
         // Every event is posted only into the disposable Xvfb owned by pairs.py.
         assert_eq!(std::env::var("DISPLAY").unwrap(), ":9");
@@ -446,6 +475,10 @@ mod pair_interop {
             std::thread::scope(|scope| {
                 let apply = scope.spawn(|| sink.apply(event, display).unwrap());
                 let mut seen = 0;
+                let mut text = match event {
+                    Event::Text(text) => text.chars(),
+                    _ => "".chars(),
+                };
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                 while std::time::Instant::now() < deadline {
                     if let Some(native) = observer.poll_for_event().unwrap() {
@@ -459,13 +492,12 @@ mod pair_interop {
                                             .unwrap()
                                             .reply()
                                             .unwrap();
-                                        let symbol = mapping.keysyms[0];
+                                        let ch = text_from_keysym(mapping.keysyms[0]);
                                         assert_eq!(
-                                            symbol & 0xff000000,
-                                            0x01000000,
-                                            "scratch mapping expired before observation"
+                                            Some(ch),
+                                            text.next(),
+                                            "scratch mapping changed before observation"
                                         );
-                                        let ch = char::from_u32(symbol & 0x00ffffff).unwrap();
                                         for unit in ch.encode_utf16(&mut [0; 2]) {
                                             out.push(json!(["text", unit]));
                                         }
