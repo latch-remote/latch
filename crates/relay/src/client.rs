@@ -1269,8 +1269,8 @@ impl Transport {
             wake: Condvar::new(),
             cancel: Cancel::new(),
             lane_wakes: [
-                Arc::new(crate::readiness::Wake::new()?),
-                Arc::new(crate::readiness::Wake::new()?),
+                Arc::new(crate::readiness::Wake::new()),
+                Arc::new(crate::readiness::Wake::new()),
             ],
             limits: config.limits.clone(),
         });
@@ -1306,6 +1306,14 @@ impl Transport {
             result.workers.lock().unwrap().push(worker);
         }
         Ok(result)
+    }
+    /// Cumulative wait and local-notification timing across both lanes.
+    pub fn wait_stats(&self) -> crate::WaitStats {
+        let mut stats = crate::WaitStats::default();
+        for wake in &self.shared.lane_wakes {
+            stats.merge(wake.stats());
+        }
+        stats
     }
     /// Selected carrier and ladder diagnostics for a lane, available after setup.
     pub fn connection_info(&self, lane: Lane) -> Option<ConnectionInfo> {
@@ -1842,8 +1850,8 @@ mod tests {
             wake: Condvar::new(),
             cancel: Cancel::new(),
             lane_wakes: [
-                Arc::new(crate::readiness::Wake::new().unwrap()),
-                Arc::new(crate::readiness::Wake::new().unwrap()),
+                Arc::new(crate::readiness::Wake::new()),
+                Arc::new(crate::readiness::Wake::new()),
             ],
             limits,
         }

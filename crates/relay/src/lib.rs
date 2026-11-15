@@ -20,6 +20,7 @@ pub use client::{
 pub use crypto::{ensure_supported_cpu, SessionKeys};
 pub use diagnostics::{AttemptFailure, Carrier, ConnectError, ConnectionInfo, Failure, MssReason};
 pub use proxy::{BasicCredentials, ProxyConfig};
+pub use readiness::WaitStats;
 pub use wire::{Attachment, Grant, Lane, Role};
 
 use std::io;

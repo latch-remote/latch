@@ -83,9 +83,27 @@ fn websocket_matches_native_video_through_a_delayed_path() {
             } else {
                 start + duration + Duration::from_millis(750)
             };
-            pending_event = viewer.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            #[cfg(not(windows))]
+            {
+                pending_event = viewer.recv_timeout(remaining);
+            }
+            #[cfg(windows)]
+            {
+                // The sender's next offer also needs a precise deadline on
+                // Windows, where a condvar timeout can use the system tick.
+                pending_event = viewer.recv_timeout(Duration::ZERO);
+                if pending_event.is_none() {
+                    thread::sleep(remaining.min(Duration::from_millis(2)));
+                }
+            }
         }
         let (chunks, p50_late, p95_late, max_late) = gateway.lateness();
+        eprintln!(
+            "{carrier:?}: product host waits={:?}, viewer waits={:?}",
+            host.wait_stats(),
+            viewer.wait_stats()
+        );
         eprintln!("{carrier:?}: offered={offered}, accepted={}, refused_would_block={refused}, delivered={received}; gateway chunks={chunks}, lateness p50={p50_late:?}, p95={p95_late:?}, max={max_late:?}", queued.len());
         assert_eq!(received, queued.len(), "{carrier:?} failed to drain");
         assert!(host.recv_timeout(Duration::ZERO).is_none());

@@ -138,6 +138,9 @@ impl Quota {
         }
         Ok(())
     }
+    pub fn can_refill(&self) -> bool {
+        self.available >= LEASE
+    }
     pub fn reservation_pending(&self) -> bool {
         self.pending
     }

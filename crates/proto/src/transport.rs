@@ -27,12 +27,35 @@ pub struct SocketInterest<'a> {
 /// Level-triggered readiness for nonblocking sockets. Interrupted waits return
 /// immediately so callers can recheck cancellation and absolute deadlines.
 pub fn wait_sockets(sockets: &[SocketInterest<'_>], wait: Duration) -> io::Result<usize> {
-    // Round up so a sub-millisecond remaining deadline cannot cause spinning.
-    let timeout = wait
-        .as_millis()
-        .saturating_add(u128::from(!wait.subsec_nanos().is_multiple_of(1_000_000)))
-        .min(i32::MAX as u128) as i32;
-    poll_sockets(sockets, timeout)
+    #[cfg(unix)]
+    {
+        // Round up so a sub-millisecond remaining deadline cannot cause spinning.
+        let timeout = wait
+            .as_millis()
+            .saturating_add(u128::from(!wait.subsec_nanos().is_multiple_of(1_000_000)))
+            .min(i32::MAX as u128) as i32;
+        poll_sockets(sockets, timeout)
+    }
+    #[cfg(windows)]
+    {
+        // WSAPoll's timed waits use the system tick (normally ~15.6 ms).
+        // Rust sleep uses the same high-resolution timer as the old relay loop.
+        // Check readiness between sleeps of at most 2 ms, including long idle
+        // waits, so neither data nor deadlines depend on system timer resolution.
+        let start = std::time::Instant::now();
+        loop {
+            let ready = if sockets.is_empty() {
+                0
+            } else {
+                poll_sockets(sockets, 0)?
+            };
+            let remaining = wait.saturating_sub(start.elapsed());
+            if ready != 0 || remaining.is_zero() {
+                return Ok(ready);
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(2)));
+        }
+    }
 }
 
 fn tcp_writable(stream: &TcpStream, wait: Duration) -> io::Result<bool> {
