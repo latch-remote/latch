@@ -2,7 +2,11 @@
 //! display order. Keep reference storage, colour, timing, cropping and all
 //! unrelated syntax intact while making that promise explicit to decoders.
 use crate::h264::{decode::golomb::Br, decode::nal::rbsp, encode::bits::Bits, CodecError};
-use std::{borrow::Cow, ops::Range};
+use std::{
+    borrow::Cow,
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 type Result<T> = std::result::Result<T, CodecError>;
 
@@ -418,6 +422,18 @@ fn hevc_low_delay(nal: &[u8]) -> Result<Cow<'_, [u8]>> {
     Ok(Cow::Owned(finish(&nal[..2], bits)))
 }
 
+fn warning_due(warned: &mut Vec<(CodecError, Instant)>, reason: &CodecError, now: Instant) -> bool {
+    if let Some((_, at)) = warned.iter_mut().find(|(seen, _)| seen == reason) {
+        if now.duration_since(*at) < Duration::from_secs(5) {
+            return false;
+        }
+        *at = now;
+    } else {
+        warned.push((reason.clone(), now));
+    }
+    true
+}
+
 /// Normalize parameter sets in one I/P-only Latch access unit. This is also
 /// applied before MF decoding to accept pre-fix 6.0.0 hosts. Other NALs,
 /// start-code lengths and trailing zero bytes are preserved byte for byte.
@@ -430,13 +446,12 @@ pub fn low_delay(annexb: &[u8], format: Format) -> Result<Cow<'_, [u8]>> {
         Err(reason) => {
             // A syntax optimization must never prevent an encoder output or
             // decoder input. Report only the parser's static reason, at most
-            // once per five seconds across streams, without logging payloads.
-            static WARNED: std::sync::Mutex<Option<std::time::Instant>> =
-                std::sync::Mutex::new(None);
+            // once per reason per five seconds across streams, without payloads.
+            static WARNED: std::sync::Mutex<Vec<(CodecError, Instant)>> =
+                std::sync::Mutex::new(Vec::new());
             let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
-            if warned.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(5)) {
+            if warning_due(&mut warned, &reason, Instant::now()) {
                 tracing::warn!(?format, %reason, "keeping original video parameter sets");
-                *warned = Some(std::time::Instant::now());
             }
             Ok(Cow::Borrowed(annexb))
         }
@@ -471,6 +486,41 @@ fn rewrite(annexb: &[u8], format: Format) -> Result<Cow<'_, [u8]>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn warning_rate_limit_is_per_reason() {
+        let mut warned = Vec::new();
+        let now = Instant::now();
+        let first = CodecError::Invalid("SPS reserved constraint bits");
+        let second = CodecError::Unsupported("SPS profile");
+        assert!(warning_due(&mut warned, &first, now));
+        assert!(warning_due(
+            &mut warned,
+            &second,
+            now + Duration::from_secs(1)
+        ));
+        assert!(!warning_due(
+            &mut warned,
+            &first,
+            now + Duration::from_secs(1)
+        ));
+        assert!(warning_due(
+            &mut warned,
+            &first,
+            now + Duration::from_secs(5)
+        ));
+        assert!(!warning_due(
+            &mut warned,
+            &second,
+            now + Duration::from_secs(5)
+        ));
+        assert!(warning_due(
+            &mut warned,
+            &second,
+            now + Duration::from_secs(6)
+        ));
+        assert_eq!(warned.len(), 2);
+    }
+
     fn hex(value: &str) -> Vec<u8> {
         value
             .as_bytes()

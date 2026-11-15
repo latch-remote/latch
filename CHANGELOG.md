@@ -85,7 +85,11 @@ GitHub release notes, so each version gets a heading of the form
   withholding with those streams was not reproduced and would now appear as
   latency flagged by CI's strict per-call assertion. Parameter sets rejected
   by the optimizer, including streams declaring nonzero reordering, pass
-  through unchanged with rate-limited warnings.
+  through unchanged with rate-limited warnings. Verification covers Mac
+  VideoToolbox H.264 and HEVC through Media Foundation's software decoder
+  and one AMD GPU, with NVENC, VA-API and AMF normalisation on hardware,
+  Intel and NVIDIA DXVA, and physical presentation unverified, and streams
+  whose encoder declares frame reordering keep their decoder delay.
 
 - Choose which of a host's displays to share. Hosts list their displays in
   `/v1/status` (`streamer.displays`), and the viewer offers them in the

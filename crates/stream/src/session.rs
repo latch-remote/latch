@@ -3167,6 +3167,7 @@ fn decode(
     let mut pending = BTreeMap::new();
     let mut sample_time = 0i64;
     let mut last_published = i64::MIN;
+    let mut pending_warning: Option<Instant> = None;
     loop {
         let ((frame, ready), route_revision) = {
             let mut q = inner.queue.lock();
@@ -3203,7 +3204,10 @@ fn decode(
         if pending.len() == 64 {
             pending.pop_first();
             inner.stats.lock().decoder_discarded_frames += 1;
-            tracing::warn!("decoder exceeded 64 unresolved inputs; discarding oldest identity");
+            if pending_warning.is_none_or(|at| start.duration_since(at) >= Duration::from_secs(5)) {
+                tracing::warn!("decoder exceeded 64 unresolved inputs; discarding oldest identity");
+                pending_warning = Some(start);
+            }
         }
         pending.insert(
             sample_time,
@@ -3224,9 +3228,18 @@ fn decode(
             pending.retain(|&time, _| time == sample_time);
             inner.stats.lock().decoder_discarded_frames += (before - pending.len()) as u64;
         }
+        let mut discarded_on_error = 1;
+        let decoded = decoded.and_then(|pictures| {
+            if !pictures.is_empty() && pictures.iter().all(|(time, _)| !pending.contains_key(time))
+            {
+                discarded_on_error = pictures.len() as u64;
+                anyhow::bail!("decoder returned pictures with no matching sample time");
+            }
+            Ok(pictures)
+        });
         if decoded.is_err() {
             pending.remove(&sample_time);
-            inner.stats.lock().decoder_discarded_frames += 1;
+            inner.stats.lock().decoder_discarded_frames += discarded_on_error;
         }
         #[cfg(test)]
         if let Some(probe) = &inner.pair_probe {
@@ -4523,6 +4536,101 @@ mod tests {
         worker.join().unwrap();
         let given_up = inner.renegotiate.lock().take().map(|(c, why, _)| (c, why));
         given_up
+    }
+
+    #[test]
+    fn all_unmatched_batches_request_keyframes_and_renegotiate() {
+        struct OwnTimes(Arc<Mutex<Vec<u8>>>);
+        impl video::Decoder for OwnTimes {
+            fn decode(
+                &mut self,
+                _: &[u8],
+                _: bool,
+                _: Option<video::Frame>,
+            ) -> anyhow::Result<Option<video::Frame>> {
+                unreachable!("timestamped session interface")
+            }
+            fn decode_frames(
+                &mut self,
+                bytes: &[u8],
+                _: bool,
+                _: i64,
+                _: Option<video::Frame>,
+            ) -> anyhow::Result<Vec<(i64, video::Frame)>> {
+                let mut inputs = self.0.lock();
+                inputs.push(bytes[0]);
+                // A decoder deriving its own clock never echoes our input times.
+                let time = inputs.len() as i64 * 166666;
+                Ok(vec![(time, video::Frame::default())])
+            }
+            fn name(&self) -> &'static str {
+                "decoder with its own sample clock"
+            }
+        }
+        let (events, _) = mpsc::channel();
+        let inner = Arc::new(Inner::new(
+            events,
+            Arc::new(FrameSlot::default()),
+            Box::new(|| {}),
+        ));
+        for frame in 0..HARDWARE_ERRORS * 2 {
+            inner.queue.lock().frames.push_back((
+                InFrame {
+                    frame,
+                    data: vec![frame as u8],
+                    keyframe: frame % 2 == 0,
+                    recovery: false,
+                    host_delay: 0,
+                    assembly: Duration::ZERO,
+                },
+                Instant::now(),
+            ));
+        }
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let (done, finished) = mpsc::channel();
+        let worker = {
+            let inner = inner.clone();
+            let inputs = inputs.clone();
+            std::thread::spawn(move || {
+                decode(
+                    &inner,
+                    Box::new(OwnTimes(inputs)),
+                    Codec::Hevc,
+                    Default::default(),
+                );
+                let _ = done.send(());
+            })
+        };
+        let recovered = finished.recv_timeout(Duration::from_secs(5));
+        inner.stop.store(true, Ordering::Release);
+        inner.queue_cv.notify_all();
+        worker.join().unwrap();
+        recovered.expect("all-unmatched output must trigger decoder recovery");
+        let (codec, why, kind) = inner.renegotiate.lock().take().expect("renegotiation");
+        assert_eq!(codec, Codec::Hevc);
+        assert_eq!(kind, video::FailureKind::Decode);
+        assert!(
+            why.contains(&format!("failed {HARDWARE_ERRORS} times")),
+            "{why}"
+        );
+        assert!(why.contains("no matching sample time"), "{why}");
+        assert_eq!(
+            *inputs.lock(),
+            (0..HARDWARE_ERRORS)
+                .map(|i| (i * 2) as u8)
+                .collect::<Vec<_>>(),
+            "keyframe requests must skip the queued P pictures"
+        );
+        assert_eq!(
+            inner.dropped.load(Ordering::Relaxed),
+            u64::from(HARDWARE_ERRORS - 1)
+        );
+        assert_eq!(
+            inner.stats.lock().decoder_discarded_frames,
+            u64::from(HARDWARE_ERRORS)
+        );
+        assert_eq!(inner.stats.lock().decoder_pending_frames, 0);
+        assert_eq!(inner.frames.seq(), 0);
     }
 
     struct Failing(bool);
