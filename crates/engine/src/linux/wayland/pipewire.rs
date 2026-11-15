@@ -132,6 +132,7 @@ const STREAM_STATE_STREAMING: c_int = 3;
 const DIRECTION_INPUT: c_int = 0;
 const FLAG_AUTOCONNECT: c_int = 1 << 0;
 const FLAG_MAP_BUFFERS: c_int = 1 << 2;
+const META_HEADER_FLAG_DISCONT: u32 = 1 << 0;
 const META_HEADER_FLAG_CORRUPTED: u32 = 1 << 1;
 /// `SPA_CHUNK_FLAG_CORRUPTED` and `SPA_CHUNK_FLAG_EMPTY`.
 const CHUNK_SKIP: i32 = (1 << 0) | (1 << 1);
@@ -226,6 +227,7 @@ struct State {
     dmabuf_failed: bool,
     frames: u64,
     full_frame: bool,
+    sequence: Option<u64>,
 }
 
 struct Shared {
@@ -454,18 +456,31 @@ unsafe fn damage(buffer: &SpaBuffer, width: u32, height: u32) -> Option<Vec<Rect
 
 /// # Safety
 /// `buffer` is live and dequeued.
-unsafe fn corrupted(buffer: &SpaBuffer) -> bool {
+unsafe fn header(buffer: &SpaBuffer) -> Option<&SpaMetaHeader> {
     if buffer.n_metas == 0 || buffer.metas.is_null() {
-        return false;
+        return None;
     }
     let metas = unsafe { std::slice::from_raw_parts(buffer.metas, buffer.n_metas as usize) };
-    metas.iter().any(|m| {
-        m.kind == pod::META_HEADER
-            && !m.data.is_null()
-            && m.size as usize >= std::mem::size_of::<SpaMetaHeader>()
-            && unsafe { (*(m.data as *const SpaMetaHeader)).flags } & META_HEADER_FLAG_CORRUPTED
-                != 0
-    })
+    metas
+        .iter()
+        .find(|m| {
+            m.kind == pod::META_HEADER
+                && !m.data.is_null()
+                && m.size as usize >= std::mem::size_of::<SpaMetaHeader>()
+        })
+        .map(|m| unsafe { &*(m.data as *const SpaMetaHeader) })
+}
+
+impl State {
+    fn note_header(&mut self, header: Option<&SpaMetaHeader>) {
+        if let Some(header) = header {
+            self.full_frame |= header.flags & META_HEADER_FLAG_DISCONT != 0
+                || self
+                    .sequence
+                    .is_some_and(|previous| header.seq != previous.wrapping_add(1));
+        }
+        self.sequence = header.map(|h| h.seq);
+    }
 }
 
 unsafe extern "C" fn on_process(data: Data) {
@@ -492,7 +507,8 @@ unsafe extern "C" fn on_process(data: Data) {
         let usable = spa.is_some_and(|spa| {
             spa.n_datas == 1
                 && !spa.datas.is_null()
-                && !unsafe { corrupted(spa) }
+                && !unsafe { header(spa) }
+                    .is_some_and(|h| h.flags & META_HEADER_FLAG_CORRUPTED != 0)
                 && unsafe { (*spa.datas).chunk.as_ref() }
                     .is_some_and(|c| c.size > 0 && c.flags & CHUNK_SKIP == 0)
         });
@@ -502,6 +518,7 @@ unsafe extern "C" fn on_process(data: Data) {
             continue;
         }
         let spa = spa.expect("usable");
+        shared.state.lock().note_header(unsafe { header(spa) });
         frame::merge(
             &mut changed,
             unsafe { damage(spa, format.width, format.height) }.as_deref(),
@@ -756,9 +773,9 @@ mod tests {
         // SAFETY: the empty buffer has no metadata to dereference.
         unsafe {
             assert_eq!(damage(&buffer, 10, 10), None);
-            assert!(!corrupted(&buffer));
+            assert!(header(&buffer).is_none());
         }
-        let mut header = SpaMetaHeader {
+        let mut meta_header = SpaMetaHeader {
             flags: 1,
             offset: 0,
             pts: 0,
@@ -767,21 +784,44 @@ mod tests {
         };
         let mut meta = SpaMeta {
             kind: pod::META_HEADER,
-            size: std::mem::size_of_val(&header) as u32,
-            data: (&mut header as *mut SpaMetaHeader).cast(),
+            size: std::mem::size_of_val(&meta_header) as u32,
+            data: (&mut meta_header as *mut SpaMetaHeader).cast(),
         };
         buffer.n_metas = 1;
         buffer.metas = &mut meta;
         // SAFETY: metadata points to the live header above.
         unsafe {
-            assert!(!corrupted(&buffer), "DISCONT is not corruption");
+            assert_eq!(header(&buffer).unwrap().flags, META_HEADER_FLAG_DISCONT);
         }
         // Mutate through the live metadata pointer, as a producer does.
         unsafe {
             (*(meta.data as *mut SpaMetaHeader)).flags = 2;
         }
         unsafe {
-            assert!(corrupted(&buffer));
+            assert_eq!(header(&buffer).unwrap().flags, META_HEADER_FLAG_CORRUPTED);
         }
+    }
+    #[test]
+    fn discontinuities_and_skipped_sequences_require_a_full_copy() {
+        let mut state = State::default();
+        let mut header = SpaMetaHeader {
+            flags: 0,
+            offset: 0,
+            pts: 0,
+            dts_offset: 0,
+            seq: 10,
+        };
+        state.note_header(Some(&header));
+        header.seq = 11;
+        state.note_header(Some(&header));
+        assert!(!state.full_frame);
+        header.seq = 13;
+        state.note_header(Some(&header));
+        assert!(state.full_frame);
+        state.full_frame = false;
+        header.seq = 14;
+        header.flags = META_HEADER_FLAG_DISCONT;
+        state.note_header(Some(&header));
+        assert!(state.full_frame);
     }
 }
