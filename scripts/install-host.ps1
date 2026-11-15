@@ -82,6 +82,8 @@ foreach ($folder in @($Desktop, $StartMenu)) {
 
 # The background service at logon; the app offers the same toggle.
 $Run = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+# A profile that never had a login item has no Run key.
+if (-not (Test-Path $Run)) { New-Item -Path $Run | Out-Null }
 Remove-ItemProperty -Path $Run -Name "BroLinkHost" -ErrorAction SilentlyContinue
 New-ItemProperty -Path $Run -Name "LatchHost" -Value "`"$DestExe`" --background" -PropertyType String -Force | Out-Null
 
