@@ -19,6 +19,9 @@ GitHub release notes, so each version gets a heading of the form
 - Send viewer mouse and keyboard input directly from OS events on macOS,
   Windows and Linux, preserving input ordering, capture, focus and local
   shortcuts while avoiding the next UI frame for ordinary input.
+- Add runtime-loaded Linux VA-API H.264 and HEVC/Main10 viewer decoding,
+  profile and resolution probing, EGL DMA-BUF presentation with readback
+  fallback, and automatic software recovery after hardware failures.
 
 ### Packaging
 

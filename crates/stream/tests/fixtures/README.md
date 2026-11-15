@@ -17,3 +17,14 @@ pixels as well as native storage and hardware selection.
 tiny pictures. H.264 uses `-tune zerolatency -bf 0`, HEVC `bframes=0`, and
 AV1 `-svtav1-params lp=1:pred-struct=1`. These are capability probes, not
 throughput benchmarks or evidence of maximum resolution/rate support.
+
+`decode-probe-main10.hevc` is the 256×256 pattern encoded as 10-bit HEVC
+with FFmpeg/libx265 (`-vf scale=256:256 -pix_fmt yuv420p10le`,
+`-x265-params pools=1:bframes=0:log-level=error`).
+
+`vaapi-b-frames.h264` and `.hevc` are 12-picture, 128×64 FFmpeg test-pattern
+streams encoded with libx264/libx265 with B pictures enabled. They exercise
+slice headers and reference lists in decoding order through a recording
+backend on every platform. Latch's streaming encoders use low-delay output.
+`vt-ltr-overflow.h264` also exercises retained long-term references across
+frame-number gaps and bounded reference storage.
