@@ -218,6 +218,16 @@ pub(crate) fn trigger(v: f64) -> u16 {
 }
 
 #[cfg(test)]
+pub(crate) fn pair_state() -> PadState {
+    #[cfg(target_os = "macos")]
+    return mac::pair_state();
+    #[cfg(windows)]
+    return windows::pair_state();
+    #[cfg(target_os = "linux")]
+    return linux::pair_state();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -45,6 +45,13 @@ extern "C" {
     fn CGEventGetFlags(event: Ref) -> u64;
     #[cfg(test)]
     fn CGEventGetIntegerValueField(event: Ref, field: u32) -> i64;
+    #[cfg(test)]
+    fn CGEventKeyboardGetUnicodeString(
+        event: Ref,
+        capacity: usize,
+        length: *mut usize,
+        text: *mut u16,
+    );
 }
 pub fn open() -> Result<Box<dyn InputSink>> {
     // SAFETY: this only queries authorization and never shows an authorization prompt.
@@ -362,6 +369,86 @@ impl Drop for Sink {
         if self.posting {
             self.release_all();
         }
+    }
+}
+
+#[cfg(test)]
+mod pair_interop {
+    use super::*;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/pairs/native_input.rs"
+    ));
+    fn native(events: &[Event]) -> Vec<Value> {
+        let mut sink = Sink {
+            held: Held::default(),
+            caps_lock: false,
+            posting: false,
+            clicks: ClickCounter::new(),
+            stream_size: None,
+        };
+        let mut out = Vec::new();
+        for event in events {
+            let built = sink
+                .build(
+                    event,
+                    DisplayRect {
+                        x: 0,
+                        y: 0,
+                        width: 640,
+                        height: 360,
+                    },
+                    Point { x: 320., y: 180. },
+                )
+                .unwrap();
+            for native in built {
+                // SAFETY: reads only locally constructed CGEvents. posting stays false.
+                unsafe {
+                    match event {
+                        Event::Key { down, .. } => out.push(json!([
+                            "key",
+                            CGEventGetIntegerValueField(native.0, 9),
+                            down,
+                            CGEventGetFlags(native.0)
+                        ])),
+                        Event::Text(_) if CGEventGetType(native.0) == 10 => {
+                            let mut units = [0; 20];
+                            let mut count = 0;
+                            CGEventKeyboardGetUnicodeString(
+                                native.0,
+                                units.len(),
+                                &mut count,
+                                units.as_mut_ptr(),
+                            );
+                            for unit in &units[..count] {
+                                out.push(json!(["text", unit]));
+                            }
+                        }
+                        Event::MouseMove { .. } => out.push(json!([
+                            "relative",
+                            CGEventGetIntegerValueField(native.0, 4),
+                            CGEventGetIntegerValueField(native.0, 5)
+                        ])),
+                        Event::MousePosition { .. } => {
+                            let point = CGEventGetLocation(native.0);
+                            out.push(json!(["absolute", point.x as i64, point.y as i64]));
+                        }
+                        Event::Scroll { .. } => out.push(json!([
+                            "pixels",
+                            CGEventGetIntegerValueField(native.0, 96),
+                            CGEventGetIntegerValueField(native.0, 97)
+                        ])),
+                        Event::MouseButton { down, .. } => out.push(json!([
+                            "button",
+                            CGEventGetIntegerValueField(native.0, 3),
+                            down
+                        ])),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        out
     }
 }
 

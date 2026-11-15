@@ -299,6 +299,150 @@ impl Drop for X11Input {
         self.release_all();
     }
 }
+
+#[cfg(test)]
+mod pair_interop {
+    use super::*;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/pairs/native_input.rs"
+    ));
+    fn native(events: &[Event]) -> Vec<Value> {
+        // Every event is posted only into the disposable Xvfb owned by pairs.py.
+        assert_eq!(std::env::var("DISPLAY").unwrap(), ":9");
+        assert_eq!(std::env::var("LATCH_PAIR_XVFB").unwrap(), "1");
+        let (observer, screen) = x11rb::connect(None).unwrap();
+        let root = observer.setup().roots[screen].root;
+        let window = observer.generate_id().unwrap();
+        observer
+            .create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                window,
+                root,
+                0,
+                0,
+                640,
+                360,
+                0,
+                xproto::WindowClass::INPUT_OUTPUT,
+                x11rb::COPY_FROM_PARENT,
+                &xproto::CreateWindowAux::new().event_mask(
+                    xproto::EventMask::KEY_PRESS
+                        | xproto::EventMask::KEY_RELEASE
+                        | xproto::EventMask::BUTTON_PRESS
+                        | xproto::EventMask::BUTTON_RELEASE
+                        | xproto::EventMask::POINTER_MOTION,
+                ),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        observer.map_window(window).unwrap().check().unwrap();
+        observer
+            .set_input_focus(xproto::InputFocus::PARENT, window, x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        observer
+            .warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, 320, 180)
+            .unwrap()
+            .check()
+            .unwrap();
+        observer.get_input_focus().unwrap().reply().unwrap();
+        while observer.poll_for_event().unwrap().is_some() {}
+        let mut sink = X11Input::new().unwrap();
+        let display = DisplayRect {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 360,
+        };
+        let mut out = Vec::new();
+        for event in events {
+            let before = observer.query_pointer(root).unwrap().reply().unwrap();
+            let expected_count = match event {
+                Event::Text(t) => t.chars().count() * 2,
+                Event::Scroll {
+                    vertical,
+                    horizontal,
+                } => {
+                    let vertical = (sink.scroll[0] + i32::from(*vertical)) / 120;
+                    let horizontal = (sink.scroll[1] + i32::from(*horizontal)) / 120;
+                    (vertical.unsigned_abs() + horizontal.unsigned_abs()) as usize * 2
+                }
+                _ => 1,
+            };
+            // Text remaps a scratch key for 12 ms. Read its keysym while the
+            // production injector holds that mapping, using another connection.
+            std::thread::scope(|scope| {
+                let apply = scope.spawn(|| sink.apply(event, display).unwrap());
+                let mut seen = 0;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while std::time::Instant::now() < deadline {
+                    if let Some(native) = observer.poll_for_event().unwrap() {
+                        match native {
+                            XEvent::KeyPress(key) | XEvent::KeyRelease(key) => {
+                                let down = key.response_type == xproto::KEY_PRESS_EVENT;
+                                if matches!(event, Event::Text(_)) {
+                                    if down {
+                                        let mapping = observer
+                                            .get_keyboard_mapping(key.detail, 1)
+                                            .unwrap()
+                                            .reply()
+                                            .unwrap();
+                                        let symbol = mapping.keysyms[0];
+                                        assert_eq!(
+                                            symbol & 0xff000000,
+                                            0x01000000,
+                                            "scratch mapping expired before observation"
+                                        );
+                                        let ch = char::from_u32(symbol & 0x00ffffff).unwrap();
+                                        for unit in ch.encode_utf16(&mut [0; 2]) {
+                                            out.push(json!(["text", unit]));
+                                        }
+                                    }
+                                } else {
+                                    out.push(json!(["key", key.detail, down, 0]));
+                                }
+                                seen += 1;
+                            }
+                            XEvent::ButtonPress(button) | XEvent::ButtonRelease(button) => {
+                                out.push(json!([
+                                    "button",
+                                    button.detail,
+                                    button.response_type == xproto::BUTTON_PRESS_EVENT
+                                ]));
+                                seen += 1;
+                            }
+                            XEvent::MotionNotify(motion) => {
+                                if matches!(event, Event::MouseMove { .. }) {
+                                    out.push(json!([
+                                        "relative",
+                                        motion.root_x - before.root_x,
+                                        motion.root_y - before.root_y
+                                    ]));
+                                } else {
+                                    out.push(json!(["absolute", motion.root_x, motion.root_y]));
+                                }
+                                seen += 1;
+                            }
+                            XEvent::Error(error) => panic!("XTest observation {error:?}"),
+                            _ => {}
+                        }
+                    } else if apply.is_finished() && seen >= expected_count {
+                        break;
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    }
+                }
+                apply.join().unwrap();
+            });
+        }
+        drop(sink);
+        observer.destroy_window(window).unwrap().check().unwrap();
+        out
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

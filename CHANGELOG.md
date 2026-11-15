@@ -10,6 +10,12 @@ GitHub release notes, so each version gets a heading of the form
   Windows and Linux, preserving input ordering, capture, focus and local
   shortcuts while avoiding the next UI frame for ordinary input.
 
+### Interoperability
+
+- Add artifact-exchanged host/viewer interoperability CI across Windows,
+  macOS and Linux x64/arm64, with decoded media, native input construction,
+  clipboard contracts and explicit known-gap assertions.
+
 ### Packaging
 
 - Add a Scoop manifest, AUR packages (`latch-remote-bin` from the release

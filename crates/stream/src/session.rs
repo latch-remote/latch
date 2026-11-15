@@ -29,6 +29,10 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+#[path = "../../../tests/pairs/replay.rs"]
+mod pair_interop;
+
 /// Builds the configured production relay with standard certificate validation.
 pub fn relay_config(settings: &control::RelaySettings) -> Option<latch_relay::ClientConfig> {
     if !settings.enabled {
@@ -1255,6 +1259,8 @@ impl Link {
 }
 
 struct Inner {
+    #[cfg(test)]
+    pair_probe: Option<Arc<pair_interop::Probe>>,
     configured_relay: Mutex<Option<latch_relay::ClientConfig>>,
     relay: Mutex<Arc<RelayRoute>>,
     relay_messages: Mutex<VecDeque<(u64, Message)>>,
@@ -1355,6 +1361,8 @@ impl Inner {
     ) -> Self {
         Self {
             configured_relay: Mutex::new(None),
+            #[cfg(test)]
+            pair_probe: None,
             relay: Mutex::new(Arc::new(RelayRoute::new(
                 0,
                 latch_relay::Role::Viewer,
@@ -1745,6 +1753,15 @@ fn run(inner: &Arc<Inner>, server: &Server, settings: &Settings) {
     }
 }
 
+fn session_decoder(inner: &Inner, accept: &control::Accept) -> anyhow::Result<Box<dyn Decoder>> {
+    #[cfg(test)]
+    if let Some(probe) = &inner.pair_probe {
+        return video::pair_decoder(probe.native, accept.width, accept.height);
+    }
+    let _ = inner;
+    video::new_decoder_for_color(accept.codec, accept.width, accept.height, accept.color)
+}
+
 /// One request for the stream, and the stream until it ends.
 fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &[Codec]) {
     if inner.stopping() {
@@ -1785,6 +1802,15 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
                 && video::decoder_available_for(SocketAddr::new(server.address, server.port), c)
         })
         .collect();
+    let audio_channels = match settings.audio.then(crate::audio::output_channels) {
+        Some(n) if n > 2 => n,
+        _ => 0,
+    };
+    #[cfg(test)]
+    let audio_channels = inner
+        .pair_probe
+        .as_ref()
+        .map_or(audio_channels, |probe| probe.channels);
     let request = StreamRequest {
         relay: inner.configured_relay.lock().is_some(),
         prefer_color: settings.prefer_color,
@@ -1805,10 +1831,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         probe_trains: true,
         // 5.1 or 7.1 when this machine's speakers have them; stereo is the
         // field's absence, which every host understands.
-        audio_channels: match settings.audio.then(crate::audio::output_channels) {
-            Some(n) if n > 2 => n,
-            _ => 0,
-        },
+        audio_channels,
     };
     let body = serde_json::to_vec(&request).unwrap_or_default();
     let host = SocketAddr::new(server.address, server.port);
@@ -1909,18 +1932,16 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
     {
         return fail("starting", "host selected unoffered colour format".into());
     }
-    let decoder =
-        match video::new_decoder_for_color(accept.codec, accept.width, accept.height, accept.color)
-        {
-            Ok(d) => d,
-            Err(e) if accept.codec != Codec::H264Baseline => {
-                *inner.renegotiate.lock() =
-                    Some((accept.codec, format!("{e:#}"), video::FailureKind::Open));
-                let _ = tcp.shutdown(Shutdown::Both);
-                return;
-            }
-            Err(e) => return fail("decoding", format!("{e:#}")),
-        };
+    let decoder = match session_decoder(inner, &accept) {
+        Ok(d) => d,
+        Err(e) if accept.codec != Codec::H264Baseline => {
+            *inner.renegotiate.lock() =
+                Some((accept.codec, format!("{e:#}"), video::FailureKind::Open));
+            let _ = tcp.shutdown(Shutdown::Both);
+            return;
+        }
+        Err(e) => return fail("decoding", format!("{e:#}")),
+    };
     {
         let mut stats = inner.stats.lock();
         stats.width = accept.width;
@@ -1939,6 +1960,10 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         }
     }
     let player = accept.audio.as_ref().and_then(|a| {
+        #[cfg(test)]
+        if inner.pair_probe.is_some() {
+            return None;
+        }
         match Player::with_gain(
             a.rate,
             a.channels as usize,
@@ -2663,6 +2688,10 @@ fn receive(
         // Also when no audio arrived: a lost packet at the end of a sound
         // must not hold the rest of it until the next sound.
         while let Some(out) = audio_rx.pop(now) {
+            #[cfg(test)]
+            if let Some(probe) = &inner.pair_probe {
+                probe.audio(&out);
+            }
             if let Some(player) = player.as_mut() {
                 match out {
                     AudioOut::Frame { payload, .. } => player.push(&payload),
@@ -3019,6 +3048,12 @@ fn handle(
         Datagram::Video { shard, .. } => {
             *media_seen = true;
             reassembler.push(shard, now);
+            #[cfg(test)]
+            if let Some(probe) = &inner.pair_probe {
+                probe
+                    .fec
+                    .store(reassembler.stats().shards_recovered, Ordering::Relaxed);
+            }
         }
         Datagram::Audio { packet, .. } => audio_rx.push(packet, now),
         Datagram::InputAck { next, .. } => {
@@ -3196,6 +3231,10 @@ fn decode(
                     st.height = picture.height;
                 }
                 let black = picture.is_black();
+                #[cfg(test)]
+                if let Some(probe) = &inner.pair_probe {
+                    probe.picture(frame.frame, &picture);
+                }
                 inner.frames.publish(picture);
                 inner
                     .published_us

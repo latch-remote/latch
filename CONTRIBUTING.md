@@ -109,6 +109,33 @@ host's capture-convert-encode pipeline with no network and prints
 per-stage times; `cargo run --release -p latch-stream --example
 stream_decode_bench` does the same for a decoder.
 
+## Pair interoperability recordings
+
+`python3 scripts/pairs.py local` builds the test peers, records this machine's
+host output and viewer input, and replays the artifacts locally. Use
+`--capture-window` on a disposable macOS or Windows desktop to open the
+deterministic capture window. Linux runs its own Xvfb on `:9` and needs the
+`xvfb` package. The output lives under `target/pairs`.
+
+```bash
+python3 scripts/pairs.py build
+python3 scripts/pairs.py record --output target/pairs/recordings
+python3 scripts/pairs.py verify --artifacts target/pairs/recordings --output target/pairs/results
+```
+
+Copy each producer's recording directory into a separate subdirectory to
+exchange sessions between machines built from the same commit. CI's
+`.github/workflows/pairs.yml` exchanges four runner artifacts and requires
+the complete producer set with `verify --grid`.
+
+Add viewer actions and their intended wire events in
+`tests/pairs/viewer_input.rs`, then add independent native expectations in
+`tests/pairs/native_input.rs` and a required case in `scripts/pairs.py`.
+Current mismatches must assert their exact observed value and fail when
+they unexpectedly pass. Document them in `tests/pairs/KNOWN-GAPS.md`.
+The recording schema and decoder tolerance are documented alongside those
+fixtures in `tests/pairs/README.md`.
+
 ## Seeing the UI
 
 ```bash

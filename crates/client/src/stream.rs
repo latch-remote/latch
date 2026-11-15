@@ -4222,6 +4222,13 @@ pub(crate) mod tests {
     use latch_stream::input::{BUTTON_LEFT, MOD_CTRL, MOD_SHIFT};
     use std::rc::Rc;
 
+    mod pair_interop {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/pairs/viewer_input.rs"
+        ));
+    }
+
     const VK_T: i16 = 0x54;
     const VK_W: i16 = 0x57;
     const VK_Y: i16 = 0x59;

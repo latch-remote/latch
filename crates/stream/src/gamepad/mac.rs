@@ -384,3 +384,18 @@ fn read(g: &GCExtendedGamepad) -> PadState {
         }
     }
 }
+
+#[cfg(test)]
+pub(super) fn pair_state() -> PadState {
+    // SAFETY: a local snapshot controller. These setters never affect a device.
+    unsafe {
+        let controller = GCController::controllerWithExtendedGamepad();
+        let gamepad = controller.extendedGamepad().unwrap();
+        gamepad.buttonA().setValue(1.);
+        gamepad.dpad().setValueForXAxis_yAxis(-1., 0.);
+        gamepad.leftThumbstick().setValueForXAxis_yAxis(-1., 1.);
+        gamepad.leftTrigger().setValue(0.25);
+        gamepad.rightTrigger().setValue(0.75);
+        read(&gamepad)
+    }
+}

@@ -28,6 +28,10 @@ use std::sync::mpsc;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+#[path = "../../../tests/pairs/record.rs"]
+pub(crate) mod pair_interop;
+
 /// A still screen still gets a nearly empty frame this often, so a viewer
 /// notices a lost last frame and the stream never looks dead. It also bounds
 /// how long a keyframe request waits while next() waits for the screen to

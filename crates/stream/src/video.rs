@@ -404,6 +404,24 @@ pub trait Decoder: Send {
     fn name(&self) -> &'static str;
 }
 
+/// Test-only strict decoder selection. A native-cell failure cannot fall back.
+#[cfg(test)]
+pub(crate) fn pair_decoder(native: bool, _width: u32, _height: u32) -> Result<Box<dyn Decoder>> {
+    if !native {
+        return Ok(Box::new(software::Software::new()));
+    }
+    #[cfg(target_os = "macos")]
+    return Ok(Box::new(videotoolbox::VideoToolbox::new(
+        Codec::H264Baseline,
+    )?));
+    #[cfg(windows)]
+    return Ok(Box::new(MediaFoundation(
+        mediafoundation::MfDecoder::with_stream(Codec::H264Baseline, _width, _height, 8)?,
+    )));
+    #[cfg(not(any(target_os = "macos", windows)))]
+    anyhow::bail!("no native decoder on this runner OS")
+}
+
 /// Startup failures (e.g. unavailable OS extensions) retry less often than
 /// transient decode failures. Each host has an independent circuit breaker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

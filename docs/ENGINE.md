@@ -5,6 +5,25 @@ moonlight-common-c (C), OpenH264 (C++) and libopus (C). Since version 5, Latch d
 in Rust, inside the one `latch-host` executable that already runs the
 control service and the window.
 
+## Pair interoperability CI
+
+The `pairs` workflow exchanges versioned session artifacts among Windows
+x64, macOS arm64, Linux x64 and Linux arm64. Every consumer starts a real
+HTTP-upgraded viewer `Session`, receives the recorded datagrams on
+loopback, reassembles and decodes them, and compares visible pixels and
+audio against the producer's references. Clean and deterministic
+loss/reorder runs cover FEC and keyframe requests, forced IDRs, repeated
+parameter sets, SPS resizing, cursor control and termination.
+
+Viewer input recordings are consumed by each host's native adapter.
+Windows constructs `INPUT` records, macOS constructs CGEvents with posting
+disabled, and Linux posts XTest into an isolated Xvfb. Clipboard writes
+have a test-only interception before OS mutation. Gamepad recordings pass
+through OS reading conversion and the production input sender, then host
+report conversion. Hosted runners report native encoder, decoder, capture
+and virtual-device limits explicitly. The schema, tolerances and known
+input gaps live in `tests/pairs`.
+
 ## Boundary
 
 Everything Latch ships is Rust source compiled by `rustc`. Allowed below

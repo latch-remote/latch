@@ -33,3 +33,7 @@ pub mod windows;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "linux/x11.rs"]
 mod x11_bootstrap_tests;
+
+#[cfg(test)]
+#[path = "../../../tests/pairs/format.rs"]
+pub(crate) mod pair_format;

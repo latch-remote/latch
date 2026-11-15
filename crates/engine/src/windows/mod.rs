@@ -35,6 +35,88 @@ use windows::{core::Interface, Win32::Media::MediaFoundation::IMFSample};
 /// without looking at its deadlines.
 const MAX_WAIT: Duration = Duration::from_millis(100);
 
+#[cfg(test)]
+pub(crate) fn pair_probe_encoder() -> Result<()> {
+    let _runtime = Runtime::new(true)?;
+    MfEncoder::software(&VideoConfig {
+        color: Default::default(),
+        width: 160,
+        height: 98,
+        fps: 25,
+        bitrate_kbps: 4000,
+        codec: Codec::H264Baseline,
+    })?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn pair_encode() -> Result<Vec<(EncodedVideo, VideoInfo)>> {
+    let _runtime = Runtime::new(true)?;
+    let mut frames = Vec::new();
+    for (group, (width, height)) in [(160, 98), (128, 74)].into_iter().enumerate() {
+        let config = VideoConfig {
+            color: Default::default(),
+            width,
+            height,
+            fps: 25,
+            bitrate_kbps: 4000,
+            codec: Codec::H264Baseline,
+        };
+        // The Microsoft software MFT is available without a GPU or desktop.
+        let mut encoder = MfEncoder::software(&config)?;
+        for index in 0..12 {
+            let picture = crate::server::pair_interop::source(width, height, group * 12 + index);
+            let (mut y, mut uv) = (Vec::new(), Vec::new());
+            let (ys, cs) = latch_codec::color::yuv420_to_nv12(&picture, &mut y, &mut uv);
+            let mut nv12 = Vec::new();
+            for row in y.chunks(ys).take(height as usize) {
+                nv12.extend_from_slice(&row[..width as usize]);
+            }
+            for row in uv.chunks(cs).take(height as usize / 2) {
+                nv12.extend_from_slice(&row[..width as usize]);
+            }
+            let force = index == 0 || index == 6;
+            let (data, keyframe) = encoder
+                .encode(&encode::memory_sample(&nv12)?, force)?
+                .context("MFT did not return the synthetic frame")?;
+            assert!(!force || keyframe, "MFT ignored forced IDR");
+            if keyframe {
+                for kind in [7, 8, 5] {
+                    assert!(
+                        data.windows(4)
+                            .any(|n| n[..3] == [0, 0, 1] && n[3] & 31 == kind),
+                        "MFT IDR missing NAL {kind}"
+                    );
+                }
+            }
+            frames.push((
+                EncodedVideo {
+                    data,
+                    keyframe,
+                    captured: Instant::now(),
+                    picture: 0,
+                    generation: 0,
+                    recovery: None,
+                },
+                VideoInfo {
+                    color: config.color,
+                    encoder: encoder.name.clone(),
+                    hardware: encoder.hardware,
+                    codec: config.codec,
+                    width,
+                    height,
+                    display: crate::input::DisplayRect {
+                        width,
+                        height,
+                        ..Default::default()
+                    },
+                },
+            ));
+        }
+    }
+    Ok(frames)
+}
+
 enum VideoEncoder {
     Mf(Box<MfEncoder>),
     Amf(Box<amf::Encoder>),

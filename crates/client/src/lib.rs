@@ -90,3 +90,7 @@ pub fn native_options() -> eframe::NativeOptions {
         ..Default::default()
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/pairs/format.rs"]
+pub(crate) mod pair_format;
