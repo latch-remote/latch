@@ -1,5 +1,5 @@
 [Unit]
-Description=Latch native TCP/TLS rendezvous relay
+Description=Latch TCP/TLS and HTTPS WebSocket rendezvous relay
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=0
@@ -9,7 +9,7 @@ Type=simple
 User=latch-relay
 Group=latch-relay
 EnvironmentFile=/etc/latch-relay/budget.conf
-ExecStart=/usr/local/bin/latch-relay --listen 0.0.0.0:443 --cert /etc/latch-relay/fullchain.pem --key /etc/latch-relay/privkey.pem --quota-file /var/lib/latch-relay/quota --monthly-bytes ${MONTHLY_BYTES} --limits-json /etc/latch-relay/limits.json
+ExecStart=/usr/local/bin/latch-relay --listen [::]:443 --cert /etc/latch-relay/fullchain.pem --key /etc/latch-relay/privkey.pem --quota-file /var/lib/latch-relay/quota --monthly-bytes ${MONTHLY_BYTES} --limits-json /etc/latch-relay/limits.json
 Restart=always
 RestartSec=30s
 TimeoutStopSec=10s

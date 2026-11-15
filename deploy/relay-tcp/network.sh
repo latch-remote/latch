@@ -45,7 +45,9 @@ net.ipv4.tcp_rmem = 4096 131072 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
-net.ipv4.tcp_mtu_probing = 1
+# Always probe packet sizes: a path that drops large segments without ICMP
+# would otherwise stall a lane past its send deadline before detection.
+net.ipv4.tcp_mtu_probing = 2
 net.ipv4.tcp_notsent_lowat = 131072
 net.ipv4.tcp_slow_start_after_idle = 0
 # About 40 MiB of entries at saturation, instead of a million-entry ceiling.
