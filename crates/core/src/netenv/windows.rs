@@ -625,6 +625,15 @@ mod tests {
         assert_eq!(result.candidates[1].proxy, Proxy::Direct);
     }
 
+    /// One worker at a time: each join tears the apartment down before the next
+    /// worker starts, which is the sequence that crashed with a cached factory.
+    #[test]
+    fn connectivity_survives_sequential_worker_apartment_teardown() {
+        for _ in 0..16 {
+            let _ = std::thread::spawn(portal).join().unwrap();
+        }
+    }
+
     #[test]
     fn connectivity_survives_repeated_worker_apartment_teardown() {
         for _ in 0..8 {
