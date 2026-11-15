@@ -323,9 +323,10 @@ pub(crate) struct WsRead {
     pub record: Option<Vec<u8>>,
     pub response: Option<Vec<u8>>,
     pub close: bool,
+    pub control: bool,
 }
 impl WebSocket {
-    fn new(client: bool) -> Self {
+    pub(crate) fn new(client: bool) -> Self {
         Self {
             client,
             header: Vec::new(),
@@ -341,8 +342,9 @@ impl WebSocket {
             record: None,
             response: None,
             close: false,
+            control: false,
         };
-        // One bounded frame per turn. Control floods share socket/idle and quota bounds.
+        // One bounded frame per turn. The TLS owner also paces control frames.
         loop {
             let needed = if self.header.len() < 2 {
                 2
@@ -411,6 +413,7 @@ impl WebSocket {
         self.read = 0;
         let payload = std::mem::take(&mut self.payload);
         let mut result = empty();
+        result.control = opcode >= 8;
         match opcode {
             8 => {
                 if payload.len() == 1 {
