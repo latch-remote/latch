@@ -1515,6 +1515,10 @@ impl View {
             .iter()
             .map(|t| (t.tone, t.text.clone()))
             .collect();
+        let pad_problem = env.live.session.pad_problem();
+        if !pad_problem.is_empty() && !env.live.pads.connected().is_empty() {
+            lines.push((Tone::Warning, pad_problem));
+        }
         if let Some(h) = &env.handover {
             lines.push((Tone::Neutral, h.clone()));
         }
@@ -1635,6 +1639,8 @@ impl View {
         // its pointer in the picture. The last session's reset left this
         // true, and a captured reconnect would then never ask for it.
         self.host_cursor_drawn = false;
+        // Shape serials belong to the host session. A reconnect may reuse one.
+        self.cursor_texture = None;
         live.session.set_volume(if self.muted {
             0.0
         } else {
@@ -2681,10 +2687,10 @@ fn question(ctx: &egui::Context, id: &str, bar: Rect, w: f32, add: impl FnOnce(&
 /// hover which, or why the host takes none.
 fn pads_tag(ui: &mut egui::Ui, live: &Live) {
     let pads = live.pads.connected();
-    if pads.is_empty() {
+    let problem = live.session.pad_problem();
+    if pads.is_empty() && problem.is_empty() {
         return;
     }
-    let problem = live.session.pad_problem();
     let taken = live.input.pad_slots();
     let tone = if !problem.is_empty() {
         Tone::Warning
@@ -2693,9 +2699,13 @@ fn pads_tag(ui: &mut egui::Ui, live: &Live) {
     } else {
         Tone::Success
     };
-    let label = match pads.len() {
-        1 => "1 gamepad".to_string(),
-        n => format!("{n} gamepads"),
+    let label = if !problem.is_empty() {
+        "Controllers unavailable".to_string()
+    } else {
+        match pads.len() {
+            1 => "1 gamepad".to_string(),
+            n => format!("{n} gamepads"),
+        }
     };
     let mut lines: Vec<String> = pads
         .iter()
@@ -5391,10 +5401,19 @@ pub(crate) mod tests {
         let live = dummy_live(&ctx);
         let mut view = View {
             host_cursor_drawn: true,
+            cursor_texture: Some((
+                1,
+                ctx.load_texture(
+                    "previous-cursor",
+                    egui::ColorImage::new([1, 1], Color32::WHITE),
+                    egui::TextureOptions::LINEAR,
+                ),
+            )),
             ..Default::default()
         };
         view.stream_started(&ctx, &live, false);
         assert!(!view.host_cursor_drawn);
+        assert!(view.cursor_texture.is_none());
     }
 
     #[test]

@@ -195,7 +195,129 @@ they are: a Windows PC gets an Xbox 360 pad for an Xbox pad and a
 DualShock 4 for a PlayStation one, a Linux host an Xbox 360 pad for each.
 The game's rumble comes back to the pad, on each handle and, on pads that
 have them, the triggers. macOS gives gamepads to the frontmost app only,
-so keep the stream's window in front. A Mac host takes no gamepads.
+so keep the stream's window in front. Current ad-hoc Mac hosts advertise
+zero controller slots and show the virtual-HID entitlement restriction.
+
+### Mac host virtual controllers
+
+The host probes `IOHIDUserDeviceCreateWithProperties` before accepting
+controllers. A denied probe advertises zero slots and sends `gamepad_problem`
+in the existing Accept. The viewer shows **Controllers unavailable** and the
+reason, with a persistent warning when a controller is connected. Accessibility
+and Screen Recording grants do not authorize virtual HID creation.
+
+The backend uses Rust FFI to IOKit/CoreFoundation and existing dispatch/block
+bindings. It stages Xbox-style HID and wired DS4 descriptors, normalized
+buttons/sticks/triggers, concurrent slot probing up to the protocol limit of
+16, connect/replacement/disconnect, cancellation on session teardown and
+output-report motor/light mapping. Generic pads use the Xbox layout. Native
+motion/touch sensors and device-specific feature reports are unimplemented.
+Descriptor/report, feedback and lifecycle tests establish byte conversion and
+cleanup. GameController, SDL and Steam compatibility still requires a real
+created device and application testing.
+
+#### Signing required to enable native pads
+
+1. Ask Apple Developer Support to authorize the Boolean entitlement
+   `com.apple.developer.hid.virtual.device` for Latch's user-space
+   `IOHIDUserDevice` controller emulation and Developer ID distribution.
+   Include the bundle identifier and Apple developer team, the personal
+   remote-streaming use case and the need for GameController/HID consumer
+   compatibility. Confirm that Apple can issue the authorization and any
+   required provisioning profile for this distribution method.
+2. After approval, sign the actual host executable with the authorized
+   Developer ID Application identity and entitlement. Add the approved key to
+   the non-ad-hoc entitlement plist in `scripts/bundle-macos.sh`, embed the
+   matching provisioning profile if Apple's authorization requires it, and
+   provide that identity/profile through the release signing configuration.
+   Keep the existing hardened-runtime Apple Events entitlement. Notarize and
+   validate the resulting bundle. A Developer ID certificate alone does not
+   grant this entitlement. Writing the key into an ad-hoc signature is rejected
+   on the machine tested here.
+3. Run the probe below with that signed host/probe identity, then verify
+   enumeration and actual inputs in GameController and SDL/Steam, including
+   both layouts, concurrent slots, disconnect/takeover and native rumble/LED
+   output reports. Device-specific feature reports may need implementation
+   after that testing. Apple approval and consumer verification are release
+   prerequisites for claiming native Mac controller support.
+
+The entitlement name and creation requirement are documented by Apple and in
+`IOKit/hidsystem/IOHIDUserDevice.h`. CoreHID is a macOS 15+ Swift API with the
+same denied creation outcome in this probe. GameController's virtual-controller
+UI API has no macOS system-wide controller injection route. No driver or system
+extension is installed by Latch's backend. [Apple entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.hid.virtual.device)
+
+#### Local probe record
+
+On 14 November 2026, Apple Silicon arm64, macOS 26.6.2 build 25G83, a temporary
+Swift probe submitted a gamepad HID descriptor with DS4 `054c:05c4` and
+Xbox-style `045e:02fd` identities to both IOKit and CoreHID. Both APIs returned
+nil with the linker's ad-hoc signature and after explicit `codesign --sign -`.
+The unsigned copy exited with signal 9. An explicitly ad-hoc signed copy
+claiming the virtual-HID entitlement also exited with signal 9 before main.
+No virtual device was created or left connected. GameController enumerated
+zero controllers. SDL/Steam visibility and rumble could not be tested without
+creation. Root case not tested because `sudo -n true` required a password.
+No privacy permissions or system settings were changed.
+
+The committed Rust probe checks the actual backend and real cursor capture,
+with bounded device/frame lifetimes and no service or input injection. It
+preflights Screen Recording and reports a missing grant without requesting it.
+
+```bash
+cargo run -p latch-engine --example mac_host_probe -j 4
+cargo test -p latch-engine mac::gamepad -j 4 -- --nocapture
+```
+
+### Mac host cursor plane
+
+A viewer that offers `cursor` receives the system image and visibility through
+the existing cursor controls. In free mode the pointer follows local mouse
+movement while ScreenCaptureKit uses `showsCursor = false`. Captured relative
+mode requests composition, allowing games to control pointer hiding as before.
+Older viewers retain composition. If AppKit cannot read the shape or the main
+queue stops answering, capture restores composition and sends `visible = false`
+to suppress the local plane. A later readable sample restores separate drawing.
+The background host pumps its main run loop while the HTTP service runs on a
+worker, so AppKit sampling also works through the installed service entry point.
+
+`NSCursor.currentSystemCursor` supplies the current system image and hotspot,
+including other applications' cursors. The image is rendered into premultiplied
+sRGB RGBA, converted to straight alpha and scaled from desktop points into
+encoded-picture pixels using the selected display's geometry and aspect fit.
+That accounts for Retina displays and display-specific scale differences. The
+existing protocol bounds the resulting image to 96×96 and rescales the hotspot.
+The cursor is hidden outside the captured display and when its alpha is empty.
+System-wide hidden state uses the exported public `CGCursorIsVisible` function.
+Apple deprecated that visibility API in macOS 10.9 and provides no AppKit
+replacement, so future macOS visibility behaviour needs continued verification.
+The system-image getter is also marked for future deprecation in the current
+SDK. [Apple system cursor API](https://developer.apple.com/documentation/appkit/nscursor/currentsystem)
+
+On the local Apple M3 Pro running macOS 26.6.2 arm64, Screen Recording preflight returned true.
+The Rust probe successfully sampled 100 system cursor shapes through the
+background host's main queue, averaging 1.061 ms per shape in the optimized dev
+build on the shared machine. The 1512×982-point display was aspect-fitted to
+1920×1080, producing a 31×44 straight-alpha image with hotspot (5, 5) and 5,456
+RGBA bytes. Separate cursor negotiation succeeded, 30 real SCK/VideoToolbox
+frames encoded and composition was restored successfully. Scheduling cursor
+samples from the video worker averaged 0.014 ms per frame across those frames.
+Visibility was false in that run. A later rebuilt probe returned true and
+sampled 100 cursor images at a mean 0.261 ms, while its Screen Recording
+preflight reported a missing grant. Both visibility values were observed.
+No permission was requested or granted by these probes.
+
+An earlier capture attempt timed out, and a separate Swift SCK enumeration
+returned zero displays while CoreGraphics listed one online display. Capture
+succeeded on the bounded retry. No privacy grants or system settings changed.
+Mixed-DPI multi-display sessions, custom game cursors and Mac-to-Windows/Linux
+pointer appearance/input-to-photon remain unqualified.
+
+Windows can reuse `VideoPipeline::set_cursor_drawn`, `take_cursor`,
+`CursorUpdate`, the control messages and viewer rendering. After enabling the shared cursor module for Windows and decoding DXGI
+shape pixels, feed a straight-alpha `CursorShape` and visibility into
+`engine::cursor::Tracker::update` and disable composition when negotiated.
+
 
 ### Clipboard
 

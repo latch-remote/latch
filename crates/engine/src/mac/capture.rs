@@ -97,6 +97,8 @@ define_class!(
 
 pub struct Capture {
     stream: Retained<SCStream>,
+    config: Retained<SCStreamConfiguration>,
+    cursor_drawn: bool,
     output: Retained<Output>,
     _queue: DispatchRetained<DispatchQueue>,
     pub shared: Arc<Shared>,
@@ -267,6 +269,8 @@ impl Capture {
             let queue = DispatchQueue::new("app.latch.capture", Some(&attr));
             let capture = Self {
                 stream,
+                config,
+                cursor_drawn: true,
                 output,
                 _queue: queue,
                 shared,
@@ -301,6 +305,41 @@ impl Capture {
     }
 }
 impl Capture {
+    pub fn cursor_drawn(&self) -> bool {
+        self.cursor_drawn
+    }
+    /// Preserve the full stream configuration when changing cursor composition.
+    pub fn set_cursor_drawn(&mut self, drawn: bool) -> Result<bool> {
+        if self.cursor_drawn == drawn {
+            return Ok(false);
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        let completion = RcBlock::new(move |error: *mut NSError| {
+            // SAFETY: ScreenCaptureKit lends the NSError during completion.
+            let _ = tx.send(unsafe { error.as_ref() }.map(ToString::to_string));
+        });
+        unsafe {
+            self.config.setShowsCursor(drawn);
+            self.stream
+                .updateConfiguration_completionHandler(&self.config, Some(&completion));
+        }
+        let applied = rx.recv_timeout(Duration::from_secs(2)).map_err(|error| {
+            // A late completion makes composition unknown. Reopen the stream
+            // before sending another frame instead of guessing its state.
+            self.shared.state.lock().stopped =
+                Some("cursor configuration completion timed out".into());
+            anyhow!("ScreenCaptureKit cursor configuration: {error}")
+        })?;
+        if let Some(error) = applied {
+            // SAFETY: restores the last applied value on our owned configuration.
+            unsafe { self.config.setShowsCursor(self.cursor_drawn) };
+            bail!("update ScreenCaptureKit cursor: {error}");
+        }
+        self.cursor_drawn = drawn;
+        // A frame captured with the old composition may still occupy the slot.
+        self.shared.state.lock().picture = None;
+        Ok(true)
+    }
     /// Whether the display changed size or place since capture started.
     /// SCK can keep running across a mode or arrangement change, scaled to
     /// the old fit, while input would still map to the old geometry.

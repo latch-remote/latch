@@ -1,9 +1,14 @@
 //! ScreenCaptureKit retains IOSurfaces through VideoToolbox encoding. Sound has its own stream.
 
 mod capture;
+mod cursor;
+pub use cursor::system_cursor;
 mod encoder;
 mod ffi;
+pub mod gamepad;
 mod input;
+mod run_loop;
+pub use run_loop::with_main_queue;
 pub(crate) mod synthetic;
 
 use crate::audio::{AudioCapture, CHANNELS, FRAME};
@@ -69,6 +74,7 @@ fn open_video_color(config: &VideoConfig) -> Result<Box<dyn VideoPipeline>> {
         pacer: Pacer::new(config.fps),
         pending: None,
         checked: Instant::now(),
+        cursor: cursor::Plane::default(),
     };
     video.wake();
     // Some virtual Macs advertise hardware that fails only on the first encode.
@@ -152,6 +158,7 @@ struct Video {
     pacer: Pacer,
     pending: Option<EncodedVideo>,
     checked: Instant,
+    cursor: cursor::Plane,
 }
 impl Video {
     /// A frame coming out of the encoder wakes `next` as a new picture does.
@@ -165,6 +172,9 @@ impl Video {
     }
     fn restart_capture(&mut self) -> Result<()> {
         self.capture = Capture::video(self.request)?;
+        self.cursor
+            .sample(self.capture.display, self.config.width, self.config.height);
+        self.capture.set_cursor_drawn(self.cursor.drawn())?;
         self.wake();
         self.generation = 0;
         self.encoder.request_keyframe();
@@ -321,6 +331,29 @@ impl VideoPipeline for Video {
             };
             self.capture.shared.ready.wait_for(&mut state, wait);
         }
+    }
+    fn set_cursor_drawn(&mut self, drawn: bool) -> bool {
+        self.cursor.requested_drawn = drawn;
+        if !drawn {
+            self.cursor
+                .sample(self.capture.display, self.config.width, self.config.height);
+        }
+        match self.capture.set_cursor_drawn(self.cursor.drawn()) {
+            Ok(changed) => {
+                if changed {
+                    self.pending = None;
+                    self.encoder.request_keyframe();
+                }
+                !self.cursor.drawn() || drawn
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not change ScreenCaptureKit cursor composition");
+                false
+            }
+        }
+    }
+    fn take_cursor(&mut self) -> Option<crate::video::CursorUpdate> {
+        self.cursor.update(self.capture.cursor_drawn())
     }
     fn recovers(&self) -> bool {
         self.encoder.recovers()
