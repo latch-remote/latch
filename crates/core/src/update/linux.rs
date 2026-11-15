@@ -545,11 +545,17 @@ mod tests {
         }
         let package_link = tempfile::tempdir().unwrap();
         let link = package_link.path().join("latch-host");
-        symlink("/usr/bin/true", &link).unwrap();
-        assert_eq!(
-            installation(&link).unwrap().unwrap_err(),
-            Managed::PackageManager
+        let utility = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|directory| directory.join("true"))
+            .find(|path| path.is_file())
+            .expect("the platform's coreutils are on PATH");
+        let expected = installation(&utility).unwrap();
+        assert!(
+            expected.is_err(),
+            "the system utility is externally managed"
         );
+        symlink(&utility, &link).unwrap();
+        assert_eq!(installation(&link).unwrap(), expected);
         let markers = tempfile::tempdir().unwrap();
         assert!(!container_install(markers.path(), false, false));
         assert!(container_install(markers.path(), true, false));
@@ -797,9 +803,12 @@ mod tests {
     fn fixture_transaction(exe: &Path) -> Transaction {
         match installation(exe).unwrap() {
             Ok(_) => Transaction::begin(exe).unwrap(),
-            // Container installs deliberately refuse production self-updates.
-            // Exercise the filesystem transaction through the private test seam.
-            Err(Managed::Container) => Transaction::begin_resolved(exe).unwrap(),
+            // Containers and Nix build sandboxes refuse production updates.
+            // Check that policy before exercising their filesystem transaction.
+            Err(why @ (Managed::Container | Managed::Permissions)) => {
+                assert!(Transaction::begin(exe).is_err(), "{why}");
+                Transaction::begin_resolved(exe).unwrap()
+            }
             Err(why) => panic!("fixture installation ownership was refused: {why}"),
         }
     }
