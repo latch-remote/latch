@@ -1006,17 +1006,27 @@ proxy can be used while other checks continue. OS discovery has a six-second
 deadline. The eight-host cache samples local routes/environment settings at most
 four times a second. Discovery refreshes on network changes and relay connection
 failures. A relay failure requests a refresh within two seconds and retains the
-previous proxy for at most 60 seconds from the first incomplete PAC/WPAD result.
-Expiry removes the retained candidates so the next connection tries direct
-access. A successful proxy observation immediately replaces that state.
-Confirmed portals double their retry backoff from 1 to 4 seconds. Recovery needs
-two open observations from distinct discovery generations at least one second
-apart, with a confirmation recheck scheduled after one second. Cached reads
-cannot confirm recovery. A redirect cancels confirmation while preserving the
-banner and back-off. Returning to the app or opening
-sign-in requests an immediate portal recheck. Healthy
-sessions send no periodic HTTP probes. No session/UI
-thread waits for PAC/WPAD, DNS or an HTTP probe.
+previous proxy on incomplete PAC/WPAD results. A retained proxy's preference
+starts with the first incomplete result and expires after 60 seconds without a
+successful verified connection through it. The shared relay `open` path then
+forces direct-first ordering ahead of cached proxy winners, with the retained
+proxy available as fallback. Success through
+the proxy renews the timer for grants, renewals and both attachment lanes.
+Successful discovery replaces the candidates and clears retention state. This
+uses monotonic `Instant` time. Platforms differ in whether suspend counts
+toward elapsed time, so waking can change ordering while retaining both paths.
+
+Confirmed portals double their retry backoff from 1 to 4 seconds. The first
+portal observation is immediate. A first open observation from a fresh
+discovery generation clears the portal immediately. Once open has been seen
+on the current network key, re-entry needs two consecutive redirect observations
+from separate generations. Cached reads and partial unknown snapshots cannot
+supply confirmation. An open or other observed non-redirect result breaks the
+redirect sequence. The existing backoff survives recovery and flapping, and
+schedules the extra confirmation round for a returning portal. Network-key
+changes reset this history. Returning to the app or opening sign-in requests
+an immediate portal recheck. Healthy sessions send no periodic HTTP probes.
+No session/UI thread waits for PAC/WPAD, DNS or an HTTP probe.
 
 `RelayRoute` retains typed terminal failures and the selected lane's
 `ConnectionInfo`. `Session::network_status` combines them with local netenv facts.

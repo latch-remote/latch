@@ -563,9 +563,10 @@ checks port 443. The dry-run then exercises the restored standalone renewal
 and stop/start hooks while the interruption is still arranged. To restore the
 probe, repeat the upgrade and webroot conversion above with the current
 certificate and a reviewed probe-capable binary. Keep standalone renewal's
-port-80 ownership and stop/start hooks while running the restored unit. Those renewals interrupt relay service for the HTTP-01 validation
-and restart, typically tens of seconds, with longer interruptions if validation
-fails. Plan that maintenance with connected users.
+port-80 ownership and stop/start hooks while running the restored unit. Those
+renewals interrupt relay service for the HTTP-01 validation and restart,
+typically tens of seconds, with longer interruptions if validation fails.
+Plan that maintenance with connected users.
 
 ```bash
 sudo env RELAY_HOST="$RELAY_HOST" RELAY_CERT_NAME="$RELAY_CERT_NAME" \
@@ -626,8 +627,8 @@ does not prove the relay is serving it. Each `-checkend` command exits nonzero
 when fewer than 30 days remain, and `is-failed` exits zero when the last
 renewal run failed. A monitoring wrapper must capture each status individually
 and avoid `set -e` around this block so every check runs. Run them daily through
-the operator's monitoring or scheduler and alert on those results. The checks below cause no relay interruption
-(0 seconds).
+the operator's monitoring or scheduler and alert on those results. The checks
+below cause no relay interruption (0 seconds).
 
 ```sh
 sudo openssl x509 -in /etc/latch-relay/fullchain.pem -noout -enddate
@@ -643,6 +644,9 @@ The HTTP listener bounds request size/time, concurrent connections and per-sourc
 30 per-source admissions per minute. Two slots and 16 admissions per minute
 reserve capacity for existing challenge files during ordinary traffic. Headers
 have an absolute 1.5-second deadline and each source can hold one idle connection.
+Under slot pressure the oldest incomplete header yields to a new arrival.
+Completed responses retain their slots. After normal admission credits are
+exhausted, incomplete headers have a 250 ms grace for ACME classification.
 Idle requests cannot occupy the reserved slots. This reduces ordinary-traffic
 starvation. A bounded unauthenticated listener remains susceptible to deliberate
 resource exhaustion, so renewal failures and certificate expiry need monitoring.

@@ -12,6 +12,8 @@ const TIMEOUT: Duration = Duration::from_secs(2);
 // A 600-ms RTT needs roughly 300 ms after accept for the request, plus
 // about one second for an initial lost segment. Leave response time in TIMEOUT.
 const HEADER_TIMEOUT: Duration = Duration::from_millis(1500);
+// After ordinary credits run out, retain only the original short ACME grace.
+const UNADMITTED_HEADER_TIMEOUT: Duration = Duration::from_millis(250);
 const CONNECTIONS: usize = 8;
 const ACCEPTS_PER_MINUTE: u32 = 120;
 const PER_SOURCE: u32 = 30;
@@ -192,20 +194,46 @@ impl ProbeServer {
     }
     fn accept_stream(&mut self, stream: TcpStream, source: IpAddr, now: Instant) {
         let source = crate::daemon::normalize_ip(source);
-        if self.requests.len() >= CONNECTIONS
-            || self.requests.iter().filter(|r| r.source == source).count() >= 2
+        if self.requests.iter().filter(|r| r.source == source).count() >= 2
             || stream.set_nonblocking(true).is_err()
         {
             return;
         }
-        let reserved_slot = self.requests.len() >= CONNECTIONS - RESERVED_CONNECTIONS;
+        // Give an arrival a slot under slow-header pressure. Completed responses
+        // keep their place, and the oldest incomplete header yields first.
+        if self.requests.len() >= CONNECTIONS - RESERVED_CONNECTIONS {
+            if let Some(oldest) = self
+                .requests
+                .iter()
+                .enumerate()
+                .filter(|(_, request)| request.output.is_empty())
+                .min_by_key(|(_, request)| request.deadline)
+                .map(|(index, _)| index)
+            {
+                self.requests.remove(oldest);
+            }
+        }
+        if self.requests.len() >= CONNECTIONS {
+            return;
+        }
+        let reserved_slot = self
+            .requests
+            .iter()
+            .filter(|request| !request.acme_only || request.output.is_empty())
+            .count()
+            >= CONNECTIONS - RESERVED_CONNECTIONS;
         let acme_only = !self.admit_probe(source) || reserved_slot;
         let mut request = Request {
             stream,
             source,
             acme_only,
             deadline: now + TIMEOUT,
-            header_deadline: now + HEADER_TIMEOUT,
+            header_deadline: now
+                + if acme_only {
+                    UNADMITTED_HEADER_TIMEOUT
+                } else {
+                    HEADER_TIMEOUT
+                },
             input: Vec::new(),
             output: Vec::new(),
             written: 0,
@@ -522,6 +550,8 @@ mod tests {
             server.accept_stream(stream, IpAddr::from([192, 0, 2, source as u8]), now);
         }
         assert_eq!(server.requests.len(), CONNECTIONS - RESERVED_CONNECTIONS);
+        // Exercise reserve credit even after pressure eviction frees an ordinary slot.
+        server.accepts = ACCEPTS_PER_MINUTE;
         let (stream, mut peer) = socket_pair();
         peer.write_all(b"GET /.well-known/acme-challenge/token HTTP/1.1\r\n\r\n")
             .unwrap();
@@ -539,6 +569,94 @@ mod tests {
         assert!(server.requests.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn slow_header_saturation_yields_to_a_new_probe_without_waiting_for_expiry() {
+        let mut server = ProbeServer::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let now = Instant::now();
+        let mut attackers = Vec::new();
+        for source in 1..=CONNECTIONS - RESERVED_CONNECTIONS {
+            let (stream, mut peer) = socket_pair();
+            peer.write_all(b"G").unwrap();
+            server.accept_stream(
+                stream,
+                IpAddr::from([192, 0, 2, source as u8]),
+                now + Duration::from_millis(source as u64),
+            );
+            attackers.push(peer);
+        }
+        assert_eq!(server.requests.len(), CONNECTIONS - RESERVED_CONNECTIONS);
+        let oldest: IpAddr = "192.0.2.1".parse().unwrap();
+        let source: IpAddr = "192.0.2.100".parse().unwrap();
+        let (stream, mut peer) = socket_pair();
+        let start = Instant::now();
+        // Accept before the legitimate client's bytes arrive, as on a real socket.
+        server.accept_stream(stream, source, now + Duration::from_millis(10));
+        assert!(server
+            .requests
+            .iter()
+            .any(|request| request.source == source));
+        assert!(!server
+            .requests
+            .iter()
+            .any(|request| request.source == oldest));
+        assert_eq!(server.requests.len(), CONNECTIONS - RESERVED_CONNECTIONS);
+        peer.write_all(b"GET /netenv/probe HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut reply = String::new();
+        loop {
+            server.poll_at(now + Duration::from_millis(11));
+            match peer.read_to_string(&mut reply) {
+                Ok(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("{error}"),
+            }
+            assert!(start.elapsed() < Duration::from_millis(100));
+            std::thread::yield_now();
+        }
+        assert!(reply.starts_with("HTTP/1.1 204"));
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert!(server.requests.len() < CONNECTIONS - RESERVED_CONNECTIONS);
+    }
+
+    #[test]
+    fn exhausted_probe_admission_limits_idle_headers_to_the_original_250_ms() {
+        let mut server = ProbeServer::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let now = Instant::now();
+        server.accepts = ACCEPTS_PER_MINUTE;
+        let mut peers = Vec::new();
+        for source in 1..=CONNECTIONS - RESERVED_CONNECTIONS {
+            let (stream, peer) = socket_pair();
+            server.accept_stream(stream, IpAddr::from([192, 0, 2, source as u8]), now);
+            peers.push(peer);
+        }
+        assert_eq!(server.requests.len(), CONNECTIONS - RESERVED_CONNECTIONS);
+        assert!(server
+            .requests
+            .iter()
+            .all(|request| request.header_deadline == now + Duration::from_millis(250)));
+        // Even data arriving after admission cannot buy the longer deadline.
+        peers[0].write_all(b"G").unwrap();
+        server.poll_at(now + Duration::from_millis(100));
+        assert_eq!(server.requests.len(), CONNECTIONS - RESERVED_CONNECTIONS);
+        server.poll_at(now + Duration::from_millis(250));
+        assert!(server.requests.is_empty());
+        // Source exhaustion has the same bound before the global cap is reached.
+        server.accepts = 0;
+        let source: IpAddr = "192.0.2.100".parse().unwrap();
+        server.sources.insert(source, PER_SOURCE);
+        let (stream, _peer) = socket_pair();
+        let next = now + Duration::from_millis(250);
+        server.accept_stream(stream, source, next);
+        assert_eq!(server.requests.len(), 1);
+        assert_eq!(
+            server.requests[0].header_deadline,
+            next + Duration::from_millis(250)
+        );
+        server.poll_at(next + Duration::from_millis(250));
+        assert!(server.requests.is_empty());
+    }
+
     #[test]
     fn global_cap_includes_active_reserved_responses_from_distinct_sources() {
         let root = std::env::temp_dir().join(format!("latch-global-slots-{}", std::process::id()));

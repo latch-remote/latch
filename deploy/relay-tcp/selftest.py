@@ -77,7 +77,7 @@ def check_upgrade_runbook():
     assert "saved `renewal.conf` points back at standalone authentication" in upgrade
     assert "port-80 probe unavailable again" in upgrade
     assert "repeat the upgrade and webroot conversion" in upgrade
-    assert "checks below cause no relay interruption" in upgrade
+    assert "checks below cause no relay interruption" in " ".join(upgrade.split())
     for block in blocks:
         subprocess.run(["bash", "-n"], input=block, text=True, check=True)
     script = blocks[0].split("bash <<'BASH'\n", 1)[1].rsplit("\nBASH", 1)[0]
