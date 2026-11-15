@@ -441,7 +441,7 @@ pub fn supervised() -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        fs::read_to_string("/proc/self/cgroup").is_ok_and(|c| in_latch_unit(&c))
+        latch_core::update::linux::supervised()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -450,7 +450,7 @@ pub fn supervised() -> bool {
 }
 
 /// `/proc/self/cgroup` of a process systemd runs as `latch.service`.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 fn in_latch_unit(cgroup: &str) -> bool {
     cgroup
         .lines()

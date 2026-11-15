@@ -41,6 +41,23 @@ struct Args {
     probation_version: Option<String>,
     #[arg(long, hide = true)]
     probation_exe: Option<std::path::PathBuf>,
+    /// Check and install a Linux release through the running local service.
+    #[cfg(target_os = "linux")]
+    #[arg(long, conflicts_with_all = ["background", "setup", "setup_elevated", "uninstall", "linux_update"])]
+    self_update: bool,
+    /// Internal Linux update supervisor, started outside latch.service.
+    #[cfg(target_os = "linux")]
+    #[arg(long, hide = true, requires_all = ["linux_update_exe", "linux_update_pid"])]
+    linux_update: Option<String>,
+    #[cfg(target_os = "linux")]
+    #[arg(long, hide = true, requires = "linux_update")]
+    linux_update_exe: Option<std::path::PathBuf>,
+    #[cfg(target_os = "linux")]
+    #[arg(long, hide = true, requires = "linux_update")]
+    linux_update_pid: Option<u32>,
+    #[cfg(target_os = "linux")]
+    #[arg(long, hide = true, requires = "linux_update")]
+    linux_update_systemd: bool,
     /// Set up sharing, then exit. Used by Mac/Linux
     /// setup and by the Docker node; on Windows this is the same path as
     /// Share this machine (UAC).
@@ -71,6 +88,10 @@ struct Args {
 /// user's, and an administrator's process must not write where that user
 /// can point a link (setup.log is written beside its protected copy).
 fn log_file(args: &Args) -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    if args.linux_update.is_some() {
+        return Some("update.log");
+    }
     if args.setup_elevated {
         None
     } else if args.background {
@@ -100,6 +121,24 @@ fn main() -> Result<()> {
     let log = log_file(&args);
     init_logging(log);
     install_panic_hook(log.and_then(|log| data_dir().ok().map(|d| d.join(log))));
+    #[cfg(target_os = "linux")]
+    {
+        // Supervisor flags must run before helper dispatch, service startup or UI.
+        if let Some(version) = args.linux_update {
+            return latch_host::update::linux::supervise(
+                args.linux_update_exe
+                    .as_deref()
+                    .context("update executable")?,
+                args.linux_update_pid.context("update process")?,
+                &semver::Version::parse(&version)?,
+                args.linux_update_systemd,
+            )
+            .inspect_err(|e| tracing::error!("Linux update failed: {e:#}"));
+        }
+        if args.self_update {
+            return latch_host::update::linux::request_update();
+        }
+    }
     #[cfg(target_os = "macos")]
     if let Err(e) = latch_host::unix_setup::adopt_legacy_bundle(args.background) {
         // Only returns when there was nothing to move or the move failed;
@@ -236,6 +275,30 @@ mod tests {
     use super::{log_file, panic_line, Args, DEFAULT_LOG};
     use clap::Parser;
     use tracing_subscriber::EnvFilter;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_update_arguments_keep_the_supervisor_and_request_distinct() {
+        let request = Args::try_parse_from(["latch-host", "--self-update"]).unwrap();
+        assert!(request.self_update);
+        assert!(Args::try_parse_from(["latch-host", "--self-update", "--background"]).is_err());
+        assert!(Args::try_parse_from(["latch-host", "--linux-update", "999.0.0"]).is_err());
+        assert!(Args::try_parse_from(["latch-host", "--linux-update-systemd"]).is_err());
+        let supervisor = Args::try_parse_from([
+            "latch-host",
+            "--linux-update",
+            "999.0.0",
+            "--linux-update-exe",
+            "/home/ada/Latch bin/latch-host",
+            "--linux-update-pid",
+            "123",
+            "--linux-update-systemd",
+        ])
+        .unwrap();
+        assert_eq!(supervisor.linux_update_pid, Some(123));
+        assert!(supervisor.linux_update_systemd);
+        assert_eq!(log_file(&supervisor), Some("update.log"));
+    }
 
     /// The elevated step opens no file under the data directory, and a
     /// caller-supplied folder changes nothing (IN-02).

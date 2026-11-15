@@ -240,6 +240,28 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Packaging
 
+- Add verified Linux self-updates for user-owned release binaries, with
+  architecture selection, private same-filesystem staging, atomic replacement,
+  service restart and post-update health rollback. Keep package-manager,
+  Nix, protected and container installs on their deployment update paths.
+  Add native x64/arm64 CI fixture updates and a headless `--self-update` request.
+  Persist supervisor progress and failures, recover interrupted swaps, avoid
+  downloading releases already installed by the local service, and suppress
+  retries of the exact release after supervisor installation or recovery failures
+  until an explicit request. Transient retries use persisted exponential back-off
+  from 15 minutes to 24 hours and reuse verified cached archives. Successful
+  installation, a new release and Check now reset the delay.
+  Require Linux 5.3+ before downloading and a working systemd user manager for
+  systemd-supervised services. Journal and cleanup errors are reported without
+  preventing service startup. Downloads use a size-derived deadline and rate floor.
+  The `Linux updater systemd` CI jobs (x64, arm64, GitHub Ubuntu 24.04 runners with a systemd user manager) show, with a fixture service, that the supervisor survives `systemctl --user restart latch.service`, that a wrong-version replacement is rolled back and the previous release keeps answering, and that a supervisor killed after the swap is rolled back when the service next starts.
+  The fixture adds crash-on-start/start-limit rollback and running-service
+  recovery cases, which pass on both architectures. The real `latch-host` binary under systemd,
+  supervisor argv parsing, self-pinning and real GitHub manifest fetching are
+  outside that fixture. No Linux desktop machine was available. Real GUI reopening and stream continuity across updates remain untested. Streams
+  admitted during probation can be cut by rollback, as on Windows. Refusing
+  toolbox/distrobox through container detection remains a documented follow-up.
+
 - Add a Scoop manifest, AUR packages (`latch-remote-bin` from the release
   binaries, `latch-remote` from the source archive) and a Nix flake that
   builds Latch from source or packages the release binary. A CI workflow
