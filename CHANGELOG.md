@@ -9,31 +9,35 @@ GitHub release notes, so each version gets a heading of the form
 ### Windows streaming
 
 - Add partial support for a separate Windows cursor plane with scaled
-  hotspots, output-relative position and visibility, including pointer movement
-  on a static desktop.
-  Convert DXGI colour, monochrome and masked-colour shapes, outline inverted
-  regions, and retain GPU composition for unsupported XOR or unreadable data.
-  Viewers without cursor support keep host-composited cursors. 6.0.0 viewers
-  receive shapes and visibility without positions. Add cross-platform buffer
-  tests and a synthetic cursor-control session independent of video production.
+  hotspots and visibility. Place the pointer locally in the viewer, including
+  on a static desktop. Convert DXGI colour, monochrome and masked-colour shapes,
+  outline inverted regions, and retain GPU composition for unsupported XOR or
+  unreadable data. Viewers without cursor support keep host-composited cursors.
+  Add cross-platform buffer tests and a synthetic cursor-control session
+  independent of video production.
   Live Windows capture of the separate plane is unverified.
-- Keep focused free-mouse placement local, deduplicate each viewer's cursor
-  controls and limit position-only updates to 120 Hz. Cache fallback bitmaps
-  with a 250 ms failure retry, preserve shapes across resolution changes and
-  reset viewer cursor textures on reconnect. Test capture ownership through
-  mode switches, idle timeouts, fallback and capture/output restarts.
-- Continue Windows video immediately when all cursor bitmap reads fail, retry
-  recovery on its backoff, and publish the final position of an established
-  visible cursor within 16.668 ms independently of video pacing. Suppress extra
-  cursor planes over an unfocused viewer's local arrow, preserve no-position
-  host behavior and test actual viewer painting across cursor ownership states.
+- Keep focused free-mouse placement local and deduplicate each viewer's cursor
+  controls. Cache fallback bitmaps with a 250 ms failure retry, preserve shapes
+  across resolution changes and use the shared viewer texture reset on reconnect.
+  Test capture ownership through mode switches, idle timeouts, fallback and
+  capture/output restarts.
+- Continue Windows video immediately when all cursor bitmap reads fail and
+  retry recovery on its backoff. Suppress extra cursor planes over an unfocused
+  viewer's local arrow and test actual viewer painting across ownership states.
   Document focused local-pointer authority when host warps or other mice move it.
-- Keep cursor ownership and independent position sampling on the viewer-selected
-  output through capture reopen and missing-display fallback. Retain and rescale
-  shapes on same-output reopen, re-send them afterward, and reset per-output
-  pointer state when changing displays. Report the captured Windows display to
-  the chooser on hardware and software encode paths. Add combined regression
-  tests for selection, fallback, sampling and shape retention.
+  If both system bitmap reads fail permanently and no retained bitmap exists,
+  the pointer remains absent until a shape becomes readable.
+- Keep cursor ownership on the viewer-selected output through capture reopen
+  and missing-display fallback. Retain and rescale shapes on same-output reopen,
+  re-send them with fresh serials, and reset per-output pointer state when
+  changing displays. Report the captured Windows display to the chooser on
+  hardware and software encode paths. Add combined regression tests for
+  selection, fallback, output exit/re-entry and shape retention.
+- Consolidate Windows and Mac cursor tracking, serial allocation and alpha
+  conversion in the shared tracker. Use main's existing shape/visibility wire
+  format across hosts. Adapt the position-extension tests to local placement
+  and shape/visibility publication. Remove the host position sampler, eliminating
+  its 120 Hz idle wakeups and its capture-dependent re-entry handoff.
 
 ### Deployment
 

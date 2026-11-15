@@ -509,15 +509,9 @@ struct VideoProxy {
     /// Whether the pipeline makes recovery frames, as of the last answer.
     recovers: bool,
     worker: Option<thread::JoinHandle<()>>,
-    cursor_worker: Option<thread::JoinHandle<()>>,
-    stop_cursor: mpsc::Sender<()>,
 }
 impl Drop for VideoProxy {
     fn drop(&mut self) {
-        let _ = self.stop_cursor.send(());
-        if let Some(worker) = self.cursor_worker.take() {
-            let _ = worker.join();
-        }
         let _ = self.requests.send(Request::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -657,32 +651,12 @@ pub fn open_video(config: &VideoConfig) -> Result<Box<dyn VideoPipeline>> {
             return Err(e);
         }
     };
-    let (stop_cursor, stopped) = mpsc::channel();
-    let position_control = cursor.clone();
-    let cursor_worker = match thread::Builder::new()
-        .name("latch-cursor-position".into())
-        .spawn(move || {
-            crate::windows_cursor::position_worker(
-                &position_control,
-                &stopped,
-                cursor::position_sample,
-            );
-        }) {
-        Ok(worker) => worker,
-        Err(error) => {
-            let _ = requests.send(Request::Shutdown);
-            let _ = worker.join();
-            return Err(error).context("spawn cursor position worker");
-        }
-    };
     Ok(Box::new(VideoProxy {
         cursor,
         requests,
         info,
         recovers,
         worker: Some(worker),
-        cursor_worker: Some(cursor_worker),
-        stop_cursor,
     }))
 }
 pub fn open_audio(layout: crate::audio::Layout) -> Result<Box<dyn AudioCapture>> {
@@ -818,13 +792,6 @@ mod tests {
             assert!(matches!(receive.recv().unwrap(), Request::Shutdown));
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
         });
-        let (stop_cursor, stopped) = mpsc::channel();
-        let cursor_released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cursor_flag = cursor_released.clone();
-        let cursor_worker = thread::spawn(move || {
-            stopped.recv().unwrap();
-            cursor_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        });
         drop(VideoProxy {
             cursor: crate::windows_cursor::Control::composited(),
             requests,
@@ -840,11 +807,8 @@ mod tests {
             },
             recovers: false,
             worker: Some(worker),
-            cursor_worker: Some(cursor_worker),
-            stop_cursor,
         });
         assert!(released.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(cursor_released.load(std::sync::atomic::Ordering::SeqCst));
     }
     #[test]
     fn software_mf_round_trip() -> Result<()> {

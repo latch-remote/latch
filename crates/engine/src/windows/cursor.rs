@@ -7,19 +7,6 @@ use windows::Win32::{
     UI::WindowsAndMessaging::*,
 };
 
-/// Query only the visible pointer's hotspot. This runs on its own
-/// thread and never touches D3D resources or reads a cursor bitmap.
-pub(super) fn position_sample() -> Option<[i32; 2]> {
-    let _dpi = super::display::DpiAwareness::physical();
-    let mut cursor = CURSORINFO {
-        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: cursor is initialized with the SDK structure size.
-    unsafe { GetCursorInfo(&mut cursor) }.ok()?;
-    (cursor.flags == CURSOR_SHOWING).then_some([cursor.ptScreenPos.x, cursor.ptScreenPos.y])
-}
-
 struct Icon(ICONINFO);
 impl Drop for Icon {
     fn drop(&mut self) {
@@ -113,12 +100,7 @@ pub(super) fn system_shape(cursor: HCURSOR) -> Result<(DXGI_OUTDUPL_POINTER_SHAP
     if alpha {
         // GetIconInfo's 32-bit colour bitmap is premultiplied. Normalize it
         // to the straight-alpha DXGI/shader contract, once per bitmap read.
-        for pixel in bytes.as_chunks_mut::<4>().0 {
-            let a = pixel[3];
-            for channel in &mut pixel[..3] {
-                *channel = crate::windows_cursor::straight(*channel, a);
-            }
-        }
+        crate::cursor::unpremultiply(&mut bytes);
     } else {
         for (pixel, mask) in bytes
             .as_chunks_mut::<4>()

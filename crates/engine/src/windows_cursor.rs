@@ -3,13 +3,10 @@
 use latch_proto::control::{Cursor, CursorShape};
 use parking_lot::Mutex;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
-
-// Viewers cache textures by serial across capture/encoder reopen.
-static NEXT_SERIAL: AtomicU32 = AtomicU32::new(1);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ShapeInfo {
@@ -151,105 +148,10 @@ impl ShapeInfo {
     }
 }
 
-pub(crate) fn straight(channel: u8, alpha: u8) -> u8 {
-    if alpha == 0 {
-        0
-    } else {
-        ((u32::from(channel) * 255 + u32::from(alpha) / 2) / u32::from(alpha)).min(255) as u8
-    }
-}
-
-/// Position-only messages are coalesced to at most 120 Hz. Shape and visibility
-/// changes bypass the interval so mode switches and hiding remain immediate.
-const POSITION_INTERVAL: Duration = Duration::from_micros(8_334);
-
-/// Sample position independently of capture, encoding and video pacing. Two
-/// ticks bound sampling plus coalescing to 16.668 ms, excluding OS scheduling
-/// and control-transport backpressure. Shape and ownership stay capture-owned.
-pub(crate) fn position_worker(
-    control: &Control,
-    stop: &std::sync::mpsc::Receiver<()>,
-    mut sample: impl FnMut() -> Option<[i32; 2]>,
-) {
-    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stop.recv_timeout(POSITION_INTERVAL)
-    {
-        if control.drawn.load(Ordering::Relaxed)
-            || !control
-                .publication
-                .lock()
-                .last
-                .is_some_and(|last| last.visible)
-        {
-            continue;
-        }
-        if let Some(point) = sample() {
-            control.publish_position_at(point, Instant::now());
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Published {
-    visible: bool,
-    position: Option<[i32; 2]>,
-    serial: u32,
-}
-
-#[derive(Clone, Copy)]
-struct PositionSource {
-    display: crate::input::DisplayRect,
-    stream: (u32, u32),
-}
-#[derive(Default)]
-struct Publication {
-    last: Option<Published>,
-    last_sent: Option<Instant>,
-    source: Option<PositionSource>,
-}
-impl Publication {
-    fn publish(
-        &mut self,
-        control: &Control,
-        current: Published,
-        shape: Option<&CursorShape>,
-        now: Instant,
-    ) {
-        if self.last == Some(current) {
-            return;
-        }
-        let position_only = self
-            .last
-            .is_some_and(|last| last.visible == current.visible && last.serial == current.serial);
-        if position_only
-            && self
-                .last_sent
-                .is_some_and(|at| now.saturating_duration_since(at) < POSITION_INTERVAL)
-        {
-            return;
-        }
-        let Some(sink) = control.sink.lock().clone() else {
-            return;
-        };
-        sink(Cursor {
-            visible: current.visible,
-            position: current.position,
-            shape: if current.visible && self.last.is_none_or(|last| last.serial != current.serial)
-            {
-                shape.cloned()
-            } else {
-                None
-            },
-        });
-        self.last = Some(current);
-        self.last_sent = Some(now);
-    }
-}
-
 #[derive(Default)]
 pub(crate) struct Control {
     pub drawn: AtomicBool,
     pub sink: Mutex<Option<crate::video::CursorSink>>,
-    publication: Mutex<Publication>,
 }
 impl Control {
     pub fn composited() -> Arc<Self> {
@@ -258,46 +160,21 @@ impl Control {
             ..Default::default()
         })
     }
-    fn publish_position_at(&self, point: [i32; 2], now: Instant) {
-        let mut publication = self.publication.lock();
-        let (Some(source), Some(last)) = (publication.source, publication.last) else {
-            return;
-        };
-        // Only capture may enable a plane or replace its shape. Position
-        // sampling keeps the latest known shape moving until capture resumes.
-        if self.drawn.load(Ordering::Relaxed) || !last.visible {
-            return;
-        }
-        let (point, on_output) = position(point, source.display, source.stream);
-        publication.publish(
-            self,
-            Published {
-                visible: on_output,
-                position: on_output.then_some(point),
-                ..last
-            },
-            None,
-            now,
-        );
-    }
 }
 
 pub(crate) struct Plane {
     pub control: Arc<Control>,
-    pub shape: Option<CursorShape>,
+    tracker: crate::cursor::Tracker,
     shape_visible: bool,
     source_shape: Option<(ShapeInfo, Vec<u8>)>,
-    serial: u32,
 }
 impl Plane {
     pub fn new(control: Arc<Control>) -> Self {
-        *control.publication.lock() = Publication::default();
         Self {
             control,
-            shape: None,
+            tracker: crate::cursor::Tracker::default(),
             shape_visible: false,
             source_shape: None,
-            serial: 0,
         }
     }
     pub fn shape(&mut self, info: ShapeInfo, bytes: &[u8], source: (u32, u32), stream: (u32, u32)) {
@@ -318,7 +195,7 @@ impl Plane {
         source: (u32, u32),
         stream: (u32, u32),
     ) {
-        let mut shape = info.rgba(bytes, self.serial);
+        let mut shape = info.rgba(bytes, 0);
         if let Some(shape) = shape.as_mut() {
             crate::software::scale_cursor(shape, source, stream);
         }
@@ -346,14 +223,9 @@ impl Plane {
             }
         }
         self.shape_visible = shape_visible;
-        if self.shape != shape {
-            self.serial = NEXT_SERIAL.fetch_add(1, Ordering::Relaxed);
-            if let Some(shape) = shape.as_mut() {
-                shape.serial = self.serial;
-            }
-            self.shape = shape;
-        }
+        self.tracker.set_shape(shape);
     }
+
     /// Visibility is authoritative only when DXGI and the OS cursor query agree
     /// that the pointer is separate from the acquired desktop image.
     pub fn separate(&self, known: bool, embedded: bool) -> bool {
@@ -361,67 +233,32 @@ impl Plane {
             && self.control.sink.lock().is_some()
             && known
             && !embedded
-            && self.shape.is_some()
+            && self.tracker.shape().is_some()
     }
-    pub fn publish(&mut self, visible: bool, position: [i32; 2], separate: bool) {
-        self.publish_at(visible, position, separate, Instant::now());
-    }
-    pub(crate) fn publish_at(
-        &mut self,
-        visible: bool,
-        position: [i32; 2],
-        separate: bool,
-        now: Instant,
-    ) {
-        let visible = visible && separate && self.shape_visible;
-        let mut publication = self.control.publication.lock();
-        let serial = if visible {
-            self.serial
-        } else {
-            publication.last.map_or(0, |last| last.serial)
+    pub fn publish(&mut self, visible: bool, separate: bool) {
+        // A missing sink must not consume the tracker's first shape update.
+        let Some(sink) = self.control.sink.lock().clone() else {
+            return;
         };
-        publication.publish(
-            &self.control,
-            Published {
-                visible,
-                position: visible.then_some(position),
-                serial,
-            },
-            self.shape.as_ref(),
-            now,
-        );
-    }
-    pub fn track_position(
-        &self,
-        display: crate::input::DisplayRect,
-        stream: (u32, u32),
-        separate: bool,
-    ) {
-        self.control.publication.lock().source =
-            separate.then_some(PositionSource { display, stream });
+        if let Some(update) = self
+            .tracker
+            .publish(visible && separate && self.shape_visible)
+        {
+            sink(Cursor {
+                visible: update.visible,
+                shape: update.shape,
+            });
+        }
     }
     pub fn invalidate(&mut self) {
-        self.shape = None;
+        self.suspend();
         self.shape_visible = false;
         self.source_shape = None;
-        self.suspend();
     }
-    /// Stop sampling the old output before capture can reopen or change it.
-    /// Forget publication so even an unchanged retained shape is sent again.
+    /// Hide before reopening and issue a fresh shared serial for the new capture.
     pub fn suspend(&mut self) {
-        let mut publication = self.control.publication.lock();
-        let serial = publication.last.map_or(0, |last| last.serial);
-        publication.publish(
-            &self.control,
-            Published {
-                visible: false,
-                position: None,
-                serial,
-            },
-            None,
-            Instant::now(),
-        );
-        *publication = Publication::default();
+        self.publish(false, false);
+        self.tracker = crate::cursor::Tracker::default();
     }
     pub fn reopen(&mut self, same_output: bool, source: (u32, u32), stream: (u32, u32)) {
         if same_output {
@@ -609,6 +446,19 @@ mod tests {
         }
     }
     #[test]
+    fn attaching_a_sink_after_shape_read_sends_the_first_shared_shape() {
+        let control = Control::composited();
+        control.drawn.store(false, Ordering::Relaxed);
+        let mut plane = Plane::new(control.clone());
+        plane.shape(info(2, 1, 1, 4), &[255; 4], (1, 1), (1, 1));
+        plane.publish(true, false);
+        let (send, receive) = std::sync::mpsc::channel();
+        *control.sink.lock() = Some(Arc::new(move |cursor| send.send(cursor).unwrap()));
+        plane.publish(true, plane.separate(true, false));
+        let first = receive.try_recv().unwrap();
+        assert!(first.visible && first.shape.is_some());
+    }
+    #[test]
     fn selected_secondary_output_owns_positions_and_composited_fallback() {
         let display = DisplayRect {
             x: 1920,
@@ -659,10 +509,9 @@ mod tests {
                 assert_eq!(owner, expected_owner);
                 assert_eq!(owner == Owner::Host, fallback && on_output);
                 assert!(state.can_render());
-                plane.publish(visible, position, separate);
+                plane.publish(visible, separate);
                 let last = updates.lock().last().unwrap().clone();
                 assert_eq!(last.visible, !fallback && on_output);
-                assert_eq!(last.position, (!fallback && on_output).then_some(position));
             }
         }
     }
@@ -692,9 +541,9 @@ mod tests {
             };
             state.dxgi_shape();
             plane.shape(info(2, 4, 4, 16), &[255; 64], (1000, 800), (1000, 800));
-            let serial = plane.shape.as_ref().unwrap().serial;
-            plane.track_position(secondary, (1000, 800), true);
-            plane.publish(true, [500, 400], true);
+            let serial = plane.tracker.shape().unwrap().serial;
+
+            plane.publish(true, true);
             assert!(updates.lock().pop().unwrap().shape.is_some());
             plane.suspend();
             assert!(!updates.lock().pop().unwrap().visible);
@@ -705,17 +554,13 @@ mod tests {
                 assert!(!updates.lock().pop().unwrap().visible);
             }
             state.restart();
-            assert!(plane.shape.is_none());
+            assert!(plane.tracker.shape().is_none());
             assert!(!state.pointer_known);
             assert!(!state.source_ready);
             assert!(state.fallback_needed);
             let count = updates.lock().len();
-            control.publish_position_at([-500, 400], Instant::now() + POSITION_INTERVAL);
-            assert_eq!(
-                updates.lock().len(),
-                count,
-                "old sampler source is detached"
-            );
+            assert!(!plane.separate(true, false));
+            assert_eq!(updates.lock().len(), count);
             state.source_ready = true;
             let (old_position, on_output) = position([-500, 400], primary, (1000, 800));
             assert_eq!(
@@ -736,21 +581,20 @@ mod tests {
             plane.shape(info(2, 4, 4, 16), &[255; 64], (1000, 800), (1000, 800));
             state.pointer_known = true;
             state.dxgi_shape();
-            assert_ne!(serial, plane.shape.as_ref().unwrap().serial);
-            plane.track_position(primary, (1000, 800), true);
-            plane.publish(true, [500, 400], true);
+            assert_ne!(serial, plane.tracker.shape().unwrap().serial);
+
+            plane.publish(true, true);
             let first = updates.lock().pop().unwrap();
-            assert_eq!(first.position, Some([500, 400]));
+            assert!(first.visible);
             assert!(
                 first.shape.is_some(),
                 "identical pixels must be sent for the new output"
             );
-            control.publish_position_at([600, 450], Instant::now() + POSITION_INTERVAL * 2);
-            assert_eq!(updates.lock().pop().unwrap().position, Some([600, 450]));
-            control.publish_position_at([-500, 400], Instant::now() + POSITION_INTERVAL * 3);
+            plane.publish(true, true);
+            assert!(updates.lock().is_empty(), "motion uses the local pointer");
+            plane.publish(false, true);
             let hidden = updates.lock().pop().unwrap();
-            assert!(!hidden.visible);
-            assert!(hidden.position.is_none());
+            assert!(!hidden.visible && hidden.shape.is_none());
         }
     }
 
@@ -772,7 +616,7 @@ mod tests {
         let now = Instant::now();
         assert!(state.fallback_due(1, now));
         state.fallback_read(true, now);
-        plane.publish(true, [50, 50], true);
+        plane.publish(true, true);
         let first = updates.lock().pop().unwrap().shape.unwrap();
         for (source, expected_width) in [((100, 100), 4), ((200, 200), 2)] {
             plane.reopen(true, source, (100, 100));
@@ -785,54 +629,50 @@ mod tests {
             state.source_ready = true;
             state.pointer_known = true;
             assert!(plane.separate(true, false));
-            plane.publish(true, [50, 50], true);
+            plane.publish(true, true);
             let resent = updates.lock().pop().unwrap().shape.unwrap();
             assert_eq!(resent.width, expected_width);
             if source == (100, 100) {
-                assert_eq!(resent, first);
+                assert_ne!(resent.serial, first.serial);
+                assert_eq!(resent.rgba, first.rgba);
+                assert_eq!(
+                    (resent.width, resent.height, resent.hot_x, resent.hot_y),
+                    (first.width, first.height, first.hot_x, first.hot_y)
+                );
             }
         }
     }
 
     #[test]
-    fn independent_sampler_tracks_selected_secondary_and_hides_on_other_outputs() {
+    fn capture_tracks_selected_secondary_and_recovers_on_reentry() {
         let control = Control::composited();
         control.drawn.store(false, Ordering::Relaxed);
         let updates = Arc::new(Mutex::new(Vec::new()));
         let received = updates.clone();
         *control.sink.lock() = Some(Arc::new(move |cursor| received.lock().push(cursor)));
-        let mut plane = Plane::new(control.clone());
+        let mut plane = Plane::new(control);
         plane.shape(info(2, 4, 4, 16), &[255; 64], (1000, 800), (500, 400));
-        plane.track_position(
-            DisplayRect {
-                x: 1920,
-                y: 200,
-                width: 1000,
-                height: 800,
-            },
-            (500, 500),
-            true,
-        );
-        let now = Instant::now();
-        plane.publish_at(true, [0, 50], true, now);
-        updates.lock().clear();
-        control.publish_position_at([2420, 600], now + POSITION_INTERVAL);
-        let moved = updates.lock().pop().unwrap();
-        assert_eq!(moved.position, Some([250, 250]));
-        assert!(moved.shape.is_none());
-        control.publish_position_at(
-            [500, 600],
-            now + POSITION_INTERVAL + Duration::from_micros(1),
-        );
-        let hidden = updates.lock().pop().unwrap();
-        assert!(!hidden.visible, "output exit bypasses position throttling");
-        assert!(hidden.position.is_none());
-        control.publish_position_at([2420, 600], now + POSITION_INTERVAL * 2);
-        assert!(
-            updates.lock().is_empty(),
-            "capture must confirm ownership before showing again"
-        );
+        let display = DisplayRect {
+            x: 1920,
+            y: 200,
+            width: 1000,
+            height: 800,
+        };
+        for (point, expected) in [
+            ([2420, 600], true),
+            ([500, 600], false),
+            ([2420, 600], true),
+        ] {
+            let (_, on_output) = position(point, display, (500, 500));
+            plane.publish(on_output, true);
+            let update = updates.lock().pop().unwrap();
+            assert_eq!(update.visible, expected);
+            if point == [500, 600] {
+                assert!(update.shape.is_none());
+            }
+        }
     }
+
     #[test]
     fn support_docs_keep_live_windows_capture_unverified() {
         let platforms = include_str!("../../../docs/PLATFORMS.md");
@@ -861,47 +701,42 @@ mod tests {
     }
     #[test]
     fn gdi_premultiplied_fallback_matches_straight_dxgi_colours() {
+        let mut rgba = [10, 20, 30, 128, 99, 0, 0, 0, 128, 7, 0, 128, 7, 0, 0, 255];
+        crate::cursor::unpremultiply(&mut rgba);
         assert_eq!(
-            [straight(10, 128), straight(20, 128), straight(30, 128)],
-            [20, 40, 60]
+            rgba,
+            [20, 40, 60, 128, 0, 0, 0, 0, 255, 14, 0, 128, 7, 0, 0, 255]
         );
-        assert_eq!(straight(99, 0), 0);
-        assert_eq!(straight(128, 128), 255);
-        assert_eq!(straight(7, 255), 7);
         // DXGI supplies straight alpha, including semi-transparent edges.
         let shape = info(2, 1, 1, 4).rgba(&[20, 40, 60, 128], 1).unwrap();
         assert_eq!(shape.decode_rgba().unwrap(), [60, 40, 20, 128]);
     }
     #[test]
-    fn position_updates_are_bounded_and_never_resend_cached_pixels() {
+    fn motion_never_sends_controls_or_copies_cached_pixels() {
         let control = Control::composited();
         let updates = Arc::new(Mutex::new(Vec::new()));
         let received = updates.clone();
         *control.sink.lock() = Some(Arc::new(move |cursor| received.lock().push(cursor)));
         let mut plane = Plane::new(control);
         plane.shape(info(2, 1, 1, 4), &[255; 4], (1, 1), (1, 1));
-        let pixels = plane.shape.as_ref().unwrap().rgba.as_ptr();
-        let now = Instant::now();
-        plane.publish_at(true, [0, 0], true, now);
-        for x in 1..1000 {
-            plane.publish_at(true, [x, 0], true, now + Duration::from_micros(x as u64));
+        let pixels = plane.tracker.shape().unwrap().rgba.as_ptr();
+        plane.publish(true, true);
+        for _ in 1..1000 {
+            plane.publish(true, true);
         }
         assert_eq!(updates.lock().len(), 1);
-        plane.publish_at(true, [999, 0], true, now + POSITION_INTERVAL);
-        assert_eq!(updates.lock().len(), 2);
-        assert!(updates.lock()[1].shape.is_none());
-        assert_eq!(plane.shape.as_ref().unwrap().rgba.as_ptr(), pixels);
-        // Hiding bypasses the rate limit. Invisible pointer moves send nothing.
-        plane.publish_at(true, [1000, 0], false, now + POSITION_INTERVAL);
-        for x in 1001..2000 {
-            plane.publish_at(true, [x, 0], false, now + POSITION_INTERVAL);
+        assert_eq!(plane.tracker.shape().unwrap().rgba.as_ptr(), pixels);
+        plane.publish(true, false);
+        for _ in 1001..2000 {
+            plane.publish(true, false);
         }
-        assert_eq!(updates.lock().len(), 3);
-        assert!(!updates.lock()[2].visible);
-        assert_eq!(updates.lock()[2].position, None);
+        assert_eq!(updates.lock().len(), 2);
+        assert!(!updates.lock()[1].visible);
+        assert!(updates.lock()[1].shape.is_none());
     }
+
     #[test]
-    fn position_worker_delivers_final_motion_while_video_is_blocked() {
+    fn shared_shape_and_visibility_publish_while_video_is_blocked() {
         let control = Control::composited();
         control.drawn.store(false, Ordering::Relaxed);
         let (updates, received) = std::sync::mpsc::channel();
@@ -910,62 +745,29 @@ mod tests {
         }));
         let mut plane = Plane::new(control.clone());
         plane.shape(info(2, 1, 1, 4), &[255; 4], (100, 100), (100, 100));
-        plane.track_position(
-            crate::input::DisplayRect {
-                width: 100,
-                height: 100,
-                ..Default::default()
-            },
-            (100, 100),
-            true,
-        );
-        let now = Instant::now();
-        plane.publish_at(true, [0, 0], true, now);
-        received.recv().unwrap();
-        let final_motion = now + Duration::from_micros(1);
-        control.publish_position_at([9, 7], final_motion);
+        plane.publish(true, true);
+        assert!(received.try_recv().unwrap().shape.is_some());
+        // No encoded frame or capture picture is needed for shape/visibility.
+        // Motion itself is handled entirely by the viewer's local pointer.
+        for _ in 0..1000 {
+            plane.publish(true, true);
+        }
         assert!(received.try_recv().is_err());
-        // Deterministic deadline, with no capture tick or encoded frame.
-        control.publish_position_at([9, 7], now + POSITION_INTERVAL);
-        let moved = received.try_recv().unwrap();
-        assert_eq!(moved.position, Some([9, 7]));
-        assert!(moved.shape.is_none());
-        assert!(
-            control
-                .publication
-                .lock()
-                .last_sent
-                .unwrap()
-                .duration_since(final_motion)
-                <= POSITION_INTERVAL * 2
-        );
-
-        let (stop, stopped) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            let worker_control = &control;
-            scope.spawn(move || position_worker(worker_control, &stopped, || Some([19, 17])));
-            // Model an encoder or network pacer that never requests capture
-            // again. The OS position sampler still sends the final position.
-            let moved = received.recv_timeout(Duration::from_secs(1)).unwrap();
-            assert_eq!(moved.position, Some([19, 17]));
-            assert!(moved.shape.is_none());
-            stop.send(()).unwrap();
-        });
-        // Idle sampling never adds a shape, changes ownership, or revives a
-        // hidden/unreadable plane. Moving to another output hides this plane.
-        control.publish_position_at([101, 40], now + POSITION_INTERVAL * 10);
+        plane.publish(false, true);
         let hidden = received.try_recv().unwrap();
-        assert!(!hidden.visible);
-        assert!(hidden.position.is_none());
-        assert!(hidden.shape.is_none());
-        control.drawn.store(true, Ordering::Relaxed);
-        control.publish_position_at([30, 40], now + POSITION_INTERVAL * 10);
-        assert!(received.try_recv().is_err());
-        control.drawn.store(false, Ordering::Relaxed);
+        assert!(!hidden.visible && hidden.shape.is_none());
+        plane.publish(true, true);
+        let shown = received.try_recv().unwrap();
+        assert!(shown.visible && shown.shape.is_none());
         plane.invalidate();
-        control.publish_position_at([30, 40], now + POSITION_INTERVAL * 10);
+        assert!(!received.try_recv().unwrap().visible);
+        assert!(!plane.separate(true, false));
+        plane.publish(true, false);
+        let fallback = received.try_recv().unwrap();
+        assert!(!fallback.visible && fallback.shape.is_none());
         assert!(received.try_recv().is_err());
     }
+
     #[test]
     fn fallback_reads_once_per_handle_and_retries_failures_after_250_ms() {
         let mut state = CaptureState::default();
@@ -1116,7 +918,7 @@ mod tests {
         pointer.tick(Owner::Viewer, true);
         pointer.tick(Owner::Viewer, false);
         pointer.plane.resize((200, 200), (100, 100));
-        assert_eq!(pointer.plane.shape.as_ref().unwrap().width, 2);
+        assert_eq!(pointer.plane.tracker.shape().unwrap().width, 2);
         pointer.tick(Owner::Viewer, false); // Resolution change retains the plane.
         pointer.sample.dxgi_visible = false;
         pointer.tick(Owner::Desktop, true); // Cursor already embedded by DXGI.
@@ -1315,7 +1117,7 @@ mod tests {
         let mut plane = Plane::new(control);
         plane.shape(info(2, 3, 1, 12), &[0; 12], (3, 1), (3, 1));
         assert!(plane.separate(true, false));
-        plane.publish(true, [1, 0], true);
+        plane.publish(true, true);
         assert!(!receive.recv().unwrap().visible);
     }
     #[test]
@@ -1323,10 +1125,10 @@ mod tests {
         let control = Control::composited();
         let mut before = Plane::new(control.clone());
         before.shape(info(2, 1, 1, 4), &[255; 4], (1, 1), (1, 1));
-        let first = before.shape.as_ref().unwrap().serial;
+        let first = before.tracker.shape().unwrap().serial;
         let mut after = Plane::new(control);
         after.shape(info(2, 1, 1, 4), &[0, 0, 0, 255], (1, 1), (1, 1));
-        assert_ne!(first, after.shape.as_ref().unwrap().serial);
+        assert_ne!(first, after.tracker.shape().unwrap().serial);
     }
     #[test]
     fn scaling_that_erases_an_inverse_region_falls_back_to_composition() {
@@ -1335,7 +1137,7 @@ mod tests {
         bytes[128..].fill(0);
         bytes[128] = 128;
         plane.shape(info(1, 32, 64, 4), &bytes, (64, 64), (32, 32));
-        assert!(plane.shape.is_none());
+        assert!(plane.tracker.shape().is_none());
     }
     #[test]
     fn plane_caches_shapes_scales_hotspot_and_falls_back_on_doubt() {
@@ -1354,25 +1156,24 @@ mod tests {
         assert!(plane.separate(true, false));
         assert!(!plane.separate(false, false));
         assert!(!plane.separate(true, true));
-        let now = Instant::now();
-        plane.publish_at(true, [10, 20], true, now);
+        plane.publish(true, true);
         let first = updates.lock()[0].shape.clone().unwrap();
         assert_eq!(
             (first.width, first.height, first.hot_x, first.hot_y),
             (2, 2, 1, 1)
         );
         plane.shape(metadata, &[255; 80], (3840, 2160), (1920, 1080));
-        plane.publish_at(true, [11, 20], true, now + POSITION_INTERVAL);
-        plane.publish_at(true, [11, 20], true, now + POSITION_INTERVAL);
-        assert_eq!(updates.lock().len(), 2);
+        plane.publish(true, true);
+        plane.publish(true, true);
+        assert_eq!(updates.lock().len(), 1);
+        plane.publish(false, true);
+        assert!(!updates.lock()[1].visible);
         assert!(updates.lock()[1].shape.is_none());
-        plane.publish(false, [11, 20], true);
-        assert!(!updates.lock()[2].visible);
         control.drawn.store(true, Ordering::Relaxed);
         assert!(!plane.separate(true, false));
         plane.invalidate();
         assert!(!plane.separate(true, false));
         plane.shape(info(4, 1, 1, 4), &[1, 2, 3, 255], (1, 1), (1, 1));
-        assert!(plane.shape.is_none());
+        assert!(plane.tracker.shape().is_none());
     }
 }

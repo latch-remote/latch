@@ -807,7 +807,6 @@ fn test_6_control_messages_roundtrip_and_errors() {
             ..Default::default()
         }),
         Message::Cursor(latch_proto::control::Cursor {
-            position: None,
             visible: true,
             shape: Some(latch_proto::control::CursorShape::new(
                 1,
@@ -1144,7 +1143,6 @@ fn av1_offer_is_additive_and_unknown_codecs_still_fall_through() {
         audio: false,
         name: String::new(),
         cursor: false,
-        cursor_position: false,
         gamepads: false,
         reference_invalidation: false,
         audio_channels: 0,

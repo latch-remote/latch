@@ -527,7 +527,6 @@ impl Server {
                 )
             })),
             cursor_supported,
-            cursor_position: prepared.req.cursor_position,
             probe_trains: prepared.req.probe_trains,
             draw_cursor: AtomicBool::new(!cursor_supported),
             control_writer: Mutex::new(None),
@@ -1199,7 +1198,6 @@ struct Session {
     /// The viewer's microphone: its packets put in order, and where they play.
     mic: Mutex<Option<(AudioReceiver, crate::mic::MicOut)>>,
     cursor_supported: bool,
-    cursor_position: bool,
     /// The viewer measures probe trains (`docs/PROTOCOL.md`, "Probe").
     probe_trains: bool,
     draw_cursor: AtomicBool,
@@ -1670,7 +1668,6 @@ fn play_mic(session: &Session, packet: Option<&latch_proto::wire::AudioPacket<'_
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct CursorWireState {
     visible: bool,
-    position: Option<[i32; 2]>,
     serial: u32,
 }
 /// Latest cursor state with pending shapes retained across coalesced moves.
@@ -1684,15 +1681,13 @@ struct CursorMailbox {
 impl CursorMailbox {
     fn publish(&self, mut cursor: control::Cursor) {
         let mut last = self.last.lock();
-        // The sink has already removed unnegotiated fields. Compare the wire
-        // state using the shape serial, without retaining or comparing pixels.
+        // Compare the shared wire state by serial without retaining pixels.
         let serial = cursor.shape.as_ref().map_or_else(
             || last.as_ref().map_or(0, |state| state.serial),
             |shape| shape.serial,
         );
         let state = CursorWireState {
             visible: cursor.visible,
-            position: cursor.position,
             serial,
         };
         if *last == Some(state) {
@@ -1720,13 +1715,7 @@ fn send_video(
     std::thread::scope(|scope| {
         let sink: video::CursorSink = {
             let mailbox = mailbox.clone();
-            let positions = session.cursor_position;
-            Arc::new(move |mut cursor| {
-                if !positions {
-                    cursor.position = None;
-                }
-                mailbox.publish(cursor)
-            })
+            Arc::new(move |cursor| mailbox.publish(cursor))
         };
         let mailbox = &mailbox;
         let done = &done;
@@ -1897,7 +1886,6 @@ fn encode_video(
         frame.generation = generation;
         if let Some(update) = pipeline.take_cursor().filter(|_| session.cursor_supported) {
             session.send_control(&Message::Cursor(control::Cursor {
-                position: None,
                 visible: update.visible,
                 shape: update.shape,
             }));

@@ -200,40 +200,37 @@ or without one if none is available, with one warning per failure episode and
 retries every 250 ms. An idle capture tick repaints the retained desktop when a bitmap becomes available.
 Hidden/suppressed and off-output cursors stay hidden.
 
-Shapes already contain the host's physical DPI sizing. The Linux scaler scales
-Windows shapes and hotspots to the stream content, including the 96×96 wire
-bound. Positions are hotspot coordinates relative to the output, fitted into the
-stream including letterboxing. Pointer-only DXGI acquisitions publish through
-a coalescing mailbox and a separate control sender before conversion/encoding.
-They leave the retained video picture alone while the separate plane is active.
-Shape data is sent when the converted/scaled shape changes and after capture
-reopens. A separate
-OS-position worker samples every 8.334 ms, sharing serial-based publication
-and the 120 Hz position limit with capture. It continues while encoding or video
-pacing blocks capture. For an established visible plane, the final position
-enters the control mailbox within 16.668 ms of motion stopping, excluding OS
-scheduling and control-transport backpressure. The worker hides the plane when
-its hotspot leaves the captured output. Capture confirms ownership before a
-hidden plane can become visible again. The worker is joined on pipeline drop.
+Shapes already contain the host's physical DPI sizing. The shared scaler scales
+Windows shapes and hotspots to stream-content pixels, including the 96×96 wire
+bound. Windows and Mac use `cursor::Tracker` for shape comparison, cached pixels,
+visibility deduplication and a single process-wide serial allocator. Native
+Windows shape changes call `set_shape`; ordinary capture ticks use `publish`,
+which compares visibility and serial without copying or comparing bitmap bytes.
+The GDI fallback uses the shared `cursor::unpremultiply` conversion.
+
+Pointer-only DXGI acquisitions publish shape/visibility through a coalescing
+mailbox and a separate control sender before conversion/encoding. They leave
+the retained video picture alone while the separate plane is active. The
+mailbox retains unsent pixels across visibility changes and deduplicates each
+viewer's wire state. Main's shape/visibility protocol is used on all platforms.
+Pointer movement uses the viewer's local input and needs no host sampler thread.
 
 The captured output is the viewer-selected monitor, including its physical
-desktop origin. Both capture and the position sampler use that rectangle.
-Reopening the same output retains the raw bitmap, rescales the plane after a
-resolution change and re-sends its shape. Output changes clear per-output pointer
-state and detach the old sampler rectangle. A selected monitor disappearing
-reopens on the host's default output with fresh cursor state. Choosing another
-display in the viewer reconnects and resets the viewer's cached cursor texture.
-Windows reports the actual captured display identity for hardware and software
-encoding so the chooser reflects missing-display fallback.
+desktop origin. Reopening the same output retains the raw bitmap, rescales the
+plane after a resolution change and re-sends its shape with a fresh shared
+serial. Output changes clear per-output pointer state. A selected monitor
+disappearing reopens on the host's default output with fresh cursor state.
+Choosing another display reconnects and uses the shared viewer reconnect reset
+to discard the cached cursor texture. Windows reports the actual captured
+display identity for hardware and software encoding so the chooser reflects
+missing-display fallback.
 
 While a focused free-mouse viewer drives the pointer, its local position is
 authoritative. If an application warps the host pointer or another mouse moves
 it, the drawn cursor stays at the local position until the user next moves the
 mouse. Hover effects on the host can diverge while the local pointer is still.
-An unfocused viewer with host positions draws the plane only when the local
-pointer is outside the stream area. Inside it, the local OS arrow stays visible
-and the viewer adds no plane. No-position hosts keep the previous unfocused
-behavior, with no plane painting or `DrawCursor` updates.
+An unfocused viewer keeps its local OS arrow, paints no plane and sends no
+`DrawCursor` updates.
 
 Separate cursor bytes remain sRGB on SDR and HDR desktops/sessions. The viewer
 renders them with its SDR UI white, including over native HDR presentation. The
@@ -632,9 +629,8 @@ refresh; GPU completion, compositor, panel response and scanout are unmeasured.
   enlargements use bilinear filtering. Filter footprints map capture damage
   into output damage, including neighbouring chroma pairs. Equal-size frames
   retain the original SIMD conversion path. Separate cursor shapes and
-  hotspots use stream-content pixels. Windows can also send negotiated hotspot
-  positions relative to the captured output, fitted into the stream. Focused
-  free-mouse viewers place the cursor at their local pointer.
+  hotspots use stream-content pixels. Free-mouse viewers place the cursor at
+  their local pointer on every host platform.
   Conversion, software encoding, and the capacity probe share a worker
   selection function of available parallelism and output dimensions. Its
   conservative table remains capped at four pending a quiet-machine sweep;

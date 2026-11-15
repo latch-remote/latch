@@ -11,7 +11,7 @@ pub mod audio;
 #[cfg(any(windows, test))]
 mod bitstream;
 mod congestion;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 mod cursor;
 pub mod display;
 pub mod gamepad;

@@ -50,7 +50,6 @@ Content-Length: <n>
 | `audio` | bool | send desktop audio |
 | `name` | string | the viewer's machine name, for the host's log |
 | `cursor` | bool | optional, default false; viewer can draw pointer locally and handle shape updates |
-| `cursor_position` | bool | optional, default false; viewer accepts optional host hotspot positions in `Cursor` messages |
 | `gamepads` | bool | optional, default false; the viewer sends gamepads (see [Gamepads](#gamepads-912)) |
 | `reference_invalidation` | bool | optional, default false; after a loss the viewer asks for a recovery frame (see [RecoveryRequest](#recoveryrequest-14-and-recoveryack-15)) |
 | `audio_channels` | u32 | optional; most channels the viewer plays (6 for 5.1, 8 for 7.1). Absent, or below 3, means stereo |
@@ -90,7 +89,7 @@ type byte and the payload and is at most 65 536. Payloads are JSON objects.
 | 3 | `Keepalive` | either | `{}` |
 | 4 | `Notice` | host → viewer | `{"kind": "audio" \| "video" \| "input", "message": string}`; `message` empty clears it |
 | 5 | `Report` | either | `{"fps", "loss_pct", "decode_ms", "rtt_ms"}`, every 50 ms (older viewers: 250 ms or once a second), for bitrate and FEC feedback |
-| 6 | `Cursor` | host → viewer | `{"visible": bool, "shape": null \| {"serial": u32, "width": u32, "height": u32, "hot_x": u32, "hot_y": u32, "rgba": "<base64>"}}`; only after an `Accept` with `cursor` true; sent when visibility, shape or offered position changes (`shape` null: unchanged); straight-alpha sRGB RGBA, at most 96×96; optional `position: [x, y]` gives the hotspot in stream pixels, including letterboxing |
+| 6 | `Cursor` | host → viewer | `{"visible": bool, "shape": null \| {"serial": u32, "width": u32, "height": u32, "hot_x": u32, "hot_y": u32, "rgba": "<base64>"}}`; only after an `Accept` with `cursor` true; sent when visibility or shape changes (`shape` null: unchanged); straight-alpha sRGB RGBA, at most 96×96 |
 | 7 | `DrawCursor` | viewer → host | `{"draw": bool}`; tells host whether to composite pointer into video |
 | 8 | `Relay` | either | `{"session": u32, "attempt": u64, "action": RelayAction}`; negotiated only when request and accept both set `relay` |
 
@@ -100,36 +99,27 @@ automatic reconnect. Code 6 is a recoverable transport failure, including
 priority backpressure or a full bounded control inbox. Every cursor update
 uses the original ordered connection, regardless of its serialized size.
 
-`Cursor.position` is sent only when the request offers `cursor_position`, and
-cursor messages still require `Accept.cursor`. In focused free-mouse mode the
-viewer's local pointer is authoritative, including while stationary. Host
-positions never override it, so pointer placement has no network round trip.
+Windows and Mac hosts use the shared shape/visibility tracker and serial
+allocator. Protocol 1 carries the same `Cursor` and `DrawCursor` objects on
+all host platforms. In focused free-mouse mode the viewer places the shape at
+its local pointer, including while stationary and while video is blocked.
 If an application warps the host pointer or another mouse moves it while the
 focused viewer is driving it, the drawn cursor stays at the local position
 until the user next moves the mouse. Host hover effects can therefore diverge
 from the drawn cursor while local input is stationary.
-An unfocused free-mouse viewer draws a host-position plane only while the local
-pointer is outside the stream area. Inside that area the visible local OS arrow
-is the only viewer-drawn pointer. Hosts without positions retain the 6.0.0
-viewer behavior, including returning before cursor drawing and `DrawCursor`
-updates while unfocused. Captured mode uses the host-composited cursor. Drawing
+An unfocused viewer keeps its OS pointer, paints no local plane and sends no
+`DrawCursor` updates. Captured mode uses the host-composited cursor. Drawing
 waits for valid stream geometry, using the negotiated size until complete stats
 arrive. Shapes and visibility remain host-authoritative in every mode.
-Both new fields default to absent/false, and 6.0.0 peers ignore unknown JSON
-fields. Shapes/visibility and `DrawCursor` retain their existing meanings and
-protocol version 1.
 
-Windows publishes pointer-only DXGI updates independently of video frames.
-Position-only updates are coalesced to at most 120 Hz. A separate OS-position
-sampler runs every 8.334 ms independently of capture, encoding and video pacing.
-For an established visible plane, the final position enters the control mailbox
-within two ticks (16.668 ms) after motion stops, excluding OS scheduling and
-control-transport backpressure. The sampler uses the captured output's rectangle
-and hides the plane when the pointer leaves it. Capture confirms ownership
-before the plane becomes visible again. Shape and visibility changes bypass the
-rate limit. Invisible planes omit positions. Each viewer's wire state is
-deduplicated after removing fields it did not negotiate, so 6.0.0 viewers receive
-no duplicate controls for pointer-only motion.
+Windows publishes pointer-only DXGI shape and visibility changes through a
+coalescing control mailbox before video conversion or encoding. The shared
+tracker retains readable pixels across temporary failures and assigns a fresh
+process-wide serial when the shape changes or capture restarts. Visibility-only
+publication compares scalar state and copies pixels only for a new serial.
+The mailbox retains an unsent shape across coalesced visibility updates and
+deduplicates each viewer's wire state by serial and visibility. Local pointer
+motion requires no cursor control traffic or host position sampling thread.
 
 Colour cursors use straight-alpha sRGB on the wire. DXGI colour buffers are
 straight-alpha BGRA, matching Microsoft's Desktop Duplication sample, which
@@ -147,9 +137,8 @@ with the last readable bitmap, or without one if none is available. The host log
 once per failure episode, and idle capture ticks repaint the pointer when a
 bitmap becomes readable. Reopening the same captured output retains and
 rescales its shape, including when the resolution changes, and re-sends it.
-Changing outputs resets per-output cursor state and detaches the old position
-sampler rectangle. Reconnect resets the viewer's cached texture because a
-restarted host can reuse shape serials.
+Changing outputs resets per-output cursor state. Reconnect resets the viewer's
+cached texture because a restarted host can reuse shape serials.
 [Microsoft's colour-buffer upload and blend state](https://github.com/microsoft/Windows-classic-samples/blob/main/Samples/DXGIDesktopDuplication/cpp/OutputManager.cpp)
 
 On native HDR output, separate RGBA uses the viewer's SDR UI white, mapped by
@@ -562,7 +551,7 @@ drives the selected output, with capability results cached per adapter.
 Windows cursor positions use the actual captured output's physical origin and
 stream-content fit. Pointers on other outputs are reported invisible for both
 separate-plane and composited drawing. Missing-display fallback switches cursor
-ownership and the independent position sampler to the fallback output.
+ownership to the fallback output.
 
 Windows choices saved as GDI source names by earlier versions follow the
 missing-display fallback. New choices use monitor device paths so source

@@ -640,7 +640,7 @@ impl Capture {
         };
         // SAFETY: cursor is initialized with the SDK structure size.
         let known = unsafe { GetCursorInfo(&mut cursor) }.is_ok();
-        let (position, on_output) = crate::windows_cursor::position(
+        let (_, on_output) = crate::windows_cursor::position(
             [cursor.ptScreenPos.x, cursor.ptScreenPos.y],
             self.display,
             self.stream_size,
@@ -724,9 +724,7 @@ impl Capture {
         );
         self.composite_pointer.Visible =
             (owner == Owner::Host && self.renderer.shape.is_some()).into();
-        self.plane
-            .track_position(self.display, self.stream_size, separate);
-        self.plane.publish(visible, position, separate);
+        self.plane.publish(visible, separate);
         // Deliver usable desktop pictures immediately while bitmap recovery
         // retries on its backoff. Missing pointer data never freezes video.
         self.cursor_state.can_render().then_some(separate)

@@ -81,7 +81,6 @@ fn session(addr: SocketAddr) -> Arc<Session> {
         surround_kbps: 0,
         mic: Mutex::new(None),
         cursor_supported: false,
-        cursor_position: false,
         probe_trains: false,
         draw_cursor: AtomicBool::new(true),
         control_writer: Mutex::new(None),
@@ -1293,64 +1292,70 @@ fn fallback_refits_geometry_and_prepares_the_final_mode() {
 }
 
 #[test]
-fn cursor_mailbox_retains_shape_when_moves_are_coalesced() {
+fn cursor_mailbox_retains_shape_when_updates_are_coalesced() {
     let mailbox = CursorMailbox::default();
     let shape = control::CursorShape::new(1, 1, 1, 0, 0, &[255; 4]);
     mailbox.publish(control::Cursor {
         visible: true,
-        position: Some([1, 2]),
         shape: Some(shape.clone()),
     });
-    for x in 2..100 {
+    for visible in [false, true].into_iter().cycle().take(100) {
         mailbox.publish(control::Cursor {
-            visible: true,
-            position: Some([x, 2]),
+            visible,
             shape: None,
         });
     }
     let latest = mailbox.pending.lock().take().unwrap();
-    assert_eq!(latest.position, Some([99, 2]));
+    assert!(latest.visible);
     assert_eq!(latest.shape, Some(shape));
     mailbox.publish(control::Cursor {
         visible: false,
-        position: Some([99, 2]),
         shape: None,
     });
     assert!(mailbox.pending.lock().as_ref().unwrap().shape.is_none());
 }
 
 #[test]
-fn cursor_mailbox_deduplicates_the_negotiated_wire_state() {
-    for positions in [false, true] {
-        let mailbox = CursorMailbox::default();
-        let publish = |x| {
-            mailbox.publish(control::Cursor {
-                visible: true,
-                position: positions.then_some([x, 2]),
-                shape: None,
-            })
-        };
-        publish(1);
-        mailbox.pending.lock().take().unwrap();
-        publish(1);
-        assert!(mailbox.pending.lock().is_none());
-        publish(2);
-        assert_eq!(mailbox.pending.lock().is_some(), positions);
-        mailbox.pending.lock().take();
-        for _ in 0..100 {
-            mailbox.publish(control::Cursor {
-                visible: false,
-                position: None,
-                shape: None,
-            });
-        }
-        assert!(!mailbox.pending.lock().take().unwrap().visible);
+fn cursor_mailbox_deduplicates_the_shared_wire_state() {
+    let mailbox = CursorMailbox::default();
+    mailbox.publish(control::Cursor {
+        visible: true,
+        shape: None,
+    });
+    mailbox.pending.lock().take().unwrap();
+    for _ in 0..100 {
         mailbox.publish(control::Cursor {
-            visible: false,
-            position: None,
+            visible: true,
             shape: None,
         });
         assert!(mailbox.pending.lock().is_none());
+    }
+    for _ in 0..100 {
+        mailbox.publish(control::Cursor {
+            visible: false,
+            shape: None,
+        });
+    }
+    assert!(!mailbox.pending.lock().take().unwrap().visible);
+    mailbox.publish(control::Cursor {
+        visible: false,
+        shape: None,
+    });
+    assert!(mailbox.pending.lock().is_none());
+}
+
+#[test]
+fn cursor_mailboxes_send_fresh_shapes_for_each_viewer() {
+    let shape = control::CursorShape::new(1, 1, 1, 0, 0, &[255; 4]);
+    for _ in 0..2 {
+        let mailbox = CursorMailbox::default();
+        mailbox.publish(control::Cursor {
+            visible: true,
+            shape: Some(shape.clone()),
+        });
+        let first = mailbox.pending.lock().take().unwrap();
+        assert!(first.visible);
+        assert_eq!(first.shape, Some(shape.clone()));
     }
 }
 
@@ -1386,24 +1391,10 @@ fn synthetic_dxgi_session_delivers_cursor_while_video_waits() {
             bytes[128] = 192; // A 2×2 inverting region survives half-size scaling.
             bytes[132] = 192;
             self.plane.shape(metadata, &bytes, (64, 64), (32, 32));
-            let mut now = Instant::now();
             while let Ok(command) = self.commands.recv() {
-                now += Duration::from_millis(10);
                 match command {
-                    0 => {
-                        self.plane
-                            .publish_at(true, [10, 20], self.plane.separate(true, false), now)
-                    }
-                    1 => {
-                        self.plane
-                            .publish_at(true, [11, 21], self.plane.separate(true, false), now)
-                    }
-                    2 => self.plane.publish_at(
-                        false,
-                        [11, 21],
-                        self.plane.separate(true, false),
-                        now,
-                    ),
+                    0 | 1 => self.plane.publish(true, self.plane.separate(true, false)),
+                    2 => self.plane.publish(false, self.plane.separate(true, false)),
                     3 => self.plane.invalidate(),
                     _ => break,
                 }
@@ -1411,73 +1402,63 @@ fn synthetic_dxgi_session_delivers_cursor_while_video_waits() {
             anyhow::bail!("synthetic video stopped before producing a frame")
         }
     }
-    for positions in [false, true] {
-        let server = Server::bind(
-            0,
-            Options {
-                relay: None,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let mut session = session("127.0.0.1:9".parse().unwrap());
-        let state = Arc::get_mut(&mut session).unwrap();
-        state.cursor_supported = true;
-        state.cursor_position = positions;
-        state.draw_cursor.store(false, Ordering::Relaxed);
-        let (host, mut viewer) = sockets();
-        *session.control_writer.lock() = Some(host);
-        let (commands, receive) = mpsc::channel();
-        let pipeline = PointerVideo {
-            plane: Plane::new(Control::composited()),
-            commands: receive,
-        };
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                send_video(&server, &session, Box::new(pipeline), config(), |_| {
-                    anyhow::bail!("unused reopen")
-                })
-            });
-            let read_cursor = |viewer: &mut TcpStream| match control::read_message(viewer).unwrap()
-            {
-                Message::Cursor(cursor) => cursor,
-                other => panic!("expected cursor, received {other:?}"),
-            };
-            commands.send(0).unwrap();
-            let first = read_cursor(&mut viewer);
-            assert!(first.visible);
-            assert_eq!(first.position, positions.then_some([10, 20]));
-            let shape = first.shape.unwrap();
-            assert_eq!(
-                (shape.width, shape.height, shape.hot_x, shape.hot_y),
-                (17, 17, 1, 2)
-            );
-            commands.send(1).unwrap();
-            if positions {
-                let moved = read_cursor(&mut viewer);
-                assert_eq!(moved.position, Some([11, 21]));
-                assert!(moved.shape.is_none());
-            }
-            commands.send(2).unwrap();
-            assert!(!read_cursor(&mut viewer).visible);
-            commands.send(3).unwrap();
-            commands.send(1).unwrap(); // Still composited/invisible after invalidation.
-            viewer
-                .set_read_timeout(Some(Duration::from_millis(100)))
-                .unwrap();
-            let error = viewer.peek(&mut [0]).unwrap_err();
-            assert!(
-                matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ),
-                "{error}"
-            );
-            assert_eq!(session.frames.load(Ordering::Relaxed), 0);
-            session.stop.store(true, Ordering::Release);
-            commands.send(4).unwrap();
+    let server = Server::bind(
+        0,
+        Options {
+            relay: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut session = session("127.0.0.1:9".parse().unwrap());
+    let state = Arc::get_mut(&mut session).unwrap();
+    state.cursor_supported = true;
+    state.draw_cursor.store(false, Ordering::Relaxed);
+    let (host, mut viewer) = sockets();
+    *session.control_writer.lock() = Some(host);
+    let (commands, receive) = mpsc::channel();
+    let pipeline = PointerVideo {
+        plane: Plane::new(Control::composited()),
+        commands: receive,
+    };
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            send_video(&server, &session, Box::new(pipeline), config(), |_| {
+                anyhow::bail!("unused reopen")
+            })
         });
-    }
+        let read_cursor = |viewer: &mut TcpStream| match control::read_message(viewer).unwrap() {
+            Message::Cursor(cursor) => cursor,
+            other => panic!("expected cursor, received {other:?}"),
+        };
+        commands.send(0).unwrap();
+        let first = read_cursor(&mut viewer);
+        assert!(first.visible);
+        let shape = first.shape.unwrap();
+        assert_eq!(
+            (shape.width, shape.height, shape.hot_x, shape.hot_y),
+            (17, 17, 1, 2)
+        );
+        commands.send(1).unwrap();
+        commands.send(2).unwrap();
+        assert!(!read_cursor(&mut viewer).visible);
+        commands.send(3).unwrap();
+        commands.send(1).unwrap(); // Still composited/invisible after invalidation.
+        viewer
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let error = viewer.peek(&mut [0]).unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "{error}"
+        );
+        assert_eq!(session.frames.load(Ordering::Relaxed), 0);
+        session.stop.store(true, Ordering::Release);
+        commands.send(4).unwrap();
+    });
 }
 
 #[test]
