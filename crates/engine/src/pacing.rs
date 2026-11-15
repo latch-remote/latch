@@ -7,6 +7,7 @@ pub(crate) struct Pacer {
     kbps: u32,
     waiting: bool,
     wake_gap: Duration,
+    slept: bool,
 }
 // Preserve the tested 16/30-ms wakes while a train waits. Longer stalls
 // restart with the ordinary one-ms allowance, including within a frame.
@@ -20,6 +21,7 @@ impl Pacer {
             kbps: 0,
             waiting: false,
             wake_gap: Duration::ZERO,
+            slept: false,
         }
     }
     pub(crate) fn begin_frame(&mut self, now: Instant, kbps: u32) {
@@ -31,6 +33,7 @@ impl Pacer {
         self.updated = now;
         self.kbps = kbps;
         self.waiting = false;
+        self.slept = false;
     }
 
     /// Repay ordinary late wakes while packets remain in a train. Completed
@@ -48,6 +51,7 @@ impl Pacer {
             self.updated = now;
             self.kbps = 0;
             self.waiting = false;
+            self.slept = false;
             return (packets.len(), Duration::ZERO);
         }
         let rate = f64::from(kbps) * 1000.0 / 8.0;
@@ -59,7 +63,7 @@ impl Pacer {
             // Repay a late wake only when recent waiting wakes were this late.
             let gap = self.wake_gap.max(Duration::from_millis(1));
             let allowed = elapsed.min(gap);
-            if !elapsed.is_zero() {
+            if self.slept {
                 self.wake_gap = (self.wake_gap * 7 / 8).max(elapsed);
             }
             BURST.max(rate * allowed.as_secs_f64() + (latch_proto::MAX_DATAGRAM + 80) as f64)
@@ -80,6 +84,7 @@ impl Pacer {
             count += 1;
         }
         self.waiting = count < packets.len();
+        self.slept = count == 0;
         if count > 0 {
             self.tokens -= bytes;
             return (count, Duration::ZERO);
@@ -177,6 +182,8 @@ mod batch_tests {
                     bytes += count * 1280;
                     if count == 0 {
                         now += wait.max(Duration::from_millis(tick_ms));
+                    } else {
+                        now += Duration::from_nanos(1);
                     }
                 }
                 let achieved = bytes as f64 * 8.0 / 3.0 / 1000.0;
@@ -315,6 +322,64 @@ mod batch_tests {
                     link.counts().1,
                     0,
                     "one {late_ms} ms late wake at {kbps} kbps"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clustered_late_wakes_pin_shallow_queue_drops() {
+        use latch_proto::sim::{Impairment, Link};
+
+        let packets = vec![vec![0; 1200]; 1500];
+        // Two nearby hiccups reuse the learned allowance. Pin this trade-off
+        // alongside the isolated-hiccup and steady coarse-clock regressions.
+        for (kbps, link_kbps, queue_ms, late_ms, expected_drops) in [
+            (20_000, 50_000, 4, 16, [14, 7, 0]),
+            (20_000, 50_000, 4, 25, [31, 20, 0]),
+            (60_000, 100_000, 5, 16, [51, 28, 0]),
+            (60_000, 100_000, 5, 25, [104, 69, 0]),
+        ] {
+            for (wakes_apart, expected) in [1, 3, 10].into_iter().zip(expected_drops) {
+                let mut now = Instant::now();
+                let mut pacer = Pacer::new(now);
+                let mut link = Link::new(Impairment::NONE, 11);
+                link.set_bandwidth(link_kbps, Duration::from_millis(queue_ms));
+                let mut sent = 0;
+                let mut wakes = 0;
+                let mut first_late_wake = None;
+                let mut hiccups = 0;
+                while sent < packets.len() {
+                    let (count, wait) = pacer.batch(now, &packets[sent..], kbps);
+                    for packet in &packets[sent..sent + count] {
+                        link.send(now, packet);
+                    }
+                    sent += count;
+                    if count == 0 {
+                        now += wait.max(Duration::from_nanos(1));
+                        wakes += 1;
+                        if sent >= 100 {
+                            let first = *first_late_wake.get_or_insert(wakes);
+                            if wakes == first || wakes == first + wakes_apart {
+                                now += Duration::from_millis(late_ms);
+                                hiccups += 1;
+                            }
+                        }
+                    } else {
+                        // Account for work before the next production retry.
+                        now += Duration::from_micros(50);
+                    }
+                    link.receive(now);
+                }
+                assert_eq!(hiccups, 2);
+                eprintln!(
+                    "{kbps} kbps, two {late_ms} ms hiccups {wakes_apart} wakes apart: {} drops",
+                    link.counts().1
+                );
+                assert_eq!(
+                    link.counts().1,
+                    expected,
+                    "{kbps} kbps, {late_ms} ms hiccups {wakes_apart} wakes apart"
                 );
             }
         }

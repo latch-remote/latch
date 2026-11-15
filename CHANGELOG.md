@@ -283,11 +283,12 @@ GitHub release notes, so each version gets a heading of the form
 ### Streaming and recovery
 
 - Preserve elapsed UDP pacing credit when recent waiting wakes establish a
-  coarse clock, bounded to 30 ms. Keep isolated hiccups and long stalls at
-  the ordinary one-ms burst and apply rate cuts immediately.
+  coarse clock, bounded to 30 ms. Update that history only after pacing
+  waits. Keep isolated hiccups and long stalls at the ordinary one-ms burst
+  and apply rate cuts immediately.
 - Prevent macOS timer coalescing from delaying live frame production and
-  video pacing, including backgrounded media threads. Report individual
-  production-stage waits and CPU work in failure diagnostics.
+  video pacing, even when the host process is backgrounded. Report
+  individual production-stage waits and CPU work in failure diagnostics.
 - Weight reduced-offer UDP loss evidence by covered receive time so coarse
   feedback windows across at least two reports can qualify a damaged path for
   relay recovery. Retain relay preparation while damage evidence is active

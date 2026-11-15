@@ -7,8 +7,16 @@ thread_local! {
     static TIMER: Option<OwnedFd> = {
         // SAFETY: kqueue takes no arguments and returns a new descriptor.
         let fd = unsafe { libc::kqueue() };
-        // SAFETY: a successful kqueue descriptor is uniquely owned here.
-        (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+        if fd < 0 {
+            tracing::debug!(
+                error = %std::io::Error::last_os_error(),
+                "cannot create critical media timer, using ordinary sleep for this thread"
+            );
+            None
+        } else {
+            // SAFETY: a successful kqueue descriptor is uniquely owned here.
+            Some(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
     };
 }
 

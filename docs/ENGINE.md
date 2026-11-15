@@ -709,7 +709,8 @@ whichever is larger. While a batch has packets left, credit follows elapsed
 time up to a slowly decaying maximum of recent waiting-wake gaps, bounded
 at 30 ms. An isolated late wake gets the previous clock allowance. Repeated
 16 ms or 30 ms wakes establish the corresponding allowance on the next wake.
-Zero-elapsed retries do not decay that history, and it survives frame boundaries.
+Retries after a send do not decay that history. Only pacing wakes update it,
+and it survives frame boundaries.
 Once a batch completes, new accrual has the ordinary one-ms cap and unspent
 tokens remain available. A gap longer than 30 ms restarts with the ordinary
 burst, even mid-frame. A rate change also clamps saved credit immediately.
@@ -725,9 +726,9 @@ allowance in a batch, which requires a queue that can absorb that batch.
 
 On macOS, live frame, idle-repeat and video-send waits use a thread-local
 one-shot kqueue timer with `NOTE_CRITICAL`, avoiding discretionary timer
-coalescing even when the process or producer thread is backgrounded. The
-ordinary sleep remains the fallback if the timer cannot be used. Interactive
-thread QoS alone does not prevent coalescing. Software diagnostics report
+coalescing even when the host process is backgrounded. Media threads request
+user-interactive QoS. Ordinary sleep remains the fallback if the timer cannot
+be used. Interactive thread QoS alone does not prevent coalescing. Software diagnostics report
 pacing duration and lateness, cumulative capture calls, idle waits, conversion,
 encoding and filler time separately. Production duration includes intentional
 frame-cadence waits. The Windows sender uses `std::thread::sleep`.
