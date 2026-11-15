@@ -217,6 +217,9 @@ GitHub release notes, so each version gets a heading of the form
   send deadline, and report offered, accepted, refused and delivered frames
   plus gateway deadline lateness and local wake/timeout timing for native TLS
   and WebSocket carriers.
+- Time the relay daemon's low-credit wake test from the peer's write, so a
+  late-starting helper thread on a loaded runner no longer fails it, and fail
+  when the wait returns before the write.
 
 ### Networking
 

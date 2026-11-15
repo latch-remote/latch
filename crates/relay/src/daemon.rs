@@ -915,16 +915,20 @@ mod tests {
         assert!(wake.interest().is_some());
         let writer = thread::spawn(move || {
             thread::sleep(Duration::from_millis(20));
+            let writing = Instant::now();
             peer.write_all(b"x").unwrap();
             // Keep the socket alive until the readiness wait has returned.
-            peer
+            (peer, writing)
         });
-        let start = Instant::now();
         // A long injected housekeeping interval exposes omission from the poll
         // set. Production calls always use TICK.
         daemon.wait(&wake, Duration::from_secs(1)).unwrap();
-        let elapsed = start.elapsed();
-        let peer = writer.join().unwrap();
+        let woke = Instant::now();
+        let (peer, writing) = writer.join().unwrap();
+        // Time the wake from the write itself. A loaded machine can start the
+        // writer late, and that delay says nothing about the readiness wait.
+        assert!(woke >= writing, "the wait returned before the peer wrote");
+        let elapsed = woke.duration_since(writing);
         assert!(elapsed < Duration::from_millis(100), "{elapsed:?}");
         drop(peer);
         drop(daemon);
