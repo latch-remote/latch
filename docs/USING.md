@@ -109,13 +109,31 @@ callback, including while a clipboard paste is waiting.
 | Linux X11 | A capture-scoped keyboard grab keeps sided Super and Alt+Tab in the stream | Another client can prevent the grab. Latch logs once and retries on later frames. An active grab blocks other X11 clients until released, so a hung Latch can hold the session keyboard until the process is killed. |
 | Linux Wayland | Compositor-delivered focused keys and sided Super | The compositor owns global shortcuts. winit 0.30 exposes no shortcut-inhibit protocol API, so Latch cannot request inhibition in this stack. |
 
-Use **Keys** in the stream toolbar to send Alt+Tab, Command+Tab,
-Command+Q, Command+Space, Win+L, the Windows key or ordinary
-Ctrl+Alt+Delete directly to the host. These actions use host key identities
+Use **Keys** in the stream toolbar to send the host-specific Alt+Tab,
+Command+Tab/Space, Win+L, Windows key or Ctrl+Alt+Delete actions. These actions use host key identities
 and bypass the modifier-mapping setting. The toolbar is available after
 Ctrl+Alt releases the mouse. Windows secure attention cannot be synthesized
 by SendInput or the elevated helper. It requires local trusted input or
 another OS-supported administration mechanism.
+
+## Linux hardware decoding
+
+The viewer tries VA-API H.264 and HEVC decoders using the installed system
+libva and GPU driver. Give your user access to `/dev/dri/renderD*`, usually
+through the distribution's `render` group. Stream stats show `VA-API H.264`
+or `VA-API HEVC` when hardware decoding is active. A machine without a usable
+driver uses software H.264 automatically.
+
+Set `LATCH_LINUX_DECODER=software` to force software decoding, or
+`LATCH_VAAPI_DEVICE=/dev/dri/renderD129` to try a particular GPU first.
+Driver-reported resolution limits filter codec offers. Hardware failures
+request a keyframe or restart the stream with another codec until software
+H.264 is available. A stalled driver disables VA-API until the app restarts.
+
+EGL/GLES renderers can import decoded DMA-BUF planes directly. Other
+renderers use hardware decode with CPU readback and texture upload. Ten-bit
+SDR requires a Main10 decoder and compatible renderer. Native HDR display
+output and AV1 decoding on Linux require further work.
 
 ## When the connection drops
 

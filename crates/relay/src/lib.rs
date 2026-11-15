@@ -1,15 +1,23 @@
-//! Two outbound native TLS lanes with capability pairing and end-to-end encryption.
+//! Two outbound native TLS or HTTPS WebSocket lanes with end-to-end encryption.
 //! See the crate README for integration and operator requirements.
 #![forbid(unsafe_code)]
 
+mod carrier;
 mod client;
 mod crypto;
 pub mod daemon;
+mod diagnostics;
+mod proxy;
 mod quota;
 mod wire;
 
-pub use client::{create_grant, ClientConfig, Endpoint, Event, Transport, TransportLimits};
+pub use carrier::WEBSOCKET_PATH;
+pub use client::{
+    create_grant, create_grant_with_info, ClientConfig, Endpoint, Event, Transport, TransportLimits,
+};
 pub use crypto::{ensure_supported_cpu, SessionKeys};
+pub use diagnostics::{AttemptFailure, Carrier, ConnectError, ConnectionInfo, Failure, MssReason};
+pub use proxy::{BasicCredentials, ProxyConfig};
 pub use wire::{Attachment, Grant, Lane, Role};
 
 use std::io;

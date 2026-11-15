@@ -12,7 +12,7 @@ binary=$1 cert=$2 key=$3 budget=$4
 for command in systemctl setpriv timeout openssl getent useradd groupadd install cmp; do
     command -v "$command" >/dev/null || die "missing prerequisite $command"
 done
-systemctl is-active --quiet latch-relay.service && die 'stop the native relay during an arranged maintenance window before installing'
+systemctl is-active --quiet latch-relay.service && die 'stop the relay during an arranged maintenance window before installing'
 # Validate TLS identity before replacing installed files. Never print key data.
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
@@ -64,4 +64,4 @@ if [[ $# == 5 ]]; then
 fi
 systemctl daemon-reload
 systemctl enable latch-relay.service
-echo 'Installed and enabled. Start explicitly with systemctl start latch-relay.service after checking firewall, DNS, TLS and quota.'
+echo 'Installed and enabled. Start explicitly with systemctl start latch-relay.service after checking IPv4/IPv6 firewall, DNS, TLS and quota.'

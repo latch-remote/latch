@@ -104,6 +104,10 @@ asks for Screen Recording). `view --keys 20` measures input-to-picture
 latency against the pattern. Both list their options at the top of
 `crates/engine/examples/serve.rs` and `crates/stream/examples/view.rs`.
 
+For automated hostile-network tests on Linux or in privileged Docker, see
+[scripts/netlab/README.md](scripts/netlab/README.md). The lab runs these
+examples and the real relay through isolated network namespaces.
+
 `cargo run --release -p latch-engine --example pipeline_bench` runs the
 host's capture-convert-encode pipeline with no network and prints
 per-stage times; `cargo run --release -p latch-stream --example
