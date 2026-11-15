@@ -269,17 +269,16 @@ impl Control {
             return;
         }
         let (point, on_output) = position(point, source.display, source.stream);
-        if on_output {
-            publication.publish(
-                self,
-                Published {
-                    position: Some(point),
-                    ..last
-                },
-                None,
-                now,
-            );
-        }
+        publication.publish(
+            self,
+            Published {
+                visible: on_output,
+                position: on_output.then_some(point),
+                ..last
+            },
+            None,
+            now,
+        );
     }
 }
 
@@ -405,7 +404,32 @@ impl Plane {
         self.shape = None;
         self.shape_visible = false;
         self.source_shape = None;
-        self.publish(false, [0, 0], false);
+        self.suspend();
+    }
+    /// Stop sampling the old output before capture can reopen or change it.
+    /// Forget publication so even an unchanged retained shape is sent again.
+    pub fn suspend(&mut self) {
+        let mut publication = self.control.publication.lock();
+        let serial = publication.last.map_or(0, |last| last.serial);
+        publication.publish(
+            &self.control,
+            Published {
+                visible: false,
+                position: None,
+                serial,
+            },
+            None,
+            Instant::now(),
+        );
+        *publication = Publication::default();
+    }
+    pub fn reopen(&mut self, same_output: bool, source: (u32, u32), stream: (u32, u32)) {
+        if same_output {
+            self.suspend();
+            self.resize(source, stream);
+        } else {
+            self.invalidate();
+        }
     }
 }
 
@@ -462,6 +486,14 @@ impl Default for CaptureState {
 impl CaptureState {
     pub fn restart(&mut self) {
         *self = Self::default();
+    }
+    /// A new duplication needs fresh position and desktop data, while its
+    /// retained bitmap and fallback cache still describe the same output.
+    pub fn reopen(&mut self) {
+        self.pointer_known = false;
+        self.source_ready = false;
+        self.current = None;
+        self.rendered = None;
     }
     pub fn fallback_due(&mut self, key: usize, now: Instant) -> bool {
         if self.fallback_key != Some(key) {
@@ -565,6 +597,7 @@ pub(crate) fn visibility(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::DisplayRect;
     fn info(kind: u32, width: u32, height: u32, pitch: u32) -> ShapeInfo {
         ShapeInfo {
             kind,
@@ -574,6 +607,231 @@ mod tests {
             hot_x: 0,
             hot_y: 0,
         }
+    }
+    #[test]
+    fn selected_secondary_output_owns_positions_and_composited_fallback() {
+        let display = DisplayRect {
+            x: 1920,
+            y: -200,
+            width: 1000,
+            height: 800,
+        };
+        let stream = (1000, 1000);
+        let control = Control::composited();
+        control.drawn.store(false, Ordering::Relaxed);
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let received = updates.clone();
+        *control.sink.lock() = Some(Arc::new(move |cursor| received.lock().push(cursor)));
+        let mut plane = Plane::new(control);
+        plane.shape(info(2, 4, 4, 16), &[255; 64], (1000, 800), (1000, 800));
+        let mut state = CaptureState {
+            source_ready: true,
+            pointer_known: true,
+            ..Default::default()
+        };
+        state.dxgi_shape();
+        for fallback in [false, true] {
+            if fallback {
+                plane.invalidate();
+                state.fallback_needed = true;
+                state.shape_uploaded(); // A readable system bitmap for composition.
+            }
+            for (point, expected_position, expected_owner) in [
+                (
+                    [2420, 200],
+                    [500, 500],
+                    if fallback { Owner::Host } else { Owner::Viewer },
+                ),
+                ([500, 400], [-1420, 700], Owner::Hidden),
+            ] {
+                let (position, on_output) = position(point, display, stream);
+                assert_eq!(position, expected_position);
+                let separate = plane.separate(!state.fallback_needed, false);
+                let (visible, owner) = state.update(
+                    PointerSample {
+                        os_visible: Some(true),
+                        on_output,
+                        dxgi_visible: true,
+                        position,
+                    },
+                    separate,
+                );
+                assert_eq!(owner, expected_owner);
+                assert_eq!(owner == Owner::Host, fallback && on_output);
+                assert!(state.can_render());
+                plane.publish(visible, position, separate);
+                let last = updates.lock().last().unwrap().clone();
+                assert_eq!(last.visible, !fallback && on_output);
+                assert_eq!(last.position, (!fallback && on_output).then_some(position));
+            }
+        }
+    }
+
+    #[test]
+    fn output_switch_and_missing_selection_fallback_reset_cursor_state() {
+        let secondary = DisplayRect {
+            x: -1000,
+            width: 1000,
+            height: 800,
+            ..Default::default()
+        };
+        let primary = DisplayRect { x: 0, ..secondary };
+        let control = Control::composited();
+        control.drawn.store(false, Ordering::Relaxed);
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let received = updates.clone();
+        *control.sink.lock() = Some(Arc::new(move |cursor| received.lock().push(cursor)));
+        // The viewer's chooser opens a new pipeline/session. Hot-unplug instead
+        // reopens the existing capture on the host's default output.
+        for reconnect in [false, true] {
+            let mut plane = Plane::new(control.clone());
+            let mut state = CaptureState {
+                source_ready: true,
+                pointer_known: true,
+                ..Default::default()
+            };
+            state.dxgi_shape();
+            plane.shape(info(2, 4, 4, 16), &[255; 64], (1000, 800), (1000, 800));
+            let serial = plane.shape.as_ref().unwrap().serial;
+            plane.track_position(secondary, (1000, 800), true);
+            plane.publish(true, [500, 400], true);
+            assert!(updates.lock().pop().unwrap().shape.is_some());
+            plane.suspend();
+            assert!(!updates.lock().pop().unwrap().visible);
+            if reconnect {
+                plane = Plane::new(control.clone());
+            } else {
+                plane.reopen(false, (1000, 800), (1000, 800));
+                assert!(!updates.lock().pop().unwrap().visible);
+            }
+            state.restart();
+            assert!(plane.shape.is_none());
+            assert!(!state.pointer_known);
+            assert!(!state.source_ready);
+            assert!(state.fallback_needed);
+            let count = updates.lock().len();
+            control.publish_position_at([-500, 400], Instant::now() + POSITION_INTERVAL);
+            assert_eq!(
+                updates.lock().len(),
+                count,
+                "old sampler source is detached"
+            );
+            state.source_ready = true;
+            let (old_position, on_output) = position([-500, 400], primary, (1000, 800));
+            assert_eq!(
+                state
+                    .update(
+                        PointerSample {
+                            os_visible: Some(true),
+                            on_output,
+                            dxgi_visible: true,
+                            position: old_position,
+                        },
+                        false,
+                    )
+                    .1,
+                Owner::Hidden,
+                "fallback must not composite the old output's pointer"
+            );
+            plane.shape(info(2, 4, 4, 16), &[255; 64], (1000, 800), (1000, 800));
+            state.pointer_known = true;
+            state.dxgi_shape();
+            assert_ne!(serial, plane.shape.as_ref().unwrap().serial);
+            plane.track_position(primary, (1000, 800), true);
+            plane.publish(true, [500, 400], true);
+            let first = updates.lock().pop().unwrap();
+            assert_eq!(first.position, Some([500, 400]));
+            assert!(
+                first.shape.is_some(),
+                "identical pixels must be sent for the new output"
+            );
+            control.publish_position_at([600, 450], Instant::now() + POSITION_INTERVAL * 2);
+            assert_eq!(updates.lock().pop().unwrap().position, Some([600, 450]));
+            control.publish_position_at([-500, 400], Instant::now() + POSITION_INTERVAL * 3);
+            let hidden = updates.lock().pop().unwrap();
+            assert!(!hidden.visible);
+            assert!(hidden.position.is_none());
+        }
+    }
+
+    #[test]
+    fn same_output_reopen_retains_and_rescales_shape_without_a_new_bitmap() {
+        let control = Control::composited();
+        control.drawn.store(false, Ordering::Relaxed);
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let received = updates.clone();
+        *control.sink.lock() = Some(Arc::new(move |cursor| received.lock().push(cursor)));
+        let mut plane = Plane::new(control);
+        plane.shape(info(2, 4, 4, 16), &[255; 64], (100, 100), (100, 100));
+        let mut state = CaptureState {
+            source_ready: true,
+            pointer_known: true,
+            ..Default::default()
+        };
+        state.dxgi_shape();
+        let now = Instant::now();
+        assert!(state.fallback_due(1, now));
+        state.fallback_read(true, now);
+        plane.publish(true, [50, 50], true);
+        let first = updates.lock().pop().unwrap().shape.unwrap();
+        for (source, expected_width) in [((100, 100), 4), ((200, 200), 2)] {
+            plane.reopen(true, source, (100, 100));
+            state.reopen();
+            assert!(!state.pointer_known);
+            assert!(!state.can_render());
+            assert!(!state.fallback_needed);
+            assert!(!state.fallback_due(1, now + Duration::from_secs(1)));
+            assert!(!updates.lock().pop().unwrap().visible);
+            state.source_ready = true;
+            state.pointer_known = true;
+            assert!(plane.separate(true, false));
+            plane.publish(true, [50, 50], true);
+            let resent = updates.lock().pop().unwrap().shape.unwrap();
+            assert_eq!(resent.width, expected_width);
+            if source == (100, 100) {
+                assert_eq!(resent, first);
+            }
+        }
+    }
+
+    #[test]
+    fn independent_sampler_tracks_selected_secondary_and_hides_on_other_outputs() {
+        let control = Control::composited();
+        control.drawn.store(false, Ordering::Relaxed);
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let received = updates.clone();
+        *control.sink.lock() = Some(Arc::new(move |cursor| received.lock().push(cursor)));
+        let mut plane = Plane::new(control.clone());
+        plane.shape(info(2, 4, 4, 16), &[255; 64], (1000, 800), (500, 400));
+        plane.track_position(
+            DisplayRect {
+                x: 1920,
+                y: 200,
+                width: 1000,
+                height: 800,
+            },
+            (500, 500),
+            true,
+        );
+        let now = Instant::now();
+        plane.publish_at(true, [0, 50], true, now);
+        updates.lock().clear();
+        control.publish_position_at([2420, 600], now + POSITION_INTERVAL);
+        let moved = updates.lock().pop().unwrap();
+        assert_eq!(moved.position, Some([250, 250]));
+        assert!(moved.shape.is_none());
+        control.publish_position_at(
+            [500, 600],
+            now + POSITION_INTERVAL + Duration::from_micros(1),
+        );
+        let hidden = updates.lock().pop().unwrap();
+        assert!(!hidden.visible, "output exit bypasses position throttling");
+        assert!(hidden.position.is_none());
+        control.publish_position_at([2420, 600], now + POSITION_INTERVAL * 2);
+        assert!(
+            updates.lock().is_empty(),
+            "capture must confirm ownership before showing again"
+        );
     }
     #[test]
     fn support_docs_keep_live_windows_capture_unverified() {
@@ -694,15 +952,17 @@ mod tests {
             stop.send(()).unwrap();
         });
         // Idle sampling never adds a shape, changes ownership, or revives a
-        // hidden/unreadable plane. Other outputs cannot move this plane.
+        // hidden/unreadable plane. Moving to another output hides this plane.
         control.publish_position_at([101, 40], now + POSITION_INTERVAL * 10);
-        assert!(received.try_recv().is_err());
+        let hidden = received.try_recv().unwrap();
+        assert!(!hidden.visible);
+        assert!(hidden.position.is_none());
+        assert!(hidden.shape.is_none());
         control.drawn.store(true, Ordering::Relaxed);
         control.publish_position_at([30, 40], now + POSITION_INTERVAL * 10);
         assert!(received.try_recv().is_err());
         control.drawn.store(false, Ordering::Relaxed);
         plane.invalidate();
-        received.recv().unwrap();
         control.publish_position_at([30, 40], now + POSITION_INTERVAL * 10);
         assert!(received.try_recv().is_err());
     }

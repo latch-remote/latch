@@ -32,6 +32,10 @@ pub trait CpuCapture: Send {
 
     fn display(&self) -> DisplayRect;
 
+    fn captured_display(&self) -> Option<String> {
+        None
+    }
+
     /// Where the picture the last `grab` that returned true differs from
     /// the one the source returned before it; `None` when it cannot tell.
     /// Lets the pipeline convert only what changed.
@@ -459,6 +463,7 @@ pub fn measure_fps(width: u32, height: u32, budget: Duration) -> u32 {
         fps,
         bitrate_kbps: 20_000,
         codec: Codec::H264Baseline,
+        display: None,
     };
     let Ok(mut pipeline) = SoftwarePipeline::new(pattern, &config) else {
         return 0;
@@ -583,6 +588,7 @@ impl<C: CpuCapture> VideoPipeline for SoftwarePipeline<C> {
         };
         let (name, hardware, codec, _) = &self.describe;
         VideoInfo {
+            captured_display: self.capture.captured_display(),
             color: Default::default(),
             encoder: format!("{name} ({})", self.capture.name()),
             hardware: *hardware,
@@ -856,6 +862,7 @@ mod tests {
         changed: bool,
         size: (u32, u32),
         waits: Vec<Duration>,
+        captured_display: Option<String>,
     }
     impl CpuCapture for Fake {
         fn size(&self) -> (u32, u32) {
@@ -884,6 +891,9 @@ mod tests {
         fn name(&self) -> String {
             "fake".into()
         }
+        fn captured_display(&self) -> Option<String> {
+            self.captured_display.clone()
+        }
     }
     fn pipeline() -> SoftwarePipeline<Fake> {
         SoftwarePipeline::new(
@@ -892,6 +902,7 @@ mod tests {
                 changed: true,
                 size: (16, 16),
                 waits: Vec::new(),
+                captured_display: None,
             },
             &VideoConfig {
                 color: Default::default(),
@@ -900,9 +911,30 @@ mod tests {
                 fps: 100,
                 bitrate_kbps: 1000,
                 codec: Codec::H264Baseline,
+                display: None,
             },
         )
         .unwrap()
+    }
+    #[test]
+    fn software_info_follows_the_captured_output_after_selection_fallback() {
+        let mut pipeline = pipeline();
+        assert!(pipeline.info().captured_display.is_none());
+        pipeline.config.display = Some("selected-secondary".into());
+        pipeline.capture.captured_display = Some("selected-secondary".into());
+        assert_eq!(
+            pipeline.info().captured_display.as_deref(),
+            Some("selected-secondary")
+        );
+        pipeline.capture.captured_display = Some("fallback-output".into());
+        assert_eq!(
+            pipeline.info().captured_display.as_deref(),
+            Some("fallback-output")
+        );
+        assert_eq!(
+            pipeline.config.display.as_deref(),
+            Some("selected-secondary")
+        );
     }
     #[test]
     fn low_bitrate_resizes_visible_input_and_recovers_requested_size() {

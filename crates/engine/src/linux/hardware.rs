@@ -301,6 +301,7 @@ fn probe(backend: Backend, codec: Codec) -> Result<Caps> {
         fps: 60,
         bitrate_kbps: 4000,
         codec,
+        display: None,
     };
     let (mut encoder, caps) = open_with_caps(backend, codec, width, height, &config)?;
     let mut picture = latch_codec::Yuv420::new(width, height);

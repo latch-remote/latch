@@ -57,6 +57,7 @@ Content-Length: <n>
 | `mic` | bool | optional, default false; the viewer offers its microphone (datagram kind 13) |
 | `probe_trains` | bool | optional, default false; the viewer times probe trains (datagram kind 16) and reports their rate |
 | `relay` | bool | optional, default false; the viewer supports the two-lane authenticated relay extension |
+| `display` | string | optional; the host display to share, by an `id` from its status `streamer.displays` (see [Choosing a display](#choosing-a-display-additive)); absent leaves the choice to the host |
 
 A request is taken within 64 to 16384 pixels a side, 1 to 500 fps and
 500 kbps to 1 Gbps (`latch_proto::control::MAX_*`). The host then meets
@@ -123,8 +124,9 @@ Position-only updates are coalesced to at most 120 Hz. A separate OS-position
 sampler runs every 8.334 ms independently of capture, encoding and video pacing.
 For an established visible plane, the final position enters the control mailbox
 within two ticks (16.668 ms) after motion stops, excluding OS scheduling and
-control-transport backpressure. The sampler never enables a hidden plane or
-changes cursor ownership. Shape and visibility changes from capture bypass the
+control-transport backpressure. The sampler uses the captured output's rectangle
+and hides the plane when the pointer leaves it. Capture confirms ownership
+before the plane becomes visible again. Shape and visibility changes bypass the
 rate limit. Invisible planes omit positions. Each viewer's wire state is
 deduplicated after removing fields it did not negotiate, so 6.0.0 viewers receive
 no duplicate controls for pointer-only motion.
@@ -143,9 +145,11 @@ and retries unsuccessful reads after 250 ms. Video has a zero cursor-wait bound.
 If both the current bitmap and system arrow are unreadable, frames continue
 with the last readable bitmap, or without one if none is available. The host logs
 once per failure episode, and idle capture ticks repaint the pointer when a
-bitmap becomes readable. Resolution changes rescale the retained shape, and
-reconnect resets the viewer's cached texture because a restarted host can reuse
-shape serials.
+bitmap becomes readable. Reopening the same captured output retains and
+rescales its shape, including when the resolution changes, and re-sends it.
+Changing outputs resets per-output cursor state and detaches the old position
+sampler rectangle. Reconnect resets the viewer's cached texture because a
+restarted host can reuse shape serials.
 [Microsoft's colour-buffer upload and blend state](https://github.com/microsoft/Windows-classic-samples/blob/main/Samples/DXGIDesktopDuplication/cpp/OutputManager.cpp)
 
 On native HDR output, separate RGBA uses the viewer's SDR UI white, mapped by
@@ -526,6 +530,50 @@ version. A host that cannot speak the requested version answers 426 with
 an `Ack` naming the versions it speaks. `/v1/status` reports
 `streamer.protocol` (1 here; absent from Latch 4 hosts, which speak only
 GameStream).
+
+## Choosing a display (additive)
+
+`/v1/status` → `streamer.displays` lists the displays a stream can
+share. It is absent from older hosts, which share the display they pick,
+and a viewer then offers no choice.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | string | the opaque ID used by `StreamRequest.display`, with a CGDirectDisplayID on macOS, a monitor device path (or adapter LUID + target ID) on Windows, and a RandR monitor name (`DP-1`) on Linux |
+| `name` | string | for people: `"Built-in display"`, a monitor's own name, `"Virtual display"` |
+| `x`, `y` | i32 | where it sits on the host's desktop, in the platform's desktop coordinates (points on macOS, pixels on Windows and X11) |
+| `width`, `height` | u32 | its size in pixels |
+| `primary` | bool | the system's main display |
+| `default` | bool | optional, default false; what a request naming no display shares. None is on a Linux host, which then shares its whole X screen |
+
+A request naming a display the host does not have now (unplugged, or
+renumbered after a restart) is served as if it named none; it is never
+refused for that. A Windows host that would otherwise size its virtual
+display to the viewer and turn the other monitors off for the session
+does neither when another output is chosen; while a session runs its
+status keeps listing the displays it had before. A Linux host shares one
+RandR 1.5 monitor's rectangle of the X screen and does not resize it when
+several are connected; its `capture_size` stays the whole screen's, and a
+viewer that chose a monitor plans for that monitor's size instead.
+Switching displays mid-stream is a new session; there is no control
+message for it. The host places the pointer in the new picture before
+relative input resumes. Windows codec negotiation probes the adapter that
+drives the selected output, with capability results cached per adapter.
+Windows cursor positions use the actual captured output's physical origin and
+stream-content fit. Pointers on other outputs are reported invisible for both
+separate-plane and composited drawing. Missing-display fallback switches cursor
+ownership and the independent position sampler to the fallback output.
+
+Windows choices saved as GDI source names by earlier versions follow the
+missing-display fallback. New choices use monitor device paths so source
+renumbering preserves the selected monitor. Windows keeps the pre-session
+list throughout preparation and restoration as well as capture.
+
+`streamer.captured_display`, when present, names the display the running
+pipeline actually captures. macOS and Windows report this even when a missing
+choice fell back to another display. The viewer uses it to mark the current
+capture and allows choosing the requested display again after reconnecting
+it. Older hosts omit this additive status field.
 
 ## Encoder limits (5.2, additive)
 

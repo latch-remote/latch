@@ -665,6 +665,7 @@ mod tests {
             bitrate_kbps: 8000,
             codec: crate::video::Codec::Hevc,
             color: Default::default(),
+            display: None,
         };
         let mut encoder = Encoder::new(&config, &gpu)?;
         ensure!(encoder.recovers(), "AMF LTR initialization failed");
@@ -768,6 +769,7 @@ mod tests {
             fps: 240,
             bitrate_kbps,
             codec: Codec::Hevc,
+            display: None,
         };
         // Two different noise pictures: every frame changes everywhere.
         let noise = |width: u32, height: u32| -> anyhow::Result<Vec<ID3D11Texture2D>> {

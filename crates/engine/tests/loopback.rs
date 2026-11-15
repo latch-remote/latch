@@ -90,6 +90,7 @@ fn connect_with(
             cursor,
             gamepads,
             mic: false,
+            display: None,
         },
         frames.clone(),
         tx,
@@ -341,6 +342,17 @@ fn local_cursor_negotiated_and_host_omits_pointer_when_asked() {
     assert_eq!(shape.hot_x, 0);
     assert_eq!(shape.hot_y, 0);
 
+    // Keep the cursor and its comparison window inside a flat, static colour
+    // bar. At the display centre, lossy H.264 reconstruction of the bar edges
+    // can differ after toggling the cursor even with identical source pixels.
+    let cursor_x = 100;
+    let cursor_y = 100;
+    session
+        .input()
+        .mouse_position(cursor_x, cursor_y, W as i16, H as i16);
+    let cursor_x = cursor_x as usize;
+    let cursor_y = cursor_y as usize;
+
     // 3. Since cursor: true, host starts with draw_cursor: false.
     // Receive a frame with cursor omitted.
     let (seq1, frame_omitted) = next_frame(&frames, 0, Duration::from_secs(5))
@@ -351,17 +363,17 @@ fn local_cursor_negotiated_and_host_omits_pointer_when_asked() {
     // 4. Request host to draw cursor
     session.draw_cursor(true);
 
-    // Wait for frame with cursor drawn (at synthetic position 100, 100)
+    // Wait for a frame with the cursor drawn at that position.
     let mut seq = seq1;
     let start = Instant::now();
     let mut cursor_drawn_seen = false;
     while start.elapsed() < Duration::from_secs(3) {
         if let Some((s, f)) = next_frame(&frames, seq, Duration::from_millis(100)) {
             seq = s;
-            // Compare around (100, 100) where synthetic arrow is composited
+            // Compare around the synthetic arrow.
             let mut diff = 0u64;
-            for y in 95..125 {
-                for x in 95..125 {
+            for y in cursor_y - 5..cursor_y + 25 {
+                for x in cursor_x - 5..cursor_x + 25 {
                     let idx = y * f.y_stride + x;
                     if idx < f.y.len() && idx < luma_omitted.len() {
                         let d = f.y[idx].abs_diff(luma_omitted[idx]);
@@ -386,12 +398,13 @@ fn local_cursor_negotiated_and_host_omits_pointer_when_asked() {
 
     let start = Instant::now();
     let mut cursor_omitted_again = false;
+    let mut least_diff = u64::MAX;
     while start.elapsed() < Duration::from_secs(3) {
         if let Some((s, f)) = next_frame(&frames, seq, Duration::from_millis(100)) {
             seq = s;
             let mut diff = 0u64;
-            for y in 95..125 {
-                for x in 95..125 {
+            for y in cursor_y - 5..cursor_y + 25 {
+                for x in cursor_x - 5..cursor_x + 25 {
                     let idx = y * f.y_stride + x;
                     if idx < f.y.len() && idx < luma_omitted.len() {
                         let d = f.y[idx].abs_diff(luma_omitted[idx]);
@@ -399,6 +412,7 @@ fn local_cursor_negotiated_and_host_omits_pointer_when_asked() {
                     }
                 }
             }
+            least_diff = least_diff.min(diff);
             frames.recycle(f);
             if diff < 50 {
                 cursor_omitted_again = true;
@@ -408,7 +422,7 @@ fn local_cursor_negotiated_and_host_omits_pointer_when_asked() {
     }
     assert!(
         cursor_omitted_again,
-        "host did not omit cursor when draw_cursor(false)"
+        "host did not omit cursor when draw_cursor(false): least luma difference {least_diff}"
     );
 
     session.stop();

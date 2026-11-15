@@ -30,6 +30,7 @@ use windows::{
 pub(super) struct Gpu {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
+    pub adapter: (i32, u32),
 }
 impl Gpu {
     pub fn new(adapter: &IDXGIAdapter1) -> Result<Self> {
@@ -52,6 +53,11 @@ impl Gpu {
         let gpu = Self {
             device: device.context("D3D11 returned no device")?,
             context: context.context("D3D11 returned no context")?,
+            // SAFETY: adapter is a live owned DXGI interface.
+            adapter: unsafe {
+                let luid = adapter.GetDesc1()?.AdapterLuid;
+                (luid.HighPart, luid.LowPart)
+            },
         };
         // SAFETY: MF may call the immediate context from driver threads.
         unsafe {
@@ -467,6 +473,9 @@ pub(super) struct Capture {
     renderer: CursorRenderer,
     pointer: DXGI_OUTDUPL_POINTER_POSITION,
     shape: DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    bitmap: Vec<u8>,
+    output_id: String,
+    output_name: [u16; 32],
     rotation: DXGI_MODE_ROTATION,
     pub display: DisplayRect,
     pub has_frame: bool,
@@ -475,6 +484,8 @@ pub(super) struct Capture {
     white: f32,
     retry: ReopenBackoff,
     staging: Option<ID3D11Texture2D>,
+    /// The output the viewer chose (its monitor device path), kept across reopens.
+    wanted: Option<String>,
 }
 struct ReopenBackoff {
     started: Instant,
@@ -546,11 +557,15 @@ unsafe impl Send for Capture {}
 impl Capture {
     #[cfg(test)]
     pub fn new() -> Result<Self> {
-        Self::new_color(Default::default())
+        Self::new_color(Default::default(), None)
     }
-    pub fn new_color(color: latch_proto::color::ColorDescription) -> Result<Self> {
+    /// Duplicates the output named `wanted` (see [`display::select_named`]).
+    pub fn new_color(
+        color: latch_proto::color::ColorDescription,
+        wanted: Option<&str>,
+    ) -> Result<Self> {
         let _dpi = display::DpiAwareness::physical();
-        let output = display::select()?;
+        let output = display::select_named(wanted)?;
         let ten_bit = color.bit_depth == 10;
         let hdr_output = color.is_hdr()
             && unsafe {
@@ -599,6 +614,9 @@ impl Capture {
             renderer,
             pointer: Default::default(),
             shape: Default::default(),
+            bitmap: Vec::new(),
+            output_id: output.id.clone(),
+            output_name: output.desc.DeviceName,
             rotation: desc.Rotation,
             display,
             has_frame: false,
@@ -607,6 +625,7 @@ impl Capture {
             white: display::sdr_white_level(&output.desc.DeviceName),
             retry: ReopenBackoff::new(),
             staging: None,
+            wanted: wanted.map(str::to_owned),
         })
     }
     pub fn cursor_control(&mut self, control: Arc<Control>, size: (u32, u32)) {
@@ -666,6 +685,7 @@ impl Capture {
                     .and_then(|(shape, bytes)| {
                         self.renderer.shape(&self.gpu, &shape, &bytes)?;
                         self.shape = shape;
+                        self.bitmap = bytes;
                         self.cursor_state.shape_uploaded();
                         Ok(())
                     });
@@ -759,9 +779,28 @@ impl Capture {
     ) -> Result<R> {
         self.gpu.read(&mut self.staging, texture, rows, use_rows)
     }
+    fn same_output(&self, id: &str, name: [u16; 32]) -> bool {
+        self.output_id == id && (!id.is_empty() || self.output_name == name)
+    }
+    fn reset_cursor(&mut self, same_output: bool) {
+        let source = (self.display.width, self.display.height);
+        let fit = self.display.fitted(self.stream_size.0, self.stream_size.1);
+        self.plane
+            .reopen(same_output, source, (fit.width, fit.height));
+        if same_output {
+            self.cursor_state.reopen();
+        } else {
+            self.cursor_state.restart();
+            self.shape = Default::default();
+            self.bitmap.clear();
+            self.renderer.shape = None;
+        }
+        self.pointer = Default::default();
+        self.composite_pointer = Default::default();
+    }
     fn reopen(&mut self) -> Result<()> {
         let _dpi = display::DpiAwareness::physical();
-        let output = display::select()?;
+        let output = display::select_named(self.wanted.as_deref())?;
         // Reuse the device and cursor shaders while the adapter is unchanged.
         // SAFETY: both descriptors are copied from live DXGI interfaces.
         let (old, new) = unsafe {
@@ -784,11 +823,30 @@ impl Capture {
                 color.transfer = 16;
             }
             let hdr_output = self.hdr_output;
-            let control = self.plane.control.clone();
-            let size = self.stream_size;
-            self.plane.invalidate();
-            *self = Self::new_color(color)?;
-            self.cursor_control(control, size);
+            let mut replacement = Self::new_color(color, self.wanted.as_deref())?;
+            std::mem::swap(&mut replacement.plane, &mut self.plane);
+            replacement.stream_size = self.stream_size;
+            let same_output = self.same_output(&replacement.output_id, replacement.output_name);
+            if same_output {
+                replacement.shape = self.shape;
+                replacement.bitmap = std::mem::take(&mut self.bitmap);
+                replacement.cursor_state = std::mem::take(&mut self.cursor_state);
+                if !replacement.bitmap.is_empty() {
+                    if let Err(error) = replacement.renderer.shape(
+                        &replacement.gpu,
+                        &replacement.shape,
+                        &replacement.bitmap,
+                    ) {
+                        tracing::warn!(
+                            "retained cursor upload failed; continuing video: {error:#}"
+                        );
+                        replacement.plane.invalidate();
+                        replacement.cursor_state.restart();
+                    }
+                }
+            }
+            replacement.reset_cursor(same_output);
+            *self = replacement;
             self.hdr_output = hdr_output;
             return Ok(());
         }
@@ -814,16 +872,15 @@ impl Capture {
             D3D11_BIND_RENDER_TARGET.0 as u32,
             false,
         )?;
+        let same_output = self.same_output(&output.id, output.desc.DeviceName);
+        self.output_id = output.id.clone();
+        self.output_name = output.desc.DeviceName;
         self.white = display::sdr_white_level(&output.desc.DeviceName);
         self.source = source;
         self.frame = frame;
         self.display = display;
         self.rotation = desc.Rotation;
-        self.plane.invalidate();
-        self.cursor_state.restart();
-        self.pointer = Default::default();
-        self.shape = Default::default();
-        self.renderer.shape = None;
+        self.reset_cursor(same_output);
         self.has_frame = false;
         self.cpu_seeded = false;
         self.duplication = Some(duplication);
@@ -892,8 +949,8 @@ impl Capture {
                 // Release the old interface before DuplicateOutput: a process can
                 // own only one duplication per output. Mark the copy unavailable
                 // so repeated reopen failures cannot stream a stale desktop forever.
-                self.plane.invalidate();
-                self.cursor_state.restart();
+                self.plane.suspend();
+                self.cursor_state.reopen();
                 self.duplication = None;
                 self.has_frame = false;
                 self.cpu_seeded = false;
@@ -1012,6 +1069,7 @@ impl Capture {
                 let fit = self.display.fitted(self.stream_size.0, self.stream_size.1);
                 self.plane
                     .shape(shape_info(&shape), &bytes, source, (fit.width, fit.height));
+                self.bitmap = bytes;
             }
         }
         let Some(separate) = self.cursor_status() else {
@@ -1059,6 +1117,9 @@ impl CpuCapture for Capture {
     }
     fn display(&self) -> DisplayRect {
         self.display
+    }
+    fn captured_display(&self) -> Option<String> {
+        (!self.output_id.is_empty()).then(|| self.output_id.clone())
     }
     fn name(&self) -> String {
         "DXGI Desktop Duplication".into()
@@ -1415,6 +1476,7 @@ mod tests {
         let gpu = Gpu {
             device: device.context("WARP returned no device")?,
             context: context.context("WARP returned no context")?,
+            adapter: (0, 0),
         };
         let white_nits = 203.0f64;
         let nits = |n: f64| n / 80.0;
@@ -1619,7 +1681,7 @@ mod timing_tests {
     fn hardware_capture_rate() -> Result<()> {
         let _runtime = super::super::Runtime::new(false)?;
         for (width, height, fps) in [(1920, 1080, 240), (2560, 1440, 240), (3840, 2160, 120)] {
-            let previous = display::prepare(width, height, fps)?;
+            let previous = display::prepare(width, height, fps, None)?;
             let result = (|| -> Result<()> {
                 let mut capture = Capture::new()?;
                 let start = Instant::now();
@@ -1756,6 +1818,7 @@ mod hdr_probe {
             height: 540,
             fps: 60,
             bitrate_kbps: 20000,
+            display: None,
         };
         let source = gpu.texture(
             960,

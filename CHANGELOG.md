@@ -28,6 +28,24 @@ GitHub release notes, so each version gets a heading of the form
   cursor planes over an unfocused viewer's local arrow, preserve no-position
   host behavior and test actual viewer painting across cursor ownership states.
   Document focused local-pointer authority when host warps or other mice move it.
+- Keep cursor ownership and independent position sampling on the viewer-selected
+  output through capture reopen and missing-display fallback. Retain and rescale
+  shapes on same-output reopen, re-send them afterward, and reset per-output
+  pointer state when changing displays. Report the captured Windows display to
+  the chooser on hardware and software encode paths. Add combined regression
+  tests for selection, fallback, sampling and shape retention.
+
+### Deployment
+
+- Upgrade the single Seoul relay to native TLS and HTTPS WebSocket on TCP 443,
+  retain its durable quota, and apply always-on TCP MTU probing. Record the
+  verified backups, the initial 0.877-second upgrade and the 0.937-second
+  reinstallation. The before/after measurements ran on unstable campus Wi-Fi
+  and most timed out: sustained 20-Mbps and WebSocket throughput are unverified.
+- Enable Lightsail IPv6 and matching firewall scopes, verify public IPv6 TLS,
+  and publish a DNS-only AAAA while preserving the existing A record.
+- Add explicit carrier and CONNECT proxy options to the bounded paired probe,
+  with per-lane diagnostics and carrier-selection regression tests.
 
 ### Relay connectivity
 
@@ -56,6 +74,17 @@ GitHub release notes, so each version gets a heading of the form
   ladder with fresh DNS after stale cached paths, invalidate shortcuts on local
   source changes, and require large-segment loss evidence for automatic MSS hints.
   Cover 280 ms RTT recovery and retry non-blocking test accepts with deadlines.
+
+### Streaming
+
+- Choose which of a host's displays to share. Hosts list their displays in
+  `/v1/status` (`streamer.displays`), and the viewer offers them in the
+  machine's menu in the list and in the stream toolbar, remembered per
+  machine. A choice made during a stream reconnects on that display. Hosts
+  that do not list displays, and viewers that do not choose, keep sharing
+  the display the host picks: the virtual display on Windows, the main
+  display (or `LATCH_MAC_DISPLAY`) on a Mac, the whole X screen on Linux.
+  `StreamRequest.display` is additive and omitted when nothing is chosen.
 
 - Send viewer mouse and keyboard input directly from OS events on macOS,
   Windows and Linux, preserving input ordering, capture, focus and local

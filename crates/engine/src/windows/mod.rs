@@ -16,7 +16,7 @@ mod vigem;
 use crate::{
     audio::AudioCapture,
     input::InputSink,
-    software::SoftwarePipeline,
+    software::{CpuCapture, SoftwarePipeline},
     video::{Codec, EncodedVideo, Pacer, VideoConfig, VideoInfo, VideoPipeline},
 };
 use anyhow::{bail, Context, Result};
@@ -105,6 +105,7 @@ struct MfPipeline {
 impl MfPipeline {
     fn info(&self) -> VideoInfo {
         VideoInfo {
+            captured_display: self.capture.captured_display(),
             color: self.config.color,
             encoder: self.encoder.name().to_string(),
             hardware: self.encoder.hardware(),
@@ -319,7 +320,7 @@ impl Pipeline {
         mf: bool,
         cursor: Arc<crate::windows_cursor::Control>,
     ) -> Result<Self> {
-        let mut capture = Capture::new_color(config.color)?;
+        let mut capture = Capture::new_color(config.color, config.display.as_deref())?;
         capture.cursor_control(cursor, (config.width, config.height));
         let mut config = config.clone();
         if config.color.is_hdr() && !capture.hdr_output {
@@ -360,20 +361,21 @@ impl Pipeline {
                     })))
                 }
                 Err(e) if matches!(config.codec, Codec::Hevc | Codec::Av1) => {
-                    // Latch's own encoder makes H.264 only, and the viewer
-                    // has been told HEVC: fail this session, and offer H.264
-                    // to the next one.
+                    // Negotiation can still try the viewer's next codec
+                    // when this adapter cannot open its hardware encoder.
                     if config.color.bit_depth == 8 {
-                        encode::codec_failed(config.codec, &e);
+                        encode::codec_failed(config.codec, &capture.gpu, &e);
                     }
-                    return Err(e.context("open hardware codec"));
+                    return Err(
+                        crate::video::Unencodable(format!("open hardware codec: {e:#}")).into(),
+                    );
                 }
                 Err(e) => {
                     tracing::warn!("Media Foundation unavailable, using Latch software: {e:#}")
                 }
             }
         } else if matches!(config.codec, Codec::Hevc | Codec::Av1) {
-            bail!("codec needs Media Foundation");
+            return Err(crate::video::Unencodable("codec needs Media Foundation".into()).into());
         }
         Ok(Self::Software(Box::new(SoftwarePipeline::new(
             capture, config,
@@ -408,7 +410,7 @@ impl Pipeline {
                         // Neither Microsoft's encoder nor Latch's software one
                         // makes HEVC, and the viewer decodes nothing else on
                         // this stream: end it, so the next offers H.264.
-                        encode::codec_failed(p.config.codec, &e);
+                        encode::codec_failed(p.config.codec, &p.capture.gpu, &e);
                         let info = self.info();
                         *self = Self::Failed(info);
                         return Err(e.context("hardware codec pipeline failed"));
@@ -583,12 +585,6 @@ pub fn open_video(config: &VideoConfig) -> Result<Box<dyn VideoPipeline>> {
     {
         bail!("invalid Windows video size, fps, or bitrate");
     }
-    if !matches!(config.codec, Codec::H264Baseline | Codec::H264High)
-        && !(matches!(config.codec, Codec::Hevc | Codec::Av1)
-            && encode::codec_allowed(config.codec))
-    {
-        bail!("Windows codec is unavailable");
-    }
     let cursor = crate::windows_cursor::Control::composited();
     let worker_cursor = cursor.clone();
     let config = config.clone();
@@ -701,16 +697,22 @@ pub fn open_pads(feedback: crate::gamepad::FeedbackFn) -> Result<crate::gamepad:
 pub use elevated::{
     helper_exe as input_helper_exe, run_helper as run_input_helper, TASK as INPUT_TASK,
 };
-pub fn encodable() -> Vec<Codec> {
+pub fn encodable(display: Option<&str>) -> Vec<Codec> {
+    let display = display.map(str::to_owned);
     thread::Builder::new()
         .name("latch-mf-probe".into())
-        .spawn(|| {
+        .spawn(move || {
             let Ok(_runtime) = Runtime::new(true) else {
                 return vec![Codec::H264Baseline];
             };
+            let _dpi = display::DpiAwareness::physical();
+            let adapter = display::encoding_adapter(display.as_deref()).ok();
             let mut codecs = Vec::new();
             for codec in [Codec::Av1, Codec::Hevc] {
-                if encode::codec_available(codec) {
+                if adapter
+                    .as_ref()
+                    .is_some_and(|o| encode::codec_available(codec, o))
+                {
                     codecs.push(codec);
                 }
             }
@@ -729,8 +731,12 @@ pub fn prepare_display(
     width: u32,
     height: u32,
     fps: u32,
+    wanted: Option<&str>,
 ) -> Result<Option<crate::display::Previous>> {
-    display::prepare(width, height, fps)
+    display::prepare(width, height, fps, wanted)
+}
+pub fn displays() -> Result<Vec<latch_proto::control::HostDisplay>> {
+    display::list()
 }
 pub fn restore_display(previous: &crate::display::Previous) -> Result<()> {
     display::restore(previous)
@@ -791,6 +797,7 @@ mod tests {
             fps: 1000,
             bitrate_kbps: 50_000,
             codec: Codec::Hevc,
+            display: None,
         };
         let mut pipeline =
             Pipeline::new(&config, true, crate::windows_cursor::Control::composited())?;
@@ -822,6 +829,7 @@ mod tests {
             cursor: crate::windows_cursor::Control::composited(),
             requests,
             info: VideoInfo {
+                captured_display: None,
                 color: Default::default(),
                 encoder: String::new(),
                 hardware: false,
@@ -856,6 +864,7 @@ mod tests {
             fps: 30,
             bitrate_kbps: 4000,
             codec: Codec::H264Baseline,
+            display: None,
         };
         let mut encoder = match MfEncoder::software(&config) {
             Ok(e) => e,

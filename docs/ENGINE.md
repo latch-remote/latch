@@ -206,13 +206,25 @@ bound. Positions are hotspot coordinates relative to the output, fitted into the
 stream including letterboxing. Pointer-only DXGI acquisitions publish through
 a coalescing mailbox and a separate control sender before conversion/encoding.
 They leave the retained video picture alone while the separate plane is active.
-Shape data is sent only when the converted/scaled shape changes. A separate
+Shape data is sent when the converted/scaled shape changes and after capture
+reopens. A separate
 OS-position worker samples every 8.334 ms, sharing serial-based publication
 and the 120 Hz position limit with capture. It continues while encoding or video
 pacing blocks capture. For an established visible plane, the final position
 enters the control mailbox within 16.668 ms of motion stopping, excluding OS
-scheduling and control-transport backpressure. The worker never enables a hidden
-plane, changes ownership or touches D3D resources, and is joined on pipeline drop.
+scheduling and control-transport backpressure. The worker hides the plane when
+its hotspot leaves the captured output. Capture confirms ownership before a
+hidden plane can become visible again. The worker is joined on pipeline drop.
+
+The captured output is the viewer-selected monitor, including its physical
+desktop origin. Both capture and the position sampler use that rectangle.
+Reopening the same output retains the raw bitmap, rescales the plane after a
+resolution change and re-sends its shape. Output changes clear per-output pointer
+state and detach the old sampler rectangle. A selected monitor disappearing
+reopens on the host's default output with fresh cursor state. Choosing another
+display in the viewer reconnects and resets the viewer's cached cursor texture.
+Windows reports the actual captured display identity for hardware and software
+encoding so the chooser reflects missing-display fallback.
 
 While a focused free-mouse viewer drives the pointer, its local position is
 authoritative. If an application warps the host pointer or another mouse moves
@@ -608,7 +620,11 @@ refresh; GPU completion, compositor, panel response and scanout are unmeasured.
   viewer is resized by the engine (`xrandr` semantics through RandR) or by
   the owner's prep command; Windows sets the virtual display's mode; macOS
   captures the main display (or `LATCH_MAC_DISPLAY`) and lets
-  ScreenCaptureKit scale it. Linux's CPU pipeline also emits the negotiated
+  ScreenCaptureKit scale it. A viewer can name another display
+  (`display::list`, `StreamRequest.display`): Windows then duplicates that
+  output and leaves the virtual display and topology alone, macOS captures
+  it, and Linux captures that RandR monitor's rectangle of the root without
+  resizing. Linux's CPU pipeline also emits the negotiated
   output size when the display stays at its native size, for software, NVENC
   and VA-API alike. It aspect-fits with centred black bars, using the same
   content rectangle for pointer injection as Windows and macOS. Reductions
@@ -616,7 +632,9 @@ refresh; GPU completion, compositor, panel response and scanout are unmeasured.
   enlargements use bilinear filtering. Filter footprints map capture damage
   into output damage, including neighbouring chroma pairs. Equal-size frames
   retain the original SIMD conversion path. Separate cursor shapes and
-  hotspots use output pixels; the viewer supplies the pointer position.
+  hotspots use stream-content pixels. Windows can also send negotiated hotspot
+  positions relative to the captured output, fitted into the stream. Focused
+  free-mouse viewers place the cursor at their local pointer.
   Conversion, software encoding, and the capacity probe share a worker
   selection function of available parallelism and output dimensions. Its
   conservative table remains capped at four pending a quiet-machine sweep;
