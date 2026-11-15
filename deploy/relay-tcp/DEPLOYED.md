@@ -514,9 +514,12 @@ timed out, after 3.02 seconds during its quarter-rate warm-up. The replacement
 was reapplied after reproducing the failure on the prior version. Subsequent
 native/WebSocket 1-Mbps paired health checks completed after the certificate
 renewal hook finished. The bounded capacity retries above still timed out.
-These runs establish carrier functionality and document the observed capacity
-limit on this changing campus path. Sustained 20-Mbps operation remains
-unverified. The transport deadlines and tests retain their existing settings.
+Seven of the ten runs timed out, including the prior binary after rollback, so
+the timeouts follow the campus Wi-Fi at that hour and are not a measurement of
+relay capacity. These runs establish that both carriers work. They do not
+establish throughput: sustained 20-Mbps operation and WebSocket throughput at
+any rate remain unverified, and no WebSocket run completed. The transport
+deadlines and tests retain their existing settings.
 
 The second installation preserved 5,286,395,904 reserved bytes exactly, ledger
 SHA-256 `f283efec2c0ca3b0ce5b4db0a40f6b19178cd88b883abb44c364badbe2982624`.
@@ -544,6 +547,10 @@ successful native and WebSocket checks after renewal.
   chain and native ALPN validation.
 - `certbot renew --dry-run --run-deploy-hooks --cert-name relay.latch.rune.foo`
   succeeded, including the deployed certificate hook and retained quota.
+- After the AAAA record was published, `certbot renew --dry-run --cert-name
+  relay.latch.rune.foo` succeeded again with the validation request arriving
+  over IPv6 (`addressUsed` in the Certbot log). It ran without deployment hooks,
+  so the relay did not restart.
 - The production listener accepted both IP families. Public IPv6 certificate,
   native ALPN and HTTP checks passed before each AAAA publication.
 - The existing Tailscale UDP listeners and peer-relay path were retained.
@@ -585,8 +592,9 @@ Tailscale state were excluded from the Mac copy. The archive and ELF executable
 were read back successfully.
 
 The rollback script passed shell syntax, backup hash, executable, retained
-limits/budget and live-ledger prerequisite checks before the upgrade. Run it
-through the existing pinned SSH alias if rollback is needed.
+limits/budget and live-ledger prerequisite checks before the upgrade. It exists
+only in that host backup directory, not in this repository. Run it through the
+existing pinned SSH alias if rollback is needed.
 
 ```sh
 ssh -F "$HOME/.ssh/latch6-lightsail.conf" latch6-relay \
