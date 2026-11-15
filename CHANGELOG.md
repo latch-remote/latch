@@ -6,6 +6,8 @@ GitHub release notes, so each version gets a heading of the form
 
 ## Unreleased
 
+### Streaming
+
 - Choose which of a host's displays to share. Hosts list their displays in
   `/v1/status` (`streamer.displays`), and the viewer offers them in the
   machine's menu in the list and in the stream toolbar, remembered per
@@ -14,6 +16,22 @@ GitHub release notes, so each version gets a heading of the form
   the display the host picks: the virtual display on Windows, the main
   display (or `LATCH_MAC_DISPLAY`) on a Mac, the whole X screen on Linux.
   `StreamRequest.display` is additive and omitted when nothing is chosen.
+
+### Packaging
+
+- Add a Scoop manifest, AUR packages (`latch-remote-bin` from the release
+  binaries, `latch-remote` from the source archive) and a Nix flake that
+  builds Latch from source or packages the release binary. A CI workflow
+  checks them against the published release, and
+  `scripts/bump-packaging.py` updates them after the next one. None is
+  published to a bucket, the AUR or nixpkgs yet.
+- `install-host.ps1` creates the per-user Run key when a Windows profile
+  has none, instead of failing.
+
+### Dependencies
+
+- Upgrade objc2 and AppKit bindings together, x11rb and libloading, preserving
+  macOS integration and Linux X11 abstract-socket connections.
 
 ## 6.0.0 (2026-11-14)
 

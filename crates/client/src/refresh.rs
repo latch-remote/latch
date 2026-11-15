@@ -82,6 +82,47 @@ fn query_child(mut command: std::process::Command, timeout: std::time::Duration)
         .filter(|hz| *hz > 0)
 }
 
+/// `x11rb::connect`, keeping 0.13's attempt at the abstract socket before
+/// the filesystem one. 0.14 dropped it, and an X server reachable only that
+/// way (a container with its own /tmp) would otherwise read as 60 Hz. The
+/// engine's connection does the same (engine::linux::x11::connect_address).
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn connect_x11() -> Option<(x11rb::rust_connection::RustConnection, usize)> {
+    use x11rb::reexports::x11rb_protocol::{parse_display::parse_display, xauth::get_auth};
+    use x11rb::rust_connection::RustConnection;
+    let display = parse_display(None).ok()?;
+    let screen = usize::from(display.screen);
+    let (stream, (family, peer)) = display
+        .connect_instruction()
+        .find_map(|address| connect_address(&address).ok())?;
+    let (name, data) = get_auth(family, &peer, display.display)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let conn = RustConnection::connect_to_stream_with_auth_info(stream, screen, name, data).ok()?;
+    Some((conn, screen))
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn connect_address(
+    address: &x11rb::reexports::x11rb_protocol::parse_display::ConnectAddress<'_>,
+) -> std::io::Result<(
+    x11rb::rust_connection::DefaultStream,
+    (x11rb::reexports::x11rb_protocol::xauth::Family, Vec<u8>),
+)> {
+    use x11rb::rust_connection::DefaultStream;
+    #[cfg(target_os = "linux")]
+    if let x11rb::reexports::x11rb_protocol::parse_display::ConnectAddress::Socket(path) = address {
+        use std::os::linux::net::SocketAddrExt;
+        let stream = std::os::unix::net::SocketAddr::from_abstract_name(path.as_bytes())
+            .and_then(|name| std::os::unix::net::UnixStream::connect_addr(&name));
+        if let Ok(stream) = stream {
+            return DefaultStream::from_unix_stream(stream);
+        }
+    }
+    DefaultStream::connect(address)
+}
+
 #[cfg(any(target_os = "linux", all(test, unix)))]
 fn query_x11() -> Option<u32> {
     use x11rb::{connection::Connection, protocol::randr::ConnectionExt};
@@ -91,7 +132,7 @@ fn query_x11() -> Option<u32> {
     }
     // Connection is initiated by a click on this display. Query in the worker,
     // never in update(): X11 replies can block.
-    let (conn, screen) = x11rb::connect(None).ok()?;
+    let (conn, screen) = connect_x11()?;
     let root = conn.setup().roots.get(screen)?.root;
     let resources = conn
         .randr_get_screen_resources_current(root)
