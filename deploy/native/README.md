@@ -133,15 +133,23 @@ A release binary installed in a user-owned writable directory, such as
 while its local service runs. The updater waits for streams to end, verifies
 the matching public manifest/archive, replaces the resolved binary atomically
 and restarts its service with health-check rollback. A registered user unit
-uses a separate transient systemd user supervisor. Reopen the window after
+uses a separate transient systemd user supervisor. A definitive systemd failure
+rolls back promptly. A supervisor lost before the swap retries with bounded
+back-off. Manifest outages have a separate retry counter, and verified downloads
+reset archive failures. Owned regular updater locks restored with incorrect
+modes are repaired to `0600` through verified descriptors. Reopen the window after
 installation. AUR/Nix and container installs use their deployment tools.
 See [Linux update ownership and recovery](../../docs/USING.md#linux-installation-ownership-and-recovery).
 
 Updater tests use Docker locally and native x64/arm64 Linux CI. No Linux machine outside CI and containers is available for this work. CI covers systemd user-session restart, rollback and killed-supervisor recovery with a fixture service; an installed desktop update remains unverified.
 It also covers a replacement that crashes on start until the start limit, and
 recovery while the service keeps running. The fixture bypasses supervisor argv parsing, self-pinning, installation
-ownership checks and real GitHub manifest fetching. Real GUI reopening and stream
-continuity remain untested.
+ownership checks and real GitHub manifest fetching. The follow-up adds bounded
+assertion diagnostics, an assertion requiring rollback within 15 seconds and a real
+`latch-host --background` startup/status smoke check under systemd with isolated
+settings. The changed systemd cases await CI verification. A full verified update
+of the production executable under systemd remains untested. Real GUI reopening
+and stream continuity remain untested.
 
 `migrate-legacy.sh` is only for upgrades from pre-4.1 BroLink unit names or
 Latch 4's separate engine service. Install the runtime prerequisites and

@@ -306,11 +306,21 @@ fn watch(
     healthy_for: Duration,
     every: Duration,
 ) -> std::result::Result<(), String> {
+    watch_checked(|| Ok(probe()), want, limit, healthy_for, every)
+}
+
+fn watch_checked(
+    mut probe: impl FnMut() -> std::result::Result<Option<String>, String>,
+    want: &str,
+    limit: Duration,
+    healthy_for: Duration,
+    every: Duration,
+) -> std::result::Result<(), String> {
     let start = Instant::now();
     let mut up_since: Option<Instant> = None;
     let mut ever_up = false;
     loop {
-        match probe() {
+        match probe()? {
             Some(v) if v == want => {
                 ever_up = true;
                 if up_since.get_or_insert_with(Instant::now).elapsed() >= healthy_for {

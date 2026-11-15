@@ -231,6 +231,17 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Packaging
 
+- Separate Linux manifest, archive and installation retry back-off so returning
+  online can download a known release at the next ordinary check. Reset archive
+  retries after verified download and preserve bounded retries when a supervisor
+  dies before swapping. Reset legacy shared retry state once on migration.
+  Roll back promptly after a definitive systemd failure, repair user-owned
+  regular lock files to `0600` through verified descriptors, preserve original
+  launch errors and share transfer-rate accounting across redirects.
+  Add bounded diagnostics for fixture assertions, a 15-second rollback assertion
+  and a real `latch-host` systemd startup/status smoke check. The changed real
+  systemd cases await CI verification.
+
 - Add verified Linux self-updates for user-owned release binaries, with
   architecture selection, private same-filesystem staging, atomic replacement,
   service restart and post-update health rollback. Keep package-manager,

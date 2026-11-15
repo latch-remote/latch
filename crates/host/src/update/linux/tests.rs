@@ -189,6 +189,9 @@ impl UnitState {
     }
 }
 
+const DIAGNOSTIC_PROPERTIES: &str =
+    "--property=LoadState,ActiveState,SubState,Result,MainPID,NRestarts,ExecMainStatus,Job";
+
 fn systemd_diagnostics() {
     if std::env::var_os("LATCH_SYSTEMD_FIXTURE").is_none() {
         return;
@@ -201,8 +204,12 @@ fn systemd_diagnostics() {
             "health.log",
             "monitor-started",
         ] {
-            match fs::read_to_string(root.join(name)) {
-                Ok(text) => {
+            use std::io::Read;
+            let mut text = String::new();
+            match fs::File::open(root.join(name))
+                .and_then(|file| file.take(64 * 1024).read_to_string(&mut text))
+            {
+                Ok(_) => {
                     eprintln!("fixture {name}\n{text}");
                     if name == "linux-update.json" {
                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -218,7 +225,10 @@ fn systemd_diagnostics() {
     }
     for unit in units {
         for (program, args) in [
-            ("systemctl", vec!["--user", "show", "--all", unit.as_str()]),
+            (
+                "systemctl",
+                vec!["--user", "show", DIAGNOSTIC_PROPERTIES, unit.as_str()],
+            ),
             (
                 "journalctl",
                 vec![
@@ -232,12 +242,16 @@ fn systemd_diagnostics() {
             ),
         ] {
             match Command::new(program).args(&args).output() {
-                Ok(output) => eprintln!(
-                    "{program} {args:?} ({})\n{}\n{}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ),
+                Ok(mut output) => {
+                    output.stdout.truncate(64 * 1024);
+                    output.stderr.truncate(64 * 1024);
+                    eprintln!(
+                        "{program} {args:?} ({})\n{}\n{}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                }
                 Err(error) => eprintln!("{program} {args:?}: {error}"),
             }
         }
@@ -348,6 +362,7 @@ fn systemd_fixture_session() {
         exe.display(), dir.display(), std::env::current_exe().unwrap().display(), dir.join("health.log").display()
     )).unwrap();
     let _unit = FixtureUnit { unit };
+    let _diagnostics = FixtureDiagnostics;
     assert!(Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status()
@@ -437,6 +452,7 @@ fn systemd_fixture_session() {
                 restart().unwrap();
             }
         }
+        let crash_started = Instant::now();
         if scenario == "crash-on-start" {
             wait_for("replacement activation before fixture crash", || {
                 let current = linux::UpdateState::load(&path).unwrap().unwrap();
@@ -525,9 +541,15 @@ fn systemd_fixture_session() {
             })
         });
         if scenario == "crash-on-start" {
+            assert!(
+                crash_started.elapsed() < Duration::from_secs(15),
+                "definitive failure must roll back well before probation expires"
+            );
             assert_eq!(outcome.failure, linux::FailureKind::Installation);
             assert!(
-                outcome.reason.contains("did not answer within 60 s"),
+                outcome
+                    .reason
+                    .contains("replacement latch.service definitively failed"),
                 "{}",
                 outcome.reason
             );
@@ -538,6 +560,7 @@ fn systemd_fixture_session() {
                 "{}",
                 outcome.reason
             );
+            println!("PASS definitive systemd failure rolled back within 15 seconds");
             let restored = UnitState::read().unwrap();
             assert_eq!(restored.result, "success");
             assert_eq!(restored.exit_status, 0);
@@ -931,39 +954,162 @@ fn a_failed_systemd_wait_reports_both_units_and_fixture_history() {
         fs::write(&script, format!("#!/bin/sh\nprintf '%s %s\\n' '{name}' \"$*\" >> \"$LATCH_DATA_DIR/calls\"\nprintf 'ActiveState=failed\\nNRestarts=3\\nfixture journal lines\\n'\n")).unwrap();
         fs::set_permissions(script, fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let output = helper("diagnostic_wait_fixture_entry")
-        .env("LATCH_SYSTEMD_FIXTURE", "1")
-        .env("LATCH_DATA_DIR", root.path())
-        .env("PATH", root.path())
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let calls = fs::read_to_string(root.path().join("calls")).unwrap();
-    for unit in ["latch.service", &state.unit] {
-        assert!(
-            calls.contains(&format!("systemctl --user show --all {unit}")),
-            "{calls}"
-        );
-        assert!(
-            calls.contains(&format!("journalctl --user --unit {unit} --lines=80")),
-            "{calls}"
-        );
-    }
-    let error = String::from_utf8_lossy(&output.stderr);
-    for text in [
-        "ActiveState=failed",
-        "NRestarts=3",
-        "fixture starts.log",
-        "fixture linux-update.json",
-        "injected failed wait",
-    ] {
-        assert!(error.contains(text), "{error}");
+    for scenario in ["wait", "assertion"] {
+        let output = helper("diagnostic_wait_fixture_entry")
+            .env("LATCH_SYSTEMD_FIXTURE", "1")
+            .env("LATCH_DIAGNOSTIC_SCENARIO", scenario)
+            .env("LATCH_DATA_DIR", root.path())
+            .env("PATH", root.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let calls = fs::read_to_string(root.path().join("calls")).unwrap();
+        for unit in ["latch.service", &state.unit] {
+            assert!(
+                calls.contains(&format!(
+                    "systemctl --user show {DIAGNOSTIC_PROPERTIES} {unit}"
+                )),
+                "{calls}"
+            );
+            assert!(
+                calls.contains(&format!("journalctl --user --unit {unit} --lines=80")),
+                "{calls}"
+            );
+        }
+        let error = String::from_utf8_lossy(&output.stderr);
+        for text in [
+            "ActiveState=failed",
+            "NRestarts=3",
+            "fixture starts.log",
+            "fixture linux-update.json",
+            "injected failed",
+        ] {
+            assert!(error.contains(text), "{error}");
+        }
     }
 }
 
 #[test]
 fn diagnostic_wait_fixture_entry() {
     if std::env::var_os("LATCH_SYSTEMD_FIXTURE").is_some() {
+        if std::env::var("LATCH_DIAGNOSTIC_SCENARIO").as_deref() == Ok("assertion") {
+            let _diagnostics = FixtureDiagnostics;
+            assert_eq!(1, 2, "injected failed assertion outside a wait");
+        }
         wait_for("injected failure", || panic!("injected failed wait"));
+    }
+}
+
+#[test]
+fn a_replaced_request_keeps_the_original_launch_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("linux-update.json");
+    let state =
+        linux::UpdateState::request(Path::new("/unused"), &Version::new(999, 0, 0), &[], &path)
+            .unwrap();
+    state.fail_pending(&path, "cancelled").unwrap();
+    let replacement =
+        linux::UpdateState::request(Path::new("/unused"), &Version::new(999, 0, 1), &[], &path)
+            .unwrap();
+    let error = start_with(
+        &mut Command::new(dir.path().join("missing-supervisor")),
+        &state,
+        &path,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("start the independent Linux update process"),
+        "{error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("No such file or directory"),
+        "{error:#}"
+    );
+    let current = linux::UpdateState::load(&path).unwrap().unwrap();
+    assert_eq!(current.unit, replacement.unit);
+    assert_eq!(current.phase, linux::Phase::Pending);
+}
+
+#[test]
+fn only_final_failed_units_abort_probation() {
+    for result in ["exit-code", "start-limit-hit", "oom-kill", "signal"] {
+        let failed =
+            format!("ActiveState=failed\nSubState=failed\nMainPID=0\nJob=\nResult={result}\n");
+        assert!(definitive_failure(&failed)
+            .unwrap()
+            .unwrap()
+            .contains(result));
+        for (from, to) in [
+            ("ActiveState=failed", "ActiveState=activating"),
+            ("SubState=failed", "SubState=auto-restart"),
+            ("SubState=failed", "SubState=auto-restart-queued"),
+            ("Job=\n", "Job=123 /org/freedesktop/systemd1/job/123\n"),
+            ("Job=\n", "Job=0\n"),
+            ("MainPID=0", "MainPID=123"),
+        ] {
+            assert!(definitive_failure(&failed.replace(from, to))
+                .unwrap()
+                .is_none());
+        }
+    }
+    assert!(definitive_failure("ActiveState=failed").is_err());
+}
+
+#[test]
+fn a_definitively_failed_fake_systemd_unit_aborts_probation_promptly() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("systemctl");
+    fs::write(
+        &script,
+        "#!/bin/sh\ncat \"$LATCH_FAILED_PROBATION_ROOT/state\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = helper("failed_probation_fixture_entry")
+        .env("LATCH_FAILED_PROBATION_ROOT", dir.path())
+        .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn failed_probation_fixture_entry() {
+    let Some(root) = std::env::var_os("LATCH_FAILED_PROBATION_ROOT").map(PathBuf::from) else {
+        return;
+    };
+    for result in ["exit-code", "start-limit-hit"] {
+        fs::write(
+            root.join("state"),
+            format!("ActiveState=failed\nSubState=failed\nMainPID=0\nJob=\nResult={result}\n"),
+        )
+        .unwrap();
+        let start = Instant::now();
+        let verdict = watch_replacement(Path::new("/unused"), &Version::new(999, 0, 0), true);
+        assert!(verdict.unwrap_err().to_string().contains(result));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+    for state in [
+        "ActiveState=activating\nSubState=auto-restart\nMainPID=0\nJob=\nResult=exit-code\n",
+        "ActiveState=failed\nSubState=failed\nMainPID=0\nJob=10 /job/10\nResult=exit-code\n",
+    ] {
+        fs::write(root.join("state"), state).unwrap();
+        super::super::watch_checked(
+            || {
+                assert!(service_failure().unwrap().is_none());
+                Ok(Some("999.0.0".into()))
+            },
+            "999.0.0",
+            Duration::from_secs(1),
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+        )
+        .unwrap();
     }
 }

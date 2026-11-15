@@ -435,7 +435,19 @@ const LINUX_RETRY_FILE: &str = "linux-update-retry.toml";
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct LinuxRetry {
+    backoff_version: u32,
     version: Option<Version>,
+    #[serde(flatten)]
+    download: LinuxBackoff,
+    installation: LinuxBackoff,
+    #[serde(skip)]
+    manifest: LinuxBackoff,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct LinuxBackoff {
     attempts: u32,
     retry_at: u64,
 }
@@ -443,14 +455,61 @@ struct LinuxRetry {
 #[cfg(target_os = "linux")]
 impl LinuxRetry {
     fn offer(&mut self, version: &Version, explicit: bool) {
-        if explicit || self.version.as_ref() != Some(version) {
+        self.manifest = LinuxBackoff::default();
+        if explicit || self.version.as_ref() != Some(version) || self.backoff_version != 1 {
             *self = Self {
+                backoff_version: 1,
                 version: Some(version.clone()),
                 ..Self::default()
             };
         }
     }
 
+    fn manifest_failed(&mut self, now: std::time::SystemTime) -> Duration {
+        self.manifest.after_attempt(now).min(CHECK_EVERY)
+    }
+
+    fn after_attempt(&mut self, now: std::time::SystemTime) -> Duration {
+        self.download.after_attempt(now)
+    }
+
+    fn attempted(&mut self, download_failed: bool) -> Duration {
+        let now = std::time::SystemTime::now();
+        let delay = if download_failed {
+            self.after_attempt(now)
+        } else {
+            self.installation.after_attempt(now)
+        };
+        self.persist();
+        delay.max(self.remaining(now))
+    }
+
+    fn remaining(&self, now: std::time::SystemTime) -> Duration {
+        self.download
+            .remaining(now)
+            .max(self.installation.remaining(now))
+    }
+
+    fn downloaded(&mut self) {
+        self.download = LinuxBackoff::default();
+        self.persist();
+    }
+
+    fn succeeded(&mut self) {
+        self.download = LinuxBackoff::default();
+        self.installation = LinuxBackoff::default();
+        self.persist();
+    }
+
+    fn persist(&self) {
+        if let Err(error) = latch_core::config::save(LINUX_RETRY_FILE, self) {
+            tracing::warn!("could not persist Linux update retry back-off: {error:#}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxBackoff {
     fn after_attempt(&mut self, now: std::time::SystemTime) -> Duration {
         self.attempts = self.attempts.saturating_add(1).min(8);
         let delay = RETRY_AFTER
@@ -461,12 +520,6 @@ impl LinuxRetry {
             .unwrap_or_default()
             .as_secs()
             .saturating_add(delay.as_secs());
-        delay
-    }
-
-    fn attempted(&mut self) -> Duration {
-        let delay = self.after_attempt(std::time::SystemTime::now());
-        self.persist();
         delay
     }
 
@@ -481,20 +534,6 @@ impl LinuxRetry {
             Duration::ZERO
         } else {
             Duration::from_secs(seconds)
-        }
-    }
-
-    fn succeeded(&mut self) {
-        if self.attempts != 0 {
-            self.attempts = 0;
-            self.retry_at = 0;
-            self.persist();
-        }
-    }
-
-    fn persist(&self) {
-        if let Err(error) = latch_core::config::save(LINUX_RETRY_FILE, self) {
-            tracing::warn!("could not persist Linux update retry back-off: {error:#}");
         }
     }
 }
@@ -533,13 +572,11 @@ fn spawn_desktop(
                         && observed_success.as_deref() != Some(&outcome.unit)
                     {
                         observed_success = Some(outcome.unit.clone());
-                        if retry.attempts != 0
-                            && runs_at_least(
-                                SocketAddr::from((Ipv4Addr::LOCALHOST, CONTROL_PORT)),
-                                &outcome.version,
-                                Duration::ZERO,
-                            )
-                        {
+                        if runs_at_least(
+                            SocketAddr::from((Ipv4Addr::LOCALHOST, CONTROL_PORT)),
+                            &outcome.version,
+                            Duration::ZERO,
+                        ) {
                             retry.succeeded();
                         }
                     }
@@ -611,7 +648,8 @@ fn spawn_desktop(
                     Err(e) => {
                         #[cfg(target_os = "linux")]
                         {
-                            next = Instant::now() + retry.attempted().min(CHECK_EVERY);
+                            next = Instant::now()
+                                + retry.manifest_failed(std::time::SystemTime::now());
                         }
                         #[cfg(not(target_os = "linux"))]
                         {
@@ -639,6 +677,8 @@ fn spawn_desktop(
                 if !idle {
                     continue;
                 }
+                #[cfg(target_os = "linux")]
+                let mut download_failed = false;
                 let result = (|| -> Result<bool> {
                     #[cfg(target_os = "linux")]
                     {
@@ -696,9 +736,12 @@ fn spawn_desktop(
                         let name = update::linux::asset_name()?;
                         let asset = rel.asset(name).context("Linux release asset")?;
                         let path = updates_dir(rel)?.join(name);
-                        update::linux::download_asset(asset, &path)?;
+                        update::linux::download_asset(asset, &path).inspect_err(|_| {
+                            download_failed = true;
+                        })?;
                         let bytes = std::fs::read(path)?;
                         update::verify_host_asset(rel, &rel.version, &bytes, name)?;
+                        retry.downloaded();
                         bytes
                     };
                     #[cfg(not(target_os = "linux"))]
@@ -722,7 +765,7 @@ fn spawn_desktop(
                     Ok(true) => {
                         #[cfg(target_os = "linux")]
                         {
-                            next = Instant::now() + retry.attempted().min(CHECK_EVERY);
+                            next = Instant::now() + retry.attempted(false).min(CHECK_EVERY);
                         }
                         state.lock().message = format!(
                             "Installing Latch {}. Reopen Latch after the service restarts.",
@@ -760,7 +803,8 @@ fn spawn_desktop(
                         state.lock().message = format!("Could not update this PC: {e:#}");
                         #[cfg(target_os = "linux")]
                         {
-                            next = Instant::now() + retry.attempted().min(CHECK_EVERY);
+                            next =
+                                Instant::now() + retry.attempted(download_failed).min(CHECK_EVERY);
                         }
                         #[cfg(not(target_os = "linux"))]
                         {
@@ -1692,6 +1736,29 @@ mod tests {
         let mut policy = LinuxRetry::default();
         policy.offer(&version, false);
         let mut now = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut legacy: LinuxRetry =
+            toml::from_str("version = '999.0.0'\nattempts = 8\nretry_at = 1086400\n").unwrap();
+        assert!(!legacy.remaining(now).is_zero());
+        legacy.offer(&version, false);
+        assert_eq!(legacy.remaining(now), Duration::ZERO);
+        let offline_until = now + Duration::from_secs(24 * 3600);
+        while now < offline_until {
+            now += policy.manifest_failed(now);
+            assert_eq!(policy.remaining(now), Duration::ZERO);
+        }
+        assert_eq!(policy.manifest.attempts, 8);
+        // The next ordinary successful manifest check admits the known release.
+        policy.offer(&version, false);
+        assert_eq!(policy.remaining(now), Duration::ZERO);
+        let ordinary_check = Instant::now();
+        assert!(update::linux::automatic_update_due(
+            &version,
+            &Version::new(1, 0, 0),
+            None,
+            false,
+            ordinary_check,
+            ordinary_check
+        ));
         for minutes in [15, 30, 60, 120, 240, 480, 960, 1440, 1440] {
             let delay = policy.after_attempt(now);
             assert_eq!(delay, Duration::from_secs(minutes * 60));
@@ -1706,6 +1773,14 @@ mod tests {
             assert_eq!(policy.remaining(now + delay), Duration::ZERO);
             now += delay;
         }
+        policy.downloaded();
+        assert_eq!(policy.remaining(now), Duration::ZERO);
+        assert_eq!(policy.after_attempt(now), RETRY_AFTER);
+        policy.installation.after_attempt(now);
+        policy.installation.after_attempt(now);
+        policy.downloaded();
+        assert_eq!(policy.installation.attempts, 2);
+        assert_eq!(policy.remaining(now), RETRY_AFTER * 2);
         policy.offer(&version, true);
         assert_eq!(policy.remaining(now), Duration::ZERO);
         assert_eq!(policy.after_attempt(now), RETRY_AFTER);
@@ -1714,10 +1789,10 @@ mod tests {
         policy.after_attempt(now);
         policy.succeeded();
         let cleared: LinuxRetry = latch_core::config::try_load(LINUX_RETRY_FILE).unwrap();
-        assert_eq!(cleared.attempts, 0);
+        assert_eq!(cleared.download.attempts, 0);
         assert_eq!(cleared.remaining(now), Duration::ZERO);
         assert_eq!(policy.after_attempt(now), RETRY_AFTER);
-        policy.retry_at = u64::MAX;
+        policy.download.retry_at = u64::MAX;
         assert_eq!(policy.remaining(now), Duration::ZERO);
     }
 
