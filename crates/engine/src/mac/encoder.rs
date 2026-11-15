@@ -448,6 +448,7 @@ impl Encoder {
             fps: 60,
             bitrate_kbps: 20_000,
             codec,
+            display: None,
         };
         let Ok(mut encoder) = Self::new(&config, Depth::Eight) else {
             return false;

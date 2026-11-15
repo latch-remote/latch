@@ -459,6 +459,7 @@ pub fn measure_fps(width: u32, height: u32, budget: Duration) -> u32 {
         fps,
         bitrate_kbps: 20_000,
         codec: Codec::H264Baseline,
+        display: None,
     };
     let Ok(mut pipeline) = SoftwarePipeline::new(pattern, &config) else {
         return 0;
@@ -583,6 +584,7 @@ impl<C: CpuCapture> VideoPipeline for SoftwarePipeline<C> {
         };
         let (name, hardware, codec, _) = &self.describe;
         VideoInfo {
+            captured_display: None,
             color: Default::default(),
             encoder: format!("{name} ({})", self.capture.name()),
             hardware: *hardware,
@@ -900,6 +902,7 @@ mod tests {
                 fps: 100,
                 bitrate_kbps: 1000,
                 codec: Codec::H264Baseline,
+                display: None,
             },
         )
         .unwrap()

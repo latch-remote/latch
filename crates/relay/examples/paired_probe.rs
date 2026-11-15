@@ -1,8 +1,11 @@
 //! Bounded public transport probe. Both roles run here and connect outbound.
-//! Usage: paired_probe HOST SECONDS MBPS FPS [WARMUP_SECONDS]
+//! Usage: paired_probe HOST SECONDS MBPS FPS [WARMUP_SECONDS] [auto|native|websocket] [PROXY_HOST:PORT]
 //! Payloads are synthetic whole frames. Capabilities and keys stay in memory.
 use latch_proto::video::InFrame;
-use latch_relay::{create_grant, Cancel, ClientConfig, Endpoint, Event, SessionKeys, Transport};
+use latch_relay::{
+    create_grant_with_info, Cancel, Carrier, ClientConfig, Endpoint, Event, Lane, ProxyConfig,
+    SessionKeys, Transport,
+};
 use serde_json::json;
 use std::{
     env, io, thread,
@@ -24,7 +27,7 @@ fn pair(
     config: &ClientConfig,
     bytes_per_second: u64,
 ) -> io::Result<(Transport, Transport, Duration)> {
-    let grant = create_grant(config, &Cancel::new())?;
+    let (grant, info) = create_grant_with_info(config, &Cancel::new())?;
     // Renew well inside both finite limits, using a new grant and fresh keys.
     let seconds = (u64::from(grant.host.session_seconds) * 3 / 4)
         .min(grant.host.session_bytes / (3 * bytes_per_second));
@@ -38,6 +41,27 @@ fn pair(
     let viewer = Transport::connect(config.clone(), grant.viewer, keys)?;
     ready(&host)?;
     ready(&viewer)?;
+    println!(
+        "{}",
+        json!({"phase":"connected", "grant_carrier":format!("{:?}", info.carrier), "via_proxy":info.via_proxy})
+    );
+    for transport in [&host, &viewer] {
+        for lane in [Lane::Priority, Lane::Video] {
+            let info = transport
+                .connection_info(lane)
+                .ok_or_else(|| io::Error::other("missing lane diagnostics"))?;
+            if config
+                .carrier
+                .is_some_and(|carrier| carrier != info.carrier)
+            {
+                return Err(io::Error::other("forced carrier did not match lane"));
+            }
+            println!(
+                "{}",
+                json!({"phase":"lane", "lane":format!("{lane:?}"), "carrier":format!("{:?}", info.carrier), "via_proxy":info.via_proxy})
+            );
+        }
+    }
     Ok((host, viewer, Duration::from_secs(seconds)))
 }
 
@@ -100,11 +124,20 @@ fn report(
     *previous = (now, stats.bytes);
 }
 
+fn parse_carrier(value: &str) -> io::Result<Option<Carrier>> {
+    match value {
+        "auto" => Ok(None),
+        "native" => Ok(Some(Carrier::Native)),
+        "websocket" => Ok(Some(Carrier::WebSocket)),
+        _ => Err(invalid("carrier must be auto, native or websocket")),
+    }
+}
+
 fn run() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
-    if !(4..=5).contains(&args.len()) {
+    if !(4..=7).contains(&args.len()) {
         return Err(invalid(
-            "usage: paired_probe HOST SECONDS MBPS FPS [WARMUP_SECONDS]",
+            "usage: paired_probe HOST SECONDS MBPS FPS [WARMUP_SECONDS] [auto|native|websocket] [PROXY_HOST:PORT]",
         ));
     }
     let seconds: u64 = args[1].parse().map_err(|_| invalid("invalid seconds"))?;
@@ -131,7 +164,17 @@ fn run() -> io::Result<()> {
     }
     let size = (bytes_per_second / u64::from(fps)) as usize;
     let warm_size = (size / 4).max(12);
-    let config = ClientConfig::production(Endpoint::new(&args[0], 443)?)?;
+    let mut config = ClientConfig::production(Endpoint::new(&args[0], 443)?)?;
+    config.carrier = parse_carrier(args.get(5).map_or("auto", String::as_str))?;
+    if let Some(proxy) = args.get(6) {
+        let (host, port) = proxy
+            .rsplit_once(':')
+            .ok_or_else(|| invalid("proxy must be HOST:PORT"))?;
+        config.proxy = Some(ProxyConfig::new(
+            host,
+            port.parse().map_err(|_| invalid("invalid proxy port"))?,
+        )?);
+    }
     if !(12..=config.limits.max_frame_bytes).contains(&size) {
         return Err(invalid("frame size exceeds the supported range"));
     }
@@ -294,6 +337,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn carrier_selection() {
+        assert_eq!(parse_carrier("auto").unwrap(), None);
+        assert_eq!(parse_carrier("native").unwrap(), Some(Carrier::Native));
+        assert_eq!(
+            parse_carrier("websocket").unwrap(),
+            Some(Carrier::WebSocket)
+        );
+        assert!(parse_carrier("unknown").is_err());
+    }
     #[test]
     fn bounded_percentiles() {
         assert_eq!(percentile(&mut [], 95), 0);

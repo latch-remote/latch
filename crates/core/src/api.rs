@@ -213,6 +213,14 @@ pub struct Streamer {
     /// from a Latch 4 host; that host needs an update.
     #[serde(default)]
     pub protocol: u32,
+    /// The displays a stream can share (`StreamRequest.display` names one
+    /// by its `id`). Empty from older hosts, which share the one they pick,
+    /// and from a host that could not look.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub displays: Vec<latch_proto::control::HostDisplay>,
+    /// The running capture's display identity, including a missing choice's fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub captured_display: Option<String>,
 }
 
 /// One codec's encoder on a host: the largest picture and the fastest
@@ -296,6 +304,29 @@ mod tests {
         assert!(!s.power_allowed);
         let back: Status = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn an_older_host_lists_no_displays_and_a_new_one_round_trips_them() {
+        let s: Status =
+            serde_json::from_str(r#"{"streamer":{"running":true,"protocol":1}}"#).unwrap();
+        assert_eq!(s.streamer.captured_display, None);
+        assert!(s.streamer.displays.is_empty(), "nothing to choose from");
+        assert!(!serde_json::to_string(&s).unwrap().contains("displays"));
+        let mut s = s;
+        s.streamer.displays = vec![latch_proto::control::HostDisplay {
+            id: "DP-1".into(),
+            name: "DP-1".into(),
+            width: 2560,
+            height: 1440,
+            primary: true,
+            ..Default::default()
+        }];
+        let back: Status = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.streamer.displays, s.streamer.displays);
+        s.streamer.captured_display = Some("fallback-display".into());
+        let back: Status = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.streamer.captured_display, s.streamer.captured_display);
     }
 
     #[test]

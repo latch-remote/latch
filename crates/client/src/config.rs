@@ -351,6 +351,11 @@ pub struct ClientConfig {
     pub github_token: Option<String>,
     /// Keyed by Tailscale node id.
     pub pcs: BTreeMap<String, KnownPc>,
+    /// The display chosen on each machine, by Tailscale node id: the id
+    /// that machine's status listed it by. A machine without an entry
+    /// shares the display it picks itself.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub displays: BTreeMap<String, String>,
 }
 
 impl Default for ClientConfig {
@@ -363,6 +368,7 @@ impl Default for ClientConfig {
             auto_update: true,
             github_token: None,
             pcs: BTreeMap::new(),
+            displays: BTreeMap::new(),
         }
     }
 }
@@ -443,6 +449,21 @@ impl ClientConfig {
         changed!(cmd_is_ctrl);
         changed!(capture_mouse);
         changed!(auto_update);
+        // Per machine, so a choice made in another window for another
+        // machine survives this one's.
+        let ids: std::collections::BTreeSet<&String> = before
+            .displays
+            .keys()
+            .chain(after.displays.keys())
+            .collect();
+        for id in ids {
+            if before.displays.get(id) != after.displays.get(id) {
+                match after.displays.get(id) {
+                    Some(display) => self.displays.insert(id.clone(), display.clone()),
+                    None => self.displays.remove(id),
+                };
+            }
+        }
     }
 
     fn apply_preferences(&mut self, settings: &Self) {
@@ -451,6 +472,7 @@ impl ClientConfig {
         self.cmd_is_ctrl = settings.cmd_is_ctrl;
         self.capture_mouse = settings.capture_mouse;
         self.auto_update = settings.auto_update;
+        self.displays = settings.displays.clone();
     }
 
     /// One read-modify-write of the file, under the process-wide config lock.
@@ -462,7 +484,24 @@ impl ClientConfig {
     /// One still on the tailnet is listed again, unwakeable
     /// until it has been seen online.
     pub fn forget(&mut self, node_id: &str) -> bool {
+        self.displays.remove(node_id);
         self.pcs.remove(node_id).is_some()
+    }
+
+    /// The display chosen on the machine `node_id`, if one was.
+    pub fn display(&self, node_id: &str) -> Option<&str> {
+        self.displays.get(node_id).map(String::as_str)
+    }
+
+    /// Choose `display` on the machine `node_id`; `None` leaves it to the
+    /// machine. Whether that changed anything.
+    pub fn choose_display(&mut self, node_id: &str, display: Option<String>) -> bool {
+        let before = self.displays.get(node_id).cloned();
+        match display.clone() {
+            Some(d) => self.displays.insert(node_id.to_string(), d),
+            None => self.displays.remove(node_id),
+        };
+        before != display
     }
 }
 
@@ -750,6 +789,36 @@ mod tests {
         assert_eq!(again.quality, Quality::Custom);
         let saved = toml::to_string(&ClientConfig::default()).unwrap();
         assert!(saved.contains("version = 2"), "{saved}");
+    }
+
+    #[test]
+    fn a_display_choice_is_kept_per_machine_and_survives_a_reload() {
+        let before = ClientConfig::default();
+        let mut after = before.clone();
+        assert!(after.choose_display("studio", Some("69733382".into())));
+        assert!(!after.choose_display("studio", Some("69733382".into())));
+        // Another window chose for another machine meanwhile.
+        let mut disk = before.clone();
+        disk.choose_display("attic", Some(r"\\.\DISPLAY2".into()));
+        disk.apply_changes(&before, &after);
+        let saved = toml::to_string(&disk).unwrap();
+        let back: ClientConfig = toml::from_str(&saved).unwrap();
+        assert_eq!(back.display("studio"), Some("69733382"));
+        assert_eq!(back.display("attic"), Some(r"\\.\DISPLAY2"));
+        assert_eq!(back.display("harbor"), None);
+        // Back to automatic: the entry goes, and only that one.
+        let mut auto = after.clone();
+        assert!(auto.choose_display("studio", None));
+        disk.apply_changes(&after, &auto);
+        assert_eq!(disk.display("studio"), None);
+        assert_eq!(disk.display("attic"), Some(r"\\.\DISPLAY2"));
+        // Forgetting a machine forgets its choice too.
+        disk.forget("attic");
+        assert!(disk.displays.is_empty());
+        // A file from before has none, and writes none.
+        let old: ClientConfig = toml::from_str("[stream]\nfps = 90\n").unwrap();
+        assert!(old.displays.is_empty());
+        assert!(!toml::to_string(&old).unwrap().contains("displays"));
     }
 
     #[test]

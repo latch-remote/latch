@@ -29,6 +29,7 @@ fn main() -> anyhow::Result<()> {
             Some("baseline") => Codec::H264Baseline,
             _ => Codec::H264High,
         },
+        display: None,
     };
     struct Restore(Option<latch_engine::display::Previous>);
     impl Drop for Restore {
@@ -44,6 +45,7 @@ fn main() -> anyhow::Result<()> {
         config.width,
         config.height,
         config.fps,
+        None,
     )?);
     let mut pipeline = latch_engine::windows::open_video(&config)?;
     eprintln!("{:?}", pipeline.info());
