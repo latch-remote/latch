@@ -395,23 +395,6 @@ fn hex(bytes: &[u8]) -> String {
 /// GET an approved public HTTPS URL. Redirects are checked at every hop and
 /// legacy token arguments are ignored, including on the first request.
 pub fn fetch(url: &str, token: Option<&str>, accept: &str, sink: &mut dyn Write) -> Result<u16> {
-    #[cfg(target_os = "linux")]
-    {
-        let started = std::time::Instant::now();
-        fetch_with(url, token, accept, sink, |host| {
-            Ok(linux::TimedIo {
-                inner: connect(host)?,
-                started,
-                read: 0,
-                minimum: if accept == "application/json" {
-                    128
-                } else {
-                    32 * 1024
-                },
-            })
-        })
-    }
-    #[cfg(not(target_os = "linux"))]
     fetch_with(url, token, accept, sink, connect)
 }
 
@@ -493,6 +476,13 @@ fn split_url(url: &str) -> Result<(String, String)> {
 }
 
 fn connect(host: &str) -> Result<impl Read + Write> {
+    connect_with(host, |tcp| tcp)
+}
+
+fn connect_with<S: Read + Write>(
+    host: &str,
+    wrap: impl FnOnce(std::net::TcpStream) -> S,
+) -> Result<rustls::StreamOwned<rustls::ClientConnection, S>> {
     let config = tls_config()?;
     let tcp = crate::http::connect((host, 443u16), TIMEOUT)
         .with_context(|| format!("connect to {host}"))?;
@@ -500,16 +490,9 @@ fn connect(host: &str) -> Result<impl Read + Write> {
         .map_err(crate::http::io_err)?;
     tcp.set_write_timeout(Some(TIMEOUT))
         .map_err(crate::http::io_err)?;
-    #[cfg(target_os = "linux")]
-    let tcp = linux::TimedIo {
-        inner: tcp,
-        started: std::time::Instant::now(),
-        read: 0,
-        minimum: 128,
-    };
     let name = rustls::pki_types::ServerName::try_from(host.to_string())?;
     let conn = rustls::ClientConnection::new(config, name)?;
-    Ok(rustls::StreamOwned::new(conn, tcp))
+    Ok(rustls::StreamOwned::new(conn, wrap(tcp)))
 }
 
 // Matches Graviola 0.4.2's mandatory features before it can assert/abort.

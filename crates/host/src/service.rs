@@ -89,6 +89,8 @@ pub struct Service {
     nat: Mutex<Option<NatReport>>,
     nat_running: AtomicBool,
     update_running: Arc<AtomicBool>,
+    #[cfg(target_os = "linux")]
+    update_issues: Arc<Mutex<Vec<String>>>,
     admission: Arc<Mutex<()>>,
     power_pending: Arc<AtomicBool>,
 }
@@ -139,6 +141,8 @@ impl Service {
             nat: Mutex::new(None),
             nat_running: AtomicBool::new(false),
             update_running: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "linux")]
+            update_issues: Arc::new(Mutex::new(Vec::new())),
             admission: Arc::new(Mutex::new(())),
             power_pending: Arc::new(AtomicBool::new(false)),
         }
@@ -207,6 +211,18 @@ impl Service {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn record_linux_update_issue(&self, result: Result<()>) {
+        if let Err(error) = result {
+            let problem = format!("Linux updater maintenance failed: {error:#}");
+            self.log(&problem);
+            let mut issues = self.update_issues.lock();
+            if !issues.contains(&problem) {
+                issues.push(problem);
+            }
+        }
+    }
+
     pub fn run_arc(self, replacing: bool) -> Result<()> {
         Arc::new(self).run(replacing)
     }
@@ -218,13 +234,21 @@ impl Service {
     pub fn run(self: Arc<Self>, replacing: bool) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
-            update::linux::reconcile()?;
-            if let Ok(exe) = std::env::current_exe().and_then(|p| p.canonicalize()) {
-                latch_core::update::linux::cleanup(&exe, std::time::SystemTime::now())?;
+            self.record_linux_update_issue(update::linux::reconcile().map(|_| ()));
+            match std::env::current_exe()
+                .context("locate Linux installation")
+                .and_then(|exe| exe.canonicalize().context("resolve Linux installation"))
+            {
+                Ok(exe) => {
+                    let now = std::time::SystemTime::now();
+                    self.record_linux_update_issue(latch_core::update::linux::cleanup(&exe, now));
+                    self.record_linux_update_issue(latch_core::config::data_dir().and_then(
+                        |data| latch_core::update::linux::cleanup_uploads(&exe, &data, now),
+                    ));
+                }
+                Err(error) => self.record_linux_update_issue(Err(error)),
             }
-            // New services accept streams during probation, as on Windows.
-            // Continue recovery monitoring if their supervisor subsequently dies.
-            update::linux::monitor(self.update_running.clone());
+            update::linux::monitor(self.update_running.clone(), self.update_issues.clone());
         }
         if !starts_with_window(&self.cfg.lock()) {
             // A Mac that is only a viewer: an older window (or anything else)
@@ -557,6 +581,8 @@ impl Service {
         }) {
             setup.push("Tagged organisation host: set allowed_logins in host.toml. An email domain does not prove membership; remote control is refused until configured.".into());
         }
+        #[cfg(target_os = "linux")]
+        setup.extend(self.update_issues.lock().iter().cloned());
         #[cfg(target_os = "linux")]
         if let Ok(Some(state)) = latch_core::update::linux::state_path()
             .and_then(|path| latch_core::update::linux::UpdateState::load(&path))
@@ -1031,7 +1057,8 @@ impl Service {
                 "a stream is running; the update is retried after it ends"
             );
             let version = install(req)?;
-            update::linux::monitor(self.update_running.clone());
+            self.update_issues.lock().clear();
+            update::linux::monitor(self.update_running.clone(), self.update_issues.clone());
             self.log(format!(
                 "installing Linux Latch {version}, requested by {from}"
             ));
@@ -2221,13 +2248,27 @@ mod tests {
     #[test]
     fn a_supervisor_start_failure_clears_busy_and_reaches_the_caller() {
         let svc = Service::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("linux-update.json");
+        let state = latch_core::update::linux::UpdateState::request(
+            std::path::Path::new("/unused"),
+            &semver::Version::new(999, 0, 0),
+            &[],
+            &path,
+        )
+        .unwrap();
         let response = svc.update_linux_with(LOOPBACK, &Request::default(), |_| {
-            anyhow::bail!("systemd update supervisor executable could not start")
+            update::linux::start_with(
+                &mut std::process::Command::new(dir.path().join("missing-supervisor")),
+                &state,
+                &path,
+            )
+            .map(|()| state.version.clone())
         });
         assert_eq!(response.status, 400);
         assert!(response
             .body
-            .contains("supervisor executable could not start"));
+            .contains("start the independent Linux update process"));
         assert!(!svc.update_running.load(Ordering::Acquire));
     }
 

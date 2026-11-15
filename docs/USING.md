@@ -397,9 +397,11 @@ For a user-owned release, the service authenticates the archive using its
 own version-specific public manifest and the shared version, size and SHA-256
 checks. Its separate supervisor fetches that manifest independently, copies the
 private upload into a `0700` sibling directory and re-hashes it against the
-manifest. The archive is downloaded once. Linux transfers have a 120-second
-budget, a 30-second socket timeout, and a minimum average rate after 30 seconds
-(32 KiB/s for archives, 128 B/s for manifests). Only the selected binary member is
+manifest. The archive is downloaded once. Linux self-update archive and manifest
+transfers have a size-derived deadline of expected bytes / 32 KiB/s + 60 seconds,
+a 30-second socket timeout, and a 32 KiB/s minimum average rate after 30 seconds.
+Manifests use a 1 MiB size allowance. The underlying TLS transport additionally
+checks a 128 B/s floor. Other downloads retain their existing transport behavior. Only the selected binary member is
 written, initially `0600`. After digest and ELF architecture verification,
 it becomes `0755` and must report the exact release version with `--version`.
 The updater holds an exclusive file lock, hard-links the old executable for
@@ -408,10 +410,11 @@ recovery and atomically renames the new executable over the install path.
 The supervisor starts in its own transient systemd user unit, without a
 `systemd-run --wait` client inside `latch.service`. The service waits for a
 fsynced supervisor-start acknowledgement before accepting the request. The
-unit has a 240-second runtime limit. A working user manager and Linux 5.3+
-(`pidfd_open`) are checked before offering or downloading an update. An
-unsupervised service uses a separate supervisor process and a pinned process
-handle for its handover, preserving the service's session environment.
+unit has a 240-second runtime limit. Linux 5.3+ (`pidfd_open`) is checked before
+offering or downloading an update. Systemd-supervised services also require a
+working user manager. An unsupervised service uses a separate supervisor
+process and a pinned process handle for its handover, preserving the service's
+session environment, without requiring a systemd user manager.
 
 The new service must report the expected version continuously for 15 seconds
 within 60 seconds. Its systemd MainPID, executable inode and ownership of the
@@ -420,16 +423,25 @@ A restart or health failure restores the previous binary and restarts it.
 The fsynced `linux-update.json` journal records progress, inode identities,
 staging location and outcome. On startup, a service detects an unfinished
 update whose supervisor died and restores the previous inode deterministically.
-A running service also monitors for this failure. If restoration itself fails,
-the journal and recovery copy remain for another recovery attempt.
+A running service also monitors for this failure. The fixture exercises both
+startup recovery and recovery while the service keeps running. If restoration
+itself fails, the update becomes terminal Failed with the recovery copy retained
+and its path reported. The next update can proceed. A journal flock and phase
+compare-and-set serialize writers. Unsafe or unparsable journals are moved aside
+with at most three diagnostic copies. Unknown fields and missing fields are
+tolerated, and unknown phases become terminal failures. Maintenance failures
+appear in service setup/status and logs while the service continues starting.
 
-The window reads the local service version before downloading. A failed
-version and its reason persist in the journal, suppressing automatic retries
-until a newer release appears. **Check now** or `latch-host --self-update`
+The window reads the local service version before downloading. Supervisor
+installation and recovery failures persist with their reason and suppress only
+the exact failed version. A newer release remains eligible. Transport failures
+retain the 15-minute retry back-off without persistent release suppression. **Check now** or `latch-host --self-update`
 explicitly retries it. The window, service status and CLI report the outcome.
 Reopen the window after a successful update. Locks live in the data directory.
 At startup, cleanup checks directory names, ownership, private permissions,
-installation markers and age before removing abandoned staging directories.
+installation markers and age before removing abandoned staging directories
+and private upload directories older than a day that no live journal references.
+Legacy private upload files use their filename, ownership, permissions and age.
 Recovery copies remain until the journal proves they can be discarded. Old
 empty updater lock files beside the binary are removed only when owned,
 private, at least one day old and unlocked.
@@ -438,7 +450,9 @@ Streams accepted during the health window can be cut off by a rollback, as on
 Windows. This remains a follow-up. Toolbox/distrobox installs remain refused
 through their container markers. Snap uses `snap refresh`, the native kit
 requires rerunning its installer, and AppImages are refused even with
-`--appimage-extract-and-run` through the `APPIMAGE` environment marker.
+`--appimage-extract-and-run` when `APPIMAGE` is set and the executable lives
+under `APPDIR`. Snap environment detection likewise requires the executable
+under `SNAP`, so a native install launched from a packaged terminal remains eligible.
 
 The authenticated `/v1/update` endpoint accepts a Linux host's matching
 release tarball with the existing version and digest headers. Automatic
@@ -450,13 +464,15 @@ required for local Linux updates.
 Linux updater validation uses local HTTP manifest/artifact fixtures and
 compiled ELF programs on native x64 and arm64 CI. Local development uses
 Docker with Ubuntu 24.04/glibc 2.39. No Linux machine outside CI and containers is available for
-this work. Treat restart and rollback under a real systemd user session as
-untested until the `Linux updater systemd` CI job for the commit passes. That test installs a fixture
-`latch.service`, launches its real supervisor from the service control group,
-and checks successful probation, wrong-version rollback and recovery after
-killing the supervisor following the swap. Real GUI reopening and stream
-continuity across an update remain untested because no Linux desktop machine
-was available.
+this work. The `Linux updater systemd` CI jobs pass on x64 and arm64 Ubuntu 24.04 runners. They install a fixture `latch.service`, launch the real supervisor from its control group, and check successful probation, wrong-version rollback and rollback after the supervisor is killed following the swap.
+They also exercise a replacement that crashes on start, including the start
+limit and `reset-failed`, and monitor recovery while the service keeps running.
+The test is ignored during ordinary test runs and requires explicit opt-in
+through the dedicated script, which refuses an existing `latch.service`.
+The fixture bypasses supervisor argv parsing, self-pinning, installation ownership
+checks and real GitHub manifest fetching. The real `latch-host` binary under
+systemd is untested. Real GUI reopening and stream continuity across an update
+remain untested because no Linux desktop machine was available.
 
 ### Moving from 5.x to 6.0.0
 

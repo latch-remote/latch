@@ -11,7 +11,7 @@ use std::time::Duration;
 pub fn request_update() -> Result<()> {
     let exe = std::env::current_exe()?;
     linux::owned(&exe)?;
-    let release = update::latest(None)?;
+    let release = linux::latest()?;
     if !release.is_newer_than(&update::current()) {
         println!("Latch {} is up to date", update::current());
         return Ok(());
@@ -81,7 +81,7 @@ pub fn authenticate(req: &latch_core::http::Request, exe: &Path) -> Result<Versi
         update::sha256_hex(&req.body).eq_ignore_ascii_case(sha),
         "upload SHA-256 mismatch"
     );
-    let release = update::for_version(&version, None)?;
+    let release = linux::for_version(&version)?;
     let asset = release
         .asset(linux::asset_name()?)
         .context("Linux release asset")?;
@@ -107,9 +107,23 @@ pub fn start(exe: &Path, version: &Version, body: &[u8]) -> Result<()> {
     if state.systemd {
         command.arg("--linux-update-systemd");
     }
-    let result = launch(&mut command, &state, &path);
-    if let Err(e) = &result {
-        state.finish(&path, &Err(anyhow::anyhow!("{e:#}")))?;
+    start_with(&mut command, &state, &path)
+}
+
+pub(crate) fn start_with(
+    command: &mut Command,
+    state: &linux::UpdateState,
+    path: &Path,
+) -> Result<()> {
+    let result = launch(command, state, path);
+    if let Err(error) = &result {
+        if !state.fail_pending(path, &format!("{error:#}"))? {
+            let current = linux::UpdateState::load(path)?.context("missing startup outcome")?;
+            if current.unit == state.unit && current.alive() && !current.terminal() {
+                return Ok(());
+            }
+            anyhow::bail!("{}", current.reason);
+        }
     }
     result
 }
@@ -212,6 +226,9 @@ fn unit_active(unit: &str) -> Result<bool> {
 /// launch failures even before a PID is recorded.
 pub fn reconcile() -> Result<Option<linux::UpdateState>> {
     let path = linux::state_path()?;
+    if let Some(problem) = linux::UpdateState::repair(&path)? {
+        anyhow::bail!("{problem}");
+    }
     let Some(mut state) = linux::UpdateState::load(&path)? else {
         return Ok(None);
     };
@@ -240,8 +257,6 @@ pub fn reconcile() -> Result<Option<linux::UpdateState>> {
                 return Ok(Some(state));
             }
             Err(e) => {
-                state.reason = format!("Linux update recovery failed: {e:#}");
-                state.save(&path)?;
                 return Err(e);
             }
         };
@@ -266,7 +281,10 @@ pub fn reconcile() -> Result<Option<linux::UpdateState>> {
     Ok(Some(state))
 }
 
-pub fn monitor(running: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+pub fn monitor(
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    issues: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+) {
     std::thread::spawn(move || loop {
         match reconcile() {
             Ok(Some(state)) if !state.terminal() => (),
@@ -275,7 +293,12 @@ pub fn monitor(running: std::sync::Arc<std::sync::atomic::AtomicBool>) {
                 break;
             }
             Err(e) => {
-                tracing::error!("Linux update recovery failed: {e:#}");
+                let problem = format!("Linux update recovery failed: {e:#}");
+                tracing::error!("{problem}");
+                let mut messages = issues.lock();
+                if !messages.contains(&problem) {
+                    messages.push(problem);
+                }
                 running.store(false, std::sync::atomic::Ordering::Release);
                 break;
             }
@@ -290,14 +313,14 @@ pub fn supervise(exe: &Path, old_pid: u32, version: &Version, systemd: bool) -> 
         // Reject delayed helpers running a different installed inode.
         drop(linux::Process::open(std::process::id(), &exe)?);
         supervise_with(&exe, old_pid, version, systemd, || {
-            update::for_version(version, None)
+            linux::for_version(version)
         })
     })();
     if result.is_err() {
         let path = linux::state_path()?;
         if let Some(mut state) = linux::UpdateState::load(&path)? {
             if state.phase == linux::Phase::Pending && state.version == *version {
-                state.finish(&path, &result)?;
+                state.finish(&path, &result, linux::FailureKind::Installation)?;
             }
         }
     }
@@ -322,13 +345,17 @@ fn supervise_with(
     state.phase = linux::Phase::Started;
     state.reason = "Verifying Linux update".into();
     state.save(&path)?;
+    let mut failure = linux::FailureKind::Installation;
     let result = (|| -> Result<()> {
         let mut transaction = linux::Transaction::begin(exe)?;
         transaction.record(&path, &mut state)?;
         let process = linux::Process::open(old_pid, exe)?;
         // The supervisor obtains its own pinned manifest and re-hashes the
         // private upload. The service's digest decision is never trusted.
-        transaction.prepare_uploaded(&manifest()?, &state.upload)?;
+        let release = manifest().inspect_err(|_| {
+            failure = linux::FailureKind::Transient;
+        })?;
+        transaction.prepare_uploaded(&release, &state.upload)?;
         let mut child: Option<Child> = None;
         transaction.install(
             || {
@@ -353,14 +380,14 @@ fn supervise_with(
                         let pid = if systemd {
                             main_pid().ok()?
                         } else {
-                            // The replacement must be the process serving the port.
-                            // /proc selection also covers direct --background starts.
                             linux::listener_pid(exe, latch_core::CONTROL_PORT).ok()?
                         };
-                        linux::owns_listener(pid, exe, latch_core::CONTROL_PORT).ok()?;
-                        let version = super::answering_version()?;
-                        linux::owns_listener(pid, exe, latch_core::CONTROL_PORT).ok()?;
-                        Some(version)
+                        answering_process(
+                            pid,
+                            exe,
+                            latch_core::CONTROL_PORT,
+                            super::answering_version,
+                        )
                     },
                     &version.to_string(),
                     super::PROBATION,
@@ -384,10 +411,22 @@ fn supervise_with(
             );
             current.save(&path)?;
         } else {
-            current.finish(&path, &result)?;
+            current.finish(&path, &result, failure)?;
         }
     }
     result
+}
+
+fn answering_process(
+    pid: u32,
+    exe: &Path,
+    port: u16,
+    response: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    linux::owns_listener(pid, exe, port).ok()?;
+    let version = response()?;
+    linux::owns_listener(pid, exe, port).ok()?;
+    Some(version)
 }
 
 fn restart() -> Result<()> {

@@ -472,7 +472,11 @@ fn spawn_desktop(
                     explicit = state.lock().check_now;
                 }
                 state.lock().check_now = false;
-                match update::latest(None) {
+                #[cfg(target_os = "linux")]
+                let latest = update::linux::latest();
+                #[cfg(not(target_os = "linux"))]
+                let latest = update::latest(None);
+                match latest {
                     Ok(rel) => {
                         next = Instant::now() + CHECK_EVERY;
                         #[cfg(target_os = "linux")]
@@ -618,29 +622,6 @@ fn spawn_desktop(
                         pending = None;
                     }
                     Err(e) => {
-                        #[cfg(target_os = "linux")]
-                        if !is_deferred(&e) {
-                            let saved = (|| -> Result<()> {
-                                let path = update::linux::state_path()?;
-                                let previous = update::linux::UpdateState::load(&path)?;
-                                if previous
-                                    .as_ref()
-                                    .is_none_or(|s| s.terminal() && s.version != rel.version)
-                                {
-                                    let mut failure = update::linux::UpdateState::request(
-                                        &std::env::current_exe()?.canonicalize()?,
-                                        &rel.version,
-                                        &[],
-                                        &path,
-                                    )?;
-                                    failure.finish(&path, &Err(anyhow!("{e:#}")))?;
-                                }
-                                Ok(())
-                            })();
-                            if let Err(why) = saved {
-                                tracing::error!("could not persist failed Linux update: {why:#}");
-                            }
-                        }
                         state.lock().message = format!("Could not update this PC: {e:#}");
                         next = Instant::now() + RETRY_AFTER;
                         pending = None;

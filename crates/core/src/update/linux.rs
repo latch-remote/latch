@@ -82,15 +82,12 @@ fn managed(path: &Path, f: Ownership) -> Option<Managed> {
 /// Resolve symlinks before checking ownership, package registration and the
 /// backing filesystem. Replacement always targets that resolved file.
 pub fn installation(path: &Path) -> Result<std::result::Result<PathBuf, Managed>> {
-    if std::env::var_os("SNAP").is_some() {
-        return Ok(Err(Managed::Snap));
-    }
-    if std::env::var_os("APPIMAGE").is_some() {
-        return Ok(Err(Managed::AppImage));
-    }
     let exe = path
         .canonicalize()
         .context("resolve the installed executable")?;
+    if let Some(reason) = packaged_environment(&exe) {
+        return Ok(Err(reason));
+    }
     let parent = exe.parent().context("executable has no parent")?;
     let meta = fs::metadata(&exe)?;
     let dir = fs::metadata(parent)?;
@@ -131,26 +128,55 @@ pub fn installation(path: &Path) -> Result<std::result::Result<PathBuf, Managed>
 
 /// Probe the actual syscall and user manager before offering or downloading.
 pub fn prerequisites() -> std::result::Result<(), Managed> {
+    prerequisites_for(supervised())
+}
+
+pub fn prerequisites_for(systemd: bool) -> std::result::Result<(), Managed> {
     use std::os::fd::FromRawFd;
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
     if fd < 0 {
         return Err(Managed::Kernel);
     }
     drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) });
-    if !Command::new("systemd-run")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-        || !Command::new("systemctl")
-            .args(["--user", "show-environment"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+    if systemd
+        && (!Command::new("systemd-run")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+            || !Command::new("systemctl")
+                .args(["--user", "show-environment"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success()))
     {
         return Err(Managed::UserManager);
     }
     Ok(())
+}
+
+/// The same cgroup test used by the host, available before a download offer.
+pub fn supervised() -> bool {
+    fs::read_to_string("/proc/self/cgroup").is_ok_and(|text| {
+        text.lines()
+            .filter_map(|line| line.splitn(3, ':').nth(2))
+            .any(|path| path.split('/').any(|part| part == "latch.service"))
+    })
+}
+
+fn packaged_environment(exe: &Path) -> Option<Managed> {
+    let under = |name| {
+        std::env::var_os(name)
+            .and_then(|root| PathBuf::from(root).canonicalize().ok())
+            .is_some_and(|root| exe.starts_with(root))
+    };
+    if under("SNAP") {
+        Some(Managed::Snap)
+    } else if std::env::var_os("APPIMAGE").is_some() && under("APPDIR") {
+        Some(Managed::AppImage)
+    } else {
+        None
+    }
 }
 
 fn container_install(root: &Path, image: bool, environment: bool) -> bool {
@@ -210,22 +236,26 @@ pub fn download_release(release: &Release) -> Result<Vec<u8>> {
     let asset = release
         .asset(asset_name()?)
         .context("Linux release asset")?;
-    super::download(asset, None, &path)?;
+    download_asset(asset, &path)?;
     fs::read(path).context("read the verified Linux archive")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Phase {
     Pending,
     Started,
     Swapping,
     Restoring,
     Succeeded,
+    #[default]
     Failed,
+    #[serde(other)]
+    Unknown,
 }
 
 /// The fsynced journal is also the persistent automatic-retry suppression record.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct UpdateState {
     pub version: semver::Version,
     pub exe: PathBuf,
@@ -239,6 +269,75 @@ pub struct UpdateState {
     pub stage: Option<PathBuf>,
     pub original: Option<(u64, u64)>,
     pub replacement: Option<(u64, u64)>,
+    pub failure: FailureKind,
+    pub preserve_recovery: bool,
+    revision: u64,
+    #[serde(skip)]
+    observed_phase: Phase,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FailureKind {
+    #[default]
+    Transient,
+    Installation,
+    Recovery,
+    #[serde(other)]
+    Unknown,
+}
+
+impl Default for UpdateState {
+    fn default() -> Self {
+        Self {
+            version: semver::Version::new(0, 0, 0),
+            exe: PathBuf::new(),
+            phase: Phase::Failed,
+            reason: "Incomplete Linux update journal".into(),
+            supervisor: 0,
+            supervisor_start: None,
+            unit: String::new(),
+            systemd: false,
+            upload: PathBuf::new(),
+            stage: None,
+            original: None,
+            replacement: None,
+            failure: FailureKind::Transient,
+            preserve_recovery: true,
+            revision: 0,
+            observed_phase: Phase::Failed,
+        }
+    }
+}
+
+/// Every read-modify-write shares this stable inode. A generation, revision and
+/// expected phase prevent a delayed process from reviving a terminal request.
+struct JournalLock {
+    _lock: UpdateLock,
+}
+impl JournalLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let parent = path.parent().context("journal directory")?;
+        fs::create_dir_all(parent)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path.with_extension("json.lock"))?;
+        let meta = file.metadata()?;
+        ensure!(
+            meta.is_file() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0,
+            "unsafe Linux update journal lock"
+        );
+        ensure!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0,
+            "lock Linux update journal"
+        );
+        Ok(Self {
+            _lock: UpdateLock(file),
+        })
+    }
 }
 
 pub fn state_path() -> Result<PathBuf> {
@@ -262,18 +361,34 @@ impl UpdateState {
         body: &[u8],
         path: &Path,
     ) -> Result<Self> {
-        if let Some(previous) = Self::load(path)? {
+        let _journal = JournalLock::acquire(path)?;
+        if let Some(previous) = Self::load_unlocked(path)? {
             ensure!(previous.terminal(), "another Linux update is unfinished");
         }
         let parent = path.parent().context("update data directory")?;
         fs::create_dir_all(parent)?;
-        let mut upload = tempfile::Builder::new()
+        let upload_dir = tempfile::Builder::new()
             .prefix("linux-update-upload-")
-            .tempfile_in(parent)?;
-        upload.write_all(body)?;
-        upload.as_file().sync_all()?;
-        let (_, upload) = upload.keep()?;
-        let state = Self {
+            .tempdir_in(parent)?;
+        fs::set_permissions(upload_dir.path(), fs::Permissions::from_mode(0o700))?;
+        let upload = upload_dir.path().join("archive");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&upload)?;
+        file.write_all(body)?;
+        file.sync_all()?;
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(upload_dir.path().join("owner"))?;
+        marker.write_all(exe.as_os_str().as_encoded_bytes())?;
+        marker.sync_all()?;
+        File::open(upload_dir.path())?.sync_all()?;
+        File::open(parent)?.sync_all()?;
+        let mut state = Self {
             version: version.clone(),
             exe: exe.into(),
             phase: Phase::Pending,
@@ -283,20 +398,32 @@ impl UpdateState {
             unit: format!(
                 "latch-update-{}-{}",
                 std::process::id(),
-                upload.file_name().context("upload name")?.to_string_lossy()
+                upload_dir
+                    .path()
+                    .file_name()
+                    .context("upload name")?
+                    .to_string_lossy()
             ),
             upload,
             systemd: false,
             stage: None,
             original: None,
             replacement: None,
+            failure: FailureKind::Transient,
+            preserve_recovery: false,
+            revision: 0,
+            observed_phase: Phase::Pending,
         };
-        state.save(path)?;
+        state.write_unlocked(path)?;
+        let _ = upload_dir.keep();
         Ok(state)
     }
 
     pub fn terminal(&self) -> bool {
-        matches!(self.phase, Phase::Succeeded | Phase::Failed)
+        matches!(
+            self.phase,
+            Phase::Succeeded | Phase::Failed | Phase::Unknown
+        )
     }
 
     pub fn alive(&self) -> bool {
@@ -304,6 +431,15 @@ impl UpdateState {
     }
 
     pub fn load(path: &Path) -> Result<Option<Self>> {
+        let _journal = JournalLock::acquire(path)?;
+        Self::load_unlocked(path)
+    }
+
+    fn load_unlocked(path: &Path) -> Result<Option<Self>> {
+        Self::load_for_uid(path, unsafe { libc::geteuid() })
+    }
+
+    fn load_for_uid(path: &Path, uid: u32) -> Result<Option<Self>> {
         let file = match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -315,24 +451,95 @@ impl UpdateState {
         };
         let meta = file.metadata()?;
         ensure!(
-            meta.is_file() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0,
+            meta.is_file() && meta.uid() == uid && meta.mode() & 0o077 == 0,
             "unsafe Linux update journal"
         );
-        Ok(Some(serde_json::from_reader(file.take(64 * 1024))?))
+        let value: serde_json::Value = serde_json::from_reader(file.take(64 * 1024))?;
+        let mut state: Self = serde_json::from_value(value.clone())?;
+        state.observed_phase = state.phase;
+        if state.phase == Phase::Unknown || !state.exe.is_absolute() || state.unit.is_empty() {
+            state.phase = Phase::Failed;
+            state.failure = FailureKind::Recovery;
+            state.preserve_recovery = true;
+            state.reason = format!(
+                "Unsupported or incomplete Linux update journal phase {}. Recovery files retained.",
+                value.get("phase").unwrap_or(&serde_json::Value::Null)
+            );
+        } else if value.get("failure").is_none() && state.original.is_some() {
+            // Earlier supervisor journals had inode identities. Window-created
+            // failure records had none and remain retryable after migration.
+            state.failure = FailureKind::Installation;
+        }
+        Ok(Some(state))
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
+    /// Quarantine a bad journal while holding the same lock as its writers.
+    /// The returned diagnostic remains visible in the running service's status.
+    pub fn repair(path: &Path) -> Result<Option<String>> {
+        let _journal = JournalLock::acquire(path)?;
+        if let Err(error) = Self::load_unlocked(path) {
+            let parent = path.parent().context("journal directory")?;
+            let keep = tempfile::Builder::new()
+                .prefix("linux-update.json.bad-")
+                .tempfile_in(parent)?;
+            fs::rename(path, keep.path())
+                .context("quarantine unsafe or invalid Linux update journal")?;
+            let (_, quarantined) = keep.keep()?;
+            File::open(parent)?.sync_all()?;
+            let mut old: Vec<_> = fs::read_dir(parent)?
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    (entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("linux-update.json.bad-")
+                        && entry.path() != quarantined
+                        && entry
+                            .file_type()
+                            .ok()
+                            .is_some_and(|kind| kind.is_file() || kind.is_symlink()))
+                    .then_some(entry.path())
+                })
+                .collect();
+            old.sort();
+            let excess = old.len().saturating_sub(2);
+            for entry in old.into_iter().take(excess) {
+                fs::remove_file(entry)?;
+            }
+            return Ok(Some(format!(
+                "Linux update journal was quarantined at {} because {error:#}",
+                quarantined.display()
+            )));
+        }
+        Ok(None)
+    }
+
+    pub fn save(&mut self, path: &Path) -> Result<()> {
+        let _journal = JournalLock::acquire(path)?;
+        let current = Self::load_unlocked(path)?.context("missing Linux update journal")?;
+        ensure!(
+            current.unit == self.unit
+                && current.revision == self.revision
+                && current.observed_phase == self.observed_phase,
+            "Linux update journal changed before the requested phase transition"
+        );
+        self.write_unlocked(path)
+    }
+
+    fn write_unlocked(&mut self, path: &Path) -> Result<()> {
         let parent = path.parent().context("journal directory")?;
-        fs::create_dir_all(parent)?;
+        self.revision += 1;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
         file.write_all(&serde_json::to_vec(self)?)?;
         file.as_file().sync_all()?;
         file.persist(path)?;
         File::open(parent)?.sync_all()?;
+        self.observed_phase = self.phase;
         Ok(())
     }
 
-    pub fn finish(&mut self, path: &Path, result: &Result<()>) -> Result<()> {
+    pub fn finish(&mut self, path: &Path, result: &Result<()>, failure: FailureKind) -> Result<()> {
+        self.failure = failure;
         self.phase = if result.is_ok() {
             Phase::Succeeded
         } else {
@@ -343,7 +550,7 @@ impl UpdateState {
             Err(e) => format!("{e:#}"),
         };
         self.save(path)?;
-        match fs::remove_file(&self.upload) {
+        match remove_upload(&self.upload) {
             Ok(()) => (),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
             Err(e) => tracing::warn!("could not remove private Linux update upload: {e}"),
@@ -352,7 +559,7 @@ impl UpdateState {
     }
 
     pub fn cleanup_completed(&self) -> Result<()> {
-        if !self.terminal() {
+        if !self.terminal() || self.preserve_recovery {
             return Ok(());
         }
         if let Some(stage) = self.stage.as_ref().filter(|stage| stage.exists()) {
@@ -373,55 +580,154 @@ impl UpdateState {
         Ok(())
     }
 
-    /// Roll back any uncommitted rename, including death between rename and fsync.
-    /// Returns true when this running service must restart onto the restored inode.
-    pub fn recover(&mut self, path: &Path) -> Result<bool> {
-        let _lock = Transaction::begin_resolved(&self.exe)?;
-        let latest = Self::load(path)?.context("missing recovery journal")?;
-        if latest.terminal() {
-            *self = latest;
+    /// Cancel only this generation's Pending request. A supervisor that lost
+    /// this race cannot transition the failed request to Started afterwards.
+    pub fn fail_pending(&self, path: &Path, reason: &str) -> Result<bool> {
+        let _journal = JournalLock::acquire(path)?;
+        let mut current = Self::load_unlocked(path)?.context("missing update request")?;
+        ensure!(
+            current.unit == self.unit,
+            "Linux update request was replaced"
+        );
+        if current.phase != Phase::Pending {
             return Ok(false);
         }
-        ensure!(
-            latest.unit == self.unit && !latest.alive(),
-            "update supervisor is still running or changed"
-        );
-        let installed = fs::symlink_metadata(&self.exe)?;
-        ensure!(
-            installed.is_file(),
-            "installation changed to a symlink during recovery"
-        );
-        let inode = (installed.dev(), installed.ino());
-        let mut restored = false;
-        if self.phase == Phase::Swapping && Some(inode) == self.replacement {
-            let stage = self.stage.as_ref().context("missing recovery directory")?;
-            validate_stage(stage, &self.exe)?;
-            let previous = stage.join("previous");
-            let meta = fs::symlink_metadata(&previous)?;
-            ensure!(
-                meta.is_file() && Some((meta.dev(), meta.ino())) == self.original,
-                "recovery inode changed"
-            );
-            fs::rename(previous, &self.exe)?;
-            File::open(self.exe.parent().context("installation directory")?)?.sync_all()?;
-            restored = true;
-        } else if matches!(self.phase, Phase::Swapping | Phase::Restoring) {
-            ensure!(
-                Some(inode) == self.original,
-                "installation changed; recovery copy preserved"
-            );
-        }
-        self.finish(path, &Err(anyhow::anyhow!(
-            "Linux update supervisor stopped before completion. Recovery restored or retained the previous release."
-        )))?;
-        if let Some(stage) = &self.stage {
-            if stage.exists() {
-                validate_stage(stage, &self.exe)?;
-                fs::remove_dir_all(stage)?;
-            }
-        }
-        Ok(restored)
+        current.phase = Phase::Failed;
+        current.failure = FailureKind::Transient;
+        current.reason = reason.into();
+        current.write_unlocked(path)?;
+        remove_upload(&current.upload)?;
+        Ok(true)
     }
+
+    /// Roll back any uncommitted rename while both installation and journal
+    /// locks are held. Failed recovery is terminal and retains its only copy.
+    pub fn recover(&mut self, path: &Path) -> Result<bool> {
+        let lock = Transaction::begin_resolved(&self.exe);
+        if lock.as_ref().err().is_some_and(|error| {
+            error
+                .to_string()
+                .contains("another updater is already running")
+        }) {
+            return Err(lock.err().unwrap());
+        }
+        let _journal = JournalLock::acquire(path)?;
+        let latest = Self::load_unlocked(path)?.context("missing recovery journal")?;
+        ensure!(
+            latest.unit == self.unit,
+            "update request changed before recovery"
+        );
+        *self = latest;
+        if self.terminal() {
+            return Ok(false);
+        }
+        ensure!(!self.alive(), "update supervisor is still running");
+        let result = (|| -> Result<bool> {
+            let _lock = lock?;
+            let installed = fs::symlink_metadata(&self.exe)?;
+            ensure!(
+                installed.is_file(),
+                "installation changed to a symlink during recovery"
+            );
+            let inode = (installed.dev(), installed.ino());
+            if self.phase == Phase::Swapping && Some(inode) == self.replacement {
+                let stage = self.stage.as_ref().context("missing recovery directory")?;
+                validate_stage(stage, &self.exe)?;
+                let previous = stage.join("previous");
+                let meta = fs::symlink_metadata(&previous)?;
+                ensure!(
+                    meta.is_file() && Some((meta.dev(), meta.ino())) == self.original,
+                    "recovery inode changed"
+                );
+                fs::rename(previous, &self.exe)?;
+                File::open(self.exe.parent().context("installation directory")?)?.sync_all()?;
+                return Ok(true);
+            }
+            if matches!(self.phase, Phase::Swapping | Phase::Restoring) {
+                ensure!(
+                    Some(inode) == self.original,
+                    "installation changed by another installer"
+                );
+            }
+            Ok(false)
+        })();
+        self.phase = Phase::Failed;
+        self.failure = FailureKind::Recovery;
+        self.preserve_recovery = result.is_err();
+        self.reason = match &result {
+            Ok(_) => "Linux update supervisor stopped before completion. Recovery restored or retained the previous release.".into(),
+            Err(error) => format!("Linux update recovery failed because {error:#}. Recovery copy retained at {}.",
+                self.stage.as_ref().map(|stage| stage.display().to_string()).unwrap_or_else(|| "an unavailable staging directory".into())),
+        };
+        self.write_unlocked(path)?;
+        if let Err(error) = remove_upload(&self.upload) {
+            tracing::warn!("Linux update upload cleanup failed: {error:#}");
+        }
+        if result.is_ok() {
+            self.cleanup_completed()?;
+        }
+        result
+    }
+}
+
+fn remove_upload(path: &Path) -> std::io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    fs::remove_file(path)?;
+    if path.file_name().is_some_and(|name| name == "archive") {
+        if let Some(parent) = path.parent().filter(|parent| {
+            parent
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("linux-update-upload-"))
+        }) {
+            fs::remove_dir_all(parent)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn cleanup_uploads(exe: &Path, data: &Path, now: std::time::SystemTime) -> Result<()> {
+    let journal = data.join("linux-update.json");
+    let _journal = JournalLock::acquire(&journal)?;
+    let active = UpdateState::load_unlocked(&journal)?;
+    for entry in fs::read_dir(data)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("linux-update-upload-")
+        {
+            continue;
+        }
+        if active.as_ref().is_some_and(|state| {
+            !state.terminal()
+                && (state.upload == path || state.upload.parent() == Some(path.as_path()))
+        }) {
+            continue;
+        }
+        let meta = fs::symlink_metadata(&path)?;
+        let private = meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0;
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|at| now.duration_since(at).ok())
+            .is_some_and(|age| age >= Duration::from_secs(24 * 3600));
+        if !private || !old {
+            continue;
+        }
+        if meta.is_dir()
+            && fs::read(path.join("owner"))
+                .is_ok_and(|owner| owner == exe.as_os_str().as_encoded_bytes())
+        {
+            fs::remove_dir_all(path)?;
+        } else if meta.is_file() && meta.mode() & 0o777 == 0o600 && meta.nlink() == 1 {
+            // Legacy uploads were private regular files with this exact prefix.
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_stage(stage: &Path, exe: &Path) -> Result<()> {
@@ -517,7 +823,12 @@ pub fn automatic_update_due(
 ) -> bool {
     offered > running
         && (explicit || now >= next)
-        && (explicit || !failed.is_some_and(|s| s.phase == Phase::Failed && offered <= &s.version))
+        && (explicit
+            || !failed.is_some_and(|s| {
+                s.phase == Phase::Failed
+                    && s.failure != FailureKind::Transient
+                    && offered == &s.version
+            }))
 }
 
 fn lock_path(exe: &Path) -> Result<PathBuf> {
@@ -620,7 +931,7 @@ impl Transaction {
     }
 
     pub fn prepare(&self, release: &Release) -> Result<()> {
-        self.prepare_with(release, |asset, path| super::download(asset, None, path))
+        self.prepare_with(release, download_asset)
     }
 
     fn prepare_with(
@@ -697,6 +1008,10 @@ impl Transaction {
     /// A hard link preserves the previous inode without removing the install
     /// path. The only visible replacement is a same-filesystem atomic rename.
     fn swap(&mut self) -> Result<()> {
+        self.swap_before_rename(|| Ok(()))
+    }
+
+    fn swap_before_rename(&mut self, before_rename: impl FnOnce() -> Result<()>) -> Result<()> {
         let meta = fs::symlink_metadata(&self.exe)?;
         ensure!(
             meta.is_file() && (meta.dev(), meta.ino()) == self.original,
@@ -715,6 +1030,7 @@ impl Transaction {
             state.reason = "Restarting and checking the Linux update".into();
             state.save(path)?;
         }
+        before_rename()?;
         fs::rename(self.stage.path().join("new"), &self.exe)?;
         self.swapped = true;
         File::open(self.exe.parent().unwrap())?.sync_all()?;
@@ -756,7 +1072,7 @@ impl Transaction {
             let result = Err(why.context("the previous Linux release was restored and restarted"));
             if let Some(path) = &self.journal {
                 let mut state = UpdateState::load(path)?.context("missing rollback journal")?;
-                state.finish(path, &result)?;
+                state.finish(path, &result, FailureKind::Installation)?;
             }
             return result;
         }
@@ -767,7 +1083,7 @@ impl Transaction {
         ensure!(self.swapped, "update has not been swapped");
         if let Some(path) = &self.journal {
             let mut state = UpdateState::load(path)?.context("missing update journal")?;
-            state.finish(path, &Ok(()))?;
+            state.finish(path, &Ok(()), FailureKind::Installation)?;
         }
         self.swapped = false;
         fs::remove_dir_all(self.stage.path())?;
@@ -912,44 +1228,126 @@ impl Process {
     }
 }
 
-/// Bounds slow headers and bodies across all redirects. A blocking read is
-/// additionally capped by the transport's 30-second socket timeout.
-pub(super) struct TimedIo<T> {
-    pub inner: T,
-    pub started: Instant,
-    pub read: u64,
-    pub minimum: u64,
+const ARCHIVE_MINIMUM_RATE: u64 = 32 * 1024;
+const MANIFEST_LIMIT: u64 = 1024 * 1024;
+
+pub fn latest() -> Result<Release> {
+    manifest(super::LATEST_MANIFEST)
 }
 
-fn transfer_budget(elapsed: Duration, read: u64, minimum: u64) -> std::io::Result<()> {
-    if elapsed >= Duration::from_secs(120) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "Linux update download exceeded its 120-second deadline",
+pub fn for_version(version: &semver::Version) -> Result<Release> {
+    let release = manifest(&format!(
+        "https://github.com/{}/releases/download/v{version}/release.json",
+        super::REPO
+    ))?;
+    ensure!(
+        release.version == *version,
+        "the manifest does not match claimed version {version}"
+    );
+    Ok(release)
+}
+
+fn manifest(url: &str) -> Result<Release> {
+    let mut body = Vec::new();
+    let status = fetch(url, "application/json", MANIFEST_LIMIT, &mut body)?;
+    ensure!(
+        status == 200,
+        "could not fetch the public release manifest (HTTP {status})"
+    );
+    super::parse_manifest(&body)
+}
+
+fn download_asset(asset: &Asset, dest: &Path) -> Result<()> {
+    super::download_with(asset, dest, |url, sink| {
+        fetch(url, "application/octet-stream", asset.size, sink)
+    })
+}
+
+fn fetch(url: &str, accept: &str, size: u64, sink: &mut dyn Write) -> Result<u16> {
+    let started = Instant::now();
+    let deadline = transfer_deadline(size, ARCHIVE_MINIMUM_RATE);
+    super::fetch_with(url, None, accept, sink, |host| {
+        let tls = super::connect_with(host, |tcp| TimedIo {
+            inner: tcp,
+            started,
+            deadline,
+            read: 0,
+            minimum: 128,
+            clock: Instant::now,
+        })?;
+        Ok(TimedIo {
+            inner: tls,
+            started,
+            deadline,
+            read: 0,
+            minimum: ARCHIVE_MINIMUM_RATE,
+            clock: Instant::now,
+        })
+    })
+}
+
+fn transfer_deadline(size: u64, minimum: u64) -> Duration {
+    // Published assets are bounded to MAX_DOWNLOAD. This gives the advertised
+    // floor enough time for a complete archive, plus connection/redirect work.
+    Duration::from_secs(size.min(super::MAX_DOWNLOAD).div_ceil(minimum) + 60)
+}
+
+struct TimedIo<T, C = fn() -> Instant> {
+    inner: T,
+    started: Instant,
+    deadline: Duration,
+    read: u64,
+    minimum: u64,
+    clock: C,
+}
+
+fn transfer_budget(
+    elapsed: Duration,
+    read: u64,
+    minimum: u64,
+    deadline: Duration,
+) -> std::io::Result<()> {
+    if elapsed >= deadline {
+        return Err(std::io::Error::other(
+            "Linux self-update download exceeded its size-derived deadline",
         ));
     }
     if elapsed >= Duration::from_secs(30) && read < minimum * elapsed.as_secs() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "Linux update download fell below its minimum transfer rate",
+        return Err(std::io::Error::other(
+            "Linux self-update download fell below its minimum transfer rate",
         ));
     }
     Ok(())
 }
 
-impl<T: Read> Read for TimedIo<T> {
+impl<T: Read, C: Fn() -> Instant> Read for TimedIo<T, C> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        transfer_budget(self.started.elapsed(), self.read, self.minimum)?;
+        transfer_budget(
+            (self.clock)().duration_since(self.started),
+            self.read,
+            self.minimum,
+            self.deadline,
+        )?;
         let count = self.inner.read(buf)?;
         self.read += count as u64;
-        transfer_budget(self.started.elapsed(), self.read, self.minimum)?;
+        transfer_budget(
+            (self.clock)().duration_since(self.started),
+            self.read,
+            self.minimum,
+            self.deadline,
+        )?;
         Ok(count)
     }
 }
 
-impl<T: Write> Write for TimedIo<T> {
+impl<T: Write, C: Fn() -> Instant> Write for TimedIo<T, C> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        transfer_budget(self.started.elapsed(), self.read, self.minimum)?;
+        transfer_budget(
+            (self.clock)().duration_since(self.started),
+            self.read,
+            self.minimum,
+            self.deadline,
+        )?;
         self.inner.write(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -997,6 +1395,7 @@ mod tests {
             .finish(
                 &path,
                 &Err(anyhow::anyhow!("health check failed; rolled back")),
+                FailureKind::Installation,
             )
             .unwrap();
         let state = UpdateState::load(&path).unwrap().unwrap();
@@ -1040,19 +1439,351 @@ mod tests {
     }
 
     #[test]
-    fn slow_downloads_have_an_overall_deadline_and_minimum_rate() {
-        assert!(transfer_budget(Duration::from_secs(29), 0, 32 * 1024).is_ok());
-        assert!(transfer_budget(Duration::from_secs(30), 1, 32 * 1024)
-            .unwrap_err()
-            .to_string()
-            .contains("minimum"));
-        assert!(transfer_budget(Duration::from_secs(119), 120 * 32 * 1024, 32 * 1024).is_ok());
-        assert!(
-            transfer_budget(Duration::from_secs(120), u64::MAX, 32 * 1024)
-                .unwrap_err()
-                .to_string()
-                .contains("deadline")
+    fn transient_timeouts_retry_after_backoff_and_install_on_an_injected_clock() {
+        let (dir, exe) = install();
+        let path = dir.path().join("journal.json");
+        let offered = Version::new(999, 0, 0);
+        let old = Version::new(1, 0, 0);
+        let now = Instant::now();
+        let mut state = UpdateState::request(&exe, &offered, b"archive", &path).unwrap();
+        state
+            .finish(
+                &path,
+                &Err(anyhow::anyhow!("manifest connection timed out")),
+                FailureKind::Transient,
+            )
+            .unwrap();
+        let retry = now + Duration::from_secs(900);
+        assert!(!automatic_update_due(
+            &offered,
+            &old,
+            Some(&state),
+            false,
+            retry - Duration::from_secs(1),
+            retry
+        ));
+        assert!(automatic_update_due(
+            &offered,
+            &old,
+            Some(&state),
+            false,
+            retry,
+            retry
+        ));
+        let mut installed = UpdateState::request(&exe, &offered, b"retry archive", &path).unwrap();
+        let mut transaction = Transaction::begin_resolved(&exe).unwrap();
+        transaction.record(&path, &mut installed).unwrap();
+        stage(&transaction, b"retried release");
+        transaction.install(|| Ok(()), || Ok(())).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), b"retried release");
+        assert_eq!(
+            UpdateState::load(&path).unwrap().unwrap().phase,
+            Phase::Succeeded
         );
+        let mut planted = installed;
+        planted.phase = Phase::Failed;
+        planted.failure = FailureKind::Installation;
+        planted.version = Version::new(u64::MAX, 0, 0);
+        assert!(automatic_update_due(
+            &offered,
+            &old,
+            Some(&planted),
+            false,
+            retry,
+            retry
+        ));
+    }
+
+    #[test]
+    fn a_large_http_asset_accepts_the_floor_without_a_fixed_120_second_cap() {
+        use std::cell::Cell;
+        use std::net::{TcpListener, TcpStream};
+        struct Metered<'a> {
+            tcp: TcpStream,
+            bytes: &'a Cell<u64>,
+        }
+        impl Read for Metered<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.tcp.read(buf)?;
+                self.bytes.set(self.bytes.get() + n as u64);
+                Ok(n)
+            }
+        }
+        impl Write for Metered<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.tcp.write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.tcp.flush()
+            }
+        }
+        let size = 5 * 1024 * 1024;
+        for rate in [ARCHIVE_MINIMUM_RATE + 1024, ARCHIVE_MINIMUM_RATE - 1024] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut tcp, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                assert!(tcp.read(&mut request).unwrap() > 0);
+                let _ = write!(
+                    tcp,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = tcp.write_all(&vec![7; size as usize]);
+            });
+            let bytes = Cell::new(0);
+            let start = Instant::now();
+            let mut body = Vec::new();
+            let result = super::super::fetch_with(
+                "https://github.com/fixture",
+                None,
+                "application/octet-stream",
+                &mut body,
+                |_| {
+                    Ok(TimedIo {
+                        inner: Metered {
+                            tcp: TcpStream::connect(address)?,
+                            bytes: &bytes,
+                        },
+                        started: start,
+                        deadline: transfer_deadline(size, ARCHIVE_MINIMUM_RATE),
+                        read: 0,
+                        minimum: ARCHIVE_MINIMUM_RATE,
+                        clock: || start + Duration::from_secs_f64(bytes.get() as f64 / rate as f64),
+                    })
+                },
+            );
+            server.join().unwrap();
+            if rate > ARCHIVE_MINIMUM_RATE {
+                assert_eq!(result.unwrap(), 200);
+                assert_eq!(body.len(), size as usize);
+                assert!(bytes.get() / rate > 120);
+            } else {
+                assert!(format!("{:#}", result.unwrap_err()).contains("minimum transfer rate"));
+            }
+        }
+    }
+
+    #[test]
+    fn journal_schema_is_forward_tolerant_and_unknown_phases_are_terminal() {
+        let (dir, exe) = install();
+        let path = dir.path().join("journal.json");
+        let state = UpdateState::request(&exe, &Version::new(999, 0, 0), &[], &path).unwrap();
+        let mut json = serde_json::to_value(&state).unwrap();
+        json["future_field"] = serde_json::json!({"new": true});
+        json["phase"] = serde_json::json!("FuturePhase");
+        json.as_object_mut().unwrap().remove("failure");
+        json.as_object_mut().unwrap().remove("preserve_recovery");
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let loaded = UpdateState::load(&path).unwrap().unwrap();
+        assert_eq!(loaded.phase, Phase::Failed);
+        assert!(loaded.reason.contains("FuturePhase"));
+        assert!(loaded.preserve_recovery);
+        assert!(UpdateState::request(&exe, &Version::new(999, 0, 1), &[], &path).is_ok());
+    }
+
+    #[test]
+    fn invalid_and_unsafe_journals_are_quarantined_with_bounded_diagnostics() {
+        let (dir, exe) = install();
+        let path = dir.path().join("linux-update.json");
+        for index in 0..5 {
+            fs::write(
+                &path,
+                if index % 2 == 0 {
+                    b"invalid".as_slice()
+                } else {
+                    b"{}"
+                },
+            )
+            .unwrap();
+            fs::set_permissions(
+                &path,
+                fs::Permissions::from_mode(if index % 2 == 0 { 0o600 } else { 0o644 }),
+            )
+            .unwrap();
+            assert!(UpdateState::repair(&path)
+                .unwrap()
+                .unwrap()
+                .contains("quarantined"));
+            assert!(!path.exists());
+            let mut state =
+                UpdateState::request(&exe, &Version::new(999, 0, index), &[], &path).unwrap();
+            assert!(UpdateState::load_for_uid(&path, unsafe { libc::geteuid() } + 1).is_err());
+            state
+                .finish(&path, &Ok(()), FailureKind::Installation)
+                .unwrap();
+            fs::remove_file(&path).unwrap();
+        }
+        assert_eq!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("linux-update.json.bad-"))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn failed_recovery_is_terminal_retains_its_copy_and_allows_a_later_update() {
+        let (dir, exe) = install();
+        let path = dir.path().join("journal.json");
+        assert!(Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "update::linux::tests::crash_fixture"])
+            .env("LATCH_CRASH_FIXTURE", &path)
+            .env("LATCH_CRASH_EXE", &exe)
+            .status()
+            .unwrap()
+            .success());
+        let external = dir.path().join("external");
+        fs::write(&external, b"manual reinstall").unwrap();
+        fs::rename(external, &exe).unwrap();
+        let mut state = UpdateState::load(&path).unwrap().unwrap();
+        assert!(state.recover(&path).is_err());
+        let terminal = UpdateState::load(&path).unwrap().unwrap();
+        assert_eq!(terminal.phase, Phase::Failed);
+        assert!(terminal.reason.contains("another installer"));
+        let recovery = terminal.stage.clone().unwrap();
+        assert!(terminal.reason.contains(&recovery.display().to_string()));
+        assert_eq!(fs::read(recovery.join("previous")).unwrap(), b"old");
+        terminal.cleanup_completed().unwrap();
+        assert!(recovery.exists());
+        assert!(UpdateState::request(&exe, &Version::new(999, 0, 1), &[], &path).is_ok());
+    }
+
+    #[test]
+    fn pending_timeout_and_supervisor_start_use_locked_compare_and_set() {
+        let (dir, exe) = install();
+        let path = dir.path().join("journal.json");
+        for timeout_wins in [true, false] {
+            let request = UpdateState::request(&exe, &Version::new(999, 0, 0), &[], &path).unwrap();
+            let mut supervisor = UpdateState::load(&path).unwrap().unwrap();
+            let (release, wait) = std::sync::mpsc::channel();
+            let worker_path = path.clone();
+            let worker = std::thread::spawn(move || {
+                wait.recv().unwrap();
+                supervisor.phase = Phase::Started;
+                supervisor.save(&worker_path)
+            });
+            if timeout_wins {
+                assert!(request.fail_pending(&path, "startup timed out").unwrap());
+                release.send(()).unwrap();
+                assert!(worker.join().unwrap().is_err());
+                assert_eq!(
+                    UpdateState::load(&path).unwrap().unwrap().phase,
+                    Phase::Failed
+                );
+            } else {
+                release.send(()).unwrap();
+                worker.join().unwrap().unwrap();
+                assert!(!request.fail_pending(&path, "late timeout").unwrap());
+                let mut current = UpdateState::load(&path).unwrap().unwrap();
+                assert_eq!(current.phase, Phase::Started);
+                current
+                    .finish(&path, &Ok(()), FailureKind::Installation)
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_phase_transition_waits_for_the_journal_flock() {
+        let (dir, exe) = install();
+        let path = dir.path().join("journal.json");
+        let mut state = UpdateState::request(&exe, &Version::new(999, 0, 0), &[], &path).unwrap();
+        let lock = JournalLock::acquire(&path).unwrap();
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (completed, result) = std::sync::mpsc::channel();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            state.phase = Phase::Started;
+            entered.send(()).unwrap();
+            completed.send(state.save(&worker_path)).unwrap();
+        });
+        ready.recv().unwrap();
+        let early = result.recv_timeout(Duration::from_millis(200));
+        drop(lock);
+        assert!(matches!(
+            early,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        result
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            UpdateState::load(&path).unwrap().unwrap().phase,
+            Phase::Started
+        );
+    }
+
+    #[test]
+    fn orphan_upload_cleanup_requires_provenance_age_and_no_live_reference() {
+        let (dir, exe) = install();
+        let path = dir.path().join("linux-update.json");
+        let mut orphan = UpdateState::request(&exe, &Version::new(999, 0, 0), &[], &path).unwrap();
+        orphan.phase = Phase::Failed;
+        orphan.save(&path).unwrap();
+        let live = UpdateState::request(&exe, &Version::new(999, 0, 1), &[], &path).unwrap();
+        let unrelated = dir.path().join("linux-update-upload-unmarked");
+        fs::create_dir(&unrelated).unwrap();
+        fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o700)).unwrap();
+        let public = dir.path().join("linux-update-upload-public");
+        fs::write(&public, b"keep").unwrap();
+        fs::set_permissions(&public, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("linux-update-upload-link");
+        symlink(orphan.upload.parent().unwrap(), &link).unwrap();
+        cleanup_uploads(&exe, dir.path(), std::time::SystemTime::now()).unwrap();
+        assert!(orphan.upload.exists());
+        cleanup_uploads(
+            &exe,
+            dir.path(),
+            std::time::SystemTime::now() + Duration::from_secs(48 * 3600),
+        )
+        .unwrap();
+        assert!(!orphan.upload.exists());
+        assert!(live.upload.exists() && unrelated.exists() && public.exists());
+        assert!(fs::symlink_metadata(link).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn slow_downloads_have_an_overall_deadline_and_minimum_rate() {
+        assert!(transfer_budget(
+            Duration::from_secs(29),
+            0,
+            32 * 1024,
+            Duration::from_secs(120)
+        )
+        .is_ok());
+        assert!(transfer_budget(
+            Duration::from_secs(30),
+            1,
+            32 * 1024,
+            Duration::from_secs(120)
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("minimum"));
+        assert!(transfer_budget(
+            Duration::from_secs(119),
+            120 * 32 * 1024,
+            32 * 1024,
+            Duration::from_secs(120)
+        )
+        .is_ok());
+        assert!(transfer_budget(
+            Duration::from_secs(120),
+            u64::MAX,
+            32 * 1024,
+            Duration::from_secs(120)
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("deadline"));
     }
 
     #[test]
@@ -1118,7 +1849,18 @@ mod tests {
         let mut tx = Transaction::begin_resolved(&exe).unwrap();
         tx.record(&path, &mut state).unwrap();
         stage(&tx, b"new");
-        tx.swap().unwrap();
+        tx.swap_before_rename(|| {
+            let journal = UpdateState::load(&path)?.unwrap();
+            assert_eq!(journal.phase, Phase::Swapping);
+            assert_eq!(
+                journal.original,
+                Some((fs::metadata(&exe)?.dev(), fs::metadata(&exe)?.ino()))
+            );
+            assert_eq!(fs::read(&exe)?, b"old");
+            assert_eq!(fs::read(journal.stage.unwrap().join("previous"))?, b"old");
+            Ok(())
+        })
+        .unwrap();
         if std::env::var_os("LATCH_CRASH_RESTORING").is_some() {
             tx.rollback().unwrap();
         }
@@ -1243,7 +1985,26 @@ mod tests {
     fn appimage_extract_and_run_is_refused() {
         if std::env::var_os("APPIMAGE").is_some() {
             let (_dir, exe) = install();
+            assert_eq!(packaged_environment(&exe), None);
+            unsafe {
+                std::env::set_var("APPDIR", exe.parent().unwrap());
+            }
             assert_eq!(installation(&exe).unwrap(), Err(Managed::AppImage));
+            unsafe {
+                std::env::remove_var("APPDIR");
+                std::env::set_var("SNAP", exe.parent().unwrap());
+            }
+            assert_eq!(installation(&exe).unwrap(), Err(Managed::Snap));
+            let other = tempfile::tempdir().unwrap();
+            unsafe {
+                std::env::set_var("SNAP", other.path());
+            }
+            assert_eq!(packaged_environment(&exe), None);
+            unsafe {
+                std::env::set_var("PATH", "");
+            }
+            assert!(prerequisites_for(false).is_ok());
+            assert_eq!(prerequisites_for(true), Err(Managed::UserManager));
         }
     }
 

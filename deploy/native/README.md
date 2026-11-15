@@ -137,8 +137,11 @@ uses a separate transient systemd user supervisor. Reopen the window after
 installation. AUR/Nix and container installs use their deployment tools.
 See [Linux update ownership and recovery](../../docs/USING.md#linux-installation-ownership-and-recovery).
 
-Updater tests use Docker locally and native x64/arm64 Linux CI. No Linux machine outside CI and containers is available for this work. A real systemd user session and
-installed desktop update remain unverified.
+Updater tests use Docker locally and native x64/arm64 Linux CI. No Linux machine outside CI and containers is available for this work. CI covers systemd user-session restart, rollback and killed-supervisor recovery with a fixture service; an installed desktop update remains unverified.
+The fixture also exercises crash-on-start/start-limit rollback and running-service
+monitor recovery. It bypasses supervisor argv parsing, self-pinning, installation
+ownership checks and real GitHub manifest fetching. Real GUI reopening and stream
+continuity remain untested.
 
 `migrate-legacy.sh` is only for upgrades from pre-4.1 BroLink unit names or
 Latch 4's separate engine service. Install the runtime prerequisites and
