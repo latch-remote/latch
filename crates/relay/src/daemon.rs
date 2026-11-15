@@ -913,19 +913,39 @@ mod tests {
         assert!(daemon.quota.can_refill());
         let wake = crate::readiness::Wake::new();
         assert!(wake.interest().is_some());
+        let (announce, announced) = std::sync::mpsc::channel();
         let writer = thread::spawn(move || {
             thread::sleep(Duration::from_millis(20));
+            announce.send(Instant::now()).unwrap();
             peer.write_all(b"x").unwrap();
             // Keep the socket alive until the readiness wait has returned.
             peer
         });
-        let start = Instant::now();
-        // A long injected housekeeping interval exposes omission from the poll
-        // set. Production calls always use TICK.
-        daemon.wait(&wake, Duration::from_secs(1)).unwrap();
-        let elapsed = start.elapsed();
+        // Time the wake from the write itself. A loaded machine can start the
+        // writer late, and that delay says nothing about the readiness wait.
+        // An interrupted poll or an expired housekeeping interval can return
+        // with no ready socket, before or after the peer writes. Only a return
+        // with a ready socket ends the test, within the bound from the write.
+        // An omitted socket leaves the next housekeeping interval to end a
+        // wait, far outside that bound.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut writing = None;
+        loop {
+            // A long injected housekeeping interval exposes omission from the
+            // poll set. Production calls always use TICK.
+            daemon.wait(&wake, Duration::from_secs(1)).unwrap();
+            let woke = Instant::now();
+            assert!(woke < deadline);
+            writing = writing.or_else(|| announced.try_recv().ok());
+            if let Some(writing) = writing.filter(|writing| woke >= *writing) {
+                let elapsed = woke.duration_since(writing);
+                assert!(elapsed < Duration::from_millis(100), "{elapsed:?}");
+                if wake.last_wait_ready.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+        }
         let peer = writer.join().unwrap();
-        assert!(elapsed < Duration::from_millis(100), "{elapsed:?}");
         drop(peer);
         drop(daemon);
         std::fs::remove_file(path).unwrap();
