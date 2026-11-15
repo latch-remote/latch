@@ -454,12 +454,16 @@ fn monthly_cap_fails_closed_with_bounded_retry_and_direct_recovery() {
     // A depleted monthly ledger refuses TLS admission. Direct restoration still
     // recovers the existing session, and repeated failures remain rate bounded.
     let pilot = Pilot::with_limits(|config| config.monthly_bytes = 64 * 1024);
+    // Spend the only credit lease before host/viewer startup can cancel a
+    // handshake and consume it without creating a grant.
+    latch_relay::create_grant(&pilot.config, &Cancel::new()).unwrap();
     let running = Running::start(pilot.config.clone(), true);
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(6) {
         assert!(!running.session.relay_active());
         thread::sleep(Duration::from_millis(10));
     }
+    assert!(pilot.metrics.rejected_connections.load(Ordering::Acquire) > 0);
     assert_eq!(pilot.metrics.grants_created.load(Ordering::Acquire), 1);
     assert!(pilot.metrics.accepted_connections.load(Ordering::Acquire) <= 3);
     assert_eq!(

@@ -208,6 +208,7 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Testing
 
+- Synchronize blocked-input shutdown before relay maintenance and exhaust the monthly-cap fixture before streaming startup. Report every failing test binary in CI and release validation while retaining failure exit status.
 - Add a Linux network-namespace harness and privileged Docker runner for
   real headless streams through blocked, lossy, proxy, TLS-inspecting,
   captive-portal and MTU-limited networks. Record decoded video, sound,
