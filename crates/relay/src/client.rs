@@ -1190,6 +1190,7 @@ struct Shared {
     state: Mutex<State>,
     wake: Condvar,
     cancel: Cancel,
+    lane_wakes: [Arc<crate::readiness::Wake>; 2],
     limits: TransportLimits,
 }
 impl Shared {
@@ -1267,8 +1268,15 @@ impl Transport {
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
             cancel: Cancel::new(),
+            lane_wakes: [
+                Arc::new(crate::readiness::Wake::new()),
+                Arc::new(crate::readiness::Wake::new()),
+            ],
             limits: config.limits.clone(),
         });
+        for wake in &shared.lane_wakes {
+            shared.cancel.register(wake);
+        }
         let result = Self {
             shared,
             workers: Mutex::new(Vec::new()),
@@ -1298,6 +1306,14 @@ impl Transport {
             result.workers.lock().unwrap().push(worker);
         }
         Ok(result)
+    }
+    /// Cumulative wait and local-notification timing across both lanes.
+    pub fn wait_stats(&self) -> crate::WaitStats {
+        let mut stats = crate::WaitStats::default();
+        for wake in &self.shared.lane_wakes {
+            stats.merge(wake.stats());
+        }
+        stats
     }
     /// Selected carrier and ladder diagnostics for a lane, available after setup.
     pub fn connection_info(&self, lane: Lane) -> Option<ConnectionInfo> {
@@ -1331,6 +1347,7 @@ impl Transport {
         packet.extend_from_slice(bytes);
         state.priority.push_back((packet, Instant::now()));
         state.priority_bytes += cost;
+        self.shared.lane_wakes[Lane::Priority as usize].notify();
         Ok(())
     }
     pub fn try_send_frame(&self, frame: &InFrame) -> io::Result<()> {
@@ -1343,6 +1360,7 @@ impl Transport {
             return Err(io::ErrorKind::WouldBlock.into());
         }
         state.frame = Some((frame.clone(), Instant::now()));
+        self.shared.lane_wakes[Lane::Video as usize].notify();
         Ok(())
     }
     /// Age of the whole unsent frame, or zero when that queue is empty.
@@ -1699,8 +1717,8 @@ fn run_lane(
                 last_sent = Instant::now();
             }
         }
-        if !application_work && before == socket.transferred {
-            thread::sleep(TICK);
+        if !application_work && before == socket.transferred && !socket.buffered_read() {
+            shared.lane_wakes[lane as usize].wait(vec![socket.interest()], TICK)?;
         }
     }
 }
@@ -1831,6 +1849,10 @@ mod tests {
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
             cancel: Cancel::new(),
+            lane_wakes: [
+                Arc::new(crate::readiness::Wake::new()),
+                Arc::new(crate::readiness::Wake::new()),
+            ],
             limits,
         }
     }

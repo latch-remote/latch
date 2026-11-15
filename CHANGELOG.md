@@ -91,8 +91,20 @@ GitHub release notes, so each version gets a heading of the form
 - Add explicit carrier and CONNECT proxy options to the bounded paired probe,
   with per-lane diagnostics and carrier-selection regression tests.
 
+- Consolidate the Seoul native TCP/TLS and Tailscale UDP peer relays on the
+  existing Lightsail instance. Add reproducible socket, queue, forwarding
+  offload, descriptor and memory tuning, with bounded before/after measurements,
+  bundle and transfer cost estimates, IPv6 findings and completed EC2 teardown.
+
 ### Relay connectivity
 
+- Keep relay connections usable when local wake notifications are unavailable,
+  and preserve short-timer precision on Windows.
+- Keep anonymous connectivity checks and certificate challenges responsive
+  while the relay is idle, and enforce their request and admission deadlines.
+- Forward relayed video, audio and input as soon as sockets or local send
+  queues are ready, reducing latency on busy machines and systems with coarse
+  timers while retaining bounded queues, deadlines and durable quotas.
 - Retain working PAC proxies across incomplete discovery, promptly recheck after
   sign-in, and measure portal waiting from detection. Report host-labelled
   network failures and preserve TLS interception evidence across routes.
@@ -192,6 +204,11 @@ GitHub release notes, so each version gets a heading of the form
   real headless streams through blocked, lossy, proxy, TLS-inspecting,
   captive-portal and MTU-limited networks. Record decoded video, sound,
   input and path recovery in CI, with strict expected-failure tracking.
+- Schedule the relay throughput fixture with socket readiness and bounded
+  per-direction delay queues. Wake the sender for received frames or its next
+  send deadline, and report offered, accepted, refused and delivered frames
+  plus gateway deadline lateness and local wake/timeout timing for native TLS
+  and WebSocket carriers.
 
 ### Networking
 
@@ -225,13 +242,6 @@ GitHub release notes, so each version gets a heading of the form
 - Document host and viewer support on Windows, macOS and Linux, with code
   evidence, verification scope, all six streaming directions and in-flight
   work. Correct platform and cursor claims.
-
-### Deployment
-
-- Consolidate the Seoul native TCP/TLS and Tailscale UDP peer relays on the
-  existing Lightsail instance. Add reproducible socket, queue, forwarding
-  offload, descriptor and memory tuning, with bounded before/after measurements,
-  bundle and transfer cost estimates, IPv6 findings and completed EC2 teardown.
 
 ### Streaming and recovery
 
