@@ -1,0 +1,95 @@
+{
+  "utc": "2026-11-15T06:30:54.552272+00:00",
+  "uptime_seconds": 73228.68,
+  "binary_sha256": "0b2b3f500cf5c9a42b49fd361dc443be309b9f92b9b7049c99e41781302c02a7",
+  "quota": {
+    "sha256": "563f80b0c23087f21a4d06b3ba98f9c66e6cc79fd9a810afca74015681a390ea",
+    "bytes": 32,
+    "mode": "0o600",
+    "reserved_bytes": 4869783552
+  },
+  "services": {
+    "latch-relay.service": {
+      "MemoryHigh": "402653184",
+      "MemoryMax": "536870912",
+      "LimitNOFILE": "65536",
+      "ActiveState": "active",
+      "ActiveEnterTimestampMonotonic": "4769560400"
+    },
+    "tailscaled.service": {
+      "MemoryHigh": "402653184",
+      "MemoryMax": "536870912",
+      "LimitNOFILE": "65536",
+      "ActiveState": "active",
+      "ActiveEnterTimestampMonotonic": "65652729839"
+    },
+    "latch-relay-offloads.service": {
+      "MemoryHigh": "infinity",
+      "MemoryMax": "infinity",
+      "LimitNOFILE": "524288",
+      "ActiveState": "active",
+      "ActiveEnterTimestampMonotonic": "73218498133"
+    }
+  },
+  "masked_units": {
+    "ModemManager.service": "masked",
+    "multipathd.service": "masked",
+    "multipathd.socket": "masked",
+    "udisks2.service": "masked",
+    "fwupd.service": "masked",
+    "fwupd-refresh.service": "masked",
+    "fwupd-refresh.timer": "masked"
+  },
+  "sysctls": {
+    "net.core.default_qdisc": "fq",
+    "net.ipv4.tcp_congestion_control": "bbr",
+    "net.core.rmem_max": "16777216",
+    "net.core.wmem_max": "16777216",
+    "net.ipv4.tcp_rmem": "4096 131072 16777216",
+    "net.ipv4.tcp_wmem": "4096 65536 16777216",
+    "net.ipv4.udp_rmem_min": "16384",
+    "net.ipv4.udp_wmem_min": "16384",
+    "net.ipv4.tcp_mtu_probing": "1",
+    "net.ipv4.tcp_notsent_lowat": "131072",
+    "net.ipv4.tcp_slow_start_after_idle": "0",
+    "net.netfilter.nf_conntrack_max": "131072"
+  },
+  "listeners": {
+    "tcp_443": true,
+    "udp_443": true,
+    "udp_41641": true
+  },
+  "qdisc": [
+    "qdisc mq 0: root ",
+    "qdisc fq 0: parent :2 limit 10000p flow_limit 100p buckets 1024 orphan_mask 1023 quantum 3028b initial_quantum 15140b low_rate_threshold 550Kbit refill_delay 40ms timer_slack 10us horizon 10s horizon_drop ",
+    "qdisc fq 0: parent :1 limit 10000p flow_limit 100p buckets 1024 orphan_mask 1023 quantum 3028b initial_quantum 15140b low_rate_threshold 550Kbit refill_delay 40ms timer_slack 10us horizon 10s horizon_drop"
+  ],
+  "offloads": {
+    "generic-segmentation-offload": "on",
+    "generic-receive-offload": "on",
+    "tx-udp-segmentation": "off [fixed]",
+    "rx-gro-list": "off",
+    "rx-udp-gro-forwarding": "on"
+  },
+  "module_boot_config": "nf_conntrack",
+  "boot_unit_order": {
+    "systemd-modules-load.service": "Before=open-vm-tools.service shutdown.target systemd-sysctl.service sysinit.target\nAfter=system.slice systemd-journald.socket\nActiveEnterTimestampMonotonic=1864767",
+    "systemd-sysctl.service": "Before=systemd-networkd.service systemd-resolved.service apparmor.service sysinit.target shutdown.target\nAfter=\"run-credentials-systemd\\\\x2dsysctl.service.mount\" system.slice systemd-journald.socket systemd-modules-load.service\nActiveEnterTimestampMonotonic=1971284",
+    "latch-relay-offloads.service": "Before=tailscaled.service shutdown.target multi-user.target\nAfter=sysinit.target system.slice basic.target network-online.target systemd-journald.socket\nActiveEnterTimestampMonotonic=73218498133",
+    "tailscaled.service": "Before=multi-user.target shutdown.target\nAfter=basic.target systemd-resolved.service network-pre.target NetworkManager.service sysinit.target latch-relay-offloads.service -.mount system.slice systemd-journald.socket systemd-remount-fs.service\nActiveEnterTimestampMonotonic=65652729839"
+  },
+  "native_recent_counters": [
+    "network_bytes=680191242 quota_reserved_bytes=4869783552 accepted=1533 rejected=110 grants=12 connections=0 sessions=0",
+    "network_bytes=680191242 quota_reserved_bytes=4869783552 accepted=1533 rejected=110 grants=12 connections=0 sessions=0",
+    "network_bytes=680191242 quota_reserved_bytes=4869783552 accepted=1533 rejected=110 grants=12 connections=0 sessions=0",
+    "network_bytes=680191242 quota_reserved_bytes=4869783552 accepted=1533 rejected=110 grants=12 connections=0 sessions=0"
+  ],
+  "peer_idle_window_seconds": 10,
+  "peer_sessions": 2,
+  "peer_window_bytes": 3008350,
+  "peer_window_packets": 4497,
+  "unit_verification": "systemd-analyze verify latch-relay.service tailscaled.service latch-relay-offloads.service exited 0",
+  "conntrack_module_loaded": true,
+  "installed_helper_no_argument_runs": 2,
+  "reboot_persistence_check": "pending, explicitly deferred by operator while coding-agent TCP traffic is active"
+}

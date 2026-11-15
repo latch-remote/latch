@@ -1,206 +1,158 @@
-# Seoul provisioning plan
+# Seoul Lightsail operations
 
-These commands are a plan for the parent operator. Provisioning has not been
-executed. The proposed resources are `latch-relay-seoul-1`, its static IP
-`latch-relay-seoul-1-ip` and a named imported SSH public key. The current
-EC2 backup relay is managed separately.
+As of 2026-11-15 UTC, `latch-relay-seoul-1` carries the public native TCP/TLS
+relay and the operator tailnet's Tailscale UDP peer relay in `ap-northeast-2a`.
+Account `043189681495`, Ubuntu 24.04, bundle `small_3_0`, static allocation
+`latch-relay-seoul-1-ip`, public IPv4 `54.116.93.176`. Existing ownership tags
+are `Project=Latch`, `Purpose=native-tcp-relay` and `Release=6.0.0`.
 
-## Check the account, price, zone and key
+## Account and access
 
-Use AWS CLI v2 with the restored session. Confirm account `043189681495` before
-any creation. Choose `small_3_0` or `micro_3_0` after the workload inspection.
-The default below proposes the $12 bundle. The parent makes the final choice.
+Check the account before every AWS mutation. Management SSH uses the pinned
+configuration at `/Users/daniel/.ssh/latch6-lightsail.conf`, alias `latch6-relay`.
 
 ```bash
 set -euo pipefail
-export AWS_REGION=ap-northeast-2
-export RELAY_NAME=latch-relay-seoul-1
-export RELAY_BUNDLE=small_3_0
-export RELAY_ZONE=ap-northeast-2a
-export RELAY_KEY=latch-relay-management
-: "${RELAY_ADMIN_CIDR:?set the operator public IPv4 /32}"
-export RELAY_ADMIN_CIDR
 test "$(aws sts get-caller-identity --query Account --output text)" = 043189681495
-python3 - <<'PY'
-import ipaddress,os
-network=ipaddress.ip_network(os.environ['RELAY_ADMIN_CIDR'], strict=True)
-assert network.version == 4 and network.prefixlen == 32
-assert os.environ['RELAY_BUNDLE'] in ('small_3_0','micro_3_0')
-PY
-# shellcheck disable=SC2016 # Backticks below are JMESPath literal syntax.
-aws lightsail get-bundles --region "$AWS_REGION" \
-  --query 'bundles[?bundleId==`small_3_0` || bundleId==`micro_3_0`].{Id:bundleId,USD:price,RAM:ramSizeInGb,CPU:cpuCount,GB:transferPerMonthInGb,Active:isActive}'
-# shellcheck disable=SC2016
-aws lightsail get-regions --region "$AWS_REGION" --include-availability-zones \
-  --query 'regions[?name==`ap-northeast-2`].availabilityZones'
-# shellcheck disable=SC2016
-aws lightsail get-blueprints --region "$AWS_REGION" \
-  --query 'blueprints[?blueprintId==`ubuntu_24_04`].{Id:blueprintId,Active:isActive}'
-aws lightsail get-key-pairs --region "$AWS_REGION" \
-  --query 'keyPairs[].{Name:name,Fingerprint:fingerprint}'
+aws lightsail get-instance --region ap-northeast-2 --instance-name latch-relay-seoul-1
+aws lightsail get-static-ip --region ap-northeast-2 --static-ip-name latch-relay-seoul-1-ip
+aws lightsail get-instance-port-states --region ap-northeast-2 --instance-name latch-relay-seoul-1
+ssh -F /Users/daniel/.ssh/latch6-lightsail.conf latch6-relay
 ```
 
-If the named key is absent, import the existing RSA management public key. The
-deployment accepted RSA SSH text with the `file://` form below. Ed25519 was
-rejected, and wrapping the SSH text in base64 also failed. The CLI must succeed before
-creating an instance. If an identically named key exists, verify its fingerprint
-against the operator's intended key before reuse. The import below takes only
-the public file.
+| Inbound port | Scope and purpose |
+| --- | --- |
+| TCP 22 | Operator /32, pinned key-only SSH |
+| TCP 80 | Public IPv4, Certbot standalone HTTP-01 |
+| TCP 443 | Public IPv4, native TLS ALPN `latch-relay/1` |
+| UDP 443 | Public IPv4, Tailscale peer relay |
+| UDP 41641 | Public IPv4, tailscaled transport and discovery |
+
+The SSH rule matched the Mac at inspection. When the operator moves networks,
+update only that rule to the current `/32`. Individual Lightsail port operations
+preserve the other rules. Tailscale manages host netfilter rules. UFW is inactive.
+
+## Relay identity and recovery
+
+The verified EC2 backup preceded migration of the relay identity to Lightsail.
+The old EC2 instance and security group were terminated/deleted on
+2026-11-15 at approximately 06:15 UTC. Lightsail is the only relay.
+
+Kernel-mode tailscaled 1.104.7 uses `/dev/net/tun`. Route acceptance, DNS
+acceptance and Tailscale SSH are disabled. The node advertises no routes.
+Give the relay a dedicated tag whose policy allows it only as a peer-relay
+destination and grants it no access into the tailnet.
 
 ```bash
-aws lightsail import-key-pair --region "$AWS_REGION" \
-  --key-pair-name "$RELAY_KEY" \
-  --public-key-base64 file:///Users/daniel/.ssh/latch6_lightsail_rsa.pub
+sudo tailscale set --relay-server-port=443 --relay-server-static-endpoints=54.116.93.176:443
+sudo systemctl enable tailscaled.service
+sudo tailscale debug peer-relay-sessions
 ```
 
-## Create or reuse tagged resources
+Retain a root-only backup of `/var/lib/tailscale`. During recovery, stop the
+existing daemon before restoring state to a replacement and keep only one
+running copy of the identity. Verify the peer-relay path from both clients.
 
-The first block reads before creating and verifies an existing instance's
-bundle, zone, key and ownership tags. A mismatched resource requires inspection.
-Any CLI error aborts the plan. It cannot be treated as a missing resource.
-Wait for each returned operation to reach `Succeeded` through
-`aws lightsail get-operation --operation-id ID` before continuing.
+## Reapply the host profile
 
 ```bash
-count=$(aws lightsail get-instances --region "$AWS_REGION" \
-  --query "length(instances[?name=='$RELAY_NAME'])" --output text)
-if [[ $count == 0 ]]; then
-  aws lightsail create-instances --region "$AWS_REGION" \
-    --instance-names "$RELAY_NAME" --availability-zone "$RELAY_ZONE" \
-    --blueprint-id ubuntu_24_04 --bundle-id "$RELAY_BUNDLE" \
-    --key-pair-name "$RELAY_KEY" --ip-address-type ipv4 \
-    --tags key=Project,value=Latch key=Purpose,value=native-tcp-relay key=Release,value=6.0.0
-else
-  aws lightsail get-instance --region "$AWS_REGION" --instance-name "$RELAY_NAME" \
-    --output json | python3 -c '
-import json,os,sys
-i=json.load(sys.stdin)["instance"]
-t={v["key"]:v["value"] for v in i.get("tags",[])}
-assert t.get("Project")=="Latch" and t.get("Purpose")=="native-tcp-relay"
-assert i["bundleId"]==os.environ["RELAY_BUNDLE"]
-assert i["location"]["availabilityZone"]==os.environ["RELAY_ZONE"]
-assert i["sshKeyName"]==os.environ["RELAY_KEY"]
-print("Verified existing instance",i["name"],i["state"]["name"])'
-fi
-aws lightsail get-instance-state --region "$AWS_REGION" --instance-name "$RELAY_NAME"
+sudo apt-get install ethtool
+sudo bash deploy/relay-tcp/tune-host.sh
+sudo systemctl is-enabled latch-relay tailscaled latch-relay-offloads
+sudo systemctl show latch-relay tailscaled -p MainPID -p ActiveState -p LimitNOFILE -p MemoryHigh -p MemoryMax
+sudo tc qdisc show
+sudo ethtool -k ens5
 ```
 
-Create the static IP once. Retain the allocation operation ID as proof of
-ownership. Reuse is safe when it is already attached to this instance. An
-existing unattached name requires checking the allocation record before use.
-The instance carries the ownership tags. Lightsail static IPs have no tags field.
+`network.sh` loads conntrack before applying sysctls and persists it through
+`/etc/modules-load.d/latch-relay.conf`. It installs daemon drop-ins and a
+boot-time offload unit.
+It applies live descriptor and memory limits without restarting either daemon.
+`tune-host.sh` also masks unnecessary modem, multipath, removable-media and
+firmware services. See the exact settings and rationale in the deployment
+report. [Deployment settings](DEPLOYED.md#dual-role-consolidation-on-2026-11-15)
 
-```bash
-count=$(aws lightsail get-static-ips --region "$AWS_REGION" \
-  --query "length(staticIps[?name=='$RELAY_NAME-ip'])" --output text)
-if [[ $count == 0 ]]; then
-  aws lightsail allocate-static-ip --region "$AWS_REGION" --static-ip-name "$RELAY_NAME-ip"
-fi
-attached=$(aws lightsail get-static-ip --region "$AWS_REGION" \
-  --static-ip-name "$RELAY_NAME-ip" --query staticIp.attachedTo --output text)
-if [[ $attached == None ]]; then
-  aws lightsail attach-static-ip --region "$AWS_REGION" \
-    --static-ip-name "$RELAY_NAME-ip" --instance-name "$RELAY_NAME"
-elif [[ $attached != "$RELAY_NAME" ]]; then
-  echo 'Static IP belongs to another instance. Inspect ownership.' >&2
-  exit 1
-fi
-aws lightsail get-static-ip --region "$AWS_REGION" --static-ip-name "$RELAY_NAME-ip" \
-  --query 'staticIp.{Name:name,IP:ipAddress,Attached:attachedTo}'
-```
+## Bundle and transfer economics
 
-Apply the exact firewall to this verified new dedicated instance. This replaces
-its public inbound rules, so repeat the instance ownership check when resuming
-the plan in another shell. TCP 80 can be added for HTTP-01 if the parent chooses
-that certificate method. The proposed DNS-01 setup uses TCP 443 and restricted
-SSH. Keep the current SSH session until a second key-based session works.
+Live Seoul API prices on 2026-11-15 were as follows. All plans have two vCPUs.
+Baseline percentages apply to each vCPU's utilization.
 
-```bash
-ports=$(python3 - <<'PY'
-import json,os
-print(json.dumps([
- {'fromPort':22,'toPort':22,'protocol':'tcp','cidrs':[os.environ['RELAY_ADMIN_CIDR']]},
- {'fromPort':443,'toPort':443,'protocol':'tcp','cidrs':['0.0.0.0/0']}
-]))
-PY
-)
-aws lightsail put-instance-public-ports --region "$AWS_REGION" \
-  --instance-name "$RELAY_NAME" --port-infos "$ports"
-aws lightsail get-instance-port-states --region "$AWS_REGION" --instance-name "$RELAY_NAME"
-```
+| Bundle | USD/month | RAM GiB | Baseline per vCPU | Sustainable total vCPU | Combined GB/month | 20-Mbps hours with 10% overhead |
+| --- | --- | --- | --- | --- | --- | --- |
+| `nano_3_0` | 5 | 0.5 | 5% | 0.10 | 1,024 | 51.7 |
+| `micro_3_0` | 7 | 1 | 10% | 0.20 | 2,048 | 103.4 |
+| `small_3_0` | 12 | 2 | 20% | 0.40 | 3,072 | 155.2 |
+| `medium_3_0` | 24 | 4 | 20% | 0.40 | 4,096 | 206.9 |
 
-Connect as Ubuntu's `ubuntu` user with the imported private key. Verify the
-host key through an authenticated AWS console path before accepting it. Install
-only the required OS tools and native relay binary, run the loopback binary
-selftest on that CPU, then follow `README.md`. Set the parent-owned DNS record
-and issue the public certificate before the first public service start.
+Recommend retaining `small_3_0`. The native 20-Mbps sample cost 0.212% of one
+core per forwarded Mbps. Peer samples around 3 Mbps cost 0.797–0.862% of one
+core per Mbps. Extrapolating the latter to 20 Mbps gives 0.16–0.17 vCPU before
+background work. Adding roughly 0.05-vCPU background work reaches the micro
+bundle's baseline. Two concurrent 20-Mbps flows, one per role, project about
+0.26 vCPU including background work. These projections need sustained-load
+confirmation. Nano has insufficient RAM for this profile. Medium doubles
+price while retaining the small bundle's CPU baseline.
 
-## Reboot, recovery and sustained-load checks
+The illustrative expected use is 60 stream-hours/month at 20 Mbps, two hours
+per day, one forwarded stream at a time, with 10% transfer overhead. This uses
+1,188 GB combined and costs about $12/month on small. At 50 Mbps for those same
+60 hours, the model uses 2,970 GB. The campus tests did not sustain 50 Mbps.
+The native 500-GB guard permits about 25.3 hours at 20 Mbps with that overhead
+factor. Peer traffic also consumes the provider allowance.
 
-Run a real host/viewer session, record the quota's current reserved bytes and
-check metrics. During an arranged interruption reboot the dedicated instance.
+Both ingress and egress consume the Lightsail allowance. Beyond it, Seoul
+public internet egress costs $0.13/GB. For steady symmetric relay traffic,
+modeled billed egress is half the combined excess. Traffic timing and
+retransmissions affect actual billing. These estimates use decimal GB and
+conservatively take the API's allowance numbers at face value.
 
-```bash
-aws lightsail reboot-instance --region "$AWS_REGION" --instance-name "$RELAY_NAME"
-aws lightsail get-instance-state --region "$AWS_REGION" --instance-name "$RELAY_NAME"
-python3 deploy/relay-tcp/selftest.py --live relay.latch.rune.foo
-```
+| 20-Mbps hours/month | Combined GB with 10% overhead | Nano cost | Micro cost | Small cost | Medium cost |
+| --- | --- | --- | --- | --- | --- |
+| 60 | 1,188 | $15.66 | $7.00 | $12.00 | $24.00 |
+| 120 | 2,376 | $92.88 | $28.32 | $12.00 | $24.00 |
+| 180 | 3,564 | $170.10 | $105.54 | $43.98 | $24.00 |
 
-Wait for reboot completion before the public probe. Check SSH and
-`systemctl is-enabled/is-active latch-relay.service`, effective `tc qdisc show`,
-BBR, unchanged idle quota, and an actual reconnect with a new grant and keys.
-For process recovery, use a controlled `systemctl kill --signal=SIGKILL
-latch-relay.service` during the test window, wait beyond 30 seconds and verify
-`NRestarts`, retained reservations and a new paired session. A live TLS probe
-checks the public certificate and ALPN. Whole-session recovery needs the paired
-application test.
+An attached static IPv4 has no additional charge. The available November
+network metrics totaled 5.97 GB after testing. Billing is authoritative for
+first-month allowance adjustments. The native 500-GB pilot guard retains
+substantial headroom. The recurring instance cost is the Lightsail
+`small_3_0` bundle at $12/month. The old EC2 instance and security group have
+been removed.
 
-Fetch sustained-load metrics with explicit UTC timestamps. `CPUUtilization`
-includes `Average`/`Maximum`; `BurstCapacityPercentage` and `BurstCapacityTime`
-show whether testing is consuming a temporary reserve. Repeat the command for
-each metric. Inspect memory and process CPU with `inspect.sh` and systemd.
+The FREE account plan expires **2026-12-21 14:35:44 UTC**. The Free Tier API
+separately reported $162 remaining credits on 2026-11-15. The instance costs
+$12/month. Verify credit expiration and plan conversion in AWS billing before
+the plan expiry date.
 
-```bash
-: "${RELAY_TEST_START:?ISO8601 UTC start}"
-: "${RELAY_TEST_END:?ISO8601 UTC end}"
-aws lightsail get-instance-metric-data --region "$AWS_REGION" \
-  --instance-name "$RELAY_NAME" --metric-name BurstCapacityPercentage \
-  --period 300 --start-time "$RELAY_TEST_START" --end-time "$RELAY_TEST_END" \
-  --unit Percent --statistics Average Minimum
-```
+Sources include the live regional bundle, Pricing and Free Tier APIs, plus
+AWS's baseline and transfer documentation.
+[AWS CPU baselines](https://docs.aws.amazon.com/lightsail/latest/userguide/baseline-cpu-performance.html)
+[AWS pricing](https://aws.amazon.com/lightsail/pricing/)
+[AWS transfer accounting](https://aws.amazon.com/lightsail/faq/)
 
-Do a fresh loopback selftest with the shipped binary before reopening service
-after CPU/OS changes. Preserve `/var/lib/latch-relay/quota` across repairs. A
-storage failure must be repaired from the current durable copy. Snapshot recovery
-can restore an older reservation count, so reconcile quota before public start.
-Take any paid snapshot only after the parent chooses that recovery policy.
+## IPv6 and DNS
 
-## Cleanup or failed provisioning
+The instance reports `ipAddressType=ipv4` and no IPv6 addresses. Its static
+allocation supplies IPv4. Lightsail supports enabling dual-stack and assigning
+a separate public IPv6 address, which persists across stop/start. Disabling
+IPv6 or deleting the instance releases that IPv6 address.
 
-Record created names and operation IDs during execution. On a failed step,
-inspect those exact names and operations, fix the failed prerequisite and rerun
-from the corresponding read-before-create block. Creation and static-IP
-attachment are asynchronous. A second invocation before completion needs the
-original operation result first. An unused IP allocation starts billing after
-AWS's grace period, so attach or release it promptly.
+Cloudflare hosts the DNS-only A record for `relay.latch.rune.foo`. There is
+currently no AAAA record. This AWS account has no Route 53 hosted zones.
 
-Deletion is an explicit parent operation after moving DNS, draining sessions,
-preserving the current quota and verifying ownership tags. These commands are
-destructive and are included for the planned new resources only.
+IPv6 deployment requires enabling Lightsail dual-stack, verifying its assigned
+address/route, adding IPv6 firewall rules, deploying the separately prepared
+dual-stack listener and publishing a DNS-only AAAA with a DNS-edit credential.
+Peer-relay IPv6 also needs UDP firewall rules and an IPv6 static endpoint
+preference. The current native listener binds IPv4. Listener and WebSocket
+deployment belong to the later PR.
+[AWS dual-stack behavior](https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-enable-disable-ipv6.html)
 
-```bash
-aws lightsail get-instance --region "$AWS_REGION" --instance-name "$RELAY_NAME" \
-  --query 'instance.{Name:name,Tags:tags,State:state.name}'
-aws lightsail get-static-ip --region "$AWS_REGION" --static-ip-name "$RELAY_NAME-ip" \
-  --query 'staticIp.{Name:name,Attached:attachedTo}'
-# After checking the exact resources and saving the current ledger:
-aws lightsail detach-static-ip --region "$AWS_REGION" --static-ip-name "$RELAY_NAME-ip"
-# Wait for the detach operation to succeed, then release the unused address.
-aws lightsail release-static-ip --region "$AWS_REGION" --static-ip-name "$RELAY_NAME-ip"
-aws lightsail delete-instance --region "$AWS_REGION" --instance-name "$RELAY_NAME"
-```
+## Completed teardown
 
-Verify deletion operations reached `Succeeded`. Inspect the exact related
-snapshots and key-pair use before deleting either. Deleting an instance leaves
-snapshots billing and does not reset the region's pooled monthly transfer usage.
-Stopping an instance continues its bundle charges.
+The old EC2 relay instance and security group were removed on 2026-11-15 at
+approximately 06:15 UTC, after backup verification. The Lightsail static IP,
+native binary, certificate automation and durable quota remain in service.
+
+Operational changes and bounded test failures are recorded with UTC times.
+[Results log](results/consolidation-20261115/CHANGES.md)

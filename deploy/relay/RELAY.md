@@ -10,9 +10,23 @@ The order is Tailscale's own and needs no Latch code: **direct â†’ peer relay â†
 DERP stays as the last-resort fallback. If the relay is down, streaming still works,
 just at DERP quality.
 
-**A relay only serves its own tailnet.** There is no shared Latch relay and there
-cannot be one: a peer relay can only relay for devices in the same tailnet as itself.
-If you and a friend are on separate tailnets, each of you runs a relay for your own.
+**A peer relay serves its own tailnet.** Each independent tailnet enrolls its
+own relay node. Latch's public native TCP/TLS endpoint is described in the
+[native relay kit](../relay-tcp/README.md).
+
+## Managed Seoul deployment
+
+The operator's peer relay now shares `latch-relay-seoul-1` with the native
+TCP/TLS daemon at static IP `54.116.93.176`. Peer traffic uses UDP 443,
+tailscaled transport uses UDP 41641, and native TLS uses TCP 443. This box runs
+kernel-mode tailscaled 1.104.7 as a native systemd service. The old EC2 instance
+and security group were removed after backup verification on 2026-11-15 at
+approximately 06:15 UTC. Give the relay a dedicated tag that allows it only
+as a peer-relay destination and grants it no access into the tailnet.
+
+Use the combined box's operating guide for this deployment. The Docker
+instructions below apply to independent installations.
+[Seoul operations](../relay-tcp/LIGHTSAIL.md)
 
 ---
 

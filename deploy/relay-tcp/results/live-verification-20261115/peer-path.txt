@@ -1,0 +1,3 @@
+Mac to Windows: peer-relay 54.116.93.176:443
+RTT 149, 146, 147 ms.
+Live check without reboot. Reboot persistence check pending.

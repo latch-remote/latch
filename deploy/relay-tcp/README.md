@@ -2,9 +2,10 @@
 
 This kit installs the `latch-relay` crate on a dedicated Linux machine with
 systemd. The public endpoint is `relay.latch.rune.foo:443` on the dedicated
-`latch-relay-seoul-1` Lightsail instance. The parent release task owns final
-application integration. The original EC2 backup relay carries a separate
-active workload.
+`latch-relay-seoul-1` Lightsail instance. Since 2026-11-15, this instance also
+carries the operator tailnet's kernel-mode Tailscale UDP peer relay on
+`54.116.93.176:443`, with tailscaled transport on UDP 41641. The old EC2 instance and security group were removed after backup
+verification on 2026-11-15 at approximately 06:15 UTC. Lightsail is the only relay. The parent release task owns final application integration.
 The completed read-only inspection and exact validation results are recorded
 in [the implementation handoff](INSPECTION.md).
 Current deployment and capacity results are recorded in [the deployment report](DEPLOYED.md).
@@ -75,6 +76,7 @@ sudo bash deploy/relay-tcp/install.sh \
   500000000000 --initialize-quota
 sudo install -o root -g root -m 0750 deploy/relay-tcp/certbot-deploy.sh \
   /etc/letsencrypt/renewal-hooks/deploy/50-latch-relay
+sudo apt-get install ethtool
 sudo bash deploy/relay-tcp/network.sh
 sudo systemctl start latch-relay.service
 sudo systemctl enable --now certbot.timer
@@ -98,11 +100,16 @@ Linux machine under the intended stream count before selecting a smaller bundle.
 An OOM kill ends current sessions and systemd restarts the service with the same
 quota. Local `limits.json` changes survive reinstalling the kit.
 
-`network.sh` enables BBR and the `fq` default when the kernel supports both,
-persisting only those two settings. It retains the existing TCP buffer defaults.
-Interface qdisc changes require interface recreation or a reboot. Check the
-effective qdisc and congestion control after reboot. Apply this script during
-setup of the dedicated relay.
+`network.sh` persists BBR/fq, 16-MiB TCP/UDP socket ceilings, PMTU probing,
+128-KiB unsent low-water mark, idle-window preservation and a 131,072-entry
+conntrack ceiling. It installs a boot-time UDP GRO forwarding unit and daemon
+drop-ins with 65,536-file limits. Tailscaled receives 384/512-MiB memory
+high/max limits. Live process limits are applied without daemon restarts.
+The existing `ens5` queues already use fq. Verify effective qdiscs after link
+recreation. `tune-host.sh` additionally masks unnecessary Ubuntu modem,
+multipath, removable-media and firmware services on this dedicated host.
+The deployment report explains each value and the retained no-swap profile.
+[Applied tuning](DEPLOYED.md#persistent-relay-tuning)
 
 For an upgrade, schedule a brief interruption, stop the native relay, repeat
 the installer with the same ledger and omit `--initialize-quota`, then start it.
@@ -158,11 +165,11 @@ recreation of an instance require a deliberate current-ledger migration.
 
 ## Monthly cost and proration
 
-Live Seoul API results on 2026-11-14 showed `small_3_0` at $12/month with 2 GiB,
+Live Seoul API results on 2026-11-15 showed `small_3_0` at $12/month with 2 GiB,
 2 vCPUs and 3,072 GB transfer, and `micro_3_0` at $7/month with 1 GiB, 2 vCPUs and
-2,048 GB. These are Linux bundles with public IPv4. Parent selection remains
-pending the workload and on-instance CPU/memory checks. The free burst capacity
-can hide an inadequate sustained CPU baseline during a short test.
+2,048 GB. These are Linux bundles with public IPv4. Retain the current small
+bundle for the combined workload's RAM, CPU baseline and transfer headroom.
+The free burst capacity can hide an inadequate sustained baseline in a short test.
 
 AWS documents a 10% baseline per vCPU for the $7/1 GiB plan and 20% per vCPU
 for the $12/2 GiB plan, equivalent to 0.2 and 0.4 continuously available vCPU
@@ -196,9 +203,13 @@ Sources are the live `aws lightsail get-bundles --region ap-northeast-2` respons
 
 ## Provisioning and health
 
-Follow [the Lightsail CLI plan](LIGHTSAIL.md) after the parent chooses a bundle
-and authorizes provisioning. The plan includes tagged resource reuse, explicit
-SSH CIDR, static IP, reboot validation and recoverable cleanup.
+Follow the Lightsail operating guide for the combined box, bundle comparison,
+monthly transfer model, credit expiration, IPv6/DNS findings and exact teardown
+state. At an assumed 60 hours/month and 20 Mbps with 10% overhead, the provider
+cost is about $12/month. The native 500-GB guard allows about 25.3 such hours.
+The Free Tier API reported $162 remaining credit and a FREE-plan expiration
+of 2026-12-21. The recurring instance cost is Lightsail `small_3_0` only.
+[Lightsail operations](LIGHTSAIL.md)
 
 On the new machine, inspect system state without dumping secrets.
 
@@ -251,10 +262,13 @@ It rotates a fresh grant and fresh keys before the negotiated session time or
 byte cap. Accepted frames still in flight during a planned rotation are reported
 in `accepted_not_received`. A terminal transport failure exits with an error.
 
-The cold 20-Mbps/60-fps campus test timed out. A warmed run sustained roughly
+The earlier cold 20-Mbps/60-fps campus test timed out. A warmed run sustained roughly
 20 Mbps for 106 seconds after its 30-second warm-up, then hit the unchanged
 750 ms deadline. Use [the deployment report](DEPLOYED.md) for the measured
-operating range and limitations.
+operating range and limitations. Matched 2026-11-15 runs completed the 5- and
+20-Mbps targets with warm-up. The 50-Mbps attempts timed out before and after
+tuning. Windows SFTP over the migrated peer path measured 3.10 Mbps.
+[Consolidation measurements](results/consolidation-20261115/README.md)
 
 Collect read-only Linux service CPU, RSS, cgroup memory and durable reservations
 during a bounded test using the supplied sampler.
