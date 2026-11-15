@@ -1051,7 +1051,8 @@ failing events are then dropped so later input can proceed.
 Windows Media Foundation workers answer their caller within a deadline: one
 second for an access unit, five to open a decoder, twenty for the
 once-per-process probe of every codec. Timeout diagnostics include the input
-identity, active COM phase and its elapsed time, operation elapsed time,
+identity, active COM phase and its elapsed time, the longest observed phase,
+operation elapsed time,
 the last 16 output HRESULT/status pairs and the cumulative count of access
 units delivered after polling. Every access unit shares a 2,048-call output
 budget across stream changes, event-only output and all drain passes, with

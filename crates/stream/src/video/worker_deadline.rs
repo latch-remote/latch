@@ -29,6 +29,7 @@ pub(super) struct Progress(Mutex<Operation>);
 struct Operation {
     phase: &'static str,
     phase_started: Instant,
+    longest: (&'static str, Duration),
     started: Instant,
     configuration: String,
     outputs: u32,
@@ -41,6 +42,7 @@ impl Progress {
         Self(Mutex::new(Operation {
             phase,
             phase_started: now,
+            longest: (phase, Duration::ZERO),
             started: now,
             configuration: String::new(),
             outputs: 0,
@@ -54,11 +56,16 @@ impl Progress {
         operation.phase = phase;
         operation.started = now;
         operation.phase_started = now;
+        operation.longest = (phase, Duration::ZERO);
         operation.outputs = 0;
         operation.recent_output.clear();
     }
     pub(super) fn phase(&self, phase: &'static str) {
         let mut operation = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let elapsed = operation.phase_started.elapsed();
+        if elapsed > operation.longest.1 {
+            operation.longest = (operation.phase, elapsed);
+        }
         operation.phase = phase;
         operation.phase_started = Instant::now();
     }
@@ -84,11 +91,19 @@ impl Progress {
     }
     pub(super) fn describe(&self) -> String {
         let operation = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let elapsed = operation.phase_started.elapsed();
+        let longest = if elapsed > operation.longest.1 {
+            (operation.phase, elapsed)
+        } else {
+            operation.longest
+        };
         format!(
-            "phase={} phase_elapsed={:?} operation_elapsed={:?} output_calls={} recent_output={:?} late_access_units={} {}",
+            "phase={} phase_elapsed={:?} operation_elapsed={:?} longest_phase={} longest_elapsed={:?} output_calls={} recent_output={:?} late_access_units={} {}",
             operation.phase,
-            operation.phase_started.elapsed(),
+            elapsed,
             operation.started.elapsed(),
+            longest.0,
+            longest.1,
             operation.outputs,
             operation.recent_output.iter().map(|&(code, flags)| (format!("0x{:08x}", code as u32), flags)).collect::<Vec<_>>(),
             operation.late_access_units,
@@ -195,5 +210,18 @@ mod tests {
             progress.output(code, 0);
         }
         assert_eq!(progress.0.lock().unwrap().recent_output.len(), 16);
+        progress.begin("ProcessOutput");
+        progress.0.lock().unwrap().phase_started = Instant::now() - Duration::from_secs(2);
+        progress.phase("send decoded pictures");
+        let finished = progress.describe();
+        assert!(
+            finished.contains("phase=send decoded pictures"),
+            "{finished}"
+        );
+        assert!(
+            finished.contains("longest_phase=ProcessOutput"),
+            "{finished}"
+        );
+        assert!(progress.0.lock().unwrap().longest.1 >= Duration::from_secs(2));
     }
 }
