@@ -276,6 +276,14 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn repeated_portal_worker_teardown() {
+        for iteration in 0..16 {
+            eprintln!("portal worker iteration {iteration}");
+            std::thread::spawn(portal).join().unwrap();
+        }
+    }
+
+    #[test]
     fn auto_sources_follow_windows_precedence() {
         use ProxySource::{WindowsPac, WindowsWpad};
         assert_eq!(auto_sources(true, true), [WindowsWpad, WindowsPac]);

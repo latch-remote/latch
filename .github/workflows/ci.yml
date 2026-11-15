@@ -42,11 +42,13 @@ jobs:
       - name: diagnose Windows network FFI
         shell: pwsh
         run: |
+          cargo test --locked -p latch-core --lib netenv::windows::tests::repeated_portal_worker_teardown -- --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p latch-core --lib netenv::tests::real_windows_portal_smoke -- --exact --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p latch-core --lib netenv::windows::tests:: -- --test-threads=1 --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p latch-core --lib netenv:: -- --nocapture
+          cargo test --locked -p latch-core --lib -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: test
         run: cargo test --locked --workspace --all-targets
