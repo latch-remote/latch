@@ -6,6 +6,10 @@ GitHub release notes, so each version gets a heading of the form
 
 ## Unreleased
 
+- Send viewer mouse and keyboard input directly from OS events on macOS,
+  Windows and Linux, preserving input ordering, capture, focus and local
+  shortcuts while avoiding the next UI frame for ordinary input.
+
 ### Packaging
 
 - Add a Scoop manifest, AUR packages (`latch-remote-bin` from the release
