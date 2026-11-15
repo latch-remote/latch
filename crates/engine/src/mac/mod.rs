@@ -275,6 +275,7 @@ impl Video {
 impl VideoPipeline for Video {
     fn info(&self) -> VideoInfo {
         VideoInfo {
+            captured_display: Some(self.capture.id.to_string()),
             color: self.config.color,
             encoder: format!(
                 "VideoToolbox {}",

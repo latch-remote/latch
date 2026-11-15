@@ -153,7 +153,7 @@ pub struct StreamRequest {
 #[serde(default)]
 pub struct HostDisplay {
     /// What a [`StreamRequest::display`] names it by. Opaque to a viewer:
-    /// a CGDirectDisplayID on a Mac, the GDI name (`\\.\DISPLAY2`) on
+    /// a CGDirectDisplayID on a Mac, a monitor device path on
     /// Windows, the RandR monitor name (`DP-1`) on Linux.
     pub id: String,
     /// For people: "Built-in display", "DELL U2720Q", "HDMI-1".

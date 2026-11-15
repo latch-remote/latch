@@ -104,6 +104,7 @@ pub struct ServerStatus {
     /// The encoder of the running or last session.
     pub encoder: String,
     pub hardware: bool,
+    pub captured_display: Option<String>,
     /// Why the running or last session had no sound.
     pub audio_problem: String,
     pub requested_bitrate_kbps: u32,
@@ -211,14 +212,21 @@ impl Server {
     /// Opens what a session needs, after ending the one running. A refusal
     /// is for the HTTP reply; nothing is left open after one.
     pub fn prepare(&self, req: StreamRequest, peer: SocketAddr) -> Result<Prepared, Refusal> {
-        self.prepare_using(req, peer, video::encodable(), video::limits, video::open)
+        let display = req.display.clone();
+        self.prepare_using(
+            req,
+            peer,
+            || video::encodable_for_display(display.as_deref()),
+            video::limits,
+            video::open,
+        )
     }
 
     fn prepare_using(
         &self,
         mut req: StreamRequest,
         peer: SocketAddr,
-        encodable: Vec<Codec>,
+        encodable: impl FnOnce() -> Vec<Codec>,
         limits_for: impl Fn(Codec) -> video::Limits,
         mut open: impl FnMut(&VideoConfig) -> anyhow::Result<Box<dyn VideoPipeline>>,
     ) -> Result<Prepared, Refusal> {
@@ -232,6 +240,30 @@ impl Server {
                 ),
             ));
         }
+        let Some(opening) = self.opening.lock(TAKEOVER_WAIT) else {
+            return Err(Refusal::new(
+                503,
+                "another viewer is still starting a stream here; try again",
+            ));
+        };
+        let running = self.current.lock().clone();
+        if let Some(old) = running {
+            self.log(format!(
+                "{} takes the stream over from {}",
+                display_name(&req.name, peer.ip()),
+                old.viewer
+            ));
+            old.end(end::TAKEN_OVER, "Another device took this stream over.");
+            if !old.wait_finished(TAKEOVER_WAIT) {
+                return Err(Refusal::new(
+                    503,
+                    "the previous stream is still letting go of the screen; try again",
+                ));
+            }
+        }
+        // The old session's undo restores physical outputs before probing
+        // the adapter that will capture the newly requested display.
+        let encodable = encodable();
         let original = req.clone();
         // Best first, of those this host encodes at the size it would send.
         let mut candidates: Vec<Codec> = req
@@ -291,27 +323,6 @@ impl Server {
         req.height = height;
         req.fps = fps;
         req.bitrate_kbps = req.bitrate_kbps.clamp(500, limits.max_kbps);
-        let Some(opening) = self.opening.lock(TAKEOVER_WAIT) else {
-            return Err(Refusal::new(
-                503,
-                "another viewer is still starting a stream here; try again",
-            ));
-        };
-        let running = self.current.lock().clone();
-        if let Some(old) = running {
-            self.log(format!(
-                "{} takes the stream over from {}",
-                display_name(&req.name, peer.ip()),
-                old.viewer
-            ));
-            old.end(end::TAKEN_OVER, "Another device took this stream over.");
-            if !old.wait_finished(TAKEOVER_WAIT) {
-                return Err(Refusal::new(
-                    503,
-                    "the previous stream is still letting go of the screen; try again",
-                ));
-            }
-        }
         let undo = match &self.options.prepare {
             Some(prepare) => prepare(&req)
                 .map_err(|e| Refusal::new(500, format!("could not prepare the desktop: {e:#}")))?,
@@ -414,7 +425,10 @@ impl Server {
         match input::open() {
             Ok(mut sink) => {
                 let info = prepared.info.as_ref().expect("prepared has video info");
-                sink.set_stream_size(info.width, info.height);
+                if let Err(e) = sink.start_display(info.display, info.width, info.height) {
+                    prepared.input_problem =
+                        Some(format!("move pointer into the captured display: {e:#}"));
+                }
                 prepared.input = Some(sink);
             }
             Err(e) => prepared.input_problem = Some(format!("{e:#}")),
@@ -513,6 +527,7 @@ impl Server {
             let mut status = self.status.lock();
             status.encoder = info.encoder.clone();
             status.hardware = info.hardware;
+            status.captured_display = info.captured_display.clone();
             status.audio_problem = prepared.audio_problem.clone();
             status.requested_bitrate_kbps = config.bitrate_kbps;
             let buffers = latch_proto::transport::configure_socket(
@@ -1799,15 +1814,27 @@ fn encode_video(
         if next_info != info {
             {
                 let mut input = session.input.lock();
-                input.display = next_info.display;
                 if let Some(sink) = &mut input.sink {
-                    sink.set_stream_size(next_info.width, next_info.height);
+                    if next_info.display != info.display {
+                        if let Err(e) =
+                            sink.start_display(next_info.display, next_info.width, next_info.height)
+                        {
+                            tracing::warn!("move pointer into the captured display: {e:#}");
+                        }
+                    } else {
+                        sink.set_stream_size(next_info.width, next_info.height);
+                    }
                 }
+                input.display = next_info.display;
             }
-            if next_info.encoder != info.encoder || next_info.hardware != info.hardware {
+            if next_info.encoder != info.encoder
+                || next_info.hardware != info.hardware
+                || next_info.captured_display != info.captured_display
+            {
                 let mut status = server.status.lock();
                 status.encoder = next_info.encoder.clone();
                 status.hardware = next_info.hardware;
+                status.captured_display = next_info.captured_display.clone();
             }
             info = next_info;
         }

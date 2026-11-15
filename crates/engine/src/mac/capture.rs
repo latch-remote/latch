@@ -102,7 +102,7 @@ pub struct Capture {
     pub shared: Arc<Shared>,
     /// Where the captured display was, in global points, at the start.
     pub display: DisplayRect,
-    id: u32,
+    pub(super) id: u32,
     audio: bool,
 }
 // SAFETY: SCStream supports background queues. This owner is exclusive, callback state is locked,

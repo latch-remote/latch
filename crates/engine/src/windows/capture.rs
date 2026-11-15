@@ -27,6 +27,7 @@ use windows::{
 pub(super) struct Gpu {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
+    pub adapter: (i32, u32),
 }
 impl Gpu {
     pub fn new(adapter: &IDXGIAdapter1) -> Result<Self> {
@@ -49,6 +50,11 @@ impl Gpu {
         let gpu = Self {
             device: device.context("D3D11 returned no device")?,
             context: context.context("D3D11 returned no context")?,
+            // SAFETY: adapter is a live owned DXGI interface.
+            adapter: unsafe {
+                let luid = adapter.GetDesc1()?.AdapterLuid;
+                (luid.HighPart, luid.LowPart)
+            },
         };
         // SAFETY: MF may call the immediate context from driver threads.
         unsafe {
@@ -1231,6 +1237,7 @@ mod tests {
         let gpu = Gpu {
             device: device.context("WARP returned no device")?,
             context: context.context("WARP returned no context")?,
+            adapter: (0, 0),
         };
         let white_nits = 203.0f64;
         let nits = |n: f64| n / 80.0;

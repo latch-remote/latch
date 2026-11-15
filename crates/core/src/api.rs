@@ -218,6 +218,9 @@ pub struct Streamer {
     /// and from a host that could not look.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub displays: Vec<latch_proto::control::HostDisplay>,
+    /// The running capture's display identity, including a missing choice's fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub captured_display: Option<String>,
 }
 
 /// One codec's encoder on a host: the largest picture and the fastest
@@ -307,6 +310,7 @@ mod tests {
     fn an_older_host_lists_no_displays_and_a_new_one_round_trips_them() {
         let s: Status =
             serde_json::from_str(r#"{"streamer":{"running":true,"protocol":1}}"#).unwrap();
+        assert_eq!(s.streamer.captured_display, None);
         assert!(s.streamer.displays.is_empty(), "nothing to choose from");
         assert!(!serde_json::to_string(&s).unwrap().contains("displays"));
         let mut s = s;
@@ -320,6 +324,9 @@ mod tests {
         }];
         let back: Status = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.streamer.displays, s.streamer.displays);
+        s.streamer.captured_display = Some("fallback-display".into());
+        let back: Status = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.streamer.captured_display, s.streamer.captured_display);
     }
 
     #[test]

@@ -208,6 +208,7 @@ pub struct Env<'a> {
     pub can_sleep: bool,
     /// The machine's displays, as its status lists them.
     pub displays: Vec<latch_proto::control::HostDisplay>,
+    pub captured_display: Option<String>,
 }
 
 struct Toast {
@@ -1362,7 +1363,11 @@ impl View {
         let displays = display_choices(env);
         if !displays.is_empty() {
             ui::menu_label(ui, "Display to share");
-            let streamed = env.live.display.as_deref();
+            let streamed = env
+                .live
+                .display
+                .as_deref()
+                .map(|requested| env.captured_display.as_deref().unwrap_or(requested));
             let current = crate::session::chosen_display(&env.displays, streamed);
             for (choice, label) in displays {
                 if ui::menu_choice(ui, &label, choice == current)
@@ -2857,6 +2862,7 @@ pub(crate) mod tests {
         pub power_allowed: bool,
         pub can_sleep: bool,
         pub displays: Vec<latch_proto::control::HostDisplay>,
+        pub captured_display: Option<String>,
     }
 
     pub(crate) struct Fixture {
@@ -2981,6 +2987,7 @@ pub(crate) mod tests {
             power_allowed: extra.power_allowed,
             can_sleep: extra.can_sleep,
             displays: extra.displays.clone(),
+            captured_display: extra.captured_display.clone(),
         };
         let actions = view.show(ctx, &env);
         if !actions.is_empty() {
@@ -3092,6 +3099,16 @@ pub(crate) mod tests {
         h.get_by_label(external).simulate_click();
         h.run_steps(2);
         assert!(h.state().actions.is_empty());
+
+        // B disappeared and capture fell back to A. Replugging B keeps
+        // A selected until B is chosen again, even though B was requested.
+        h.state_mut().extra.captured_display = Some("1".into());
+        h.get_by_label("Mac").simulate_click();
+        h.run_steps(2);
+        h.get_by_label(external).simulate_click();
+        h.run_steps(2);
+        assert_eq!(h.state().actions, [Action::ChooseDisplay(Some("2".into()))]);
+        h.state_mut().actions.clear();
 
         h.get_by_label("Mac").simulate_click();
         h.run_steps(2);

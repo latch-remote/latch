@@ -11,30 +11,82 @@ use std::time::{Duration, Instant};
 /// How long a look at the displays stands before the next status looks again.
 const DISPLAYS_FOR: Duration = Duration::from_secs(3);
 
-/// The displays a viewer can choose from. On Windows while `streaming`,
-/// keep the list from before the session: a session on the virtual display
-/// switches the other monitors off until it ends, and they are still
-/// there to choose.
+#[derive(Default)]
+struct Displays {
+    seen: Option<(Instant, Vec<HostDisplay>)>,
+    held: usize,
+}
+
+impl Displays {
+    fn list(
+        &mut self,
+        streaming: bool,
+        now: Instant,
+        read: impl FnOnce() -> anyhow::Result<Vec<HostDisplay>>,
+    ) -> Vec<HostDisplay> {
+        if let Some((at, list)) = &self.seen {
+            if self.held > 0 || streaming || now.duration_since(*at) < DISPLAYS_FOR {
+                return list.clone();
+            }
+        }
+        match read() {
+            Ok(list) => {
+                self.seen = Some((now, list.clone()));
+                list
+            }
+            Err(error) => {
+                tracing::debug!("could not list the displays: {error:#}");
+                self.seen
+                    .as_ref()
+                    .map(|(_, list)| list.clone())
+                    .unwrap_or_default()
+            }
+        }
+    }
+
+    fn release(&mut self) {
+        self.held -= 1;
+        if self.held == 0 {
+            // The topology has been restored. Refresh at the next poll.
+            if let Some((at, _)) = &mut self.seen {
+                *at = Instant::now() - DISPLAYS_FOR;
+            }
+        }
+    }
+}
+
+static DISPLAYS: Mutex<Displays> = Mutex::new(Displays {
+    seen: None,
+    held: 0,
+});
+
+/// Keep Windows' pre-session list through preparation, capture and restoration.
+/// Polls and preparation use the same lock so a late enumeration cannot overwrite it.
+pub fn hold_displays() -> Option<HeldDisplays> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let mut displays = DISPLAYS.lock();
+    displays.list(false, Instant::now(), latch_engine::display::list);
+    displays.held += 1;
+    Some(HeldDisplays)
+}
+
+pub struct HeldDisplays;
+impl Drop for HeldDisplays {
+    fn drop(&mut self) {
+        DISPLAYS.lock().release();
+    }
+}
+
+/// The displays a viewer can choose from, preserving Windows' topology
+/// while preparation temporarily switches physical outputs off.
 pub fn displays(streaming: bool) -> Vec<HostDisplay> {
-    static SEEN: Mutex<Option<(Instant, Vec<HostDisplay>)>> = Mutex::new(None);
-    if let Some((at, list)) = &*SEEN.lock() {
-        if (cfg!(windows) && streaming) || at.elapsed() < DISPLAYS_FOR {
-            return list.clone();
-        }
-    }
-    match latch_engine::display::list() {
-        Ok(list) => {
-            *SEEN.lock() = Some((Instant::now(), list.clone()));
-            list
-        }
-        Err(error) => {
-            tracing::debug!("could not list the displays: {error:#}");
-            SEEN.lock()
-                .as_ref()
-                .map(|(_, list)| list.clone())
-                .unwrap_or_default()
-        }
-    }
+    DISPLAYS.lock().list(
+        cfg!(windows) && streaming,
+        Instant::now(),
+        latch_engine::display::list,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -202,6 +254,36 @@ fn caps(codec: Codec, limits: Limits) -> CodecCaps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_keeps_physical_displays_through_expired_status_polls() {
+        let now = Instant::now();
+        let physical = vec![HostDisplay {
+            id: "physical".into(),
+            ..Default::default()
+        }];
+        let virtual_only = vec![HostDisplay {
+            id: "virtual".into(),
+            ..Default::default()
+        }];
+        let mut cache = Displays::default();
+        assert_eq!(cache.list(false, now, || Ok(physical.clone())), physical);
+        cache.held += 1;
+        let later = now + DISPLAYS_FOR * 2;
+        assert_eq!(
+            cache.list(false, later, || Ok(virtual_only.clone())),
+            physical
+        );
+        assert_eq!(
+            cache.list(true, later, || Ok(virtual_only.clone())),
+            physical
+        );
+        cache.release();
+        assert_eq!(
+            cache.list(false, later, || Ok(virtual_only.clone())),
+            virtual_only
+        );
+    }
 
     #[test]
     fn only_the_software_encoder_is_measured() {

@@ -50,6 +50,27 @@ pub trait InputSink: Send {
     /// Stream dimensions for platforms whose cursor uses logical display points.
     fn set_stream_size(&mut self, _width: u32, _height: u32) {}
 
+    /// Move into a newly captured display before relative input resumes.
+    fn start_display(
+        &mut self,
+        display: DisplayRect,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<()> {
+        self.set_stream_size(width, height);
+        let width = width.clamp(1, u32::from(u16::MAX)) as u16;
+        let height = height.clamp(1, u32::from(u16::MAX)) as u16;
+        self.apply(
+            &Event::MousePosition {
+                x: width / 2,
+                y: height / 2,
+                width,
+                height,
+            },
+            display,
+        )
+    }
+
     /// Applies one event. `display` is where absolute positions land.
     fn apply(&mut self, event: &Event, display: DisplayRect) -> anyhow::Result<()>;
 
@@ -597,5 +618,76 @@ mod mapping_tests {
         assert_eq!(display.map(960, 600, 1920, 1200), (990, 440));
         assert_eq!(display.map(0, 0, 0, 0), (30, -100));
         assert_eq!(DisplayRect::default().map(u16::MAX, u16::MAX, 0, 0), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod display_start_tests {
+    use super::*;
+
+    #[test]
+    fn starting_another_display_places_relative_input_inside_its_picture() {
+        #[derive(Default)]
+        struct Pointer {
+            point: (i32, i32),
+            size: (u32, u32),
+        }
+        impl InputSink for Pointer {
+            fn set_stream_size(&mut self, width: u32, height: u32) {
+                self.size = (width, height);
+            }
+            fn apply(&mut self, event: &Event, display: DisplayRect) -> anyhow::Result<()> {
+                match *event {
+                    Event::MousePosition {
+                        x,
+                        y,
+                        width,
+                        height,
+                    } => self.point = display.map(x, y, width, height),
+                    Event::MouseMove { dx, dy } => {
+                        self.point.0 += i32::from(dx);
+                        self.point.1 += i32::from(dy);
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+            fn release_all(&mut self) {}
+        }
+        let mut pointer = Pointer::default();
+        for display in [
+            DisplayRect {
+                x: 1920,
+                y: -200,
+                width: 1920,
+                height: 1080,
+            },
+            DisplayRect {
+                x: -2560,
+                y: 500,
+                width: 2560,
+                height: 1440,
+            },
+        ] {
+            pointer.start_display(display, 1280, 720).unwrap();
+            assert_eq!(pointer.size, (1280, 720));
+            assert_eq!(
+                pointer.point,
+                (
+                    display.x + display.width as i32 / 2,
+                    display.y + display.height as i32 / 2
+                )
+            );
+            pointer
+                .apply(&Event::MouseMove { dx: 5, dy: -3 }, display)
+                .unwrap();
+            assert_eq!(
+                pointer.point,
+                (
+                    display.x + display.width as i32 / 2 + 5,
+                    display.y + display.height as i32 / 2 - 3
+                )
+            );
+        }
     }
 }

@@ -53,6 +53,8 @@ pub struct VideoInfo {
     pub height: u32,
     /// The captured display, where absolute mouse positions land.
     pub display: DisplayRect,
+    /// The display actually captured, when the platform reports its identity.
+    pub captured_display: Option<String>,
 }
 
 /// A cursor update from the capture pipeline to be sent to the viewer.
@@ -271,6 +273,13 @@ impl Unencodable {
 
 /// What this machine can encode, best first.
 pub fn encodable() -> Vec<Codec> {
+    encodable_for_display(None)
+}
+
+/// What the adapter driving the selected display can encode.
+pub fn encodable_for_display(display: Option<&str>) -> Vec<Codec> {
+    #[cfg(not(windows))]
+    let _ = display;
     if crate::testmode::motion().is_some() {
         #[cfg(target_os = "macos")]
         if crate::testmode::native_encoder() {
@@ -281,7 +290,7 @@ pub fn encodable() -> Vec<Codec> {
     #[cfg(target_os = "macos")]
     return crate::mac::encodable();
     #[cfg(windows)]
-    return crate::windows::encodable();
+    return crate::windows::encodable(display);
     #[cfg(target_os = "linux")]
     return crate::linux::encodable();
 }

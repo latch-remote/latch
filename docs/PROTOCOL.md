@@ -474,7 +474,7 @@ and a viewer then offers no choice.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `id` | string | what `StreamRequest.display` names it by; opaque to the viewer: a CGDirectDisplayID on a Mac, the GDI name (`\\.\DISPLAY2`) on Windows, the RandR monitor name (`DP-1`) on Linux |
+| `id` | string | the opaque ID used by `StreamRequest.display`, with a CGDirectDisplayID on macOS, a monitor device path (or adapter LUID + target ID) on Windows, and a RandR monitor name (`DP-1`) on Linux |
 | `name` | string | for people: `"Built-in display"`, a monitor's own name, `"Virtual display"` |
 | `x`, `y` | i32 | where it sits on the host's desktop, in the platform's desktop coordinates (points on macOS, pixels on Windows and X11) |
 | `width`, `height` | u32 | its size in pixels |
@@ -491,7 +491,20 @@ RandR 1.5 monitor's rectangle of the X screen and does not resize it when
 several are connected; its `capture_size` stays the whole screen's, and a
 viewer that chose a monitor plans for that monitor's size instead.
 Switching displays mid-stream is a new session; there is no control
-message for it.
+message for it. The host places the pointer in the new picture before
+relative input resumes. Windows codec negotiation probes the adapter that
+drives the selected output, with capability results cached per adapter.
+
+Windows choices saved as GDI source names by earlier versions follow the
+missing-display fallback. New choices use monitor device paths so source
+renumbering preserves the selected monitor. Windows keeps the pre-session
+list throughout preparation and restoration as well as capture.
+
+`streamer.captured_display`, when present, names the display the running
+pipeline actually captures. macOS reports this even when a missing choice
+fell back to another display. The viewer uses it to mark the current
+capture and allows choosing the requested display again after reconnecting
+it. Older hosts omit this additive status field.
 
 ## Encoder limits (5.2, additive)
 

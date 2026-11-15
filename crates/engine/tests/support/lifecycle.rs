@@ -23,6 +23,7 @@ fn config() -> VideoConfig {
 
 fn info() -> VideoInfo {
     VideoInfo {
+        captured_display: None,
         color: Default::default(),
         encoder: "initial".into(),
         hardware: true,
@@ -533,10 +534,20 @@ fn repeated_video_errors_release_exclusive_capture_and_have_a_retry_budget() {
 
 #[test]
 fn idle_requests_are_prompt_and_each_encoded_frame_updates_mapping_and_is_sent() {
+    struct Pointer(Arc<Mutex<Vec<(input::Event, DisplayRect)>>>);
+    impl InputSink for Pointer {
+        fn apply(&mut self, event: &input::Event, display: DisplayRect) -> anyhow::Result<()> {
+            self.0.lock().push((event.clone(), display));
+            Ok(())
+        }
+        fn release_all(&mut self) {}
+    }
     let server = Server::bind(0, Options::default()).unwrap();
     let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     udp.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
     let session = session(udp.local_addr().unwrap());
+    let positions = Arc::new(Mutex::new(Vec::new()));
+    session.input.lock().sink = Some(Box::new(Pointer(positions.clone())));
     let (entered_tx, entered_rx) = mpsc::channel();
     let (request_tx, request_rx) = mpsc::channel();
     let (idr_tx, idr_rx) = mpsc::channel();
@@ -558,6 +569,7 @@ fn idle_requests_are_prompt_and_each_encoded_frame_updates_mapping_and_is_sent()
                     width: 128,
                     height: 96,
                 };
+                info.captured_display = Some("fallback-display".into());
                 info.encoder = "fallback".into();
                 info.hardware = false;
             } else if calls == 2 {
@@ -615,6 +627,24 @@ fn idle_requests_are_prompt_and_each_encoded_frame_updates_mapping_and_is_sent()
     worker.join().unwrap();
     let display = session.input.lock().display;
     assert_eq!(display.map(32, 32, 64, 64), (-64, 58));
+    let positions = positions.lock();
+    assert_eq!(positions.len(), 1);
+    assert_eq!(
+        positions[0],
+        (
+            input::Event::MousePosition {
+                x: 32,
+                y: 32,
+                width: 64,
+                height: 64
+            },
+            display
+        )
+    );
+    assert_eq!(
+        server.status().captured_display.as_deref(),
+        Some("fallback-display")
+    );
     assert_eq!(server.status().encoder, "fallback");
     assert!(!server.status().hardware);
     assert_eq!(session.frames.load(Ordering::Relaxed), 2);
@@ -1246,7 +1276,7 @@ fn fallback_refits_geometry_and_prepares_the_final_mode() {
     let result = server.prepare_using(
         req,
         "127.0.0.1:9".parse().unwrap(),
-        vec![Codec::H264High, Codec::H264Baseline],
+        || vec![Codec::H264High, Codec::H264Baseline],
         limits_for,
         |cfg| {
             calls.push(cfg.clone());
@@ -1258,4 +1288,50 @@ fn fallback_refits_geometry_and_prepares_the_final_mode() {
     let last = calls.last().unwrap();
     assert_eq!((last.width, last.height, last.fps), expected);
     assert_eq!(prepared_sizes.lock().last(), Some(&expected));
+}
+
+#[test]
+fn display_codec_negotiation_waits_for_the_previous_capture_to_release_its_topology() {
+    let server = Server::bind(0, Options::default()).unwrap();
+    let old = session("127.0.0.1:9".parse().unwrap());
+    *server.current.lock() = Some(old.clone());
+    let cleanup = {
+        let old = old.clone();
+        std::thread::spawn(move || {
+            while !old.stopping() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            old.mark_finished();
+        })
+    };
+    let req: StreamRequest = serde_json::from_value(serde_json::json!({
+        "protocol": 1, "width": 64, "height": 64, "fps": 30,
+        "bitrate_kbps": 1000, "codecs": ["av1", "h264-baseline"],
+        "udp_port": 9, "audio": false, "display": "secondary-monitor"
+    }))
+    .unwrap();
+    let mut opened = Vec::new();
+    let result = server.prepare_using(
+        req,
+        "127.0.0.1:9".parse().unwrap(),
+        || {
+            assert!(old.stopping());
+            assert!(
+                *old.finished.lock(),
+                "probe must follow topology restoration"
+            );
+            // The selected adapter supports H.264, even if the old one used AV1.
+            vec![Codec::H264Baseline]
+        },
+        video::Limits::level,
+        |config| {
+            opened.push(config.clone());
+            Err(video::Unencodable("injected open failure".into()).into())
+        },
+    );
+    cleanup.join().unwrap();
+    assert!(result.is_err());
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opened[0].codec, Codec::H264Baseline);
+    assert_eq!(opened[0].display.as_deref(), Some("secondary-monitor"));
 }

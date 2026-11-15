@@ -584,6 +584,7 @@ impl<C: CpuCapture> VideoPipeline for SoftwarePipeline<C> {
         };
         let (name, hardware, codec, _) = &self.describe;
         VideoInfo {
+            captured_display: None,
             color: Default::default(),
             encoder: format!("{name} ({})", self.capture.name()),
             hardware: *hardware,

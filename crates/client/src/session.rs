@@ -737,8 +737,14 @@ impl HostLimits {
     /// that display at its own size, not the whole desktop's.
     pub fn of_display(streamer: &latch_core::api::Streamer, chosen: Option<&str>) -> Self {
         let mut limits = Self::of(streamer);
-        if limits.capture_size.is_some() {
+        if let Some([width, height]) = limits.capture_size {
             if let Some(d) = HostDisplay::find(&streamer.displays, chosen) {
+                let pixels = u64::from(d.width) * u64::from(d.height);
+                if limits.max_fps > 0 && pixels > 0 {
+                    let rate = u128::from(limits.max_fps) * u128::from(width) * u128::from(height);
+                    limits.max_fps =
+                        (rate / u128::from(pixels)).clamp(1, u128::from(u32::MAX)) as u32;
+                }
                 limits.capture_size = Some([d.width, d.height]);
             }
         }
@@ -1348,6 +1354,36 @@ mod tests {
             HostLimits::of_display(&follows, Some("2")).capture_size,
             None
         );
+    }
+
+    #[test]
+    fn selecting_a_monitor_preserves_the_software_pixel_rate() {
+        let mut streamer = latch_core::api::Streamer {
+            capture_size: Some([3840, 1080]),
+            max_fps: 30,
+            displays: vec![HostDisplay {
+                id: "1".into(),
+                name: "Monitor".into(),
+                width: 1920,
+                height: 1080,
+                primary: true,
+                default: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(HostLimits::of_display(&streamer, Some("1")).max_fps, 60);
+        assert_eq!(HostLimits::of_display(&streamer, None).max_fps, 30);
+        assert_eq!(
+            HostLimits::of_display(&streamer, Some("missing")).max_fps,
+            30
+        );
+        streamer.displays[0].width = 7680;
+        assert_eq!(HostLimits::of_display(&streamer, Some("1")).max_fps, 15);
+        streamer.max_fps = 0;
+        assert_eq!(HostLimits::of_display(&streamer, Some("1")).max_fps, 0);
+        streamer.displays[0].width = 0;
+        assert_eq!(HostLimits::of_display(&streamer, Some("1")).max_fps, 0);
     }
 
     #[test]

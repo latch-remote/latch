@@ -104,6 +104,7 @@ struct MfPipeline {
 impl MfPipeline {
     fn info(&self) -> VideoInfo {
         VideoInfo {
+            captured_display: None,
             color: self.config.color,
             encoder: self.encoder.name().to_string(),
             hardware: self.encoder.hardware(),
@@ -354,20 +355,21 @@ impl Pipeline {
                     })))
                 }
                 Err(e) if matches!(config.codec, Codec::Hevc | Codec::Av1) => {
-                    // Latch's own encoder makes H.264 only, and the viewer
-                    // has been told HEVC: fail this session, and offer H.264
-                    // to the next one.
+                    // Negotiation can still try the viewer's next codec
+                    // when this adapter cannot open its hardware encoder.
                     if config.color.bit_depth == 8 {
-                        encode::codec_failed(config.codec, &e);
+                        encode::codec_failed(config.codec, &capture.gpu, &e);
                     }
-                    return Err(e.context("open hardware codec"));
+                    return Err(
+                        crate::video::Unencodable(format!("open hardware codec: {e:#}")).into(),
+                    );
                 }
                 Err(e) => {
                     tracing::warn!("Media Foundation unavailable, using Latch software: {e:#}")
                 }
             }
         } else if matches!(config.codec, Codec::Hevc | Codec::Av1) {
-            bail!("codec needs Media Foundation");
+            return Err(crate::video::Unencodable("codec needs Media Foundation".into()).into());
         }
         Ok(Self::Software(Box::new(SoftwarePipeline::new(
             capture, config,
@@ -402,7 +404,7 @@ impl Pipeline {
                         // Neither Microsoft's encoder nor Latch's software one
                         // makes HEVC, and the viewer decodes nothing else on
                         // this stream: end it, so the next offers H.264.
-                        encode::codec_failed(p.config.codec, &e);
+                        encode::codec_failed(p.config.codec, &p.capture.gpu, &e);
                         let info = self.info();
                         *self = Self::Failed(info);
                         return Err(e.context("hardware codec pipeline failed"));
@@ -561,12 +563,6 @@ pub fn open_video(config: &VideoConfig) -> Result<Box<dyn VideoPipeline>> {
     {
         bail!("invalid Windows video size, fps, or bitrate");
     }
-    if !matches!(config.codec, Codec::H264Baseline | Codec::H264High)
-        && !(matches!(config.codec, Codec::Hevc | Codec::Av1)
-            && encode::codec_allowed(config.codec))
-    {
-        bail!("Windows codec is unavailable");
-    }
     let config = config.clone();
     let (requests, receive) = mpsc::channel();
     let (ready, startup) = mpsc::sync_channel(1);
@@ -655,16 +651,22 @@ pub fn open_pads(feedback: crate::gamepad::FeedbackFn) -> Result<crate::gamepad:
 pub use elevated::{
     helper_exe as input_helper_exe, run_helper as run_input_helper, TASK as INPUT_TASK,
 };
-pub fn encodable() -> Vec<Codec> {
+pub fn encodable(display: Option<&str>) -> Vec<Codec> {
+    let display = display.map(str::to_owned);
     thread::Builder::new()
         .name("latch-mf-probe".into())
-        .spawn(|| {
+        .spawn(move || {
             let Ok(_runtime) = Runtime::new(true) else {
                 return vec![Codec::H264Baseline];
             };
+            let _dpi = display::DpiAwareness::physical();
+            let output = display::select_named(display.as_deref()).ok();
             let mut codecs = Vec::new();
             for codec in [Codec::Av1, Codec::Hevc] {
-                if encode::codec_available(codec) {
+                if output
+                    .as_ref()
+                    .is_some_and(|o| encode::codec_available(codec, o))
+                {
                     codecs.push(codec);
                 }
             }
@@ -772,6 +774,7 @@ mod tests {
         drop(VideoProxy {
             requests,
             info: VideoInfo {
+                captured_display: None,
                 color: Default::default(),
                 encoder: String::new(),
                 hardware: false,

@@ -10,6 +10,20 @@ use std::time::{Duration, Instant};
 type Undo = Option<Box<dyn FnOnce() + Send>>;
 
 pub fn prepare(cfg: &HostConfig, req: &StreamRequest) -> Result<Undo> {
+    let held = crate::streamer::hold_displays();
+    let undo = prepare_desktop(cfg, req)?;
+    if held.is_none() && undo.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Box::new(move || {
+        if let Some(undo) = undo {
+            undo();
+        }
+        drop(held);
+    })))
+}
+
+fn prepare_desktop(cfg: &HostConfig, req: &StreamRequest) -> Result<Undo> {
     let size = [
         req.width.clamp(64, latch_proto::control::MAX_SIDE) & !1,
         req.height.clamp(64, latch_proto::control::MAX_SIDE) & !1,

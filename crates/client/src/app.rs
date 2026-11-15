@@ -1138,6 +1138,9 @@ impl eframe::App for ClientApp {
                     // Discovery's fresh word on it; without that, nothing.
                     power_allowed: pc_now.is_some_and(|p| p.power_allowed()),
                     can_sleep: pc_now.is_some_and(|p| p.can_sleep()),
+                    captured_display: pc_now
+                        .and_then(|p| p.host.as_ref())
+                        .and_then(|h| h.streamer.captured_display.clone()),
                     displays: pc_now
                         .and_then(|p| p.host.as_ref())
                         .map(|h| h.streamer.displays.clone())
@@ -1146,6 +1149,7 @@ impl eframe::App for ClientApp {
                 let actions = self.view.show(ctx, &env);
                 let (ip, name, input) = (l.ip, l.pc.clone(), l.input.clone());
                 let (node_id, streamed_display) = (l.node_id.clone(), l.display.clone());
+                let captured_display = env.captured_display.clone();
                 // What a reconnect for a new display would ask for, beside
                 // what this stream asked for.
                 let display_request = (
@@ -1189,7 +1193,11 @@ impl eframe::App for ClientApp {
                             self.dirty = true;
                             // Another display is another capture: the
                             // stream starts again on it.
-                            if display != streamed_display {
+                            if display != streamed_display
+                                || (display.is_some()
+                                    && captured_display.is_some()
+                                    && display != captured_display)
+                            {
                                 self.disconnect();
                                 self.reconnect = self.last_pc.clone();
                             }

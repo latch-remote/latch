@@ -129,6 +129,7 @@ pub(super) struct Output {
     pub output: IDXGIOutput,
     pub desc: DXGI_OUTPUT_DESC,
     pub virtual_display: bool,
+    pub id: String,
 }
 fn text(s: &[u16]) -> String {
     String::from_utf16_lossy(&s[..s.iter().position(|&c| c == 0).unwrap_or(s.len())])
@@ -167,6 +168,7 @@ fn outputs() -> Result<Vec<Output>> {
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().context("create DXGI factory")?;
         let mut outputs = Vec::new();
+        let monitors = monitor_names();
         for a in 0.. {
             let adapter = match factory.EnumAdapters1(a) {
                 Ok(a) => a,
@@ -188,6 +190,11 @@ fn outputs() -> Result<Vec<Output>> {
                         output,
                         desc,
                         virtual_display,
+                        id: monitors
+                            .iter()
+                            .find(|(gdi, _, _)| *gdi == desc.DeviceName)
+                            .map(|(_, id, _)| id.clone())
+                            .unwrap_or_default(),
                     });
                 }
             }
@@ -241,6 +248,7 @@ fn primary(output: &Output) -> bool {
 /// attached, else the virtual display, else the primary one.
 fn pick(outputs: &[(String, bool, bool)], wanted: Option<&str>) -> Option<usize> {
     wanted
+        .filter(|w| !w.is_empty())
         .and_then(|w| outputs.iter().position(|(name, _, _)| name == w))
         .or_else(|| {
             outputs
@@ -253,13 +261,13 @@ fn pick(outputs: &[(String, bool, bool)], wanted: Option<&str>) -> Option<usize>
 fn keys(outputs: &[Output]) -> Vec<(String, bool, bool)> {
     outputs
         .iter()
-        .map(|o| (text(&o.desc.DeviceName), o.virtual_display, primary(o)))
+        .map(|o| (o.id.clone(), o.virtual_display, primary(o)))
         .collect()
 }
 pub(super) fn select() -> Result<Output> {
     select_named(None)
 }
-/// The output named `wanted` (its GDI name, `\\.\DISPLAY2`), or the one
+/// The output named `wanted` (its monitor device path), or the one
 /// [`select`] takes when that is `None` or not attached now.
 pub(super) fn select_named(wanted: Option<&str>) -> Result<Output> {
     let mut outputs = outputs()?;
@@ -268,8 +276,8 @@ pub(super) fn select_named(wanted: Option<&str>) -> Result<Output> {
     };
     Ok(outputs.swap_remove(index))
 }
-/// The monitor names Windows shows in Settings, by GDI source name.
-fn friendly_names() -> Vec<([u16; 32], String)> {
+/// Join DXGI's current GDI sources to persistent monitor identities and labels.
+fn monitor_names() -> Vec<([u16; 32], String, String)> {
     let Ok((paths, _)) = topology() else {
         return Vec::new();
     };
@@ -299,34 +307,51 @@ fn friendly_names() -> Vec<([u16; 32], String)> {
                 && DisplayConfigGetDeviceInfo(&mut target.header) == 0
             {
                 let name = text(&target.monitorFriendlyDeviceName);
-                if !name.is_empty() {
-                    names.push((source.viewGdiDeviceName, name));
-                }
+                let device_path = text(&target.monitorDevicePath);
+                let luid = path.targetInfo.adapterId;
+                let id = monitor_identity(
+                    &device_path,
+                    (luid.HighPart, luid.LowPart, path.targetInfo.id),
+                );
+                names.push((source.viewGdiDeviceName, id, name));
             }
         }
     }
     names
 }
+fn monitor_identity(device_path: &str, target: (i32, u32, u32)) -> String {
+    if device_path.is_empty() {
+        format!("target:{:x}:{:x}:{}", target.0, target.1, target.2)
+    } else {
+        device_path.to_ascii_lowercase()
+    }
+}
+
 /// Every output attached to the desktop, for a viewer to choose from. The
 /// one [`select`] takes is the default.
 pub(super) fn list() -> Result<Vec<latch_proto::control::HostDisplay>> {
     let outputs = outputs()?;
     let default = pick(&keys(&outputs), None);
-    let friendly = friendly_names();
+    let friendly = monitor_names();
     Ok(outputs
         .iter()
         .enumerate()
+        .filter(|(_, o)| !o.id.is_empty())
         .map(|(i, o)| {
-            let id = text(&o.desc.DeviceName);
+            let id = o.id.clone();
             let r = o.desc.DesktopCoordinates;
             let name = if o.virtual_display {
                 "Virtual display".to_string()
             } else {
                 friendly
                     .iter()
-                    .find(|(gdi, _)| *gdi == o.desc.DeviceName)
-                    .map(|(_, name)| name.clone())
-                    .unwrap_or_else(|| id.trim_start_matches(r"\\.\").to_string())
+                    .find(|(gdi, _, name)| *gdi == o.desc.DeviceName && !name.is_empty())
+                    .map(|(_, _, name)| name.clone())
+                    .unwrap_or_else(|| {
+                        text(&o.desc.DeviceName)
+                            .trim_start_matches(r"\\.\")
+                            .to_string()
+                    })
             };
             latch_proto::control::HostDisplay {
                 id,
@@ -561,7 +586,37 @@ mod tests {
             "a display that has gone falls back to the default"
         );
         assert_eq!(super::pick(&[], Some("x")), None);
+        assert_eq!(
+            super::pick(
+                &[
+                    (String::new(), false, false),
+                    ("virtual".into(), true, false)
+                ],
+                Some("")
+            ),
+            Some(1)
+        );
     }
+    #[test]
+    fn remembered_monitors_follow_device_paths_after_sources_are_renumbered() {
+        let a = super::monitor_identity(r"\\?\DISPLAY#AAA#serial-a", (0, 1, 1));
+        let b = super::monitor_identity(r"\\?\DISPLAY#BBB#serial-b", (0, 1, 2));
+        let before = vec![(a.clone(), false, true), (b.clone(), false, false)];
+        let after = vec![(b.clone(), false, true), (a.clone(), false, false)];
+        assert_eq!(super::pick(&before, Some(&b)), Some(1));
+        assert_eq!(super::pick(&after, Some(&b)), Some(0));
+        assert_eq!(super::pick(&after[1..], Some(&b)), Some(0));
+        assert_eq!(super::pick(&after, Some(r"\\.\DISPLAY2")), Some(0));
+        assert_eq!(
+            a,
+            super::monitor_identity(r"\\?\display#aaa#serial-a", (9, 9, 9))
+        );
+        assert_ne!(
+            super::monitor_identity("", (0, 1, 1)),
+            super::monitor_identity("", (0, 1, 2))
+        );
+    }
+
     #[test]
     fn virtual_output_wins_over_primary() {
         let candidates = [(false, true), (true, false)];
