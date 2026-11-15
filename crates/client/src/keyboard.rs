@@ -2,9 +2,13 @@
 //! Uses the same egui-winit callback as the event-time dispatch work.
 
 use egui::{Event, Modifiers};
+#[cfg(any(not(target_os = "macos"), test))]
+use egui_winit::winit::keyboard::NativeKeyCode;
+#[cfg(any(target_os = "macos", test))]
+use egui_winit::winit::platform::scancode::PhysicalKeyExtScancode;
 use egui_winit::winit::{
     event::WindowEvent,
-    keyboard::{KeyCode, PhysicalKey},
+    keyboard::{KeyCode, NamedKey, PhysicalKey},
 };
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -70,17 +74,16 @@ pub fn vk(code: KeyCode) -> Option<u16> {
     })
 }
 
-/// Preserve the existing default on Mac viewers. On W/L viewers the same
-/// setting maps Ctrl to Command only for a Mac host. Super always stays Meta.
+/// True sided Ctrl/Meta swap. The caller chooses its shortcut scope.
 pub fn shortcut(vk: u16, viewer_mac: bool, host_mac: bool, map: bool) -> u16 {
     if !map || viewer_mac == host_mac {
         return vk;
     }
-    match (viewer_mac, vk) {
-        (true, 0x5b) => 0xa2,
-        (true, 0x5c) => 0xa3,
-        (false, 0xa2) => 0x5b,
-        (false, 0xa3) => 0x5c,
+    match vk {
+        0x5b => 0xa2,
+        0x5c => 0xa3,
+        0xa2 => 0x5b,
+        0xa3 => 0x5c,
         _ => vk,
     }
 }
@@ -103,6 +106,7 @@ struct State {
     text_keys: BTreeSet<KeyCode>,
     alt_gr: bool,
     installed: bool,
+    key_positions: bool,
     owned: bool,
     pressed: BTreeSet<u16>,
 }
@@ -135,8 +139,6 @@ pub fn install(cc: &eframe::CreationContext<'_>) {
             },
         )
     });
-    #[cfg(windows)]
-    windows::install();
     #[cfg(target_os = "linux")]
     linux::install(cc);
 }
@@ -150,21 +152,72 @@ pub fn latest() -> Option<Frame> {
     STATE.with_borrow(|s| s.installed.then(|| s.latest.clone()))
 }
 
-pub fn mapped(vk: u16, host_mac: bool, map: bool) -> u16 {
-    if alt_gr() && matches!(vk, 0xa2 | 0xa3) {
-        vk
-    } else {
-        shortcut(vk, cfg!(target_os = "macos"), host_mac, map)
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn test_frame(frame: Frame) {
     STATE.with_borrow_mut(|s| s.frame = Some(frame));
 }
 
+#[cfg(test)]
+pub(crate) fn test_install(installed: bool) {
+    STATE.with_borrow_mut(|s| {
+        s.installed = installed;
+        s.key_positions = installed;
+    });
+}
+
 pub fn available() -> bool {
-    STATE.with_borrow(|s| s.installed)
+    STATE.with_borrow(|s| s.installed && s.key_positions)
+}
+
+pub fn key_positions(accepted: bool) {
+    STATE.with_borrow_mut(|s| s.key_positions = accepted);
+}
+
+/// System shortcut capture requires deliberate fullscreen/mouse capture.
+pub fn capture_system_keys(keys: bool, fullscreen: bool, mouse: bool) -> bool {
+    keys && (fullscreen || mouse)
+}
+
+fn event_key(
+    physical: PhysicalKey,
+    logical: &egui_winit::winit::keyboard::Key,
+    iso: bool,
+    positions: bool,
+) -> Option<KeyCode> {
+    if !positions || *logical == egui_winit::winit::keyboard::Key::Named(NamedKey::Process) {
+        return None;
+    }
+    native_code(physical, iso)
+}
+
+fn native_code(physical: PhysicalKey, iso: bool) -> Option<KeyCode> {
+    #[cfg(target_os = "macos")]
+    let scan = physical.to_scancode().map(|v| v as u16);
+    #[cfg(not(target_os = "macos"))]
+    let scan = match physical {
+        PhysicalKey::Unidentified(NativeKeyCode::MacOS(code)) => Some(code),
+        _ => None,
+    };
+    if let Some(scan) = scan {
+        return Some(match latch_proto::keyboard::apple_iso(scan, iso) {
+            0x0a => KeyCode::IntlBackslash,
+            0x32 => KeyCode::Backquote,
+            0x5e => KeyCode::IntlRo,
+            0x5f => KeyCode::NumpadComma,
+            0x66 => KeyCode::Lang2,
+            0x68 => KeyCode::Lang1,
+            // Mac Clear must not toggle a PC host's Num Lock.
+            0x47 => return None,
+            _ => match physical {
+                PhysicalKey::Code(code) => code,
+                _ => return None,
+            },
+        });
+    }
+    match physical {
+        PhysicalKey::Code(code) => Some(code),
+        _ => None,
+    }
 }
 
 pub fn alt_gr() -> bool {
@@ -222,11 +275,24 @@ impl State {
                 .extend(events.iter().cloned().map(|e| (e, None, false)));
             return;
         };
-        let PhysicalKey::Code(code) = event.physical_key else {
+        #[cfg(target_os = "macos")]
+        let iso = latch_proto::keyboard::apple_keyboard_is_iso();
+        #[cfg(not(target_os = "macos"))]
+        let iso = false;
+        let Some(code) = event_key(
+            event.physical_key,
+            &event.logical_key,
+            iso,
+            self.key_positions,
+        ) else {
             self.pending
                 .extend(events.iter().cloned().map(|e| (e, None, false)));
             return;
         };
+        if code == KeyCode::AltRight {
+            self.alt_gr = event.state.is_pressed()
+                && event.logical_key == egui_winit::winit::keyboard::Key::Named(NamedKey::AltGraph);
+        }
         self.key(
             code,
             event.state.is_pressed(),
@@ -246,15 +312,21 @@ impl State {
         events: &[Event],
         mods: Modifiers,
     ) {
+        if !self.key_positions {
+            self.pending
+                .extend(events.iter().cloned().map(|e| (e, None, false)));
+            return;
+        }
+        #[cfg(windows)]
+        if vk(code).is_some_and(|vk| windows::take_forwarded(Key { vk, down })) {
+            return;
+        }
         if let Some(vk) = vk(code) {
             if down {
                 self.pressed.insert(vk);
             } else {
                 self.pressed.remove(&vk);
             }
-        }
-        if code == KeyCode::AltRight {
-            self.alt_gr = down;
         }
         // Caps Lock on macOS is a state change, already converted to a tap
         // by the stream. Other platforms deliver a normal down/up pair.
@@ -289,6 +361,18 @@ impl State {
         {
             self.pending
                 .extend(events.iter().cloned().map(|e| (e, None, false)));
+            return;
+        }
+        if matches!(
+            code,
+            KeyCode::AudioVolumeMute
+                | KeyCode::AudioVolumeDown
+                | KeyCode::AudioVolumeUp
+                | KeyCode::MediaTrackNext
+                | KeyCode::MediaTrackPrevious
+                | KeyCode::MediaStop
+                | KeyCode::MediaPlayPause
+        ) {
             return;
         }
         let Some(vk) = vk(code) else {
@@ -339,6 +423,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn process_keys_stay_with_ime_and_altgr_requires_layout_identity() {
+        use egui_winit::winit::keyboard::Key as Logical;
+        let physical = PhysicalKey::Code(KeyCode::KeyA);
+        assert!(event_key(physical, &Logical::Named(NamedKey::Process), false, true).is_none());
+        assert!(event_key(physical, &Logical::Character("a".into()), false, false).is_none());
+        assert_eq!(
+            event_key(physical, &Logical::Character("a".into()), false, true),
+            Some(KeyCode::KeyA)
+        );
+        assert_ne!(
+            Logical::<String>::Named(NamedKey::Alt),
+            Logical::<String>::Named(NamedKey::AltGraph)
+        );
+    }
+
+    #[test]
     fn layouts_keep_positions_and_dead_keys_deliver_one_composed_text() {
         for logical in [egui::Key::Q, egui::Key::A] {
             let event = Event::Key {
@@ -348,11 +448,17 @@ mod tests {
                 repeat: false,
                 modifiers: Modifiers::NONE,
             };
-            let mut state = State::default();
+            let mut state = State {
+                key_positions: true,
+                ..State::default()
+            };
             state.key(KeyCode::KeyQ, true, false, false, &[event], Modifiers::NONE);
             assert_eq!(state.pending[0].1.as_ref().unwrap().vk, 0x51);
         }
-        let mut state = State::default();
+        let mut state = State {
+            key_positions: true,
+            ..State::default()
+        };
         state.key(KeyCode::Quote, true, false, true, &[], Modifiers::NONE);
         state.key(KeyCode::Quote, false, false, true, &[], Modifiers::NONE);
         let key = Event::Key {
@@ -376,94 +482,240 @@ mod tests {
         assert!(state.pending[0].1.is_none());
         assert!(state.pending[0].2);
         state.key(KeyCode::AltRight, true, false, false, &[], Modifiers::ALT);
-        assert!(state.alt_gr);
+        assert!(!state.alt_gr, "Right Alt alone is not evidence of AltGr");
         state.event(Some(&WindowEvent::Focused(false)), &[], Modifiers::NONE);
         assert!(!state.alt_gr);
         assert!(state.pressed.is_empty());
     }
 
+    const CODES: &[KeyCode] = &[
+        KeyCode::KeyA,
+        KeyCode::KeyQ,
+        KeyCode::KeyY,
+        KeyCode::IntlBackslash,
+        KeyCode::ShiftLeft,
+        KeyCode::ShiftRight,
+        KeyCode::ControlLeft,
+        KeyCode::ControlRight,
+        KeyCode::AltLeft,
+        KeyCode::AltRight,
+        KeyCode::SuperLeft,
+        KeyCode::SuperRight,
+        KeyCode::Numpad0,
+        KeyCode::NumpadEnter,
+        KeyCode::NumpadEqual,
+        KeyCode::IntlRo,
+        KeyCode::IntlYen,
+        KeyCode::Lang1,
+        KeyCode::Lang2,
+        KeyCode::F13,
+        KeyCode::F24,
+        KeyCode::CapsLock,
+        KeyCode::NumLock,
+        KeyCode::AudioVolumeMute,
+        KeyCode::F14,
+        KeyCode::F15,
+        KeyCode::F16,
+        KeyCode::F17,
+        KeyCode::F18,
+        KeyCode::F19,
+        KeyCode::F20,
+        KeyCode::F21,
+        KeyCode::F22,
+        KeyCode::F23,
+        KeyCode::Numpad1,
+        KeyCode::Numpad2,
+        KeyCode::Numpad3,
+        KeyCode::Numpad4,
+        KeyCode::Numpad5,
+        KeyCode::Numpad6,
+        KeyCode::Numpad7,
+        KeyCode::Numpad8,
+        KeyCode::Numpad9,
+        KeyCode::NumpadMultiply,
+        KeyCode::NumpadAdd,
+        KeyCode::NumpadComma,
+        KeyCode::NumpadSubtract,
+        KeyCode::NumpadDecimal,
+        KeyCode::NumpadDivide,
+        KeyCode::AudioVolumeDown,
+        KeyCode::AudioVolumeUp,
+        KeyCode::MediaTrackNext,
+        KeyCode::MediaTrackPrevious,
+        KeyCode::MediaStop,
+        KeyCode::MediaPlayPause,
+        KeyCode::KanaMode,
+        KeyCode::Convert,
+        KeyCode::NonConvert,
+    ];
+    mod legacy {
+        include!("keyboard/legacy_fixture.rs");
+    }
+
     #[test]
-    fn native_positions_and_shortcut_policy_cover_every_os_pair() {
-        let codes = [
-            KeyCode::KeyA,
-            KeyCode::KeyQ,
-            KeyCode::KeyY,
-            KeyCode::IntlBackslash,
-            KeyCode::ShiftLeft,
-            KeyCode::ShiftRight,
-            KeyCode::ControlLeft,
-            KeyCode::ControlRight,
-            KeyCode::AltLeft,
-            KeyCode::AltRight,
-            KeyCode::SuperLeft,
-            KeyCode::SuperRight,
-            KeyCode::Numpad0,
-            KeyCode::NumpadEnter,
-            KeyCode::NumpadEqual,
-            KeyCode::IntlRo,
-            KeyCode::IntlYen,
-            KeyCode::Lang1,
-            KeyCode::Lang2,
-            KeyCode::F13,
-            KeyCode::F24,
-            KeyCode::CapsLock,
-            KeyCode::NumLock,
-            KeyCode::AudioVolumeMute,
-            KeyCode::F14,
-            KeyCode::F15,
-            KeyCode::F16,
-            KeyCode::F17,
-            KeyCode::F18,
-            KeyCode::F19,
-            KeyCode::F20,
-            KeyCode::F21,
-            KeyCode::F22,
-            KeyCode::F23,
-            KeyCode::Numpad1,
-            KeyCode::Numpad2,
-            KeyCode::Numpad3,
-            KeyCode::Numpad4,
-            KeyCode::Numpad5,
-            KeyCode::Numpad6,
-            KeyCode::Numpad7,
-            KeyCode::Numpad8,
-            KeyCode::Numpad9,
-            KeyCode::NumpadMultiply,
-            KeyCode::NumpadAdd,
-            KeyCode::NumpadComma,
-            KeyCode::NumpadSubtract,
-            KeyCode::NumpadDecimal,
-            KeyCode::NumpadDivide,
-            KeyCode::AudioVolumeDown,
-            KeyCode::AudioVolumeUp,
-            KeyCode::MediaTrackNext,
-            KeyCode::MediaTrackPrevious,
-            KeyCode::MediaStop,
-            KeyCode::MediaPlayPause,
-            KeyCode::KanaMode,
-            KeyCode::Convert,
-            KeyCode::NonConvert,
-        ];
-        assert_eq!(codes.len(), latch_proto::keyboard::CASES.len());
+    fn native_viewer_translation_crosses_each_host_map() {
+        use latch_engine::input::keymap;
+        assert_eq!(CODES.len(), latch_proto::keyboard::CASES.len());
         for viewer in ["windows", "macos", "linux"] {
-            for host in ["windows", "macos", "linux"] {
-                for (code, case) in codes.iter().zip(latch_proto::keyboard::CASES) {
-                    assert_eq!(vk(*code), Some(case.vk), "{viewer} -> {host}, {code:?}");
-                    assert_eq!(
-                        shortcut(case.vk, viewer == "macos", host == "macos", false),
-                        case.vk
-                    );
-                }
-                let expected = if viewer == "macos" && host != "macos" {
-                    0xa2
+            for (code, case) in CODES.iter().zip(latch_proto::keyboard::CASES) {
+                let physical = if viewer == "macos" {
+                    let Some(mac) = case.mac else { continue };
+                    if matches!(mac, 0x0a | 0x32 | 0x5e | 0x5f | 0x66 | 0x68 | 0x47) {
+                        PhysicalKey::Unidentified(NativeKeyCode::MacOS(
+                            latch_proto::keyboard::apple_iso(mac, true),
+                        ))
+                    } else if cfg!(target_os = "macos") {
+                        PhysicalKey::from_scancode(u32::from(mac))
+                    } else {
+                        PhysicalKey::Code(*code)
+                    }
+                } else if (viewer == "windows" && cfg!(windows))
+                    || (viewer == "linux" && cfg!(target_os = "linux"))
+                {
+                    let scan = if viewer == "windows" {
+                        u32::from(case.scan) | if case.extended { 0xe000 } else { 0 }
+                    } else {
+                        u32::from(case.linux - 8)
+                    };
+                    PhysicalKey::from_scancode(scan)
                 } else {
-                    0x5b
+                    PhysicalKey::Code(*code)
                 };
+                // Mac media are system-defined events and Clear stays local.
+                if viewer == "macos"
+                    && (matches!(case.vk, 0xad..=0xb3 | 0x90)
+                        || matches!(case.vk, 0x188 | 0x18a | 0x18b))
+                {
+                    continue;
+                }
+                let translated = native_code(physical, viewer == "macos")
+                    .and_then(vk)
+                    .unwrap();
+                assert_eq!(translated, case.vk, "{viewer}, {code:?}");
+                // Each host runs its production injection lookup, including
+                // different sided flags and native numeric code spaces.
+                assert_eq!(keymap::us_scan(translated), Some(case.scan));
+                assert_eq!(keymap::extended(translated), case.extended);
+                assert_eq!(keymap::vk_to_mac(translated), case.mac);
+                let name = keymap::vk_to_xkb_name(translated).unwrap();
                 assert_eq!(
-                    shortcut(0x5b, viewer == "macos", host == "macos", true),
-                    expected
+                    std::str::from_utf8(&name).unwrap().trim_end_matches('\0'),
+                    case.xkb
                 );
             }
+        }
+    }
+
+    #[test]
+    fn legacy_full_position_replay_matches_600_events_and_text() {
+        for code in CODES {
+            let mut upstream = Vec::new();
+            for down in [true, false] {
+                if let Some(key) = egui_winit::key_from_key_code(*code) {
+                    upstream.push(Event::Key {
+                        key,
+                        physical_key: Some(key),
+                        pressed: down,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    });
+                } else if down {
+                    upstream.push(Event::Text("<>한".into()));
+                }
+            }
+            let mut state = State::default();
+            state.key(*code, true, false, false, &upstream, Modifiers::NONE);
+            assert!(state.pending.iter().all(|(_, key, _)| key.is_none()));
+            assert_eq!(
+                state
+                    .pending
+                    .iter()
+                    .map(|(e, _, _)| e.clone())
+                    .collect::<Vec<_>>(),
+                upstream
+            );
+            let render = |events: Vec<Event>, historical: bool| {
+                let physical = events.iter().any(|e| matches!(e, Event::Key { key, pressed: true, .. } if if historical { legacy::vk(*key).is_some() } else { crate::input::vk(*key).is_some() }));
+                events
+                    .into_iter()
+                    .filter_map(|e| match e {
+                        Event::Key { key, pressed, .. } => (if historical {
+                            legacy::vk(key)
+                        } else {
+                            crate::input::vk(key)
+                        })
+                        .map(|vk| latch_proto::input::Event::Key {
+                            vk: vk as u16,
+                            down: pressed,
+                            modifiers: 0,
+                        }),
+                        Event::Text(t) if !physical => Some(latch_proto::input::Event::Text(t)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                render(
+                    state.pending.into_iter().map(|(e, _, _)| e).collect(),
+                    false
+                ),
+                render(upstream, true),
+                "{code:?}"
+            );
+        }
+        // No newly captured virtual key can enter a legacy datagram.
+        for key in egui::Key::ALL {
+            if let Some(vk) = legacy::vk(*key) {
+                assert_eq!(latch_proto::keyboard::legacy(vk as u16), Some(vk as u16));
+            }
+        }
+    }
+
+    #[test]
+    fn apple_missing_positions_and_iso_swap_are_native() {
+        for (scan, iso, expected) in [
+            (0x0a, false, KeyCode::IntlBackslash),
+            (0x32, true, KeyCode::IntlBackslash),
+            (0x0a, true, KeyCode::Backquote),
+            (0x5e, false, KeyCode::IntlRo),
+            (0x5f, false, KeyCode::NumpadComma),
+            (0x66, false, KeyCode::Lang2),
+            (0x68, false, KeyCode::Lang1),
+        ] {
+            assert_eq!(
+                native_code(PhysicalKey::Unidentified(NativeKeyCode::MacOS(scan)), iso),
+                Some(expected)
+            );
+        }
+        assert!(
+            native_code(PhysicalKey::Unidentified(NativeKeyCode::MacOS(0x47)), false).is_none()
+        );
+    }
+
+    #[test]
+    fn system_capture_requires_focused_capture_and_media_remain_local() {
+        for keys in [false, true] {
+            for full in [false, true] {
+                for mouse in [false, true] {
+                    assert_eq!(
+                        capture_system_keys(keys, full, mouse),
+                        keys && (full || mouse)
+                    );
+                }
+            }
+        }
+        for code in [
+            KeyCode::AudioVolumeMute,
+            KeyCode::MediaPlayPause,
+            KeyCode::MediaTrackNext,
+            KeyCode::MediaStop,
+        ] {
+            let mut state = State {
+                key_positions: true,
+                ..State::default()
+            };
+            state.key(code, true, false, false, &[], Modifiers::NONE);
+            assert!(state.pending.is_empty());
         }
     }
 }

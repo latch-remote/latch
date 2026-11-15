@@ -180,6 +180,7 @@ impl Sink {
         // text pointers remain live until CoreGraphics has copied their contents.
         unsafe {
             match event {
+                Event::UnknownPosition { .. } => {}
                 Event::MouseMove { dx, dy } => {
                     let scale = self.stream_size.map_or(1.0, |(w, h)| {
                         let content = display.fitted(w, h);
@@ -239,6 +240,10 @@ impl Sink {
                             events.push(e);
                         }
                     } else if let Some(key) = crate::input::keymap::vk_to_mac(*vk) {
+                        let key = latch_proto::keyboard::apple_iso(
+                            key,
+                            latch_proto::keyboard::apple_keyboard_is_iso(),
+                        );
                         let e = Owned::new(CGEventCreateKeyboardEvent(ptr::null(), key, *down))?;
                         // kCGKeyboardEventAutorepeat: repeated down while already held.
                         CGEventSetIntegerValueField(
@@ -645,49 +650,45 @@ mod tests {
     }
     #[test]
     fn every_viewer_builds_shared_key_codes_flags_and_releases() -> Result<()> {
-        for viewer in ["windows", "macos", "linux"] {
-            for case in latch_proto::keyboard::CASES {
-                let mut sink = sink();
-                for down in [true, false] {
-                    let records = sink.build(
-                        &Event::Key {
-                            vk: case.vk,
-                            down,
-                            modifiers: case.mask,
-                        },
-                        display(),
-                        Point::default(),
-                    )?;
-                    if media_key(case.vk).is_some() {
-                        assert_eq!(records.len(), 1);
-                        // SAFETY: inspection of an unposted system-defined event.
-                        assert_eq!(unsafe { CGEventGetType(records[0].0) }, 14);
-                    } else if let Some(key) = case.mac {
-                        assert_eq!(records.len(), 1, "{viewer} -> macos, {:#x}", case.vk);
-                        // SAFETY: inspecting locally constructed events only.
-                        unsafe {
-                            assert_eq!(
-                                CGEventGetIntegerValueField(records[0].0, 9),
-                                i64::from(key)
-                            );
-                            let generic = (CGEventGetFlags(records[0].0) >> 17) & 15;
-                            assert_eq!(generic, if down { u64::from(case.mask) } else { 0 });
-                            let keypad = matches!(
-                                case.vk,
-                                0x60..=0x6f
-                                    | 0x90
-                                    | latch_proto::keyboard::KEYPAD_ENTER
-                                    | latch_proto::keyboard::KEYPAD_EQUAL
-                            );
-                            assert_eq!(CGEventGetFlags(records[0].0) & (1 << 21) != 0, keypad);
-                        }
-                    } else {
-                        assert!(records.is_empty());
+        for case in latch_proto::keyboard::CASES {
+            let mut sink = sink();
+            for down in [true, false] {
+                let records = sink.build(
+                    &Event::Key {
+                        vk: case.vk,
+                        down,
+                        modifiers: case.mask,
+                    },
+                    display(),
+                    Point::default(),
+                )?;
+                if media_key(case.vk).is_some() {
+                    assert_eq!(records.len(), 1);
+                    // SAFETY: inspection of an unposted system-defined event.
+                    assert_eq!(unsafe { CGEventGetType(records[0].0) }, 14);
+                } else if let Some(key) = case.mac {
+                    assert_eq!(records.len(), 1, "host macos, {:#x}", case.vk);
+                    // SAFETY: inspecting locally constructed events only.
+                    unsafe {
+                        assert_eq!(CGEventGetIntegerValueField(records[0].0, 9), i64::from(key));
+                        let generic = (CGEventGetFlags(records[0].0) >> 17) & 15;
+                        assert_eq!(generic, if down { u64::from(case.mask) } else { 0 });
+                        let keypad = matches!(
+                            case.vk,
+                            0x60..=0x6f
+                                | 0x90
+                                | latch_proto::keyboard::KEYPAD_ENTER
+                                | latch_proto::keyboard::KEYPAD_EQUAL
+                        );
+                        assert_eq!(CGEventGetFlags(records[0].0) & (1 << 21) != 0, keypad);
                     }
+                } else {
+                    assert!(records.is_empty());
                 }
-                assert!(sink.held.keys.is_empty());
             }
+            assert!(sink.held.keys.is_empty());
         }
+
         for text in latch_proto::keyboard::TEXT_CASES {
             let mut sink = sink();
             let records = sink.build(&Event::Text((*text).into()), display(), Point::default())?;

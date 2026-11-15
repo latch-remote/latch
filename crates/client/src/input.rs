@@ -324,6 +324,47 @@ pub struct Held {
 }
 
 impl Held {
+    pub fn shortcut_key(
+        &mut self,
+        out: &(impl Sink + ?Sized),
+        key: crate::keyboard::Key,
+        viewer_mac: bool,
+        host_mac: bool,
+        map: bool,
+    ) {
+        let scoped = !viewer_mac && host_mac;
+        // Only these common editing shortcuts acquire Command on a Mac.
+        // No Alt/AltGr combinations are rewritten.
+        let editing = |vk| matches!(vk, 0x41 | 0x43 | 0x58 | 0x56 | 0x5a | 0x46);
+        let active = map
+            && (!scoped
+                || (!self.physical.keys().any(|vk| matches!(vk, 0xa4 | 0xa5))
+                    && ((key.down && editing(key.vk))
+                        || self.physical.keys().any(|&vk| vk != key.vk && editing(vk)))));
+        // PC->Mac swaps are chord-scoped, including the displaced Super.
+        if scoped {
+            let modifiers: Vec<_> = self
+                .physical
+                .iter()
+                .filter(|(source, _)| matches!(source, 0xa2 | 0xa3 | 0x5b | 0x5c))
+                .map(|(&source, &target)| (source, target))
+                .collect();
+            for (source, target) in modifiers {
+                let next = crate::keyboard::shortcut(source, viewer_mac, host_mac, active) as i16;
+                if next != target {
+                    self.physical.remove(&source);
+                    if !self.physical.values().any(|&held| held == target) {
+                        self.key(out, target, false);
+                    }
+                    self.physical.insert(source, next);
+                    self.key(out, next, true);
+                }
+            }
+        }
+        let target = crate::keyboard::shortcut(key.vk, viewer_mac, host_mac, active);
+        self.physical_key(out, key.vk, key.down, target);
+    }
+
     /// Retain each source's destination until release. Two physical keys
     /// mapped to one remote modifier keep it down until both are released.
     pub fn physical_key(
@@ -479,6 +520,19 @@ impl Held {
 pub struct SharedHeld(std::rc::Rc<std::cell::RefCell<Held>>);
 
 impl SharedHeld {
+    pub fn shortcut_key(
+        &self,
+        out: &(impl Sink + ?Sized),
+        key: crate::keyboard::Key,
+        viewer_mac: bool,
+        host_mac: bool,
+        map: bool,
+    ) {
+        self.0
+            .borrow_mut()
+            .shortcut_key(out, key, viewer_mac, host_mac, map);
+    }
+
     pub fn physical_down(&self, source: u16) -> bool {
         self.0.borrow().physical_down(source)
     }
@@ -535,6 +589,100 @@ impl SharedHeld {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortcut_scope_is_a_true_swap_for_every_pair_and_safe_for_destructive_chords() {
+        for viewer in ["windows", "macos", "linux"] {
+            for host in ["windows", "macos", "linux"] {
+                for map in [false, true] {
+                    for modifier in [0xa2, 0xa3, 0x5b, 0x5c] {
+                        for letter in [
+                            0x41, 0x43, 0x58, 0x56, 0x5a, 0x46, 0x08, 0x51, 0x48, 0x4d, 0x09, 0x20,
+                            0x25, 0x26, 0x27, 0x28, 0x44, 0x52,
+                        ] {
+                            let out = Recorder::default();
+                            let mut held = Held::default();
+                            let vm = viewer == "macos";
+                            let hm = host == "macos";
+                            for (vk, down) in [(modifier, true), (letter, true)] {
+                                held.shortcut_key(
+                                    &out,
+                                    crate::keyboard::Key { vk, down },
+                                    vm,
+                                    hm,
+                                    map,
+                                );
+                            }
+                            let editing = matches!(letter, 0x41 | 0x43 | 0x58 | 0x56 | 0x5a | 0x46);
+                            let swapped = map && vm != hm && (vm || editing);
+                            let expected = if swapped {
+                                match modifier {
+                                    0xa2 => 0x5b,
+                                    0xa3 => 0x5c,
+                                    0x5b => 0xa2,
+                                    0x5c => 0xa3,
+                                    _ => unreachable!(),
+                                }
+                            } else {
+                                modifier
+                            };
+                            assert_eq!(
+                                held.physical[&modifier], expected as i16,
+                                "{viewer}->{host} {modifier:#x}+{letter:#x} map={map}"
+                            );
+                            assert_eq!(
+                                out.take().last(),
+                                Some(&Sent::Key(
+                                    letter as i16,
+                                    true,
+                                    modifier_mask(expected as i16)
+                                ))
+                            );
+                            for (vk, down) in [(letter, false), (modifier, false)] {
+                                held.shortcut_key(
+                                    &out,
+                                    crate::keyboard::Key { vk, down },
+                                    vm,
+                                    hm,
+                                    map,
+                                );
+                            }
+                            assert!(!held.any_down());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shortcut_swap_keeps_displaced_control_and_altgr_available() {
+        let out = Recorder::default();
+        let mut held = Held::default();
+        for vk in [0xa2, 0x5b, 0x43] {
+            held.shortcut_key(
+                &out,
+                crate::keyboard::Key { vk, down: true },
+                false,
+                true,
+                true,
+            );
+        }
+        assert_eq!(held.physical[&0xa2], 0x5b);
+        assert_eq!(held.physical[&0x5b], 0xa2);
+        held.release_all(&out);
+        for vk in [0xa5, 0xa2, 0x43] {
+            held.shortcut_key(
+                &out,
+                crate::keyboard::Key { vk, down: true },
+                false,
+                true,
+                true,
+            );
+        }
+        assert_eq!(held.physical[&0xa2], 0xa2);
+        assert_eq!(held.physical[&0xa5], 0xa5);
+    }
 
     #[test]
     fn lock_keys_toggle_once_per_physical_press() {

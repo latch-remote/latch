@@ -22,25 +22,59 @@ pub fn position(vk: u16) -> Option<u16> {
     .then(|| vk - 0x100)
 }
 
-/// Closest 6.0.0 key, without ever putting an extended ID in kind 4.
+/// Image of client input::vk at bf5da0d (6.0.0), plus modifiers,
+/// Caps Lock and the existing toolbar's Print Screen. New viewers must
+/// retain egui/text translation for every other key with an old peer.
 pub fn legacy(vk: u16) -> Option<u16> {
+    matches!(vk, 0x08 | 0x09 | 0x0d | 0x10..=0x12 | 0x14 | 0x1b | 0x20..=0x28
+        | 0x2c..=0x2e | 0x30..=0x39 | 0x41..=0x5a | 0x5b | 0x6b | 0x70..=0x87
+        | 0xba..=0xc0 | 0xdb..=0xde)
+    .then_some(vk)
+}
+
+/// The helper's v1 protocol already accepts all ordinary VKs. This is
+/// deliberately separate from the 6.0.0 viewer's smaller capture set.
+pub fn helper_legacy(vk: u16) -> Option<u16> {
     Some(match vk {
         0..=255 => vk,
         KEYPAD_ENTER => 0x0d,
         KEYPAD_EQUAL => 0xbb,
         INTL_RO => 0xe2,
         INTL_YEN => 0xdc,
+        KANA => 0x15,
         CONVERT => 0x1c,
         NON_CONVERT => 0x1d,
-        KANA => 0x15,
         _ => return None,
     })
+}
+
+/// Apple ISO hardware reports these two native codes at reversed USB
+/// positions. The involution also converts USB positions for injection.
+pub fn apple_iso(code: u16, iso: bool) -> u16 {
+    match (iso, code) {
+        (true, 0x0a) => 0x32,
+        (true, 0x32) => 0x0a,
+        _ => code,
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn apple_keyboard_is_iso() -> bool {
+    #[link(name = "Carbon", kind = "framework")]
+    unsafe extern "C" {
+        fn LMGetKbdType() -> u8;
+        fn KBGetLayoutType(kind: i16) -> u32;
+    }
+    // SAFETY: Carbon keyboard-type queries take no pointers or ownership.
+    unsafe { KBGetLayoutType(i16::from(LMGetKbdType())) == 1 }
 }
 
 /// Shared fixtures consumed by each viewer and native host test. `mac` is
 /// absent for positions the Carbon keyboard API cannot represent.
 pub struct Case {
     pub vk: u16,
+    pub usage: u32,
+    pub linux: u16,
     pub scan: u16,
     pub extended: bool,
     pub mac: Option<u16>,
@@ -48,469 +82,4 @@ pub struct Case {
     pub mask: u8,
 }
 
-pub const CASES: &[Case] = &[
-    Case {
-        vk: 0x41,
-        scan: 0x1e,
-        extended: false,
-        mac: Some(0),
-        xkb: "AC01",
-        mask: 0,
-    },
-    Case {
-        vk: 0x51,
-        scan: 0x10,
-        extended: false,
-        mac: Some(0x0c),
-        xkb: "AD01",
-        mask: 0,
-    },
-    Case {
-        vk: 0x59,
-        scan: 0x15,
-        extended: false,
-        mac: Some(0x10),
-        xkb: "AD06",
-        mask: 0,
-    },
-    Case {
-        vk: 0xe2,
-        scan: 0x56,
-        extended: false,
-        mac: Some(0x0a),
-        xkb: "LSGT",
-        mask: 0,
-    },
-    Case {
-        vk: 0xa0,
-        scan: 0x2a,
-        extended: false,
-        mac: Some(0x38),
-        xkb: "LFSH",
-        mask: 1,
-    },
-    Case {
-        vk: 0xa1,
-        scan: 0x36,
-        extended: false,
-        mac: Some(0x3c),
-        xkb: "RTSH",
-        mask: 1,
-    },
-    Case {
-        vk: 0xa2,
-        scan: 0x1d,
-        extended: false,
-        mac: Some(0x3b),
-        xkb: "LCTL",
-        mask: 2,
-    },
-    Case {
-        vk: 0xa3,
-        scan: 0x1d,
-        extended: true,
-        mac: Some(0x3e),
-        xkb: "RCTL",
-        mask: 2,
-    },
-    Case {
-        vk: 0xa4,
-        scan: 0x38,
-        extended: false,
-        mac: Some(0x3a),
-        xkb: "LALT",
-        mask: 4,
-    },
-    Case {
-        vk: 0xa5,
-        scan: 0x38,
-        extended: true,
-        mac: Some(0x3d),
-        xkb: "RALT",
-        mask: 4,
-    },
-    Case {
-        vk: 0x5b,
-        scan: 0x5b,
-        extended: true,
-        mac: Some(0x37),
-        xkb: "LWIN",
-        mask: 8,
-    },
-    Case {
-        vk: 0x5c,
-        scan: 0x5c,
-        extended: true,
-        mac: Some(0x36),
-        xkb: "RWIN",
-        mask: 8,
-    },
-    Case {
-        vk: 0x60,
-        scan: 0x52,
-        extended: false,
-        mac: Some(0x52),
-        xkb: "KP0",
-        mask: 0,
-    },
-    Case {
-        vk: KEYPAD_ENTER,
-        scan: 0x1c,
-        extended: true,
-        mac: Some(0x4c),
-        xkb: "KPEN",
-        mask: 0,
-    },
-    Case {
-        vk: KEYPAD_EQUAL,
-        scan: 0x59,
-        extended: false,
-        mac: Some(0x51),
-        xkb: "KPEQ",
-        mask: 0,
-    },
-    Case {
-        vk: INTL_RO,
-        scan: 0x73,
-        extended: false,
-        mac: Some(0x5e),
-        xkb: "AB11",
-        mask: 0,
-    },
-    Case {
-        vk: INTL_YEN,
-        scan: 0x7d,
-        extended: false,
-        mac: Some(0x5d),
-        xkb: "AE13",
-        mask: 0,
-    },
-    Case {
-        vk: 0x15,
-        scan: 0x72,
-        extended: false,
-        mac: Some(0x68),
-        xkb: "HNGL",
-        mask: 0,
-    },
-    Case {
-        vk: 0x19,
-        scan: 0x71,
-        extended: false,
-        mac: Some(0x66),
-        xkb: "HJCV",
-        mask: 0,
-    },
-    Case {
-        vk: 0x7c,
-        scan: 0x64,
-        extended: false,
-        mac: Some(0x69),
-        xkb: "FK13",
-        mask: 0,
-    },
-    Case {
-        vk: 0x87,
-        scan: 0x76,
-        extended: false,
-        mac: None,
-        xkb: "FK24",
-        mask: 0,
-    },
-    Case {
-        vk: 0x14,
-        scan: 0x3a,
-        extended: false,
-        mac: Some(0x39),
-        xkb: "CAPS",
-        mask: 0,
-    },
-    Case {
-        vk: 0x90,
-        scan: 0x45,
-        extended: true,
-        mac: Some(0x47),
-        xkb: "NMLK",
-        mask: 0,
-    },
-    Case {
-        vk: 0xad,
-        scan: 0x20,
-        extended: true,
-        mac: Some(0x4a),
-        xkb: "MUTE",
-        mask: 0,
-    },
-    Case {
-        vk: 0x7d,
-        scan: 0x65,
-        extended: false,
-        mac: Some(0x6b),
-        xkb: "FK14",
-        mask: 0,
-    },
-    Case {
-        vk: 0x7e,
-        scan: 0x66,
-        extended: false,
-        mac: Some(0x71),
-        xkb: "FK15",
-        mask: 0,
-    },
-    Case {
-        vk: 0x7f,
-        scan: 0x67,
-        extended: false,
-        mac: Some(0x6a),
-        xkb: "FK16",
-        mask: 0,
-    },
-    Case {
-        vk: 0x80,
-        scan: 0x68,
-        extended: false,
-        mac: Some(0x40),
-        xkb: "FK17",
-        mask: 0,
-    },
-    Case {
-        vk: 0x81,
-        scan: 0x69,
-        extended: false,
-        mac: Some(0x4f),
-        xkb: "FK18",
-        mask: 0,
-    },
-    Case {
-        vk: 0x82,
-        scan: 0x6a,
-        extended: false,
-        mac: Some(0x50),
-        xkb: "FK19",
-        mask: 0,
-    },
-    Case {
-        vk: 0x83,
-        scan: 0x6b,
-        extended: false,
-        mac: Some(0x5a),
-        xkb: "FK20",
-        mask: 0,
-    },
-    Case {
-        vk: 0x84,
-        scan: 0x6c,
-        extended: false,
-        mac: None,
-        xkb: "FK21",
-        mask: 0,
-    },
-    Case {
-        vk: 0x85,
-        scan: 0x6d,
-        extended: false,
-        mac: None,
-        xkb: "FK22",
-        mask: 0,
-    },
-    Case {
-        vk: 0x86,
-        scan: 0x6e,
-        extended: false,
-        mac: None,
-        xkb: "FK23",
-        mask: 0,
-    },
-    Case {
-        vk: 0x61,
-        scan: 0x4f,
-        extended: false,
-        mac: Some(0x53),
-        xkb: "KP1",
-        mask: 0,
-    },
-    Case {
-        vk: 0x62,
-        scan: 0x50,
-        extended: false,
-        mac: Some(0x54),
-        xkb: "KP2",
-        mask: 0,
-    },
-    Case {
-        vk: 0x63,
-        scan: 0x51,
-        extended: false,
-        mac: Some(0x55),
-        xkb: "KP3",
-        mask: 0,
-    },
-    Case {
-        vk: 0x64,
-        scan: 0x4b,
-        extended: false,
-        mac: Some(0x56),
-        xkb: "KP4",
-        mask: 0,
-    },
-    Case {
-        vk: 0x65,
-        scan: 0x4c,
-        extended: false,
-        mac: Some(0x57),
-        xkb: "KP5",
-        mask: 0,
-    },
-    Case {
-        vk: 0x66,
-        scan: 0x4d,
-        extended: false,
-        mac: Some(0x58),
-        xkb: "KP6",
-        mask: 0,
-    },
-    Case {
-        vk: 0x67,
-        scan: 0x47,
-        extended: false,
-        mac: Some(0x59),
-        xkb: "KP7",
-        mask: 0,
-    },
-    Case {
-        vk: 0x68,
-        scan: 0x48,
-        extended: false,
-        mac: Some(0x5b),
-        xkb: "KP8",
-        mask: 0,
-    },
-    Case {
-        vk: 0x69,
-        scan: 0x49,
-        extended: false,
-        mac: Some(0x5c),
-        xkb: "KP9",
-        mask: 0,
-    },
-    Case {
-        vk: 0x6a,
-        scan: 0x37,
-        extended: false,
-        mac: Some(0x43),
-        xkb: "KPMU",
-        mask: 0,
-    },
-    Case {
-        vk: 0x6b,
-        scan: 0x4e,
-        extended: false,
-        mac: Some(0x45),
-        xkb: "KPAD",
-        mask: 0,
-    },
-    Case {
-        vk: 0x6c,
-        scan: 0x7e,
-        extended: false,
-        mac: Some(0x5f),
-        xkb: "I129",
-        mask: 0,
-    },
-    Case {
-        vk: 0x6d,
-        scan: 0x4a,
-        extended: false,
-        mac: Some(0x4e),
-        xkb: "KPSU",
-        mask: 0,
-    },
-    Case {
-        vk: 0x6e,
-        scan: 0x53,
-        extended: false,
-        mac: Some(0x41),
-        xkb: "KPDL",
-        mask: 0,
-    },
-    Case {
-        vk: 0x6f,
-        scan: 0x35,
-        extended: true,
-        mac: Some(0x4b),
-        xkb: "KPDV",
-        mask: 0,
-    },
-    Case {
-        vk: 0xae,
-        scan: 0x2e,
-        extended: true,
-        mac: Some(0x49),
-        xkb: "VOL-",
-        mask: 0,
-    },
-    Case {
-        vk: 0xaf,
-        scan: 0x30,
-        extended: true,
-        mac: Some(0x48),
-        xkb: "VOL+",
-        mask: 0,
-    },
-    Case {
-        vk: 0xb0,
-        scan: 0x19,
-        extended: true,
-        mac: None,
-        xkb: "I171",
-        mask: 0,
-    },
-    Case {
-        vk: 0xb1,
-        scan: 0x10,
-        extended: true,
-        mac: None,
-        xkb: "I173",
-        mask: 0,
-    },
-    Case {
-        vk: 0xb2,
-        scan: 0x24,
-        extended: true,
-        mac: None,
-        xkb: "I174",
-        mask: 0,
-    },
-    Case {
-        vk: 0xb3,
-        scan: 0x22,
-        extended: true,
-        mac: None,
-        xkb: "I172",
-        mask: 0,
-    },
-    Case {
-        vk: 0x188,
-        scan: 0x70,
-        extended: false,
-        mac: Some(0x68),
-        xkb: "HKTG",
-        mask: 0,
-    },
-    Case {
-        vk: 0x18a,
-        scan: 0x79,
-        extended: false,
-        mac: Some(0x68),
-        xkb: "HENK",
-        mask: 0,
-    },
-    Case {
-        vk: 0x18b,
-        scan: 0x7b,
-        extended: false,
-        mac: Some(0x66),
-        xkb: "MUHE",
-        mask: 0,
-    },
-];
+include!("../fixtures/keyboard.rs");

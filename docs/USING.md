@@ -38,56 +38,75 @@ limits for every host/viewer direction.
 ## Keyboard between different operating systems
 
 The stream toolbar's **Keys** menu offers **Send keys as pressed** and
-**Map Command ↔ Ctrl**. The mapping option is the default and retains the
-existing `cmd_is_ctrl = true` setting in `client.toml`. A Mac viewer sends
-Command as Ctrl to Windows/Linux. A Windows/Linux viewer sends Ctrl as
-Command to a Mac. Same-platform modifiers keep their identity. Win/Super
-always sends Meta, which is Command on a Mac. Left and right sides are
-preserved, including right Alt/AltGr.
+**Map Command ↔ Ctrl**. The default retains `cmd_is_ctrl = true` in
+`client.toml`. Mapping preserves left/right sides and swaps both modifiers,
+so each host modifier remains reachable.
 
-This default keeps familiar copy, paste, undo and application shortcuts
-usable across platforms and preserves existing Mac-viewer preferences.
-Choose **Send keys as pressed** for game bindings or software that needs
-Control and Command independently. A held key keeps its destination until
-released, including when the setting changes.
+On a Mac viewer connected to Windows/Linux, Command becomes Ctrl and
+Control becomes Win/Super for every key. This preserves the existing
+Command-to-Ctrl shortcuts and makes the displaced modifier available.
+On Windows/Linux viewers connected to a Mac, the swap applies only while
+A, C, X, V, Z or F is held, including Shift variants, for select all, copy,
+cut, paste, undo/redo and find. Ctrl becomes Command and Win/Super becomes
+Control within those chords. Other combinations keep their physical
+modifiers. In particular Ctrl+Backspace, Q, H, M, Tab, Space and arrows
+remain Control on the Mac, including Terminal and input-source shortcuts.
+Alt/AltGr combinations keep their physical modifiers.
 
-Keys use physical US scan positions, interpreted by the **host's** layout.
-For example, the Q position on a US or German viewer reaches the A position
-on a French AZERTY host. UK/German/French ISO extra keys, separate numpad
-keys and Japanese/Korean language keys retain their positions when the
-host has an equivalent. The viewer's IME composition and dead-key results
-use separate Unicode text events, so a committed `한글` or `é` arrives once.
-Preedit stays on the viewer. Committed text temporarily releases and then
-restores held sided modifiers in the reliable input sequence. Ordinary
-printable keys and AltGr combinations
+Same-OS pairs and **Send keys as pressed** preserve modifier identities.
+Captured-mouse mode and the **Captured, for games** mouse setting use
+as-pressed automatically. Release held keys when changing capture or mapping
+settings. A Mac-to-PC held modifier keeps its press-time destination until
+released. On PC-to-Mac, the six editing chords temporarily swap modifiers
+and restore them when the chord finishes.
+
+Keys use physical US positions, interpreted by the **host's** layout.
+UK/German/French ISO extra keys, separate numpad keys and Japanese/Korean
+language keys retain positions where the host has an equivalent. Mac
+viewers recover native ISO/JIS codes omitted by winit and account for
+Apple's ISO section/backquote swap. German ISO hardware has yet to be
+verified on either end. Ordinary printable keys and AltGr combinations
 use the host layout. Configure that layout on the host for the intended
-physical-key output.
+output.
 
-Caps Lock toggles the host on each viewer change, with repeat presses
-ignored by the viewer. It starts from the host's existing state. Lock states
-are independent when connecting. Num Lock toggles on Windows/X11 and is
-keypad Clear on macOS. macOS maps Korean language positions to its JIS
-Kana/Eisu positions. Semantic Hangul/Hanja conversion depends on the host's
-input source. Viewer IME commits provide composed Korean text directly.
-macOS has Carbon positions through F20. F21–F24 and media Stop have no
-corresponding event in the current injector. Volume, mute, play/pause and
-next/previous use system-defined media events.
+The stream window uses the host's IME for ordinary native typing. Winit
+currently disables viewer IME composition in this window. Windows Process
+keys stay with the input method. The separate UTF-8 path carries dead-key
+results, pasted text and any IME commit supplied by an embedding application,
+with modifiers temporarily released and restored. Native Korean/Japanese
+composition still requires the appropriate host input source.
+
+Caps Lock toggles on each viewer change, with repeats ignored. Lock state
+starts on the host. Num Lock toggles on Windows/X11 and becomes keypad
+Clear on macOS. A Mac viewer's Clear stays local, avoiding an unintended
+Num Lock toggle on a PC. macOS approximates Korean language and Japanese
+Convert/NonConvert positions using Kana/Eisu. Semantic conversion remains
+input-source dependent. F21–F24 and media Stop have no corresponding event
+in the Mac injector. Volume, mute, play/pause and next/previous injection
+use system-defined Mac media events, while viewers leave media controls
+local. Under an active X11 keyboard grab desktop media bindings may be
+inhibited until capture is released.
 
 New peers negotiate distinct keypad Enter/Equals and additional Japanese
-positions. With a 6.0.0 host, keypad Enter falls back to Return, Equals to
-the main equal key, IntlRo to ISO extra, IntlYen to backslash and language
-positions to their closest VK. Older hosts retain their native key-table limits. A 6.0.0 viewer retains
-its original capture limits. Focus loss, opening a local control, disconnect and stream teardown
-release remote held keys. Focus-loss release is queued directly from the
-native callback, including while a clipboard paste is waiting.
+positions. With a 6.0.0 host the viewer uses the original egui/text path for
+all keys, including ISO text, generic modifiers and keypad identity limits.
+New native-only VKs and kind 8 stay behind negotiation. A 6.0.0 viewer
+keeps its original capture limits against a new host. A stale Windows
+input helper negotiates its own v1 pipe protocol and receives legacy VK
+forms, including Return for keypad Enter. Holding both Return and keypad
+Enter can produce an extra Return repeat with that helper.
+
+Focus loss, opening a local control, disconnect and stream teardown release
+remote held keys. Focus-loss release is queued directly from the native
+callback, including while a clipboard paste is waiting.
 
 ### System shortcuts
 
-| Viewer | Captured while the stream owns focused keyboard input | Viewer-owned combinations and limits |
+| Viewer | Captured in a focused fullscreen or captured-mouse stream | Viewer-owned combinations and limits |
 | --- | --- | --- |
-| Windows | Sided Win keys, Alt+Tab/F4/Space through a low-level hook, plus ordinary focused keys | Ctrl+Alt+Delete is secure attention. Win+L remains OS-reserved and capture cannot be relied on. Hook installation failures are logged. |
+| Windows | Sided Win keys, Alt+Tab/F4/Space through a capture-scoped low-level hook | Ctrl+Alt+Delete is secure attention. Win+L remains OS-reserved and capture cannot be relied on. Hook installation failures are logged. |
 | macOS | Command, Option, Control, Shift and Command+Q/H through the existing app-menu override | Command+Tab and Command+Space are owned by macOS. |
-| Linux X11 | A focus-scoped keyboard grab keeps sided Super and Alt+Tab in the stream | Another client can prevent the grab. Latch logs a refusal and continues with delivered focused keys. |
+| Linux X11 | A capture-scoped keyboard grab keeps sided Super and Alt+Tab in the stream | Another client can prevent the grab. Latch logs once and retries on later frames. An active grab blocks other X11 clients until released, so a hung Latch can hold the session keyboard until the process is killed. |
 | Linux Wayland | Compositor-delivered focused keys and sided Super | The compositor owns global shortcuts. winit 0.30 exposes no shortcut-inhibit protocol API, so Latch cannot request inhibition in this stack. |
 
 Use **Keys** in the stream toolbar to send Alt+Tab, Command+Tab,
@@ -297,3 +316,11 @@ Setup removes the old engine, its pairing data and its services.
 
 Use `LATCH_DATA_DIR` to override the settings directory. Version 6 public
 updates ignore the legacy GitHub token settings.
+
+Windows IME injection uses the documented `VK_HANGUL`/`VK_HANJA`, Kana,
+Convert and NonConvert virtual keys with their scan codes and without
+`KEYEVENTF_SCANCODE`, which would ignore the virtual key. Korean Windows
+IME acceptance has yet to be verified on hardware. Microsoft's definitions
+identify Hangul and Hanja as IME keys and document the injection flag behavior.
+[Virtual-key codes](https://learn.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes),
+[KEYBDINPUT](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-keybdinput).

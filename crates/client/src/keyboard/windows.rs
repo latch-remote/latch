@@ -1,121 +1,193 @@
-//! Swallow Win keys and app-switch/menu chords while this process owns focused stream
-//! input. Other keys continue through winit, including IME and clipboard.
+//! Focus/capture-scoped Windows system shortcuts. Ordinary modifier events
+//! share the hook's ordering so a posted Shift cannot follow a sent Win.
 
 use super::{Key, STATE};
-use std::cell::Cell;
+use std::{
+    cell::RefCell,
+    collections::{BTreeSet, VecDeque},
+};
 use windows::Win32::{
     Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM},
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentProcessId},
     UI::WindowsAndMessaging::*,
 };
 
-thread_local! {
-    static OWNED: Cell<bool> = const { Cell::new(false) };
-    static HOOK: Cell<HHOOK> = const { Cell::new(HHOOK(std::ptr::null_mut())) };
+#[derive(Default)]
+struct Capture {
+    hook: HHOOK,
+    consumed: BTreeSet<u16>,
+    forwarded: VecDeque<Key>,
 }
-
-pub fn install() {
-    // SAFETY: the callback lives for the process and runs on the installing
-    // event-loop thread. No pointer to stack state is retained.
-    let installed = unsafe {
-        GetModuleHandleW(None).and_then(|module| {
-            SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), HINSTANCE(module.0), 0)
-        })
-    };
-    match installed {
-        Ok(hook) => HOOK.set(hook),
-        Err(error) => tracing::warn!(%error, "cannot capture the Windows key"),
+impl Drop for Capture {
+    fn drop(&mut self) {
+        if !self.hook.0.is_null() {
+            // SAFETY: this thread owns this installed hook.
+            let _ = unsafe { UnhookWindowsHookEx(self.hook) };
+        }
     }
+}
+thread_local! {
+    static CAPTURE: RefCell<Capture> = RefCell::new(Capture::default());
 }
 
 pub fn owns_keys(owned: bool) {
-    OWNED.set(owned);
+    CAPTURE.with_borrow_mut(|capture| {
+        if !owned {
+            *capture = Capture::default();
+        } else if capture.hook.0.is_null() {
+            // SAFETY: callback and module live through the hook's lifetime.
+            match unsafe {
+                GetModuleHandleW(None).and_then(|module| {
+                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), HINSTANCE(module.0), 0)
+                })
+            } {
+                Ok(hook) => capture.hook = hook,
+                Err(error) => tracing::warn!(%error, "cannot capture Windows system shortcuts"),
+            }
+        }
+    });
 }
 
-fn captures(event: &KBDLLHOOKSTRUCT) -> bool {
-    !event.flags.contains(LLKHF_INJECTED)
-        && (matches!(event.vkCode, 0x5b | 0x5c)
-            || (matches!(event.vkCode, 0x09 | 0x20 | 0x73) && event.flags.contains(LLKHF_ALTDOWN)))
+pub fn take_forwarded(key: Key) -> bool {
+    CAPTURE.with_borrow_mut(|capture| {
+        if capture.forwarded.front() == Some(&key) {
+            capture.forwarded.pop_front();
+            true
+        } else {
+            false
+        }
+    })
+}
+
+fn captures(vk: u16, alt: bool) -> bool {
+    matches!(vk, 0x5b | 0x5c) || (alt && matches!(vk, 0x09 | 0x20 | 0x73))
+}
+
+impl Capture {
+    fn consume(&mut self, key: Key, alt: bool) -> bool {
+        if key.down {
+            if captures(key.vk, alt) {
+                self.consumed.insert(key.vk);
+                return true;
+            }
+            false
+        } else {
+            // An activation chord can press Win before this hook exists.
+            // Its release belongs to the local OS, even if focused now.
+            self.consumed.remove(&key.vk)
+        }
+    }
 }
 
 unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 && OWNED.get() {
-        // SAFETY: WH_KEYBOARD_LL supplies a KBDLLHOOKSTRUCT for HC_ACTION.
+    if code >= 0 {
+        // SAFETY: WH_KEYBOARD_LL supplies this record for HC_ACTION.
         let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         let mut process = 0;
-        // SAFETY: both APIs only query process/window identity.
+        // SAFETY: query foreground process identity only.
         unsafe {
             GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut process));
         }
-        let ours = process == unsafe { GetCurrentProcessId() };
-        if ours && captures(event) {
-            let down = !event.flags.contains(LLKHF_UP);
-            STATE.with_borrow_mut(|s| {
-                if down {
-                    s.pressed.insert(event.vkCode as u16);
-                } else {
-                    s.pressed.remove(&(event.vkCode as u16));
+        if process == unsafe { GetCurrentProcessId() } && !event.flags.contains(LLKHF_INJECTED) {
+            let key = Key {
+                vk: event.vkCode as u16,
+                down: !event.flags.contains(LLKHF_UP),
+            };
+            let alt = event.flags.contains(LLKHF_ALTDOWN);
+            let swallowed = CAPTURE.with_borrow_mut(|capture| capture.consume(key, alt));
+            // Shift is unambiguous in the hook. Let winit filter the synthetic
+            // Control generated by AltGr before Ctrl/Alt reach the host.
+            let modifier = matches!(key.vk, 0xa0 | 0xa1);
+            if swallowed || modifier {
+                if modifier {
+                    CAPTURE.with_borrow_mut(|capture| capture.forwarded.push_back(key));
                 }
-                s.pending.push((
-                    egui::Event::Key {
-                        key: egui::Key::F35,
-                        physical_key: None,
-                        pressed: down,
-                        repeat: false,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                    Some(Key {
-                        vk: event.vkCode as u16,
-                        down,
-                    }),
-                    false,
-                ))
-            });
-            let mods = STATE.with_borrow(|s| egui::Modifiers {
-                ctrl: s.pressed.contains(&0xa2) || s.pressed.contains(&0xa3),
-                alt: event.flags.contains(LLKHF_ALTDOWN),
-                ..egui::Modifiers::NONE
-            });
-            crate::early::physical(
-                Key {
-                    vk: event.vkCode as u16,
-                    down,
-                },
-                mods,
-            );
-            return LRESULT(1);
+                STATE.with_borrow_mut(|s| {
+                    if key.down {
+                        s.pressed.insert(key.vk);
+                    } else {
+                        s.pressed.remove(&key.vk);
+                    }
+                    s.pending.push((
+                        egui::Event::Key {
+                            key: egui::Key::F35,
+                            physical_key: None,
+                            pressed: key.down,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                        Some(key),
+                        false,
+                    ));
+                });
+                let mods = STATE.with_borrow(|s| egui::Modifiers {
+                    shift: s.pressed.contains(&0xa0) || s.pressed.contains(&0xa1),
+                    ctrl: s.pressed.contains(&0xa2) || s.pressed.contains(&0xa3),
+                    alt,
+                    ..egui::Modifiers::NONE
+                });
+                crate::early::physical(key, mods);
+            }
+            if swallowed {
+                return LRESULT(1);
+            }
         }
     }
-    // SAFETY: pass unhandled input to the next hook unchanged.
+    // SAFETY: pass unhandled input through unchanged.
     unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn constructs_hook_records_without_installing_or_posting() {
-        for (vk, flags, captured) in [
-            (0x5b, KBDLLHOOKSTRUCT_FLAGS(0), true),
-            (0x5c, LLKHF_UP, true),
-            (0x09, LLKHF_ALTDOWN, true),
-            (0x20, LLKHF_ALTDOWN, true),
-            (0x73, LLKHF_ALTDOWN, true),
-            (0x09, KBDLLHOOKSTRUCT_FLAGS(0), false),
-            (0x5b, LLKHF_INJECTED, false),
-            (0x41, KBDLLHOOKSTRUCT_FLAGS(0), false),
-        ] {
-            let event = KBDLLHOOKSTRUCT {
-                vkCode: vk,
-                flags,
-                ..Default::default()
-            };
-            assert_eq!(captures(&event), captured);
+    fn ownership_requires_consumed_down_and_survives_alt_release() {
+        let mut capture = Capture::default();
+        for vk in [0x5b, 0x5c, 0x09, 0x20, 0x73] {
+            assert!(!capture.consume(Key { vk, down: false }, true));
+            assert!(capture.consume(Key { vk, down: true }, true));
+            assert!(capture.consume(Key { vk, down: false }, false));
+            assert!(!capture.consume(Key { vk, down: false }, true));
         }
-        owns_keys(true);
-        assert!(OWNED.get());
+        assert!(!capture.consume(
+            Key {
+                vk: 0x09,
+                down: true
+            },
+            false
+        ));
+        assert!(!capture.consume(
+            Key {
+                vk: 0x41,
+                down: true
+            },
+            true
+        ));
+    }
+    #[test]
+    fn forwarded_modifier_order_and_release_clear_without_installing() {
+        CAPTURE.with_borrow_mut(|capture| {
+            capture.forwarded.push_back(Key {
+                vk: 0xa0,
+                down: true,
+            });
+            capture.forwarded.push_back(Key {
+                vk: 0xa0,
+                down: false,
+            });
+        });
+        assert!(take_forwarded(Key {
+            vk: 0xa0,
+            down: true
+        }));
+        assert!(take_forwarded(Key {
+            vk: 0xa0,
+            down: false
+        }));
         owns_keys(false);
-        assert!(!OWNED.get());
+        CAPTURE.with_borrow(|c| {
+            assert!(c.hook.0.is_null());
+            assert!(c.consumed.is_empty());
+        });
     }
 }

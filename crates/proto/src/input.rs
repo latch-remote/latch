@@ -57,13 +57,22 @@ pub enum Event {
     /// 1 to [`MAX_TEXT`] bytes of UTF-8.
     Text(String),
     ReleaseAll,
+    /// A future fixed-length kind-8 usage. Acknowledge without injection.
+    UnknownPosition {
+        usage: u16,
+        down: bool,
+        modifiers: u8,
+    },
 }
 
 impl Event {
     /// Bytes this event takes in an `Input` datagram.
     pub fn wire_len(&self) -> usize {
         match self {
-            Event::MouseMove { .. } | Event::Scroll { .. } | Event::Key { .. } => 5,
+            Event::MouseMove { .. }
+            | Event::Scroll { .. }
+            | Event::Key { .. }
+            | Event::UnknownPosition { .. } => 5,
             Event::MousePosition { .. } => 9,
             Event::MouseButton { .. } => 3,
             Event::Text(s) => 2 + s.len(),
@@ -114,6 +123,15 @@ impl Event {
                 out.extend(text.as_bytes());
             }
             Event::ReleaseAll => out.push(7),
+            Event::UnknownPosition {
+                usage,
+                down,
+                modifiers,
+            } => {
+                out.push(8);
+                out.extend(usage.to_le_bytes());
+                out.extend([*down as u8, *modifiers]);
+            }
         }
     }
 
@@ -183,16 +201,25 @@ impl Event {
             }
             7 => (Event::ReleaseAll, 1),
             8 => {
-                let vk = u16at(1)?.checked_add(0x100)?;
-                crate::keyboard::position(vk)?;
-                (
-                    Event::Key {
+                let usage = u16at(1)?;
+                let down = boolean(3)?;
+                let modifiers = *bytes.get(4)?;
+                let event = match usage
+                    .checked_add(0x100)
+                    .filter(|&vk| crate::keyboard::position(vk).is_some())
+                {
+                    Some(vk) => Event::Key {
                         vk,
-                        down: boolean(3)?,
-                        modifiers: *bytes.get(4)?,
+                        down,
+                        modifiers,
                     },
-                    5,
-                )
+                    None => Event::UnknownPosition {
+                        usage,
+                        down,
+                        modifiers,
+                    },
+                };
+                (event, 5)
             }
             _ => return None,
         })
@@ -373,6 +400,7 @@ pub struct InputReceiver {
     pending: BTreeMap<u32, Event>,
     /// The event at `next` that failed, and since when.
     failing: Option<(u32, Instant)>,
+    unknown_position_logged: bool,
 }
 
 /// How long a failing event is retried before it is dropped. A transient
@@ -387,6 +415,7 @@ impl InputReceiver {
             next: 0,
             pending: Default::default(),
             failing: None,
+            unknown_position_logged: false,
         }
     }
 
@@ -432,6 +461,14 @@ impl InputReceiver {
             }
         }
         while let Some(event) = self.pending.remove(&self.next) {
+            if let Event::UnknownPosition { usage, .. } = event {
+                if !self.unknown_position_logged {
+                    eprintln!("Latch ignored unknown keyboard usage {usage:#x}");
+                    self.unknown_position_logged = true;
+                }
+                self.next = self.next.wrapping_add(1);
+                continue;
+            }
             if apply(event.clone()).is_err() {
                 let since = match self.failing {
                     Some((seq, since)) if seq == self.next => since,

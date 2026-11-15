@@ -45,6 +45,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 raw-window-handle = "0.6"
 
 [dev-dependencies]
+latch-engine.workspace = true
 x11rb = { version = "0.14", features = ["randr"] }
 toml.workspace = true
 egui_kittest = { version = "0.31", features = ["wgpu", "eframe"] }

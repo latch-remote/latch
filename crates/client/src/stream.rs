@@ -438,6 +438,7 @@ impl View {
         }
         crate::macos::stream_owns_keys(false);
         crate::keyboard::owns_keys(false);
+        crate::keyboard::key_positions(false);
         ctx.options_mut(|o| o.zoom_with_keyboard = true);
         self.set_captured(ctx, false);
         self.bar_shown = false;
@@ -1428,12 +1429,14 @@ impl View {
             ("Windows key", &[input::VK_LWIN][..]),
             ("Alt+Tab", &[input::VK_MENU, input::VK_TAB][..]),
             ("Command+Tab", &[input::VK_LWIN, input::VK_TAB][..]),
-            ("Command+Q", &[input::VK_LWIN, 0x51][..]),
             ("Command+Space", &[input::VK_LWIN, 0x20][..]),
             ("Win+L", &[input::VK_LWIN, 0x4c][..]),
             ("Escape", &[input::VK_ESCAPE][..]),
             ("Print Screen", &[input::VK_SNAPSHOT][..]),
         ] {
+            if !toolbar_key_for_host(label, self.host_mac) {
+                continue;
+            }
             if ui::menu_item(ui, label).clicked() {
                 self.held.chord(input, keys);
             }
@@ -1644,6 +1647,7 @@ impl View {
         // its pointer in the picture. The last session's reset left this
         // true, and a captured reconnect would then never ask for it.
         self.host_cursor_drawn = false;
+        crate::keyboard::key_positions(live.session.key_positions());
         live.session.set_volume(if self.muted {
             0.0
         } else {
@@ -1772,8 +1776,13 @@ impl View {
         // ⌘Q and ⌘H belong to the PC too while it has the keys, and so do
         // ⌘+, ⌘- and ⌘0: egui would zoom Latch's own window on them while
         // they zoomed the browser on the PC.
-        crate::macos::stream_owns_keys(keys_to_pc);
-        crate::keyboard::owns_keys(keys_to_pc);
+        let system_capture = crate::keyboard::capture_system_keys(
+            keys_to_pc,
+            ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)),
+            self.captured,
+        );
+        crate::macos::stream_owns_keys(system_capture);
+        crate::keyboard::owns_keys(system_capture && crate::keyboard::available());
         if ctx.options(|o| o.zoom_with_keyboard) == keys_to_pc {
             ctx.options_mut(|o| o.zoom_with_keyboard = !keys_to_pc);
         }
@@ -2073,7 +2082,7 @@ impl View {
                     mouse,
                     cmd_is_ctrl: self.cmd_is_ctrl(cfg),
                     host_mac: self.host_mac,
-                    map_shortcuts: cfg.cmd_is_ctrl,
+                    map_shortcuts: self.map_shortcuts(cfg),
                     motion_scale,
                     video,
                     pointer_region: if free_mouse {
@@ -2156,8 +2165,13 @@ impl View {
                         self.paste(link, String::new());
                     }
                 }
-                let target = crate::keyboard::mapped(key.vk, self.host_mac, link.cfg.cmd_is_ctrl);
-                self.held.physical_key(out, key.vk, key.down, target);
+                self.held.shortcut_key(
+                    out,
+                    key,
+                    cfg!(target_os = "macos"),
+                    self.host_mac,
+                    self.map_shortcuts(link.cfg),
+                );
                 return;
             }
             Queued::Modifiers(m) => {
@@ -2340,16 +2354,20 @@ impl View {
         crate::macos::caps_lock()
     }
 
+    fn map_shortcuts(&self, cfg: &ClientConfig) -> bool {
+        cfg.cmd_is_ctrl && (!crate::keyboard::available() || (!self.captured && !cfg.capture_mouse))
+    }
+
     /// Whether ⌘ goes to the PC as Ctrl. A Mac there gets Command whatever
     /// the setting, which is about Windows and Linux.
     fn cmd_is_ctrl(&self, cfg: &ClientConfig) -> bool {
-        cfg.cmd_is_ctrl && !self.host_mac
+        self.map_shortcuts(cfg) && !self.host_mac
     }
 
     /// What ⌘ stands for in a clipboard shortcut.
     fn clipboard_modifier(&self, cfg: &ClientConfig) -> i16 {
-        if (cfg!(target_os = "macos") && (self.host_mac || !cfg.cmd_is_ctrl))
-            || (!cfg!(target_os = "macos") && self.host_mac && cfg.cmd_is_ctrl)
+        if (cfg!(target_os = "macos") && (self.host_mac || !self.map_shortcuts(cfg)))
+            || (!cfg!(target_os = "macos") && self.host_mac && self.map_shortcuts(cfg))
         {
             input::VK_LWIN
         } else {
@@ -2360,7 +2378,7 @@ impl View {
     /// egui swallows Cmd/Ctrl+C/X/V into clipboard events; replay them as
     /// the key chord the PC expects.
     fn clipboard_chord<S: Sink + ?Sized>(&mut self, link: &Link<'_, S>, edit: Edit) {
-        let shortcuts = if link.cfg.cmd_is_ctrl {
+        let shortcuts = if self.map_shortcuts(link.cfg) {
             link.live.shortcuts
         } else {
             crate::clipboard::Shortcuts::Letters
@@ -2795,6 +2813,37 @@ pub(crate) mod tests {
     use crate::config::ClientConfig;
     use crate::session::Live;
     use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn toolbar_keys_follow_host_and_game_capture_disables_mapping() {
+        for host_mac in [false, true] {
+            for label in ["Command+Tab", "Command+Space"] {
+                assert_eq!(toolbar_key_for_host(label, host_mac), host_mac);
+            }
+            for label in [
+                "Windows key",
+                "Win+L",
+                "Ctrl+Alt+Delete",
+                "Alt+Tab",
+                "Print Screen",
+            ] {
+                assert_eq!(toolbar_key_for_host(label, host_mac), !host_mac);
+            }
+        }
+        let mut cfg = ClientConfig::default();
+        cfg.capture_mouse = false;
+        let mut view = View::default();
+        // The native observer is installed by production. Enable it here
+        // to test game policy through the normal view helper.
+        crate::keyboard::test_install(true);
+        assert!(view.map_shortcuts(&cfg));
+        view.captured = true;
+        assert!(!view.map_shortcuts(&cfg));
+        view.captured = false;
+        cfg.capture_mouse = true;
+        assert!(!view.map_shortcuts(&cfg));
+        crate::keyboard::test_install(false);
+    }
 
     #[test]
     fn a_capture_puts_a_pointer_off_the_window_on_the_picture() {
@@ -5723,5 +5772,13 @@ pub(crate) mod tests {
         h.get_by_label("Try again").simulate_click();
         h.run_steps(1);
         assert!(h.state().actions.contains(&Action::Reconnect));
+    }
+}
+
+fn toolbar_key_for_host(label: &str, host_mac: bool) -> bool {
+    match label {
+        "Command+Tab" | "Command+Space" => host_mac,
+        "Windows key" | "Win+L" | "Ctrl+Alt+Delete" | "Alt+Tab" | "Print Screen" => !host_mac,
+        _ => true,
     }
 }

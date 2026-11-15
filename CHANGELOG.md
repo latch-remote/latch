@@ -8,6 +8,11 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Input
 
+- Restore legacy keyboard compatibility, negotiate elevated helper positions,
+  and acknowledge unknown future positions without blocking input. Recover
+  native Mac ISO/JIS positions, scope system-key capture to fullscreen or
+  captured mouse, and keep modifiers reachable with a safe shortcut swap.
+
 - Send viewer mouse and keyboard input directly from OS events on macOS,
   Windows and Linux, preserving input ordering, capture, focus and local
   shortcuts while avoiding the next UI frame for ordinary input.
@@ -16,7 +21,7 @@ GitHub release notes, so each version gets a heading of the form
   viewer, toolbar actions for reserved shortcuts and native focus-loss
   releases.
 - Preserve ISO, numpad and Japanese/Korean positions with a negotiated
-  key-position extension and 6.0.0 fallbacks. Expand native keyboard maps,
+  key-position extension and the original 6.0.0 egui/text path. Expand native keyboard maps,
   macOS media events and shared cross-platform event-construction tests.
 
 ### Packaging

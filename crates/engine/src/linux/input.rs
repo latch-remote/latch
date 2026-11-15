@@ -57,6 +57,7 @@ impl X11Input {
         let mut changed = false;
         while let Some(event) = self.conn.poll_for_event()? {
             match event {
+                Event::UnknownPosition { .. } => {}
                 XEvent::MappingNotify(_) => changed = true,
                 XEvent::Error(error) => anyhow::bail!("X11 input error: {error:?}"),
                 _ => {}
@@ -190,6 +191,7 @@ impl InputSink for X11Input {
     fn apply(&mut self, event: &Event, display: DisplayRect) -> anyhow::Result<()> {
         self.refresh()?;
         match event {
+            Event::UnknownPosition { .. } => {}
             Event::Key { vk, down, .. } => {
                 let code = if let Some(&code) = self.pressed.get(vk) {
                     code
@@ -382,37 +384,33 @@ mod tests {
                         xkb::KeyName { name: bytes }
                     })
                     .collect();
-                for viewer in ["windows", "macos", "linux"] {
-                    for case in latch_proto::keyboard::CASES {
-                        let name = CString::new(case.xkb).unwrap();
-                        let expected = xkb_keymap_key_by_name(keymap, name.as_ptr());
-                        assert_ne!(
-                            expected,
-                            u32::MAX,
-                            "{viewer} -> linux, {layout:?}, {}",
-                            case.xkb
-                        );
-                        assert_eq!(u32::from(keycode(8, &names, case.vk).unwrap()), expected);
-                        let state = xkb_state_new(keymap);
-                        assert!(!state.is_null());
-                        xkb_state_update_key(state, expected, 1);
-                        let active =
-                            |name: &CStr| xkb_state_mod_name_is_active(state, name.as_ptr(), 8) > 0;
-                        assert_eq!(active(c"Shift"), case.mask & 1 != 0);
-                        assert_eq!(active(c"Control"), case.mask & 2 != 0);
-                        assert_eq!(active(c"Mod1") || active(c"Mod5"), case.mask & 4 != 0);
-                        assert_eq!(active(c"Mod4"), case.mask & 8 != 0);
-                        xkb_state_update_key(state, expected, 0);
-                        assert!(
-                            !active(c"Shift")
-                                && !active(c"Control")
-                                && !active(c"Mod1")
-                                && !active(c"Mod4")
-                                && !active(c"Mod5")
-                        );
-                        xkb_state_unref(state);
-                    }
+
+                for case in latch_proto::keyboard::CASES {
+                    let name = CString::new(case.xkb).unwrap();
+                    let expected = xkb_keymap_key_by_name(keymap, name.as_ptr());
+                    assert_ne!(expected, u32::MAX, "host linux, {layout:?}, {}", case.xkb);
+                    assert_eq!(expected, u32::from(case.linux));
+                    assert_eq!(u32::from(keycode(8, &names, case.vk).unwrap()), expected);
+                    let state = xkb_state_new(keymap);
+                    assert!(!state.is_null());
+                    xkb_state_update_key(state, expected, 1);
+                    let active =
+                        |name: &CStr| xkb_state_mod_name_is_active(state, name.as_ptr(), 8) > 0;
+                    assert_eq!(active(c"Shift"), case.mask & 1 != 0);
+                    assert_eq!(active(c"Control"), case.mask & 2 != 0);
+                    assert_eq!(active(c"Mod1") || active(c"Mod5"), case.mask & 4 != 0);
+                    assert_eq!(active(c"Mod4"), case.mask & 8 != 0);
+                    xkb_state_update_key(state, expected, 0);
+                    assert!(
+                        !active(c"Shift")
+                            && !active(c"Control")
+                            && !active(c"Mod1")
+                            && !active(c"Mod4")
+                            && !active(c"Mod5")
+                    );
+                    xkb_state_unref(state);
                 }
+
                 xkb_keymap_unref(keymap);
                 xkb_context_unref(context);
                 for text in latch_proto::keyboard::TEXT_CASES {

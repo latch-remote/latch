@@ -432,8 +432,13 @@ impl State {
                 {
                     return Outcome::Declined;
                 }
-                let target = crate::keyboard::mapped(key.vk, gate.host_mac, gate.map_shortcuts);
-                self.held.physical_key(out, key.vk, key.down, target);
+                self.held.shortcut_key(
+                    out,
+                    key,
+                    cfg!(target_os = "macos"),
+                    gate.host_mac,
+                    gate.map_shortcuts && !gate.mouse,
+                );
                 Outcome::Sent(Some(Ahead::Physical(key.vk, key.down)))
             }
             // Free mode uses absolute pointer positions, so raw device

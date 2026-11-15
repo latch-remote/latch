@@ -2010,6 +2010,7 @@ dependencies = [
  "egui_kittest",
  "image",
  "latch-core",
+ "latch-engine",
  "latch-proto",
  "latch-stream",
  "latch-ui",

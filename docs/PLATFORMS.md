@@ -101,37 +101,47 @@ keyboard/mouse/gamepad/clipboard/audio/HDR acceptance record.[^negotiation]
 | Direction | Known session evidence | Unverified | Broken, missing or restricted |
 |---|---|---|---|
 | Windows → Mac | **partial** · F-WM actual DXGI/AMF HEVC desktop delivery, F reverse Windows-software H.264 synthetic input/relay. Numerical Windows HDR→Mac decode/render probes.[^field] | NVIDIA/Intel, AV1 host, real gamepads/rumble, mic cable, clipboard/layout permutations, mixed DPI, physical HDR and scanout. | Windows cursor remains in video. System shortcuts remain viewer-OS dependent.[^wcursor][^viewerinput] |
-| Mac → Windows | **partial** · F-MW synthetic IOSurface→VT H.264→DXVA/client renderer, public relay, synthetic key-to-picture and software audio delivery.[^field] | Full SCK desktop session, HEVC whole session, actual host CGEvent injection, mic, native clipboard, physical HDR and controllers. | Mac host gamepad injection and virtual-display/mode change **missing**. Windows held Win becomes Mac Command. Mac F21–F24/media Stop and semantic Hangul/Hanja conversion remain restricted by native input APIs/input sources.[^pads][^resize][^viewerinput] |
-| Windows → Linux | **untested** cross-machine pair, S-L establishes local real receive/decode of synthetic Baseline sessions.[^sessiontests] | Windows-generated Baseline against Linux decoder, all desktop I/O, distro/window-system/DPI combinations. | Linux viewer only advertises H.264 Baseline/SDR8. HEVC/AV1/Main10/HDR viewing **missing**. Windows host must choose H.264/MF or software. X11 grabs Super while focused. Wayland compositor shortcuts remain local. Separate Windows cursor **missing**.[^negotiation][^decode][^wcursor] |
+| Mac → Windows | **partial** · F-MW synthetic IOSurface→VT H.264→DXVA/client renderer, public relay, synthetic key-to-picture and software audio delivery.[^field] | Full SCK desktop session, HEVC whole session, actual host CGEvent injection, mic, native clipboard, physical HDR and controllers. | Mac host gamepad injection and virtual-display/mode change **missing**. Windows held Win becomes Mac Command, with Ctrl displaced during the six editing chords. Mac F21–F24/media Stop and semantic Hangul/Hanja conversion remain restricted by native input APIs/input sources.[^pads][^resize][^viewerinput] |
+| Windows → Linux | **untested** cross-machine pair, S-L establishes local real receive/decode of synthetic Baseline sessions.[^sessiontests] | Windows-generated Baseline against Linux decoder, all desktop I/O, distro/window-system/DPI combinations. | Linux viewer only advertises H.264 Baseline/SDR8. HEVC/AV1/Main10/HDR viewing **missing**. Windows host must choose H.264/MF or software. X11 grabs Super in focused fullscreen/captured-mouse mode. Wayland compositor shortcuts remain local. Separate Windows cursor **missing**.[^negotiation][^decode][^wcursor] |
 | Linux → Windows | **untested** cross-machine pair, F-LM validates Linux X11/software source separately, S-W validates viewer receive separately.[^field][^sessiontests] | Linux hardware codecs/Windows decoder combinations, native input/pad/clipboard/audio/mic pair. | Linux Wayland hosting **missing**, X11 required. Linux host is SDR8 and emulates Xbox pads. Held Windows Meta is forwarded as Super. Windows secure-attention/lock shortcuts remain viewer-reserved.[^lcap][^lencode][^pads][^viewerinput] |
 | Mac → Linux | **untested** cross-machine pair, U-M proves VT Baseline output with independent decode, S-L proves Rust viewer path separately.[^mencode][^sessiontests] | VT Baseline→Rust interoperability session, native injection, clipboard/audio/mic, raw movement and Retina scaling. | Viewer must negotiate Baseline/SDR8, HEVC/Main10/HDR unavailable. Mac gamepad injection, host mode change and separate cursor **missing**. Linux Super→Command is captured with an X11 keyboard grab. Wayland compositor shortcuts remain local. Mac F21–F24/media Stop and language-key semantics remain restricted.[^decode][^pads][^resize][^viewerinput] |
 | Linux → Mac | **partial** · F-LM X11/software Baseline→Mac, motion/resize, synthetic key-to-picture. F-LM does not certify real keyboard injection.[^field] | Linux GPU encode, actual pads/rumble, acoustic audio/mic, native clipboard/layouts and mixed Retina displays. | X11 host only, SDR8. Sony pads become Xbox on Linux. Smooth scroll becomes X wheel steps. Mac Cmd defaults to Ctrl for this host.[^lcap][^pads][^scroll][^viewerinput] |
 
 ### Pair-specific contracts and caveats
 
-1. **Keys and modifiers.** Every viewer uses native winit physical positions,
-   retaining left/right Shift, Ctrl, Alt/AltGr and Win/Super/Command. The
-   existing VK wire carries sided modifiers. Negotiated input kind 8 adds
-   keypad Enter/Equals and Japanese positions that lack distinct VKs, with
-   kind-4 fallbacks for 6.0.0 hosts. Older viewers retain their capture limits.
-   Shared ordinary unit tests cover each viewer→host combination. Host tests
-   construct Windows INPUT, unposted Mac CGEvents and real XKB keymaps for
-   US ANSI, UK/DE/FR ISO, Korean and Japanese layouts. This leaves physical
-   desktop/IME acceptance in all six pairs unverified. Host layouts interpret
-   physical keys and AltGr. Viewer IME/dead-key commits use UTF-8 text once,
-   with temporary X11 key remapping and 12 ms per character. The default
-   `cmd_is_ctrl` maps Mac Cmd to Ctrl on W/L and W/L Ctrl to Cmd on Mac.
-   **Send keys as pressed** preserves modifiers instead. Win/Super remains
-   Meta, which is Cmd on Mac. The toolbar sends reserved combinations using
-   host identities. Mac Cmd+Tab/Space, Wayland compositor grabs, Windows
-   secure attention and Win+L retain viewer-OS restrictions. winit exposes
-   no Wayland shortcut-inhibit API. X11 grabs the keyboard only while the
-   stream owns focused input. Native window-manager acceptance remains
-   unverified. Focus loss and disconnect release held
-   input, including native focus-loss release while a paste waits. Lock
-   state starts on the host. Num Lock becomes Clear on Mac. Mac F21–F24,
-   media Stop and semantic Korean language conversion remain restricted.
-   See USING.md for the setting, fallbacks and reserved-key table.[^keys][^viewerinput]
+1. **Keys and modifiers.** Negotiated native input retains sided modifiers,
+   ISO/numpad and Japanese/Korean positions. Peers without `key_positions`
+   use the original egui/text capture path. Tests replay all 58 fixture
+   positions through that path against a frozen 6.0.0 `input::vk` function.
+   The independent fixture records USB usages, Windows set-1/E0 scan codes,
+   Apple kVK values and Linux evdev+8 codes. Client tests combine viewer
+   translation with all three production host lookup tables. The running
+   OS additionally exercises winit's native scancode conversion. Other OS
+   inputs use explicit physical-key fixtures, including Mac native ISO/JIS
+   codes and the ISO swap. These tests cover translation and constructed
+   records. They leave physical cross-machine capture and desktop/IME
+   acceptance in all six pairs unverified.
+   Host tests construct Windows INPUT and unposted Mac CGEvents. Linux tests
+   check numeric codes against real XKB US/UK/DE/FR/Korean/Japanese keymaps.
+   The default swaps Mac Cmd/Ctrl fully toward PCs. PC-to-Mac swaps only
+   A/C/X/V/Z/F chords, including Shift, with Alt combinations excluded.
+   Game/relative capture uses as-pressed. See USING.md for the exact scope.
+   System chords require focused fullscreen or captured-mouse mode on
+   Windows/X11. Mac Cmd+Tab/Space, Wayland compositor grabs, Windows secure
+   attention and Win+L retain OS restrictions. X11 retries refused grabs,
+   and an active grab can hold the session keyboard if Latch hangs.
+   Viewer media controls stay local, with X11 media-daemon bindings possibly
+   inhibited during a grab. Windows hooks install only during capture and
+   release on focus loss, teardown and app drop. Hook callbacks preserve
+   Shift-before-Win ordering while winit retains AltGr filtering.
+   German Mac ISO keyboards, Korean Windows IME toggling, native
+   window-manager chords and mixed-layout hardware remain unverified.
+   Mac F21–F24/media Stop have no injector equivalent. Kana/Eisu
+   approximations depend on the Mac input source. Mac Clear stays local.
+   Dead-key and explicit Unicode text are unit-tested. The stream window's
+   ordinary composition runs in the host IME. Focus loss and disconnect
+   release held input, including while clipboard paste waits.[^viewerinput]
+
 2. **Mouse and scroll.** All pairs send relative deltas or an absolute point
    in the encoded picture. Aspect-fit bars and display origin are accounted
    for. W hosts use DPI-aware physical virtual-desktop pixels, M hosts global
@@ -300,7 +310,7 @@ injection, its passing results cover that narrower scope.[^examples]
 [^binary]: [host/main.rs:120](../crates/host/src/main.rs#L120), [host/product.rs:34](../crates/host/src/product.rs#L34).
 [^decode]: [stream/video.rs:459](../crates/stream/src/video.rs#L459), [video.rs:514](../crates/stream/src/video.rs#L514), [video.rs:562](../crates/stream/src/video.rs#L562), [video/software.rs:21](../crates/stream/src/video/software.rs#L21), [video/mediafoundation.rs:218](../crates/stream/src/video/mediafoundation.rs#L218), [mediafoundation.rs:1126](../crates/stream/src/video/mediafoundation.rs#L1126), [video/videotoolbox.rs:353](../crates/stream/src/video/videotoolbox.rs#L353), [videotoolbox.rs:916](../crates/stream/src/video/videotoolbox.rs#L916). Tests use committed H.264/HEVC/AV1/Main10 fixtures, conditionally on successful probes. Rust fallback accepts Constrained Baseline only. Windows negotiated Main10 uses `new_decoder_for_color`, the older format-only constructor has stricter platform checks.
 [^present]: [client/lib.rs:23](../crates/client/src/lib.rs#L23), [stream/video.rs:356](../crates/stream/src/video.rs#L356), [client/video.rs:367](../crates/client/src/video.rs#L367), [video/edr.rs:117](../crates/client/src/video/edr.rs#L117), [video/hdr10.rs:86](../crates/client/src/video/hdr10.rs#L86), [video/presenter.rs:60](../crates/client/src/video/presenter.rs#L60). Shader numerical tests, import/crop logic and presenter fake-time tests accompany these implementations. W/M renderer-preparation and HDR readback records are in the field notes, compositor/scanout are outside their timing boundary.
-[^viewerinput]: [native translation and composition](../crates/client/src/keyboard.rs), [focused Windows hook](../crates/client/src/keyboard/windows.rs), [focused X11 grab](../crates/client/src/keyboard/linux.rs), [held/source-key and release tests](../crates/client/src/input.rs), [stream dispatch, reserved-key menu and focus/disconnect recorder tests](../crates/client/src/stream.rs), [Mac menu overrides](../crates/client/src/macos.rs), [keyboard behaviour and OS limits](USING.md#keyboard-between-different-operating-systems). The egui-winit callback patch is shared with the event-time dispatch merged in #101. Its native-key observer has an independent callback slot.
+[^viewerinput]: [native translation and composition](../crates/client/src/keyboard.rs), [capture-scoped Windows hook](../crates/client/src/keyboard/windows.rs), [capture-scoped X11 grab](../crates/client/src/keyboard/linux.rs), [held/source-key and release tests](../crates/client/src/input.rs), [stream dispatch, reserved-key menu and focus/disconnect recorder tests](../crates/client/src/stream.rs), [Mac menu overrides](../crates/client/src/macos.rs), [keyboard behaviour and OS limits](USING.md#keyboard-between-different-operating-systems). The egui-winit callback patch is shared with the event-time dispatch merged in #101. Its native-key observer has an independent callback slot.
 [^playback]: [stream/audio.rs:131](../crates/stream/src/audio.rs#L131), [audio.rs:519](../crates/stream/src/audio.rs#L519), [stream/audio_wasapi.rs:68](../crates/stream/src/audio_wasapi.rs#L68), [stream/speakers.rs:12](../crates/stream/src/speakers.rs#L12), [speakers.rs:420](../crates/stream/src/speakers.rs#L420). Audio unit tests at [audio.rs:1125](../crates/stream/src/audio.rs#L1125) include long simulated jitter/drift and mixer tests, physical playback is outside those simulations.
 [^fullscreen]: [client/app.rs:420](../crates/client/src/app.rs#L420), [client/refresh.rs:86](../crates/client/src/refresh.rs#L86), [client/video/presenter.rs:60](../crates/client/src/video/presenter.rs#L60), [engine/input.rs:6](../crates/engine/src/input.rs#L6), [engine/server.rs:293](../crates/engine/src/server.rs#L293) single-session takeover. Fullscreen uses the shared viewport code, native presenter tests simulate display changes.
 [^negotiation]: [engine/server.rs:232](../crates/engine/src/server.rs#L232), [server.rs:339](../crates/engine/src/server.rs#L339), [stream/video.rs:430](../crates/stream/src/video.rs#L430), [stream/session.rs:1577](../crates/stream/src/session.rs#L1577). Server negotiation tests inject fake pipelines, colour matrix tests are [proto/color.rs:261](../crates/proto/src/color.rs#L261). These establish selection logic independently of each hardware encoder's output.
@@ -308,3 +318,15 @@ injection, its passing results cover that narrower scope.[^examples]
 [^examples]: [engine/examples/serve.rs:18](../crates/engine/examples/serve.rs#L18), [stream/examples/view.rs:114](../crates/stream/examples/view.rs#L114), [client/examples/present.rs:141](../crates/client/examples/present.rs#L141), [stream/examples/stream_decode_bench.rs:158](../crates/stream/examples/stream_decode_bench.rs#L158), [stream/examples/pads.rs:19](../crates/stream/examples/pads.rs#L19), [engine/examples/linux_input.rs:5](../crates/engine/examples/linux_input.rs#L5), [engine/examples/linux_capture.rs:5](../crates/engine/examples/linux_capture.rs#L5), [engine/examples/mac_capture.rs:4](../crates/engine/examples/mac_capture.rs#L4), [engine/examples/windows_capture.rs:3](../crates/engine/examples/windows_capture.rs#L3), [engine/testmode.rs:48](../crates/engine/src/testmode.rs#L48). Test-pattern host and example authorizers differ from the installed service's authentication and permissions.
 [^tailscale]: [core/tailscale.rs:22](../crates/core/src/tailscale.rs#L22), [tailscale.rs:321](../crates/core/src/tailscale.rs#L321), [tailscale.rs:358](../crates/core/src/tailscale.rs#L358), [tailscale.rs:559](../crates/core/src/tailscale.rs#L559), [tailscale.rs:635](../crates/core/src/tailscale.rs#L635) parser/trust tests.
 [^flight]: Issues #77–#81 track input, display selection, VA-API, Wayland and packaging work. The table maps each issue to its branch and current PR, including merged packaging PR #93. Verify branch heads and PR state at merge time.
+
+Keyboard fixture sources are USB HID Usage Tables (keyboard and consumer
+pages), Microsoft's scan-code and virtual-key documentation, Apple's Carbon
+`Events.h` kVK constants and Linux `input-event-codes.h` with the X11 offset
+of eight. Chromium's cross-reference was transcribed into
+`crates/proto/fixtures/keyboard.rs` on 2026-11-15. Kana/Convert/NonConvert's
+Mac entries explicitly describe Latch's input-source approximations.
+[USB HID tables](https://usb.org/sites/default/files/hut1_6.pdf),
+[Windows scan codes](https://learn.microsoft.com/en-us/windows/win32/inputdev/about-keyboard-input#scan-codes),
+[Apple Events.h](https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX14.4.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h),
+[Linux codes](https://github.com/torvalds/linux/blob/master/include/uapi/linux/input-event-codes.h),
+[Chromium cross-reference](https://chromium.googlesource.com/chromium/src/+/main/ui/events/keycodes/dom/dom_code_data.inc).

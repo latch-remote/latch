@@ -285,18 +285,28 @@ booleans, default false and omitted when false. A host answers true only
 when the viewer offered true. Kind 8 is sent only after that acceptance.
 Supported keyboard-page usages are `58` (keypad Enter), `67` (keypad
 Equals), `87` (IntlRo), `88` (Kana), `89` (IntlYen), `8a` (Convert) and
-`8b` (NonConvert), all hexadecimal. Unknown positions are rejected.
+`8b` (NonConvert), all hexadecimal. Unknown usages are parsed as fixed five-byte events and ignored individually.
+The receiver acknowledges their sequence numbers and logs only the first
+unknown usage per receiver. Datagram size and the existing reorder window
+bound their memory use. Invalid lengths and boolean fields are rejected.
 Other keys keep kind 4. Internally the Rust input type represents a kind-8
 position as `Event::Key.vk = 0x100 + usage`. Those internal values never
 appear as a kind-4 payload from the sender.
 
-A viewer connected to an older host uses the existing kind-4 fallback
-Return, main Equals, ISO extra, Kana/Hangul, backslash, Convert and
-NonConvert respectively. Fallbacks that share a destination release it
-only after both source positions are released. An older viewer sends its
-existing kind-4 keys to a new host. Neither peer sends new events to a
-6.0.0 peer. Input ordering, retransmission and InputAck cover kind 8 in the
-same sequence space as every other input event.
+A viewer connected to a host without `key_positions` uses the 6.0.0
+egui/text translation path. Only the historical `input::vk` image and
+existing modifier, Caps Lock and toolbar events can enter kind 4. ISO and
+other native-only positions retain their old text behavior. The negotiated
+native path is selected before physical-text suppression. An older viewer
+sends its existing kind-4 keys to a new host. Input ordering, retransmission
+and InputAck cover kind 8 in the same sequence space as every other event.
+
+The Windows elevated helper negotiates its pipe separately. New clients
+try `LATCHIN2` and reconnect with `LATCHIN1` for an old helper. A new helper
+echoes either handshake, preserving v1 clients. Only a v2 echo advertises
+kind 8. A v1 helper receives legacy VK forms for extended positions.
+Length-delimited unsupported requests receive an error reply and leave
+the connection usable for later input and releases.
 
 Input is reliable without retransmission timers: the viewer numbers every
 event and keeps it until the host acknowledges it. Each `Input` datagram

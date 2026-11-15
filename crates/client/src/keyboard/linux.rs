@@ -17,6 +17,7 @@ thread_local! {
     // a grab automatically when this window is destroyed.
     static WINDOW: RefCell<Option<Window>> = const { RefCell::new(None) };
     static REQUESTED: Cell<bool> = const { Cell::new(false) };
+    static WARNED: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn install(cc: &eframe::CreationContext<'_>) {
@@ -46,7 +47,7 @@ pub fn install(cc: &eframe::CreationContext<'_>) {
 pub fn owns_keys(owned: bool) {
     WINDOW.with_borrow(|window| {
         let Some(window) = window else { return };
-        if REQUESTED.replace(owned) == owned {
+        if REQUESTED.get() == owned {
             return;
         }
         // SAFETY: the Xlib display and window belong to the live eframe window.
@@ -62,13 +63,38 @@ pub fn owns_keys(owned: bool) {
                     xlib::GrabModeAsync,
                     xlib::CurrentTime,
                 );
-                if status != 0 {
+                if record_grab(status) {
                     tracing::warn!(status, "cannot capture X11 global shortcuts");
                 }
             } else {
+                REQUESTED.set(false);
+                WARNED.set(false);
                 (window.calls.XUngrabKeyboard)(window.display, xlib::CurrentTime);
             }
             (window.calls.XFlush)(window.display);
         }
     });
+}
+
+fn record_grab(status: i32) -> bool {
+    REQUESTED.set(status == 0);
+    status != 0 && !WARNED.replace(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn a_failed_grab_remains_retryable_and_logs_once() {
+        REQUESTED.set(false);
+        WARNED.set(false);
+        assert!(record_grab(1));
+        assert!(!REQUESTED.get());
+        assert!(!record_grab(1));
+        assert!(!REQUESTED.get());
+        assert!(!record_grab(0));
+        assert!(REQUESTED.get());
+        REQUESTED.set(false);
+        WARNED.set(false);
+    }
 }

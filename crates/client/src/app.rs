@@ -199,6 +199,7 @@ pub struct ClientApp {
 
 impl Drop for ClientApp {
     fn drop(&mut self) {
+        crate::keyboard::owns_keys(false);
         self.commit();
         self.save_tx.take();
         if let Some(worker) = self.save_worker.take() {
