@@ -127,21 +127,37 @@ fn start_watchdog(
         .name("x11-keyboard-watchdog".into())
         .spawn(move || {
             while !worker_stop.load(Ordering::Acquire) {
-                if !worker_lease.active(worker_lease.elapsed()) {
-                    let display = display as *mut xlib::Display;
-                    // SAFETY: winit calls XInitThreads before opening its display.
-                    // Window owns this worker, and shutdown joins it before eframe
-                    // destroys the display. Lock pairs also serialize with media replay.
-                    unsafe {
-                        (worker_calls.XLockDisplay)(display);
-                        if !worker_lease.active(worker_lease.elapsed())
-                            && worker_grabbed.swap(false, Ordering::AcqRel)
-                        {
-                            (worker_calls.XUngrabKeyboard)(display, xlib::CurrentTime);
-                            (worker_calls.XFlush)(display);
+                // Leave the display entirely alone while capture is idle.
+                if worker_grabbed.load(Ordering::Acquire)
+                    && !worker_lease.active(worker_lease.elapsed())
+                {
+                    let calls = worker_calls.clone();
+                    let lease = worker_lease.clone();
+                    let grabbed = worker_grabbed.clone();
+                    let (done, completed) = std::sync::mpsc::sync_channel(1);
+                    // Xlib has no try-lock API. Supervise the potentially stuck
+                    // native call from this watchdog, with a bounded deadline.
+                    let release = thread::spawn(move || {
+                        let display = display as *mut xlib::Display;
+                        // SAFETY: winit initialized Xlib threading. Window joins
+                        // this watchdog before eframe destroys its display.
+                        unsafe {
+                            (calls.XLockDisplay)(display);
+                            if !lease.active(lease.elapsed())
+                                && grabbed.swap(false, Ordering::AcqRel)
+                            {
+                                (calls.XUngrabKeyboard)(display, xlib::CurrentTime);
+                                (calls.XFlush)(display);
+                            }
+                            (calls.XUnlockDisplay)(display);
                         }
-                        (worker_calls.XUnlockDisplay)(display);
+                        let _ = done.send(());
+                    });
+                    if completed.recv_timeout(Duration::from_secs(2)).is_err() {
+                        tracing::error!("X11 keyboard grab recovery stalled on the display connection for two seconds, aborting to release the keyboard");
+                        std::process::abort();
                     }
+                    let _ = release.join();
                 }
                 thread::park_timeout(Duration::from_millis(10));
             }
@@ -276,6 +292,60 @@ mod tests {
     #[test]
     #[ignore = "requires an isolated Xvfb server, changes its focus and grabs"]
     fn watchdog_and_media_replay_restore_local_x11_delivery() {
+        // A subprocess can wedge Xlib and verify the last-resort abort without
+        // terminating the test runner. It uses this isolated server only.
+        if std::env::var_os("LATCH_TEST_STUCK_X11").is_some() {
+            let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+            let calls = Arc::new(xlib::Xlib::open().unwrap());
+            unsafe {
+                (calls.XInitThreads)();
+                let display = (calls.XOpenDisplay)(std::ptr::null());
+                assert!(!display.is_null());
+                let root = (calls.XDefaultRootWindow)(display);
+                assert_eq!(
+                    (calls.XGrabKeyboard)(
+                        display,
+                        root,
+                        0,
+                        xlib::GrabModeAsync,
+                        xlib::GrabModeAsync,
+                        xlib::CurrentTime
+                    ),
+                    xlib::GrabSuccess
+                );
+                (calls.XSync)(display, 0);
+                (calls.XLockDisplay)(display);
+                let _watchdog = start_watchdog(
+                    display as usize,
+                    calls.clone(),
+                    Arc::new(Lease::default()),
+                    Arc::new(AtomicBool::new(true)),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap();
+                let (_tx, rx) = std::sync::mpsc::channel::<()>();
+                let _ = rx.recv_timeout(Duration::from_secs(4));
+                eprintln!("a stuck display lock did not abort grab recovery");
+                std::process::exit(1);
+            }
+        }
+        use std::os::unix::process::ExitStatusExt;
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "keyboard::linux::tests::watchdog_and_media_replay_restore_local_x11_delivery",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("LATCH_TEST_STUCK_X11", "1")
+            .output()
+            .unwrap();
+        assert_eq!(child.status.signal(), Some(6), "{:?}", child);
+        assert!(
+            String::from_utf8_lossy(&child.stdout).contains("aborting to release the keyboard"),
+            "{:?}",
+            child
+        );
         let calls = Arc::new(xlib::Xlib::open().unwrap());
         let (media_connection, _) = x11rb::connect(None).unwrap();
         // SAFETY: this isolated test initializes threading before opening either display.
@@ -357,17 +427,20 @@ mod tests {
                 assert!(!grabbed.load(Ordering::Acquire));
                 assert!(!local_media(code, true), "replayed presses stay local");
                 let until = std::time::Instant::now() + Duration::from_secs(1);
-                let mut local_press = false;
-                while std::time::Instant::now() < until && !local_press {
+                let mut local_events = Vec::new();
+                while std::time::Instant::now() < until && local_events.is_empty() {
                     while (calls.XPending)(daemon) > 0 {
                         let mut event: xlib::XEvent = std::mem::zeroed();
                         (calls.XNextEvent)(daemon, &mut event);
-                        local_press |= event.get_type() == xlib::KeyPress
-                            && event.key.keycode == u32::from(key);
+                        local_events.push((event.get_type(), event.key.keycode));
                     }
                     thread::sleep(Duration::from_millis(2));
                 }
-                assert!(local_press, "{code:?} must reach the local daemon");
+                assert_eq!(
+                    local_events,
+                    [(xlib::KeyPress, u32::from(key))],
+                    "{code:?} must reach the local daemon exactly once"
+                );
                 owns_keys(true);
                 assert!(
                     !grabbed.load(Ordering::Acquire),
@@ -389,6 +462,20 @@ mod tests {
                     .unwrap();
                 });
                 (calls.XSync)(display, 0);
+                (calls.XSync)(daemon, 0);
+                while (calls.XPending)(daemon) > 0 {
+                    let mut event: xlib::XEvent = std::mem::zeroed();
+                    (calls.XNextEvent)(daemon, &mut event);
+                    local_events.push((event.get_type(), event.key.keycode));
+                }
+                assert_eq!(
+                    local_events,
+                    [
+                        (xlib::KeyPress, u32::from(key)),
+                        (xlib::KeyRelease, u32::from(key))
+                    ],
+                    "{code:?} local replay must have one down and one up"
+                );
                 (calls.XUngrabKey)(daemon, i32::from(key), xlib::AnyModifier, root);
                 (calls.XSync)(daemon, 0);
             }

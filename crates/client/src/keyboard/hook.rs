@@ -8,6 +8,9 @@ use std::{
 };
 
 pub const LEASE_MS: u64 = 250;
+pub const HEARTBEAT_MS: u64 = LEASE_MS / 3;
+#[cfg(any(windows, test))]
+pub const BARRIER_MS: u64 = 8;
 #[cfg(any(windows, test))]
 pub const QUEUE_SIZE: usize = 256;
 
@@ -29,8 +32,11 @@ impl Default for Lease {
 
 impl Lease {
     pub fn renew(&self) {
-        self.deadline
-            .store(self.elapsed() + LEASE_MS, Ordering::Release);
+        self.renew_at(self.elapsed());
+    }
+
+    pub fn renew_at(&self, now: u64) {
+        self.deadline.store(now + LEASE_MS, Ordering::Release);
     }
 
     pub fn elapsed(&self) -> u64 {
@@ -117,6 +123,7 @@ impl Capture {
 pub fn take_ready(
     pending: &mut std::collections::VecDeque<Event>,
     native: Option<Key>,
+    now: u64,
 ) -> Vec<Event> {
     let mut events = Vec::new();
     while let Some(event) = pending.front().copied() {
@@ -126,20 +133,42 @@ pub fn take_ready(
                     pending.pop_front();
                     continue;
                 }
-                None if native != Some(event.key) => break,
+                None if native != Some(event.key) => {
+                    if now.saturating_sub(event.queued_at) < BARRIER_MS {
+                        break;
+                    }
+                    // An unconfirmed lone Control can be an AltGr synthetic event.
+                    pending.pop_front();
+                    continue;
+                }
                 _ => {}
             }
         }
         if !event.captured && !matches!(event.key.vk, 0xa0..=0xa5) {
             if native == Some(event.key) {
                 pending.pop_front();
+                break;
             }
-            break;
+            if now.saturating_sub(event.queued_at) < BARRIER_MS {
+                break;
+            }
+            pending.pop_front();
+            continue;
         }
         pending.pop_front();
         events.push(event);
     }
     events
+}
+
+#[cfg(any(windows, test))]
+pub fn deliver(tx: &std::sync::mpsc::SyncSender<Event>, lease: &Lease, event: Event) -> bool {
+    if tx.try_send(event).is_ok() {
+        true
+    } else {
+        lease.fail();
+        false
+    }
 }
 
 #[cfg(test)]
@@ -157,6 +186,51 @@ mod tests {
     }
 
     #[test]
+    fn queue_handoff_is_immediate_and_full_or_disconnected_queues_fail_open() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let lease = Lease::default();
+        let key = event(0x5b, true);
+        assert!(deliver(&tx, &lease, key));
+        assert_eq!(rx.try_recv(), Ok(key));
+        assert!(deliver(&tx, &lease, key));
+        assert!(!deliver(&tx, &lease, key));
+        assert!(!lease.active(0));
+        let lease = Lease::default();
+        drop(rx);
+        assert!(!deliver(&tx, &lease, key));
+        assert!(!lease.active(0));
+    }
+
+    #[test]
+    fn missing_barrier_expires_in_eight_ms_without_releasing_held_input() {
+        use crate::input::{Recorder, Sent, SharedHeld};
+        let out = Recorder::default();
+        let held = SharedHeld::default();
+        out.connected.set(true);
+        held.physical_key(&out, 0x57, true, 0x57);
+        out.take();
+        let lease = Lease::default();
+        let mut pending = std::collections::VecDeque::from([
+            event(0x2c, true),
+            event(0xa2, true),
+            event(0x5b, true),
+        ]);
+        assert!(take_ready(&mut pending, None, BARRIER_MS - 1).is_empty());
+        let ready = take_ready(&mut pending, None, BARRIER_MS);
+        assert_eq!(ready, [event(0xa2, true), event(0x5b, true)]);
+        for event in ready {
+            held.physical_key(&out, event.key.vk, event.key.down, event.key.vk);
+        }
+        assert_eq!(
+            out.take(),
+            [Sent::Key(0xa2, true, 2), Sent::Key(0x5b, true, 10)]
+        );
+        assert!(held.physical_down(0x57));
+        assert!(lease.active(BARRIER_MS));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
     fn queued_control_alt_and_shift_keep_hook_order_across_frame_boundaries() {
         use std::collections::VecDeque;
         for modifier in 0xa0..=0xa5 {
@@ -165,9 +239,9 @@ mod tests {
                 ..event(modifier, true)
             };
             let mut pending = VecDeque::from([first]);
-            let before = take_ready(&mut pending, None);
+            let before = take_ready(&mut pending, None, 0);
             pending.push_back(event(0x5b, true));
-            let after = take_ready(&mut pending, None);
+            let after = take_ready(&mut pending, None, 0);
             assert_eq!(
                 [before, after]
                     .concat()
@@ -182,11 +256,11 @@ mod tests {
             ..event(0xa2, true)
         };
         let mut pending = VecDeque::from([control]);
-        assert!(take_ready(&mut pending, None).is_empty());
-        assert_eq!(take_ready(&mut pending, Some(control.key)), [control]);
+        assert!(take_ready(&mut pending, None, 0).is_empty());
+        assert_eq!(take_ready(&mut pending, Some(control.key), 0), [control]);
         pending.extend([control, event(0xa5, true), event(0x5b, true)]);
         assert_eq!(
-            take_ready(&mut pending, None)
+            take_ready(&mut pending, None, 0)
                 .iter()
                 .map(|e| e.key.vk)
                 .collect::<Vec<_>>(),
@@ -204,11 +278,11 @@ mod tests {
             event(0xa0, false),
             event(0x5b, true),
         ]);
-        assert_eq!(take_ready(&mut pending, None), [event(0xa0, true)]);
-        assert!(take_ready(&mut pending, None).is_empty());
-        assert!(take_ready(&mut pending, Some(event(0x41, true).key)).is_empty());
+        assert_eq!(take_ready(&mut pending, None, 0), [event(0xa0, true)]);
+        assert!(take_ready(&mut pending, None, 0).is_empty());
+        assert!(take_ready(&mut pending, Some(event(0x41, true).key), 0).is_empty());
         assert_eq!(
-            take_ready(&mut pending, None),
+            take_ready(&mut pending, None, 0),
             [event(0xa0, false), event(0x5b, true)]
         );
         assert!(pending.is_empty());

@@ -80,6 +80,7 @@ pub struct Gate {
     pub host_mac: bool,
     pub viewer_mac: bool,
     pub map_shortcuts: bool,
+    pub control_as_meta: bool,
     /// Stream pixels per unit of raw movement.
     pub motion_scale: f32,
     /// Geometry and hit region from the last completed frame.
@@ -444,10 +445,13 @@ impl State {
                 self.held.shortcut_key(
                     out,
                     key,
-                    gate.viewer_mac,
-                    gate.host_mac,
-                    gate.map_shortcuts,
-                    gate.mouse,
+                    crate::keyboard::Mapping {
+                        viewer_mac: gate.viewer_mac,
+                        host_mac: gate.host_mac,
+                        enabled: gate.map_shortcuts,
+                        relative: gate.mouse,
+                        control_as_meta: gate.control_as_meta,
+                    },
                 );
                 Outcome::Sent(Some(Ahead::Physical(key.vk, key.down)))
             }
@@ -632,6 +636,63 @@ mod tests {
     const SHIFT: Modifiers = Modifiers::SHIFT;
 
     #[test]
+    fn heartbeat_survives_one_second_without_video_and_dead_ui_expires() {
+        use crate::keyboard::{
+            capture_heartbeat,
+            hook::{Lease, HEARTBEAT_MS, LEASE_MS},
+        };
+        let (early, held, out) = armed(true, true);
+        assert!(deliver(&early, key(Key::A, true, SHIFT)));
+        assert!(deliver(
+            &early,
+            Native::Button {
+                button: BUTTON_LEFT,
+                down: true,
+                mods: SHIFT,
+                pos: None,
+            }
+        ));
+        out.take();
+        let lease = Lease::default();
+        let ctx = egui::Context::default();
+        let mut last_heartbeat = 0;
+        // Inject time. Video delivers no frames or input during this interval.
+        for now in (0..=1_000).step_by(HEARTBEAT_MS as usize) {
+            assert!(lease.active(now));
+            ctx.begin_pass(egui::RawInput {
+                time: Some(now as f64 / 1000.0),
+                ..Default::default()
+            });
+            capture_heartbeat(&ctx, true);
+            let output = ctx.end_pass();
+            assert!(
+                output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+                    <= Duration::from_millis(HEARTBEAT_MS)
+            );
+            lease.renew_at(now);
+            last_heartbeat = now;
+            assert!(held.is_down(0x41));
+            assert!(held.any_down());
+            assert!(out.take().is_empty());
+        }
+        assert!(lease.active(1_000));
+        // A dead UI stops heartbeats. Both native workers use this deadline.
+        assert!(lease.active(last_heartbeat + LEASE_MS - 1));
+        assert!(!lease.active(last_heartbeat + LEASE_MS));
+        early.on_event(Some(&WindowEvent::Focused(false)), &[], Modifiers::NONE);
+        assert_eq!(
+            out.take(),
+            [
+                Sent::Key(VK_SHIFT, false, 0),
+                Sent::Key(0x41, false, 0),
+                Sent::Button(BUTTON_LEFT, false),
+                Sent::ReleaseAll
+            ]
+        );
+        assert!(!held.any_down());
+    }
+
+    #[test]
     fn native_positions_use_the_existing_event_time_gate_and_receipts() {
         for case in latch_proto::keyboard::CASES {
             let (early, held, out) = armed(true, false);
@@ -672,6 +733,7 @@ mod tests {
             host_mac: false,
             viewer_mac: cfg!(target_os = "macos"),
             map_shortcuts: false,
+            control_as_meta: false,
             motion_scale: 1.0,
             video: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
             pointer_region: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
@@ -843,6 +905,7 @@ mod tests {
             host_mac: false,
             viewer_mac: cfg!(target_os = "macos"),
             map_shortcuts: false,
+            control_as_meta: false,
             motion_scale: 2.0,
             video: Rect::NOTHING,
             pointer_region: Rect::NOTHING,

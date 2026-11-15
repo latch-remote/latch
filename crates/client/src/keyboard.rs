@@ -73,17 +73,40 @@ pub fn vk(code: KeyCode) -> Option<u16> {
     })
 }
 
-/// True sided Ctrl/Meta swap. The caller chooses its shortcut scope.
-pub fn shortcut(vk: u16, viewer_mac: bool, host_mac: bool, map: bool, relative: bool) -> u16 {
-    if !map || viewer_mac == host_mac || (relative && (!viewer_mac || matches!(vk, 0xa2 | 0xa3))) {
-        return vk;
-    }
-    match vk {
-        0x5b => 0xa2,
-        0x5c => 0xa3,
-        0xa2 => 0x5b,
-        0xa3 => 0x5c,
-        _ => vk,
+/// Modifier policy shared by event-time and frame dispatch.
+#[derive(Clone, Copy)]
+pub struct Mapping {
+    pub viewer_mac: bool,
+    pub host_mac: bool,
+    pub enabled: bool,
+    pub relative: bool,
+    pub control_as_meta: bool,
+}
+
+impl Mapping {
+    pub fn shortcut(self, vk: u16) -> u16 {
+        if !self.enabled || self.viewer_mac == self.host_mac {
+            return vk;
+        }
+        if self.viewer_mac {
+            return match vk {
+                0x5b => 0xa2,
+                0x5c => 0xa3,
+                0xa2 if self.control_as_meta && !self.relative => 0x5b,
+                0xa3 if self.control_as_meta && !self.relative => 0x5c,
+                _ => vk,
+            };
+        }
+        if self.relative {
+            return vk;
+        }
+        match vk {
+            0x5b => 0xa2,
+            0x5c => 0xa3,
+            0xa2 => 0x5b,
+            0xa3 => 0x5c,
+            _ => vk,
+        }
     }
 }
 
@@ -202,6 +225,15 @@ pub fn key_positions(accepted: bool) {
 }
 
 /// System shortcut capture requires deliberate fullscreen/mouse capture.
+pub fn capture_heartbeat(ctx: &egui::Context, owned: bool) {
+    #[cfg(all(target_os = "macos", not(test)))]
+    let _ = (ctx, owned);
+    #[cfg(any(windows, target_os = "linux", test))]
+    if owned {
+        ctx.request_repaint_after(std::time::Duration::from_millis(hook::HEARTBEAT_MS));
+    }
+}
+
 pub fn capture_system_keys(keys: bool, fullscreen: bool, mouse: bool) -> bool {
     keys && (fullscreen || mouse)
 }
@@ -497,7 +529,7 @@ pub fn text_position(vk: u16) -> bool {
 }
 
 #[cfg(any(windows, target_os = "linux", test))]
-mod hook;
+pub(crate) mod hook;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(windows)]

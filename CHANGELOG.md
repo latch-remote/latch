@@ -8,17 +8,25 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Input
 
-- Preserve main's default Command/Ctrl and clipboard mapping in every mouse
-  mode, including 6.0.0 hosts. Limit new swap halves to a free mouse and make
-  Send keys as pressed the explicit all-mode opt-out. Restore the Mac Quit
+- Preserve the previous default Command/Ctrl and clipboard mapping in every mouse
+  mode, including hosts running Latch 6.0.0 or older. Mac Control stays Ctrl
+  by default. Add an off-by-default **Control key acts as Windows key** choice
+  beside **Send keys as pressed**, mapping Control to Win/Super with a free
+  mouse and back to Ctrl during game capture. Re-target held modifiers on
+  capture changes. Keep Send keys as pressed as the explicit all-mode opt-out. Restore the Mac Quit
   and Hide menu override in windowed free-mouse streams. Preserve native
   paste fallback when the viewer clipboard contains an image or no text.
 - Move Windows keyboard capture to a dedicated message-loop thread with a
-  bounded queue, all-modifier ordering and a 250 ms UI watchdog. Release X11
-  grabs after a 250 ms UI stall and replay grabbed media controls locally.
+  bounded queue, all-modifier ordering and a 250 ms UI watchdog. Pump Windows
+  messages with GetMessageW and stop with a posted WM_QUIT. Renew capture
+  every 83 ms independently of video. Drop unmatched ordering barriers after
+  8 ms without releasing held input. Release X11 grabs after a 250 ms UI stall and replay grabbed media controls locally.
+  Leave the X11 watchdog idle without a grab and log then abort if native
+  grab recovery stalls for two seconds.
   Constructed-event tests cover every viewer/host pair and default mouse
-  state, with bytes recorded from main. Isolated Xvfb tests cover local
-  media replay and grab expiry. Real keyboards and Windows hook timeouts
+  state, with exact native event sequences and previous-release byte recordings.
+  Linux CI runs isolated Xvfb tests for local media replay, grab expiry and
+  stuck-display recovery. Real keyboards, Windows hook latency and timeouts
   remain unverified.
 
 - Restore legacy keyboard compatibility, negotiate elevated helper positions,

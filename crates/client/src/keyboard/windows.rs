@@ -9,20 +9,24 @@ use std::{
     cell::RefCell,
     collections::VecDeque,
     sync::{
+        atomic::Ordering,
         mpsc::{self, Receiver, SyncSender},
         Arc,
     },
     thread::{self, JoinHandle},
-    time::Duration,
 };
 use windows::Win32::{
     Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM},
-    System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentProcessId},
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        Threading::{GetCurrentProcessId, GetCurrentThreadId},
+    },
     UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 
 struct Worker {
     lease: Arc<Lease>,
+    thread_id: u32,
     events: Receiver<Event>,
     thread: Option<JoinHandle<()>>,
     forwarded: VecDeque<Key>,
@@ -32,7 +36,8 @@ impl Drop for Worker {
     fn drop(&mut self) {
         self.lease.fail();
         if let Some(thread) = self.thread.take() {
-            thread.thread().unpark();
+            // SAFETY: startup publishes the ID after creating its message queue.
+            let _ = unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
             let _ = thread.join();
         }
     }
@@ -66,10 +71,10 @@ pub fn owns_keys(owned: bool, ctx: &egui::Context) {
     }
     drain(None);
     WORKER.with_borrow_mut(|worker| {
-        if worker
-            .as_ref()
-            .is_some_and(|w| !w.lease.active(w.lease.elapsed()))
-        {
+        if worker.as_ref().is_some_and(|w| {
+            w.lease.failed.load(Ordering::Acquire)
+                || w.thread.as_ref().is_some_and(|t| t.is_finished())
+        }) {
             *worker = None;
         }
         if let Some(worker) = worker {
@@ -78,15 +83,22 @@ pub fn owns_keys(owned: bool, ctx: &egui::Context) {
         }
         let lease = Arc::new(Lease::default());
         let (tx, rx) = mpsc::sync_channel(QUEUE_SIZE);
+        let (started, ready) = mpsc::sync_channel(1);
         let thread_lease = lease.clone();
         let ctx = ctx.clone();
         match thread::Builder::new()
             .name("keyboard-capture".into())
-            .spawn(move || run(thread_lease, tx, ctx))
+            .spawn(move || run(thread_lease, tx, ctx, started))
         {
             Ok(thread) => {
+                let Ok(thread_id) = ready.recv() else {
+                    lease.fail();
+                    let _ = thread.join();
+                    return;
+                };
                 *worker = Some(Worker {
                     lease,
+                    thread_id,
                     events: rx,
                     thread: Some(thread),
                     forwarded: VecDeque::new(),
@@ -117,7 +129,7 @@ pub fn drain(native: Option<&egui_winit::winit::event::WindowEvent>) {
             return (Vec::new(), false);
         };
         let now = worker.lease.elapsed();
-        let failed = !worker.lease.active(now)
+        let failed = worker.lease.failed.load(Ordering::Acquire)
             || worker
                 .thread
                 .as_ref()
@@ -130,16 +142,20 @@ pub fn drain(native: Option<&egui_winit::winit::event::WindowEvent>) {
         worker
             .pending
             .extend(worker.events.try_iter().take(QUEUE_SIZE));
-        if worker.pending.len() > QUEUE_SIZE
-            || worker
-                .pending
-                .front()
-                .is_some_and(|e| now.saturating_sub(e.queued_at) >= super::hook::LEASE_MS)
-        {
+        if worker.pending.len() > QUEUE_SIZE {
             worker.lease.fail();
             return (Vec::new(), true);
         }
-        let events = super::hook::take_ready(&mut worker.pending, native_key);
+        let events = super::hook::take_ready(&mut worker.pending, native_key, now);
+        if !worker.pending.is_empty() {
+            // Ordering hints need their own wake even when video has stopped.
+            STATE.with_borrow(|s| {
+                s.ctx
+                    .request_repaint_after(std::time::Duration::from_millis(
+                        super::hook::BARRIER_MS,
+                    ))
+            });
+        }
         worker.forwarded.extend(
             events
                 .iter()
@@ -198,7 +214,15 @@ fn has_altgr(layout: HKL) -> bool {
     })
 }
 
-fn run(lease: Arc<Lease>, events: SyncSender<Event>, ctx: egui::Context) {
+fn run(lease: Arc<Lease>, events: SyncSender<Event>, ctx: egui::Context, started: SyncSender<u32>) {
+    // Create the queue before publishing its ID, so teardown can always post quit.
+    unsafe {
+        let mut msg = MSG::default();
+        let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+        if started.send(GetCurrentThreadId()).is_err() {
+            return;
+        }
+    }
     let (_, mut layout) = foreground();
     let mut state = Hook {
         handle: HHOOK::default(),
@@ -223,9 +247,19 @@ fn run(lease: Arc<Lease>, events: SyncSender<Event>, ctx: egui::Context) {
         }
     }
     HOOK.with_borrow_mut(|slot| *slot = Some(state));
-    // PeekMessage dispatches the hook's sent messages on this dedicated thread.
-    // The short park also services the lease when there are no key messages.
+    // GetMessage dispatches low-level hook callbacks immediately. A thread
+    // timer checks UI liveness even when no input or video arrives.
+    let timer = unsafe { SetTimer(None, 0, 10, None) };
+    if timer == 0 {
+        lease.fail();
+    }
     while lease.active(lease.elapsed()) {
+        let mut msg = MSG::default();
+        let status = unsafe { GetMessageW(&mut msg, None, 0, 0) }.0;
+        if status <= 0 {
+            lease.fail();
+            break;
+        }
         let (owned, current_layout) = foreground();
         if !owned {
             lease.fail();
@@ -240,17 +274,9 @@ fn run(lease: Arc<Lease>, events: SyncSender<Event>, ctx: egui::Context) {
                 }
             });
         }
-        let mut msg = MSG::default();
-        // SAFETY: this thread owns this message queue.
-        while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() } {
-            if msg.message == WM_QUIT {
-                lease.fail();
-                break;
-            }
-            unsafe {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
         HOOK.with_borrow_mut(|slot| {
             if let Some(h) = slot {
@@ -259,18 +285,12 @@ fn run(lease: Arc<Lease>, events: SyncSender<Event>, ctx: egui::Context) {
                 }
             }
         });
-        thread::park_timeout(Duration::from_millis(2));
+    }
+    if timer != 0 {
+        let _ = unsafe { KillTimer(None, timer) };
     }
     HOOK.with_borrow_mut(|slot| *slot = None);
-}
-
-fn deliver(tx: &SyncSender<Event>, lease: &Lease, event: Event) -> bool {
-    if tx.try_send(event).is_ok() {
-        true
-    } else {
-        lease.fail();
-        false
-    }
+    lease.fail();
 }
 
 unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -316,7 +336,12 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
             };
             h.capture.consume(event, |e| {
                 h.dirty = true;
-                deliver(&h.events, &h.lease, e)
+                let delivered = super::hook::deliver(&h.events, &h.lease, e);
+                // Wake only this message loop. Repaint runs outside the callback.
+                let _ = unsafe {
+                    PostThreadMessageW(GetCurrentThreadId(), WM_APP, WPARAM(0), LPARAM(0))
+                };
+                delivered
             })
         })
     });
@@ -377,14 +402,20 @@ mod tests {
                     let lease = Arc::new(Lease::default());
                     let thread_lease = lease.clone();
                     let (_, events) = mpsc::sync_channel(QUEUE_SIZE);
+                    let (started, ready) = mpsc::sync_channel(1);
                     let thread = thread::spawn(move || {
-                        while !thread_lease.failed.load(Ordering::Acquire) {
-                            thread::park_timeout(Duration::from_millis(2));
+                        unsafe {
+                            let mut msg = MSG::default();
+                            let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+                            started.send(GetCurrentThreadId()).unwrap();
+                            while GetMessageW(&mut msg, None, 0, 0).0 > 0 {}
                         }
+                        assert!(thread_lease.failed.load(Ordering::Acquire));
                         stopped.store(true, Ordering::Release);
                     });
                     let _owner = Worker {
                         lease,
+                        thread_id: ready.recv().unwrap(),
                         events,
                         thread: Some(thread),
                         forwarded: VecDeque::new(),

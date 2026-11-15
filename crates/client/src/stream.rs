@@ -104,6 +104,7 @@ pub enum Action {
     Power(PowerAction),
     Fullscreen(bool),
     ToggleCmd,
+    ToggleControlAsMeta,
     /// Install a new Latch Host on the PC through the stream.
     InstallHost,
     ApplySettings(StreamSettings),
@@ -1488,6 +1489,12 @@ impl View {
                 actions.push(Action::ToggleCmd);
             }
         }
+        if self.viewer_mac
+            && !self.host_mac
+            && ui::menu_choice(ui, "Control key acts as Windows key", cfg.control_as_meta).clicked()
+        {
+            actions.push(Action::ToggleControlAsMeta);
+        }
         ui::menu_note(
             ui,
             "Win/Super is Command on a Mac. Ctrl+Alt+Delete cannot open Windows secure attention.",
@@ -1640,7 +1647,10 @@ impl View {
 
     /// Capture the mouse and take the toolbar away: the picture is all.
     fn grab(&mut self, ctx: &egui::Context, out: &(impl Sink + ?Sized)) {
-        self.held.release_all(out);
+        self.held.release_for_capture(
+            out,
+            crate::keyboard::available() && self.viewer_mac && !self.host_mac,
+        );
         self.motion = (0.0, 0.0);
         // A captured mouse sends every click to the PC, while egui still
         // sees them at the frozen pointer: a panel, question or menu left
@@ -1656,7 +1666,10 @@ impl View {
 
     /// Give the mouse back.
     fn release(&mut self, ctx: &egui::Context, out: &(impl Sink + ?Sized)) {
-        self.held.release_all(out);
+        self.held.release_for_capture(
+            out,
+            crate::keyboard::available() && self.viewer_mac && !self.host_mac,
+        );
         self.set_captured(ctx, false);
     }
 
@@ -1824,7 +1837,12 @@ impl View {
             self.captured,
         );
         crate::macos::stream_owns_keys(keys_to_pc);
-        crate::keyboard::owns_keys(system_capture && crate::keyboard::available());
+        let owned = system_capture && crate::keyboard::available();
+        crate::keyboard::capture_heartbeat(ctx, owned);
+        crate::keyboard::owns_keys(owned);
+        if keys_to_pc && crate::keyboard::available() && self.viewer_mac && !self.host_mac {
+            self.held.retarget_modifiers(out, self.mapping(cfg));
+        }
         if ctx.options(|o| o.zoom_with_keyboard) == keys_to_pc {
             ctx.options_mut(|o| o.zoom_with_keyboard = !keys_to_pc);
         }
@@ -2126,6 +2144,7 @@ impl View {
                     host_mac: self.host_mac,
                     viewer_mac: self.viewer_mac,
                     map_shortcuts: self.map_shortcuts(cfg),
+                    control_as_meta: cfg.control_as_meta,
                     motion_scale,
                     video,
                     pointer_region: if free_mouse {
@@ -2208,14 +2227,7 @@ impl View {
                         self.paste(link, String::new());
                     }
                 }
-                self.held.shortcut_key(
-                    out,
-                    key,
-                    self.viewer_mac,
-                    self.host_mac,
-                    self.map_shortcuts(link.cfg),
-                    self.captured,
-                );
+                self.held.shortcut_key(out, key, self.mapping(link.cfg));
                 return;
             }
             Queued::Modifiers(m) => {
@@ -2313,6 +2325,9 @@ impl View {
                     self.bar_shown = false;
                     if link.cfg.capture_mouse {
                         self.grab(link.ctx, out);
+                        if crate::keyboard::available() && self.viewer_mac && !self.host_mac {
+                            self.held.retarget_modifiers(out, self.mapping(link.cfg));
+                        }
                     }
                 }
                 if at.keys_to_pc && !(m.ctrl && m.alt) {
@@ -2398,6 +2413,16 @@ impl View {
         crate::macos::caps_lock()
     }
 
+    fn mapping(&self, cfg: &ClientConfig) -> crate::keyboard::Mapping {
+        crate::keyboard::Mapping {
+            viewer_mac: self.viewer_mac,
+            host_mac: self.host_mac,
+            enabled: self.map_shortcuts(cfg),
+            relative: self.captured,
+            control_as_meta: cfg.control_as_meta,
+        }
+    }
+
     fn map_shortcuts(&self, cfg: &ClientConfig) -> bool {
         cfg.cmd_is_ctrl
     }
@@ -2453,10 +2478,13 @@ impl View {
                 self.held.shortcut_key(
                     link.out,
                     crate::keyboard::Key { vk, down },
-                    false,
-                    true,
-                    true,
-                    false,
+                    crate::keyboard::Mapping {
+                        viewer_mac: false,
+                        host_mac: true,
+                        enabled: true,
+                        relative: false,
+                        control_as_meta: false,
+                    },
                 );
             }
             return;
@@ -2483,6 +2511,7 @@ struct EarlyGate {
     host_mac: bool,
     viewer_mac: bool,
     map_shortcuts: bool,
+    control_as_meta: bool,
     motion_scale: f32,
     video: Rect,
     pointer_region: Rect,
@@ -2503,6 +2532,7 @@ impl EarlyGate {
             host_mac: self.host_mac,
             viewer_mac: self.viewer_mac,
             map_shortcuts: self.map_shortcuts,
+            control_as_meta: self.control_as_meta,
             motion_scale: self.motion_scale,
             video: self.video,
             pointer_region: self.pointer_region,
@@ -2956,14 +2986,18 @@ pub(crate) mod tests {
                 (Event::Copy, None, false),
             ]);
             frame(&mut h, vec![], Modifiers::CTRL);
-            let sent = tap.take();
-            assert!(sent.contains(&Sent::Key(target, true, latch_stream::input::MOD_META)));
-            assert!(sent.contains(&Sent::Key(input::VK_C, true, latch_stream::input::MOD_META)));
-            assert!(!sent.contains(&Sent::Key(
-                input::VK_C,
-                true,
-                latch_stream::input::MOD_META | latch_stream::input::MOD_CTRL
-            )));
+            assert_eq!(
+                tap.take(),
+                [
+                    Sent::Key(source as i16, true, 2),
+                    Sent::Key(source as i16, false, 0),
+                    Sent::Key(target, true, 8),
+                    Sent::Key(input::VK_C, true, 8),
+                    Sent::Key(target, false, 0),
+                    Sent::Key(source as i16, true, 2),
+                    Sent::Key(input::VK_C, false, 2),
+                ]
+            );
             crate::keyboard::test_install(false);
         }
     }
@@ -2976,9 +3010,17 @@ pub(crate) mod tests {
         held.physical_key(&out, 0xa2, true, 0xa2);
         out.take();
         held.chord_alone(&out, &[input::VK_LWIN, input::VK_C]);
-        assert!(out
-            .take()
-            .contains(&Sent::Key(input::VK_C, true, latch_stream::input::MOD_META)));
+        assert_eq!(
+            out.take(),
+            [
+                Sent::Key(0xa2, false, 0),
+                Sent::Key(input::VK_LWIN, true, 8),
+                Sent::Key(input::VK_C, true, 8),
+                Sent::Key(input::VK_C, false, 8),
+                Sent::Key(input::VK_LWIN, false, 0),
+                Sent::Key(0xa2, true, 2),
+            ]
+        );
         assert!(held.is_down(0xa2));
     }
 
@@ -4074,7 +4116,11 @@ pub(crate) mod tests {
         // The separate menus exist from this width up; at the minimum
         // height they must fit too.
         let short = Vec2::new(OVERFLOW_BELOW, 420.0);
-        let last_key = "Map Command ↔ Ctrl";
+        let last_key = if cfg!(target_os = "macos") {
+            "Control key acts as Windows key"
+        } else {
+            "Map Command ↔ Ctrl"
+        };
         for (trigger, last) in [
             ("Keys", last_key),
             ("Mouse", "Free, for desktops (follows this cursor)"),
@@ -4167,7 +4213,11 @@ pub(crate) mod tests {
         use crate::app::snapshots::{file_name, save};
         let min = Vec2::new(640.0, 420.0);
         let short = Vec2::new(OVERFLOW_BELOW, 420.0);
-        let last_key = "Map Command ↔ Ctrl";
+        let last_key = if cfg!(target_os = "macos") {
+            "Control key acts as Windows key"
+        } else {
+            "Map Command ↔ Ctrl"
+        };
         for ppp in [1.0, 2.0] {
             for (name, size, trigger, last) in [
                 ("more-end", min, "More", LAST_POWER_ITEM),
@@ -4678,7 +4728,18 @@ pub(crate) mod tests {
             tap.take();
             frame(&mut h, vec![Event::WindowFocused(false)], Modifiers::NONE);
             assert!(!h.state().view.held.any_down());
-            assert!(tap.take().contains(&Sent::ReleaseAll), "{os}");
+            let mut released = if cfg!(target_os = "macos") && os != "macos" {
+                vec![0xa1, 0xa3, 0xa5, latch_proto::keyboard::KEYPAD_ENTER]
+            } else {
+                vec![0x5c, 0xa1, 0xa3, 0xa5, latch_proto::keyboard::KEYPAD_ENTER]
+            };
+            released.sort_unstable();
+            let mut expected: Vec<_> = released
+                .into_iter()
+                .map(|vk| Sent::Key(vk as i16, false, 0))
+                .collect();
+            expected.push(Sent::ReleaseAll);
+            assert_eq!(tap.take(), expected, "{os}");
             tap.connected.set(false);
             frame(&mut h, vec![], Modifiers::NONE);
             assert!(!h.state().view.held.any_down());

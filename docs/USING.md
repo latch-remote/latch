@@ -38,12 +38,12 @@ limits for every host/viewer direction.
 ## Keyboard between different operating systems
 
 The stream toolbar's **Keys** menu offers **Send keys as pressed** and
-**Map Command ↔ Ctrl**. Mapping is enabled by default with
-`cmd_is_ctrl = true` in `client.toml`. **Send keys as pressed** is the
-explicit opt-out and preserves modifiers in every mouse mode, including
+**Map Command ↔ Ctrl**. Mapping is enabled by default.
+**Send keys as pressed** is the explicit opt-out and preserves modifiers in every mouse mode, including
 clipboard shortcuts. Alt, Option and AltGr keep their physical identities.
 
-The following table describes negotiated native input with mapping enabled.
+The following table describes hosts running this release with default
+keyboard settings.
 Free includes the **Free, for desktop** setting and a released mouse with
 **Captured, for games** selected. Fullscreen has the same mapping as a
 window in the corresponding mouse state. Left and right sides are preserved.
@@ -51,13 +51,13 @@ window in the corresponding mouse state. Left and right sides are preserved.
 | Viewer | Host | Free or capture selected but released | Relative capture actually engaged | Send keys as pressed, all mouse modes |
 | --- | --- | --- | --- | --- |
 | Windows | Windows | Physical modifiers | Physical modifiers | Physical modifiers |
-| Windows | macOS | Editing-chord swap | Main's clipboard mapping | Physical modifiers |
+| Windows | macOS | Editing-chord swap | Command clipboard chords | Physical modifiers |
 | Windows | Linux | Physical modifiers | Physical modifiers | Physical modifiers |
-| macOS | Windows | Command → Ctrl, Control → Win | Command → Ctrl, Control → Ctrl | Physical modifiers |
+| macOS | Windows | Command → Ctrl, Control → Ctrl | Command → Ctrl, Control → Ctrl | Physical modifiers |
 | macOS | macOS | Physical modifiers | Physical modifiers | Physical modifiers |
-| macOS | Linux | Command → Ctrl, Control → Super | Command → Ctrl, Control → Ctrl | Physical modifiers |
+| macOS | Linux | Command → Ctrl, Control → Ctrl | Command → Ctrl, Control → Ctrl | Physical modifiers |
 | Linux | Windows | Physical modifiers | Physical modifiers | Physical modifiers |
-| Linux | macOS | Editing-chord swap | Main's clipboard mapping | Physical modifiers |
+| Linux | macOS | Editing-chord swap | Command clipboard chords | Physical modifiers |
 | Linux | Linux | Physical modifiers | Physical modifiers | Physical modifiers |
 
 The editing-chord swap applies only while A, C, X, V, Z or F is held,
@@ -67,24 +67,31 @@ including Ctrl+Backspace, Q, H, M, Tab, Space and arrows. Alt/AltGr disables
 this swap. Pressing a key outside the six editing keys and Shift/Ctrl/Win
 restores the physical modifiers before that key reaches the host.
 
-Main's clipboard mapping sends copy, cut and paste with Command to a Mac
-host, in every mouse mode. During relative capture on a PC viewer, Ctrl and
-Win/Super otherwise keep their identities, so Ctrl+Z stays Ctrl+Z as on main.
-On a Mac viewer, Command → Ctrl remains enabled toward PC hosts during
-relative capture, preserving main's shortcuts, while Control stays Control
-for game bindings such as crouch. Selecting the game mouse setting alone
-keeps the free-state mapping until capture is actually engaged.
+Copy, cut and paste use Command on a Mac host in every mouse mode.
+In game capture, a Windows or Linux viewer's Ctrl+C, Ctrl+V and Ctrl+X
+still reach a Mac host as Command+C, Command+V and Command+X. Other game
+bindings keep their physical modifiers, so Ctrl+Z stays Ctrl+Z.
+On a Mac viewer, Command maps to Ctrl toward Windows and Linux hosts in
+every mouse mode. Control also stays Ctrl by default, preserving
+Control+Tab and Control shortcuts in terminals.
 
-Hosts without `key_positions`, including 6.0.0, use main's original
-modifier mapping in every mouse mode. Mac Command becomes Ctrl toward a
-PC, Mac Control remains Control, and PC modifiers retain their original
-identities. Clipboard chords use Command toward Mac hosts. The new full
-and editing-chord swaps require negotiated native input. The explicit
-**Send keys as pressed** choice also applies to legacy sessions.
+The **Keys** menu also offers **Control key acts as Windows key** on a Mac
+viewer connected to a Windows or Linux host. It is off by default. When
+it is on and Command/Ctrl mapping is enabled, Control becomes Win on
+Windows or Super on Linux while the mouse is free. During game capture,
+Control returns to Ctrl. A modifier held across a capture change is
+re-targeted immediately. The replacement Ctrl press precedes a Win release
+to avoid turning the change into a Windows-key tap. Selecting the game
+mouse setting alone keeps the free-mouse mapping until capture engages.
 
-Release held keys when changing capture or mapping settings. A Mac-to-PC
-held modifier retains its press-time destination until released. PC-to-Mac
-editing chords restore modifiers when the chord finishes.
+Hosts running Latch 6.0.0 or older keep the previous keyboard behaviour in
+every mouse mode. Mac Command becomes Ctrl toward a Windows or Linux host,
+Mac Control stays Ctrl, and PC modifiers retain their original identities.
+Copy, cut and paste use Command toward Mac hosts. The new Control-key option
+and editing-chord swaps require hosts running this release. Win, Alt+Tab
+and Super stay local against hosts running Latch 6.0.0 or older, even in
+fullscreen or game capture. **Send keys as pressed** also applies to these
+older hosts.
 
 Keys use physical US positions, interpreted by the **host's** layout.
 UK/German/French ISO extra keys, separate numpad keys and Japanese/Korean
@@ -116,11 +123,11 @@ then waits for that key's release before recapturing. Replaying a media key
 releases remote held input. X11 capture requires Xlib and server-side XTest support. Without them,
 focused keys continue through winit.
 
-New peers negotiate distinct keypad Enter/Equals and additional Japanese
-positions. With a 6.0.0 host the viewer uses the original egui/text path for
-all keys, including ISO text, generic modifiers and keypad identity limits.
-New native-only VKs and kind 8 stay behind negotiation. A 6.0.0 viewer
-keeps its original capture limits against a new host. A stale Windows
+Viewers and hosts running this release preserve distinct keypad Enter/Equals
+and additional Japanese positions. Hosts running Latch 6.0.0 or older keep
+the previous text handling, modifier identities and keypad limitations.
+Viewers running Latch 6.0.0 or older keep their original capture limits
+against a newer host. A stale Windows
 input helper negotiates its own v1 pipe protocol and receives legacy VK
 forms, including Return for keypad Enter. Holding both Return and keypad
 Enter can produce an extra Return repeat with that helper.
@@ -133,8 +140,8 @@ callback, including while a clipboard paste is waiting.
 
 | Viewer | Captured in a focused fullscreen or captured-mouse stream | Viewer-owned combinations and limits |
 | --- | --- | --- |
-| Windows | Sided Win keys, Alt+Tab/F4/Space through a dedicated capture-thread low-level hook | Ctrl+Alt+Delete is secure attention. Win+L remains OS-reserved. Hook installation failures are logged. |
-| macOS | Command, Option, Control and Shift | Command+Q/H and Option+Command+H use main's app-menu override whenever a focused connected stream owns the keyboard, including a windowed free mouse. Command+Tab/Space are owned by macOS. |
+| Windows | Sided Win keys, Alt+Tab/F4/Space through a dedicated capture-thread low-level hook | Ctrl+Alt+Delete is secure attention. Win+L is expected to remain reserved by Windows, which Latch does not test. Hook installation failures are logged. |
+| macOS | Command, Option, Control and Shift | Command+Q/H and Option+Command+H use the app-menu override whenever a focused connected stream owns the keyboard, including a windowed free mouse. Command+Tab/Space are owned by macOS. |
 | Linux X11 | A capture-scoped keyboard grab keeps sided Super and Alt+Tab in the stream | Another client can prevent the grab. Latch logs once and retries on later frames. A watchdog releases a grab after 250 ms without an event-loop heartbeat, checked every 10 ms. |
 | Linux Wayland | Compositor-delivered focused keys and sided Super | The compositor owns global shortcuts. winit 0.30 exposes no shortcut-inhibit protocol API, so Latch cannot request inhibition in this stack. |
 
@@ -148,26 +155,32 @@ another OS-supported administration mechanism.
 The Windows hook has its own message loop and a 256-event bounded queue.
 Its callback performs fixed-size state updates and nonblocking queue sends.
 All sided modifiers share its ordering before Win. Ordinary keys form
-queue barriers until winit has translated them, preserving their position
-between modifiers. AltGr's synthetic Control
+queue barriers until the window has translated them, preserving their position
+between modifiers. A barrier without a matching window event is dropped
+after 8 ms, allowing later events through without releasing held input. AltGr's synthetic Control
 is filtered using the active layout and the adjacent right-Alt event, with
 winit confirming an otherwise lone real Control. Focus loss, capture end,
 window destruction, app teardown and worker unwinding uninstall the hook.
-A 250 ms UI heartbeat lease, an event waiting 250 ms for translation, a full
-or disconnected queue, or lost foreground
-ownership makes it pass keys through and uninstall. The UI releases remote
-held input when it resumes. A worker wake requests repaint after publication.
+The message loop blocks in Windows' message retrieval API so hook callbacks
+run as input arrives. A timer checks a 250 ms UI heartbeat lease. While
+capture is active, Latch schedules a UI repaint every 83 ms independently
+of video arrival. A video freeze therefore preserves held keys and mouse
+buttons. A dead UI, full or disconnected queue, or lost foreground ownership
+ends capture. Lost capture releases remote held input when the UI resumes.
+Queue publication posts a message to wake the worker for repaint.
 
 The X11 watchdog uses winit's thread-enabled Xlib connection because X11
 allows only the grabbing client to ungrab its keyboard. Teardown joins the
 helper before eframe closes the display. It can release a stalled UI's grab
 while the X server and Xlib connection remain responsive. An Xlib display
-lock held by a stuck native call, an unresponsive X server or a process-wide
-suspension can prevent timely recovery. Killing Latch releases its grab.
+lock held by a stuck native call or an unresponsive X server triggers a
+logged process abort after two seconds of failed grab recovery. Process exit
+lets the server release the grab. The watchdog leaves the display alone
+while nothing is grabbed. Process-wide suspension can prevent timely recovery.
 Windows process-wide suspension or a stalled hook thread can still encounter
 Windows' `LowLevelHooksTimeout`. These recovery mechanisms have constructed
-state-machine coverage, and isolated Xvfb tests exercise local media delivery
-and timed grab release. Real keyboard, desktop media-daemon and Windows
+state-machine coverage. Linux CI runs isolated Xvfb tests for local media
+delivery, timed grab release and stuck-display recovery. Real keyboard, desktop media-daemon and Windows
 hook-timeout behaviour have never been tried in this change.
 
 

@@ -1178,6 +1178,10 @@ impl eframe::App for ClientApp {
                             self.cfg.stream.fullscreen = on;
                             self.dirty = true;
                         }
+                        Action::ToggleControlAsMeta => {
+                            self.cfg.control_as_meta = !self.cfg.control_as_meta;
+                            self.dirty = true;
+                        }
                         Action::ToggleCmd => {
                             self.cfg.cmd_is_ctrl = !self.cfg.cmd_is_ctrl;
                             self.dirty = true;
@@ -3373,6 +3377,7 @@ pub(crate) mod snapshots {
             host_mac: false,
             viewer_mac: cfg!(target_os = "macos"),
             map_shortcuts: false,
+            control_as_meta: false,
             motion_scale: 1.0,
             video: region,
             pointer_region: region,

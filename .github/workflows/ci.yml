@@ -230,6 +230,10 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --locked --workspace --all-targets
+      - name: X11 capture recovery and media replay
+        run: |
+          sudo apt-get install -y --no-install-recommends xvfb xauth
+          xvfb-run -a cargo test --locked -p latch-client --lib -j 4 keyboard::linux::tests::watchdog_and_media_replay_restore_local_x11_delivery -- --ignored --exact
       - name: release host
         run: cargo build --locked --release -p latch-host
       - name: native TCP relay deployment checks
