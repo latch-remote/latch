@@ -273,13 +273,16 @@ Input is reliable without retransmission timers: the viewer numbers every
 event and keeps it until the host acknowledges it. Each `Input` datagram
 carries every unacknowledged event, oldest first, as many as fit. The
 viewer sends one whenever it has a new event, and again every 20 ms while
-any event is unacknowledged. The host applies events in sequence order,
-ignores ones it has applied, and keeps a later event until the gap before
-it is filled. An injection failure holds the acknowledgment and retries
-that event for up to two seconds. A persistently failing event is then
-dropped so later events can proceed. The viewer bounds pending input at
-4,096 events and ends a session after five seconds without acknowledgment
-progress. Teardown releases held keys and buttons.
+any event is unacknowledged. Adjacent absolute positions that have yet to
+enter a datagram coalesce to the latest position. Coalescing stops at
+every other event, preserving click locations and input order. Payloads
+already sent remain immutable through acknowledgment. The host applies
+events in sequence order, ignores ones it has applied, and keeps a later
+event until the gap before it is filled. An injection failure holds the
+acknowledgment and retries that event for up to two seconds. A persistently
+failing event is then dropped so later events can proceed. The viewer
+bounds pending input at 4,096 events and ends a session after five seconds
+without acknowledgment progress. Teardown releases held keys and buttons.
 
 ### InputAck (5)
 
