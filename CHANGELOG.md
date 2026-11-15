@@ -208,7 +208,6 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Testing
 
-- Synchronize blocked-input shutdown before relay maintenance and exhaust the monthly-cap fixture before streaming startup. Report every failing test binary in CI and release validation while retaining failure exit status.
 - Add a Linux network-namespace harness and privileged Docker runner for
   real headless streams through blocked, lossy, proxy, TLS-inspecting,
   captive-portal and MTU-limited networks. Record decoded video, sound,
@@ -224,6 +223,8 @@ GitHub release notes, so each version gets a heading of the form
 - Repeat the relay probe's delayed-header test only when its own sleeps
   overran the header deadline before the headers were sent. Every attempt
   that sends its headers in time must be answered.
+
+- Synchronize shutdown, quota and decoder-probation fixtures, and accept WebSocket setup closure only after its admission deadline. Report every failing test binary in CI and release validation while retaining failure exit status.
 
 ### Networking
 

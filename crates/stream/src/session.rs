@@ -4542,34 +4542,40 @@ mod tests {
             Arc::new(FrameSlot::default()),
             Box::new(|| {}),
         ));
-        for frame in 0..frames {
-            inner.queue.lock().frames.push_back((
-                InFrame {
-                    frame,
-                    data: vec![0, 0, 0, 1],
-                    keyframe: true,
-                    recovery: false,
-                    host_delay: 0,
-                    assembly: Duration::ZERO,
-                },
-                Instant::now(),
-            ));
-        }
         let worker = {
             let inner = inner.clone();
-            std::thread::spawn(move || decode(&inner, decoder, codec, Default::default()))
+            std::thread::spawn(move || {
+                // Keep thread startup outside the queued-frame age.
+                for frame in 0..frames {
+                    inner.queue.lock().frames.push_back((
+                        InFrame {
+                            frame,
+                            data: vec![0, 0, 0, 1],
+                            keyframe: true,
+                            recovery: false,
+                            host_delay: 0,
+                            assembly: Duration::ZERO,
+                        },
+                        Instant::now(),
+                    ));
+                }
+                decode(&inner, decoder, codec, Default::default());
+            })
         };
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !inner.queue.lock().frames.is_empty()
-            && !inner.attempt_over.load(Ordering::Acquire)
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(5));
+        // An empty queue can still have a decode in progress. Completion or a
+        // waiter on the empty queue proves the last result has been handled.
+        while !worker.is_finished() && !inner.queue_cv.notify_one() {
+            assert!(
+                Instant::now() < deadline,
+                "decoder did not finish its inputs"
+            );
+            std::thread::yield_now();
         }
-        std::thread::sleep(Duration::from_millis(20));
         inner.stop.store(true, Ordering::Release);
         inner.queue_cv.notify_all();
         worker.join().unwrap();
+        assert_eq!(inner.dropped.load(Ordering::Relaxed), 0);
         let given_up = inner.renegotiate.lock().take().map(|(c, why, _)| (c, why));
         given_up
     }

@@ -891,19 +891,21 @@ fn raw_http(
         tcp,
     )
 }
-fn raw_websocket(pilot: &Pilot) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+fn raw_websocket(
+    pilot: &Pilot,
+) -> io::Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
     let mut tls = raw_http(pilot, vec![b"http/1.1".to_vec()]);
-    tls.write_all(b"GET /relay HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").unwrap();
-    tls.flush().unwrap();
+    tls.write_all(b"GET /relay HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")?;
+    tls.flush()?;
     let mut response = Vec::new();
     while !response.ends_with(b"\r\n\r\n") {
         let mut byte = [0];
-        tls.read_exact(&mut byte).unwrap();
+        tls.read_exact(&mut byte)?;
         response.push(byte[0]);
         assert!(response.len() < 8192);
     }
     assert!(response.starts_with(b"HTTP/1.1 101 "));
-    tls
+    Ok(tls)
 }
 fn client_frame(opcode: u8, final_frame: bool, payload: &[u8], masked: bool) -> Vec<u8> {
     assert!(payload.len() <= u16::MAX as usize);
@@ -959,7 +961,7 @@ fn read_until_closed(
 #[test]
 fn daemon_websocket_accepts_fragmentation_and_rejects_malformed_socket_frames() {
     let pilot = Pilot::start();
-    let mut tls = raw_websocket(&pilot);
+    let mut tls = raw_websocket(&pilot).unwrap();
     let mut bytes = client_frame(2, false, &[0, 0], true);
     bytes.extend(client_frame(9, true, b"ping", true));
     bytes.extend(client_frame(0, true, &[0, 1, 1], true));
@@ -984,7 +986,7 @@ fn daemon_websocket_accepts_fragmentation_and_rejects_malformed_socket_frames() 
             bytes
         },
     ] {
-        let mut tls = raw_websocket(&pilot);
+        let mut tls = raw_websocket(&pilot).unwrap();
         let _ = tls.write_all(&bytes).and_then(|_| tls.flush());
         assert!(read_until_closed(&mut tls).is_empty());
     }
@@ -993,38 +995,50 @@ fn daemon_websocket_accepts_fragmentation_and_rejects_malformed_socket_frames() 
 }
 #[test]
 fn daemon_websocket_ping_and_close_floods_have_bounded_responses_and_lifetime() {
+    let handshake_timeout = Duration::from_millis(400);
     let pilot = Pilot::with_limits(PilotLimits {
-        handshake_timeout: Duration::from_millis(400),
+        handshake_timeout,
         stall_timeout: Duration::from_millis(200),
         ..PilotLimits::default()
     });
-    let mut tls = raw_websocket(&pilot);
-    let start = Instant::now();
-    let flood = client_frame(9, true, b"", true).repeat(2000);
-    let _ = tls.write_all(&flood).and_then(|_| tls.flush());
-    let responses = read_until_closed(&mut tls);
-    let (pongs, remainder) = responses.as_chunks::<2>();
-    assert!(remainder.is_empty());
-    assert!(pongs.len() <= 2000 && pongs.iter().all(|bytes| *bytes == [0x8a, 0]));
-    assert!(start.elapsed() < Duration::from_secs(2));
-    let mut tls = raw_websocket(&pilot);
-    let start = Instant::now();
+    let pings = client_frame(9, true, b"", true).repeat(2000);
     // Interleaved controls cannot extend a partial message's record deadline.
-    let mut flood = client_frame(2, false, &[0, 0], true);
-    for _ in 0..2000 {
-        flood.extend(client_frame(9, true, b"", true));
+    let mut partial = client_frame(2, false, &[0, 0], true);
+    partial.extend_from_slice(&pings);
+    let close = client_frame(8, true, &1000u16.to_be_bytes(), true).repeat(1000);
+    for (index, flood) in [pings, partial, close].into_iter().enumerate() {
+        let opening = Instant::now();
+        let mut tls = match raw_websocket(&pilot) {
+            Ok(tls) => tls,
+            Err(error) => {
+                // Admission expires from TCP accept, including TLS/HTTP setup.
+                // A late client may observe that close before sending its flood.
+                assert!(
+                    matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::BrokenPipe
+                    ) && opening.elapsed() >= handshake_timeout,
+                    "WebSocket setup closed before its deadline: {error}"
+                );
+                assert!(opening.elapsed() < Duration::from_secs(2));
+                continue;
+            }
+        };
+        let start = Instant::now();
+        let _ = tls.write_all(&flood).and_then(|_| tls.flush());
+        let responses = read_until_closed(&mut tls);
+        if index == 2 {
+            assert_eq!(responses, [0x88, 2, 3, 232]);
+        } else {
+            let (pongs, remainder) = responses.as_chunks::<2>();
+            assert!(remainder.is_empty());
+            assert!(pongs.len() <= 2000 && pongs.iter().all(|bytes| *bytes == [0x8a, 0]));
+        }
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
-    let _ = tls.write_all(&flood).and_then(|_| tls.flush());
-    let responses = read_until_closed(&mut tls);
-    assert!(responses.len() <= 4000);
-    let (pongs, remainder) = responses.as_chunks::<2>();
-    assert!(remainder.is_empty());
-    assert!(pongs.iter().all(|bytes| *bytes == [0x8a, 0]));
-    assert!(start.elapsed() < Duration::from_secs(2));
-    let mut tls = raw_websocket(&pilot);
-    let close = client_frame(8, true, &1000u16.to_be_bytes(), true);
-    let _ = tls.write_all(&close.repeat(1000)).and_then(|_| tls.flush());
-    assert_eq!(read_until_closed(&mut tls), [0x88, 2, 3, 232]);
     create_grant(&pilot.config, &Cancel::new()).unwrap();
     assert!(pilot.metrics.network_bytes.load(Ordering::Relaxed) < 128 * 1024);
 }
