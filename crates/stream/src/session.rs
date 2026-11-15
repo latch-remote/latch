@@ -3269,6 +3269,13 @@ fn decode(
             Ok(None) => {}
             Err(e) => {
                 tracing::debug!("decode: {e:#}");
+                #[cfg(test)]
+                if let Some(probe) = &inner.pair_probe {
+                    probe
+                        .decode_errors
+                        .lock()
+                        .push((frame.frame, format!("{e:#}")));
+                }
                 inner.video_health.lock().last_error = Some(format!("{e:#}"));
                 inner.queue.lock().want_keyframe = true;
             }

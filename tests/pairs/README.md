@@ -123,7 +123,7 @@ physical pads, rumble motors, physical audio playback, native global
 keyboard capture and user-granted Screen Recording remain outside these
 artifact assertions.
 
-`KNOWN-GAPS.md` names the currently failing input contracts. Their exact
+`KNOWN-GAPS.md` names the currently failing media and input contracts. Their exact
 observed values are asserted, and an unexpected pass fails so a behavior
 fix updates the list. CI summaries contain observed and expected native
 values for every case. Every required producer, media schedule, input
@@ -159,3 +159,18 @@ or scheduling stall exceeding the hold can therefore waste redundancy in
 a live session too. The pacing/capture-cadence investigation needs its own
 product follow-up. This PR preserves product timing and tests both timely
 repair and exact late-packet concealment through the real receiver.
+
+
+## VideoToolbox to Media Foundation finding
+
+Run 43697534260 reaches all 162 media cells. Six fail on the Windows native
+decoder with Mac native/capture tapes, for all three schedules. Each returns
+only frames 6, 12 and 18, against 24 expected pictures for clean/late-audio
+or 22 for loss/reorder. The same tapes pass Windows software decoding and
+both Mac decoders, and both Linux consumers pass them. Windows native
+decoding of software and Windows-native tapes passes. `MAC_VT_MF_GAP`
+asserts this exact frame sequence, retains the full intended sequence in
+results and fails on unexpected pass. Returned pictures retain the normal
+identity, crop and PSNR assertions. Audio, video FEC and causal keyframe
+request assertions continue to run. Decode errors are captured per frame
+for the product follow-up, whose fixing PR remains unassigned.
