@@ -58,6 +58,9 @@ impl DisplayRect {
 }
 
 pub trait InputSink: Send {
+    /// An explicit monitor choice can fill one X screen on a multi-screen host.
+    fn set_display_selected(&mut self, _selected: bool) {}
+
     /// Stream dimensions for platforms whose cursor uses logical display points.
     fn set_stream_size(&mut self, _width: u32, _height: u32) {}
 

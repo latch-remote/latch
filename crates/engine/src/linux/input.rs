@@ -15,6 +15,7 @@ pub(super) struct X11Input {
     conn: X11,
     root: u32,
     screen: DisplayRect,
+    selected: bool,
     mapping: xproto::GetKeyboardMappingReply,
     min_keycode: u8,
     key_names: xkb::GetNamesReply,
@@ -58,6 +59,7 @@ impl X11Input {
             conn,
             root,
             screen,
+            selected: false,
             mapping,
             min_keycode,
             key_names,
@@ -186,6 +188,10 @@ fn notches(remainder: &mut i32, delta: i16) -> i32 {
     count
 }
 impl InputSink for X11Input {
+    fn set_display_selected(&mut self, selected: bool) {
+        self.selected = selected;
+    }
+
     fn apply(&mut self, event: &Event, display: DisplayRect) -> anyhow::Result<()> {
         self.refresh()?;
         match event {
@@ -240,10 +246,11 @@ impl InputSink for X11Input {
                 )?;
             }
             Event::MouseMove { dx, dy } => {
-                let position = relative_position(display, self.screen, *dx, *dy, || {
-                    let pointer = self.conn.query_pointer(self.root)?.reply()?;
-                    Ok((pointer.root_x, pointer.root_y))
-                })?;
+                let position =
+                    relative_position(display, self.screen, self.selected, *dx, *dy, || {
+                        let pointer = self.conn.query_pointer(self.root)?.reply()?;
+                        Ok((pointer.root_x, pointer.root_y))
+                    })?;
                 if let Some((x, y)) = position {
                     self.fake(xproto::MOTION_NOTIFY_EVENT, 0, x, y)?;
                 } else {
@@ -326,11 +333,12 @@ impl InputSink for X11Input {
 fn relative_position(
     display: DisplayRect,
     screen: DisplayRect,
+    selected: bool,
     dx: i16,
     dy: i16,
     pointer: impl FnOnce() -> anyhow::Result<(i16, i16)>,
 ) -> anyhow::Result<Option<(i16, i16)>> {
-    if display == screen {
+    if display == screen && !selected {
         return Ok(None);
     }
     let (x, y) = pointer()?;
@@ -422,6 +430,7 @@ mod timeout_tests {
             conn,
             root: 0,
             screen: Default::default(),
+            selected: false,
             mapping: Default::default(),
             min_keycode: 8,
             key_names: Default::default(),
@@ -458,12 +467,12 @@ mod display_motion_tests {
             (10, -5, (2010, 195)),
         ] {
             assert_eq!(
-                relative_position(monitor, screen, dx, dy, || Ok((2000, 200))).unwrap(),
+                relative_position(monitor, screen, true, dx, dy, || Ok((2000, 200))).unwrap(),
                 Some(expected)
             );
         }
         assert_eq!(
-            relative_position(screen, screen, 123, -456, || panic!(
+            relative_position(screen, screen, false, 123, -456, || panic!(
                 "whole screen must stay asynchronous"
             ))
             .unwrap(),
@@ -476,8 +485,14 @@ mod display_motion_tests {
             ..screen
         };
         assert_eq!(
-            relative_position(left, screen, 1, 1, || Ok((3000, 200))).unwrap(),
+            relative_position(left, screen, true, 1, 1, || Ok((3000, 200))).unwrap(),
             Some((1919, 201))
+        );
+        // A selected monitor filling this root still uses absolute XTest on
+        // this root, even when the pointer has crossed to another X screen.
+        assert_eq!(
+            relative_position(screen, screen, true, i16::MAX, i16::MIN, || Ok((100, 200))).unwrap(),
+            Some((4479, 0))
         );
     }
 }

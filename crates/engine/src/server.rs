@@ -416,6 +416,7 @@ impl Server {
         }
         match input::open() {
             Ok(mut sink) => {
+                sink.set_display_selected(prepared.req.display.is_some());
                 let info = prepared.info.as_ref().expect("prepared has video info");
                 if let Err(e) = sink.start_display(info.display, info.width, info.height) {
                     prepared.input_problem =
