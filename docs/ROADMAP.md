@@ -4,7 +4,8 @@
 
 Latch 6 shares and views a desktop over Tailscale with one Rust app per
 machine. Mac and Windows viewers probe hardware decode for AV1, HEVC and
-H.264; Linux viewers use software H.264. Mac hosts encode H.264/HEVC;
+H.264. Linux viewers probe VA-API H.264 and HEVC/Main10, with software
+H.264 fallback and physical GPU verification pending. Mac hosts encode H.264/HEVC;
 Windows and Linux can offer AV1 where the encoder supports it. HEVC
 sessions negotiate ten-bit SDR or HDR from the viewer's capabilities.
 Mouse, keyboard, clipboard, audio and microphone forwarding are implemented;
@@ -48,8 +49,9 @@ date, and none of it is a tested capability until it leaves this list.
 
 ### Hosts and viewers
 
-- **Linux viewer hardware decode** (VA-API, then Vulkan Video) with
-  synchronized GPU buffer import. Linux viewers decode H.264 in software.
+- **Linux viewer hardware verification.** Exercise VA-API decode, EGL
+  DMA-BUF presentation and failure recovery on Intel and AMD GPUs. Add
+  AV1 decoding and a Vulkan GPU-import path.
 - **Linux host GPU path without the CPU round trip.** NVENC and VA-API
   encode from pictures prepared on the CPU; capture, colour conversion and
   encode should stay on the GPU. Both backends also still need a first run

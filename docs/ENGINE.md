@@ -124,10 +124,11 @@ scanout still determine physical display latency; immediate mode may tear.
 measures decode completion to renderer preparation on the viewer clock;
 it does not measure GPU completion, OS present or photons.
 
-Linux remains Baseline software decode. VA-API needs a Rust bitstream-to-VA
-picture/slice parameter path (loading libva alone is not a decoder), plus
-synchronized dma-buf import into wgpu. It is deferred; no native codec
-library or C/C++ build is added.
+Linux uses runtime-probed VA-API for H.264 and HEVC Main/Main10, with
+software Baseline fallback. Rust parses the picture and slice parameters;
+compatible EGL/GLES renderers import synchronized DMA-BUF planes. Other
+paths read back NV12/P010. See the viewer negotiation section for limits,
+recovery and hardware verification still required.
 
 The decoder's reconstruction kernels were adapted from the MIT-licensed
 `pith-h264` (see `crates/codec/src/h264/decode/SOURCE.md`); everything it

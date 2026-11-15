@@ -117,7 +117,7 @@ performance and remaining field limits are recorded in the
 |---|---|---|
 | **Windows** | HEVC or H.264 on the GPU, AV1 where it has an encoder (not yet run on one); HDR10; virtual gamepads | hardware AV1, HEVC and H.264; HDR |
 | **macOS** | HEVC or H.264 on VideoToolbox; HDR10 | hardware AV1 (M3 and later), HEVC and H.264; HDR |
-| **Linux** | software H.264; NVENC and VA-API (not yet run on a GPU); virtual gamepads | software H.264 |
+| **Linux** | software H.264; NVENC and VA-API (not yet run on a GPU); virtual gamepads | VA-API H.264 and HEVC/Main10 (hardware verification pending), software H.264 fallback |
 
 Latch is young. HDR has been checked by reading pixels back, not yet by
 eye on an HDR panel. Viewers are desktop apps only: for a phone, a TV or a
