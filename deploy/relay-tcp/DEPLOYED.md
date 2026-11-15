@@ -628,6 +628,25 @@ completed two of three 20 Mbps runs and WebSocket completed one of three.
 Both carriers timed out in the second pair. The earlier deployment's
 multi-fold WebSocket throughput collapse was not reproduced. Variable WAN
 conditions and shared transport deadlines remain the likely explanation.
+
+Limits of this comparison:
+
+- Most controlled cells are a single run. Only the 150 ms/50 Mbps cell and the
+  300 ms/5 Mbps cell were repeated, and "similar" above refers to completed
+  runs. The live 20 Mbps set is three pairs.
+- WebSocket through the CONNECT proxy was not rechecked and is not covered by
+  the conclusion. Its single samples were lower than both direct carriers at
+  150 ms/50 Mbps (33.3 against 45.1 Mbps native), slower at 300 ms/20 Mbps
+  (frame p95 788 against 409 ms) and the only cold 150 ms/5 Mbps timeout. The
+  lab proxy (tinyproxy) may be the cause. Its CPU was not measured.
+- Runs in a cell always went native, WebSocket, then CONNECT, and Linux could
+  carry cached TCP path state from one run to the next, which may explain the
+  300 ms/5 Mbps reversal. `carrier_comparison.py` now flushes and disables
+  that cache. The tables above predate that change.
+- With 0.5% loss at 150 ms RTT every run on every carrier ended on the video
+  acknowledgement deadline at 1–2 Mbps. A single TCP connection cannot carry
+  more than about 1 Mbps at that loss and delay, and the fixed-rate probe does
+  not adapt. How a real session behaves there is not measured here.
 The exact cause of the earlier deployment failures remains unknown.
 
 ### Method and interpretation

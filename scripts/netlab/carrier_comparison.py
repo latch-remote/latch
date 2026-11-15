@@ -24,6 +24,9 @@ def measure(lab, relay, args, path, rate, carrier):
         lab.ns(role, "tc", "qdisc", "del", "dev", device, "root", check=False)
         lab.ns(role, "tc", "qdisc", "add", "dev", device, "root", "netem",
                "limit", "20000", "delay", f"{rtt / 2}ms", "loss", f"{loss}%")
+    # Each run starts cold: no cached RTT, ssthresh or congestion window from the previous carrier.
+    for role in ("v", "c", "i"):
+        lab.ns(role, "ip", "tcp_metrics", "flush", check=False)
     name = f"{path}-{rate}-{carrier}"
     command = [args.probe, "relay.netlab.test", str(args.seconds), str(rate), "60", str(args.warmup),
                "native" if carrier == "native" else "websocket"]
@@ -33,10 +36,16 @@ def measure(lab, relay, args, path, rate, carrier):
     started = time.monotonic()
     client = lab.spawn("v", name, command, env={"PAIRED_PROBE_CA": str(lab.output / "relay-ca.pem")})
     client_cpu = 0
+    overran = False
     while client.poll() is None:
-        if STOP.is_set() or time.monotonic() - started > args.seconds + 25:
+        if STOP.is_set():
             lab.stop_process(client)
-            raise RuntimeError("probe exceeded its bounded runtime or was interrupted")
+            raise RuntimeError("interrupted")
+        if time.monotonic() - started > args.seconds + 25:
+            # Keep the sweep going: an overrunning probe is a failed sample, not a lab error.
+            lab.stop_process(client)
+            overran = True
+            break
         try:
             client_cpu = cpu_seconds(client.pid)
         except FileNotFoundError:
@@ -51,7 +60,7 @@ def measure(lab, relay, args, path, rate, carrier):
             if line.startswith("{"):
                 events.append(json.loads(line))
     result = next((event for event in reversed(events) if event.get("final")), {})
-    result.update(path=path, offered_mbps=rate, carrier=carrier, exit_code=client.returncode,
+    result.update(path=path, offered_mbps=rate, carrier=carrier, exit_code=client.returncode, overran=overran,
                   wall_s=wall, client_cpu_percent=100 * client_cpu / wall,
                   relay_cpu_percent=100 * (cpu_seconds(relay.pid) - before) / wall)
     for role, device in (("v", "tail"), ("c", "viewer")):
@@ -99,6 +108,8 @@ def main():
         config = args.output / "tinyproxy.conf"
         config.write_text(f"Port 3128\nListen 10.77.2.1\nTimeout 30\nAllow 10.77.2.0/24\nConnectPort 443\nLogLevel Error\nLogFile \"{args.output}/proxy.log\"\nPidFile \"{args.output}/proxy.pid\"\n")
         lab.spawn("c", "proxy", ["tinyproxy", "-d", "-c", config])
+        for role in ("v", "c", "i"):
+            lab.ns(role, "sysctl", "-qw", "net.ipv4.tcp_no_metrics_save=1", check=False)
         time.sleep(0.5)
         results = []
         for path in args.paths.split(","):
