@@ -142,6 +142,13 @@ pub enum PathActivity {
 }
 
 impl PathActivity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PreparingRelay => "preparing-relay",
+            Self::TestingUdp => "testing-udp",
+        }
+    }
+
     pub fn description(self) -> &'static str {
         match self {
             Self::PreparingRelay => "Preparing the relay",
@@ -150,6 +157,7 @@ impl PathActivity {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaPathState {
     pub path: MediaPath,
@@ -157,6 +165,8 @@ pub struct MediaPathState {
     pub carrier: Option<Carrier>,
     pub since: Instant,
     pub activity: Option<PathActivity>,
+    /// Announced peak wire rate of the current UDP return probe.
+    pub udp_probe_kbps: Option<u32>,
 }
 
 impl MediaPathState {
@@ -240,6 +250,7 @@ impl Default for MediaPathState {
             carrier: None,
             since: Instant::now(),
             activity: None,
+            udp_probe_kbps: None,
         }
     }
 }
@@ -588,6 +599,8 @@ mod tests {
 
     #[test]
     fn typed_path_extensions_have_stable_machine_strings_and_plain_descriptions() {
+        assert_eq!(PathActivity::PreparingRelay.as_str(), "preparing-relay");
+        assert_eq!(PathActivity::TestingUdp.as_str(), "testing-udp");
         assert_eq!(Carrier::Native.as_str(), "native");
         assert_eq!(Carrier::Tls.as_str(), "tls");
         assert_eq!(Carrier::WebSocket.as_str(), "websocket");

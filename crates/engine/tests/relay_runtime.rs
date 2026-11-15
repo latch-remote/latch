@@ -48,7 +48,9 @@ impl Default for Network {
     }
 }
 
-// The synthetic host's pattern and virtual pads are process-wide.
+// Synthetic input is process-wide. Real-time session and TLS fixtures must
+// also take turns so their host, viewer, relay and gateway workers have CPU
+// on three-core CI runners, regardless of the test harness thread count.
 static SESSION_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct Running {
@@ -59,6 +61,7 @@ struct Running {
     blackhole: Arc<AtomicBool>,
     downstream: Arc<parking_lot::Mutex<latch_proto::sim::Link>>,
     max_datagram: Arc<AtomicU64>,
+    probe_packets: Arc<parking_lot::Mutex<Vec<(Instant, usize)>>>,
     stop: Arc<AtomicBool>,
     host: Option<JoinHandle<()>>,
     proxy: Option<JoinHandle<()>>,
@@ -132,7 +135,9 @@ impl Running {
         link.set_bandwidth(network.bandwidth, network.queue);
         let downstream = Arc::new(parking_lot::Mutex::new(link));
         let max_datagram = Arc::new(AtomicU64::new(1200));
+        let probe_packets = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let proxy = {
+            let probe_packets = probe_packets.clone();
             let downstream = downstream.clone();
             let max_datagram = max_datagram.clone();
             let blackhole = blackhole.clone();
@@ -158,6 +163,12 @@ impl Running {
                             continue;
                         }
                         if from.port() == host_port {
+                            if matches!(latch_proto::wire::parse(&bytes[..len]),
+                                Ok(latch_proto::wire::Datagram::Probe { train, count: 16, .. })
+                                    if train < 0x8000)
+                            {
+                                probe_packets.lock().push((Instant::now(), len));
+                            }
                             if len <= max_datagram.load(Ordering::Acquire) as usize {
                                 downstream.lock().send(Instant::now(), &bytes[..len]);
                             }
@@ -196,7 +207,9 @@ impl Running {
             })
         };
         let host_server = server.clone();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let host = thread::spawn(move || {
+            let _tracing = tracing::dispatcher::set_default(&dispatch);
             let (mut tcp, peer) = listener.accept().unwrap();
             tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let request = http::read_request(&mut tcp).unwrap().unwrap();
@@ -250,6 +263,7 @@ impl Running {
             blackhole,
             downstream,
             max_datagram,
+            probe_packets,
             stop,
             host: Some(host),
             proxy: Some(proxy),
@@ -633,6 +647,7 @@ fn actual_relay_audio_and_microphone_reach_pcm_sinks() {
 
 #[test]
 fn negotiation_rejects_stale_malformed_and_unconfigured_offers() {
+    let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
     use latch_stream::session::RelayRoute;
     let pilot = Pilot::start();
     let route = RelayRoute::new(42, latch_relay::Role::Viewer, Some(pilot.config.clone()));
@@ -701,6 +716,7 @@ fn negotiation_rejects_stale_malformed_and_unconfigured_offers() {
 
 #[test]
 fn cancelled_prepare_joins_its_worker_and_rejects_endpoint_role_and_generation() {
+    let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
     use latch_stream::session::RelayRoute;
     let pilot = Pilot::start();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -1029,20 +1045,45 @@ fn blocked_start_has_a_two_second_first_picture_bound_and_healthy_udp_uses_no_gr
 #[test]
 fn recovered_udp_switches_back_at_twenty_and_sixty_megabits() {
     let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
-    let pilot = Pilot::start();
+    // Full-rate warmup counts both relay legs. Keep quota/grant renewal out of
+    // this handoff measurement, with enough credit for both 90-second setups.
+    let pilot = Pilot::with_limits(|config| {
+        config.monthly_bytes = 4 * 1024 * 1024 * 1024;
+        config.limits.session_bytes = 2 * 1024 * 1024 * 1024;
+    });
     for kbps in [20_000, 60_000] {
-        // Continuous motion gives each frame a fresh picture during handoff.
-        let running = Running::with_rate(pilot.config.clone(), true, "sweep", kbps, 64, 64);
+        let running = Running::with_rate(pilot.config.clone(), true, "load", kbps, 64, 64);
         running.wait(Duration::from_secs(2), || {
             running.session.connected() && running.session.relay_active()
         });
         running.hold_key();
+        // Relay starts at 8 Mbps and climbs. Fill the five-second delivery
+        // window at the ceiling before the first UDP Hello starts its check.
+        let stable = std::cell::Cell::new(Instant::now());
+        let peak_delivery = std::cell::Cell::new(0.0_f32);
+        running.wait(Duration::from_secs(90), || {
+            let stats = running.session.stats();
+            peak_delivery.set(peak_delivery.get().max(stats.received_mbps));
+            if stats.wire_budget_kbps != kbps {
+                stable.set(Instant::now());
+            }
+            stable.get().elapsed() >= Duration::from_secs(5)
+        });
+        assert!(
+            peak_delivery.get() >= kbps as f32 / 1000.0 * 0.95,
+            "relay delivered only {} Mbps",
+            peak_delivery.get()
+        );
+        let probe_kbps = std::cell::Cell::new(0);
         running.blackhole.store(false, Ordering::Release);
         let start = Instant::now();
         let before = running.frames.seq();
         let last_picture = std::cell::Cell::new(running.session.published_at().unwrap());
         let largest_gap = std::cell::Cell::new(Duration::ZERO);
         let measure_gap = || {
+            if let Some(rate) = running.session.media_path().udp_probe_kbps {
+                probe_kbps.set(probe_kbps.get().max(rate));
+            }
             if let Some(at) = running.session.published_at() {
                 largest_gap.set(
                     largest_gap
@@ -1071,10 +1112,31 @@ fn recovered_udp_switches_back_at_twenty_and_sixty_megabits() {
             "handoff stalled video for {:?}",
             largest_gap.get()
         );
+        let probe_kbps = probe_kbps.get();
+        assert!(
+            (kbps * 103 / 100..=kbps * 115 / 100).contains(&probe_kbps),
+            "probe {probe_kbps} kbps for {kbps} kbps relay"
+        );
+        let packets = running.probe_packets.lock();
+        let hold = packets[0].0 + Duration::from_millis(200);
+        let last = packets.last().unwrap().0;
+        assert!(last.duration_since(hold) >= Duration::from_millis(350));
+        let hold_bytes = packets
+            .iter()
+            .filter(|(at, _)| *at >= hold)
+            .map(|(_, len)| len + 80)
+            .sum::<usize>();
+        let sent_kbps = hold_bytes as f64 * 8.0 / last.duration_since(hold).as_secs_f64() / 1000.0;
+        assert!(
+            (f64::from(probe_kbps) * 0.90..=f64::from(probe_kbps) * 1.10).contains(&sent_kbps),
+            "sent {sent_kbps:.0} kbps for {probe_kbps} kbps probe"
+        );
+        drop(packets);
         eprintln!(
-            "UDP return at {kbps} kbps {:?}, largest decoded-picture gap {:?}",
+            "UDP return at {kbps} kbps {:?}, largest decoded-picture gap {:?}, relay peak {:.2} Mbps, probe {probe_kbps} kbps, measured hold {sent_kbps:.0} kbps",
             start.elapsed(),
-            largest_gap.get()
+            largest_gap.get(),
+            peak_delivery.get()
         );
         running.release_key();
         running.ordered_input();
@@ -1124,9 +1186,10 @@ fn bursty_seventeen_percent_udp_loss_switches_without_reconnecting() {
     let start = Instant::now();
     running.wait(Duration::from_secs(2), || running.session.relay_active());
     eprintln!(
-        "bursty loss relay selection {:?}, sent/lost/duplicate {:?}",
+        "bursty loss relay selection {:?}, sent/lost/duplicate {:?}, {:?}",
         start.elapsed(),
-        running.downstream.lock().counts()
+        running.downstream.lock().counts(),
+        running.session.stats()
     );
     assert!(running.session.connected());
     running.release_key();
@@ -1237,7 +1300,7 @@ fn auto_on_a_twenty_five_megabit_uplink_adapts_on_udp_until_random_loss_persists
     let stats = running.session.stats();
     let mean_budget =
         budgets.iter().map(|rate| u64::from(*rate)).sum::<u64>() / budgets.len() as u64;
-    eprintln!("25 Mbps Auto UDP adapted mean budget {mean_budget} kbps, video {:.2} Mbps, {:.1} fps, raw loss {:.1}%", stats.mbps, stats.fps, stats.raw_loss_pct);
+    eprintln!("25 Mbps Auto UDP adapted mean budget {mean_budget} kbps, video {:.2} Mbps, {:.1} fps, raw loss {:.1}%, host {:.1} ms, assembly {:.1} ms", stats.mbps, stats.fps, stats.raw_loss_pct, stats.host_ms, stats.assembly_ms);
     // Congestion-controlled capacity probes can temporarily exceed the FIFO.
     // Measure the adapted tail budget across its probe cycle.
     assert!(
@@ -1388,13 +1451,15 @@ fn return_probes_share_a_constrained_uplink_without_stalling_relay_video() {
     assert!(running.session.relay_active());
     assert_eq!(pilot.metrics.grants_created.load(Ordering::Acquire), 1);
     eprintln!(
-        "25 Mbps shared uplink return probe largest frame gap {:?}",
-        gap.get()
+        "25 Mbps shared uplink return probe largest frame gap {:?}, {:?}",
+        gap.get(),
+        running.session.stats()
     );
 }
 
 #[test]
 fn withdrawn_preparation_reuses_its_authorized_grant_on_a_new_attempt() {
+    let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
     use latch_stream::session::RelayRoute;
     let pilot = Pilot::start();
     let route = RelayRoute::new(7, latch_relay::Role::Host, Some(pilot.config.clone()));
@@ -1522,12 +1587,11 @@ fn delayed_relay_survives_its_first_large_keyframe_and_spends_one_grant() {
     }
     let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
     let first_ack = Arc::new(AtomicU64::new(0));
-    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(
+    let _tracing = tracing::subscriber::set_default(tracing_subscriber::registry().with(
         FirstAck(first_ack.clone()).with_filter(tracing_subscriber::filter::filter_fn(
             |metadata| metadata.fields().field("first_relay_ack_us").is_some(),
         )),
-    ))
-    .unwrap();
+    ));
     let pilot = Pilot::start();
     let gateway = gateway::Gateway::with_delay(
         pilot.config.endpoint.port(),

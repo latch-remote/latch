@@ -356,6 +356,7 @@ impl RelayRoute {
         let state = self.state.lock();
         let mut path = state.path.clone();
         if self.policy_enabled() {
+            path.udp_probe_kbps = state.udp_probe.as_ref().map(|probe| probe.kbps);
             path.activity = if state.udp_probe.is_some() {
                 Some(PathActivity::TestingUdp)
             } else if !state.paused
@@ -413,6 +414,7 @@ impl RelayRoute {
             path: MediaPath::LatchRelay,
             reason: state.reason.clone(),
             activity: None,
+            udp_probe_kbps: None,
             carrier: Some(Carrier::Tls),
             since: Instant::now(),
         };
@@ -456,6 +458,7 @@ impl RelayRoute {
                 path: MediaPath::TailscaleUdp(state.udp_path),
                 reason: PathReason::RelayUnavailable(state.close_reason),
                 activity: None,
+                udp_probe_kbps: None,
                 carrier: None,
                 since: Instant::now(),
             };
@@ -966,7 +969,15 @@ impl RelayRoute {
         } else {
             Duration::from_millis(350)
         };
-        floor.max(state.ack_rtt * 2 + Duration::from_millis(100)) + state.frame_send_time
+        let deadline =
+            floor.max(state.ack_rtt * 2 + Duration::from_millis(100)) + state.frame_send_time;
+        if state.ack_base == Duration::MAX {
+            // Setup includes waiting for the peer. Bound the whole first-frame
+            // allowance so a route that died during that wait recovers promptly.
+            deadline.min(Duration::from_secs(3))
+        } else {
+            deadline
+        }
     }
 
     /// Runs on the TCP control owner. Return false for an authority write failure.
@@ -3854,16 +3865,12 @@ impl Throughput {
 
     /// Video and received Mbps over `secs`; starts the next window.
     fn take(&mut self, secs: f32) -> (f32, f32) {
-        let probes = std::mem::take(&mut self.probes);
-        let window = std::mem::replace(
-            self,
-            Self {
-                probes,
-                ..Default::default()
-            },
-        );
+        // Statistics and congestion feedback have independent window clocks.
+        // Reset only their own counters, retaining the next delivery report.
+        let video = std::mem::take(&mut self.video);
+        let received = std::mem::take(&mut self.received);
         let mbps = |bytes: u64| bytes as f32 * 8.0 / secs / 1e6;
-        (mbps(window.video), mbps(window.received))
+        (mbps(video), mbps(received))
     }
 }
 
@@ -5345,6 +5352,23 @@ mod media_policy_tests {
     }
 
     #[test]
+    fn statistics_do_not_discard_pending_delivery_feedback() {
+        let mut throughput = Throughput {
+            received: 1000,
+            feedback_received: 1000,
+            video: 1000,
+            ..Default::default()
+        };
+        throughput.take(0.25);
+        assert_eq!(throughput.feedback_received, 1000);
+        throughput.received += 2000;
+        throughput.feedback_received += 2000;
+        throughput.take(0.25);
+        assert_eq!(std::mem::take(&mut throughput.feedback_received), 3000);
+        assert_eq!(throughput.take(0.25), (0.0, 0.0));
+    }
+
+    #[test]
     fn first_relay_ack_has_setup_and_large_frame_allowances_then_uses_progress() {
         let route = RelayRoute::new(7, latch_relay::Role::Host, None);
         route.enable_policy(true);
@@ -5359,6 +5383,37 @@ mod media_policy_tests {
         state.ack_base = state.ack_rtt;
         state.frame_send_time = Duration::ZERO;
         assert_eq!(route.ack_deadline(&state), Duration::from_millis(350));
+    }
+
+    #[test]
+    fn first_relay_ack_deadline_caps_slow_setup_and_frame_serialization() {
+        let route = RelayRoute::new(7, latch_relay::Role::Host, None);
+        route.enable_policy(true);
+        {
+            let mut state = route.state.lock();
+            route.activate(&mut state);
+            state.ack_rtt = Duration::from_secs(20);
+            state.frame_send_time = Duration::from_secs(4);
+            assert_eq!(route.ack_deadline(&state), Duration::from_secs(3));
+            state.frame_pending = Some(Instant::now() - Duration::from_secs(3));
+        }
+        let mut aborted = false;
+        assert!(route.maintain(false, |message| {
+            aborted |= matches!(
+                message,
+                Message::Relay(control::RelayControl {
+                    action: control::RelayAction::Abort,
+                    ..
+                })
+            );
+            true
+        }));
+        assert!(aborted);
+        assert!(!route.active());
+        assert_eq!(
+            route.path_state().reason,
+            PathReason::RelayUnavailable(RelayFailure::Stalled)
+        );
     }
 
     #[test]
@@ -5382,6 +5437,7 @@ mod media_policy_tests {
             state.udp_probe = Some(UdpProbe::policy(0, 2000, 1200));
         }
         assert_eq!(route.path_state().activity, Some(PathActivity::TestingUdp));
+        assert_eq!(route.path_state().udp_probe_kbps, Some(2000));
         route.state.lock().udp_probe = None;
         assert_eq!(route.path_state().activity, None);
     }

@@ -90,6 +90,7 @@ pub fn open_video(config: &VideoConfig, motion: Motion) -> anyhow::Result<Box<dy
             pipeline,
             kbps: config.bitrate_kbps,
             fps: config.fps,
+            last_frame: None,
         }));
     }
     Ok(pipeline)
@@ -101,6 +102,7 @@ struct LoadPattern {
     pipeline: Box<dyn VideoPipeline>,
     kbps: u32,
     fps: u32,
+    last_frame: Option<Instant>,
 }
 impl VideoPipeline for LoadPattern {
     fn info(&self) -> crate::video::VideoInfo {
@@ -114,7 +116,15 @@ impl VideoPipeline for LoadPattern {
         // Repeat at frame cadence. Filler establishes the wire load while
         // unchanged pictures keep capture and encoding cheap on CI runners.
         let mut frame = self.pipeline.next(keyframe, Duration::ZERO)?;
-        let bytes = (u64::from(self.kbps) * 1000 / 8 / u64::from(self.fps.max(1))) as usize;
+        let now = Instant::now();
+        let interval = Duration::from_secs(1) / self.fps.max(1);
+        // Preserve the offered bitrate when capture wakes late. Bound credit
+        // after a long stall, with the normal video pacer controlling egress.
+        let elapsed = self.last_frame.map_or(interval, |last| {
+            now.saturating_duration_since(last).min(interval * 2)
+        });
+        self.last_frame = Some(now);
+        let bytes = (f64::from(self.kbps) * 1000.0 / 8.0 * elapsed.as_secs_f64()) as usize;
         if frame.data.len() + 6 < bytes {
             frame.data.extend_from_slice(&[0, 0, 0, 1, 12]);
             frame.data.resize(bytes - 1, 0xff);

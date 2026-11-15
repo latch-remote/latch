@@ -1018,7 +1018,7 @@ The authorized Tailscale TCP connection remains required on both paths.
 - Only the host reassesses UDP. After a minimum sixty-second relay dwell it
   announces `UdpProbe`, waits 100 ms, and sends one second of 1,200-byte UDP
   padding at 125% of requested kbps, with a 2 Mbps minimum. The 50 Mbps
-  probe ceiling excludes requests above 40 Mbps. At most 64 packets leave
+  probe ceiling excludes requests above 40 Mbps. At most 2,048 packets leave
   per control turn. Each probe start doubles the next interval up to 600 seconds, including
   successful attempts.
   Viewer reports arrive after two seconds. Host expires a missing report
@@ -1123,9 +1123,12 @@ conservative seed includes peer setup waits and leaves headroom for
 fresh-connection slow start.
 Until the first video ACK,
 the floor is at least 750 ms and the configured relay stall timeout. Later
-ACKs use a 350 ms floor. Serialization uses the largest pending frame's bytes
-and the current relay wire budget. The relay crate also seeds its video ACK
-estimate from setup and retains its existing frame, write and queue deadlines.
+ACKs use a 350 ms floor. The complete first-ACK deadline, including
+serialization, is capped at three seconds. Serialization uses the largest
+pending frame's bytes and the current relay wire budget. The relay crate also
+seeds its video ACK estimate from setup. Its ACK watchdog counts recent ordered authenticated
+ACK progress as lane liveness even when prior queueing has aged the next
+pending frame. Existing frame, write and queue deadlines still apply.
 The application watchdog handles silent black holes
 before that deadline where RTT permits. Invalid control and bounded inbox
 exhaustion still terminate the session.
@@ -1144,9 +1147,12 @@ for 400 ms. A delayed sender may finish within another 250 ms. Send
 credit follows elapsed time, capped at forty milliseconds of the ramp's
 integrated rate, so coarse turns retain their budget and long stalls discard
 older credit. The relay encoder subtracts the current UDP reservation from
-the same measured budget, retaining a 1 Mbps video floor. Probe traffic thus
-replaces relay encoder budget. The 2 Mbps probe floor adds at most 1 Mbps
-beside the minimum relay stream.
+the same measured budget, retaining a 1 Mbps video floor. During the hold
+phase, UDP carries about 110% of the relay's pre-probe mean delivery while relay video retains its 1 Mbps floor. Their combined
+wire load briefly exceeds the user's requested bitrate when relay delivery
+was near that request. The UDP probe peak is capped at 125% of the request,
+with the 1 Mbps relay floor additional. At the 2 Mbps probe minimum the
+combined load can reach 3 Mbps.
 
 Loss in completed probe trains cancels the check after a 100 ms receive
 grace. Relay ACK growth over `max(100 ms, baseline ACK RTT)` from the pre-probe
@@ -1245,8 +1251,8 @@ passed. The tests retain the same timing and delivery bounds on every OS.
 | Same FIFO plus 17% random loss | Relay selected in 1.15 s | 2 s |
 | Mixed random and burst loss | 1.08 s to relay, 187 of 1,069 UDP packets lost, 17.5% | 2 s |
 | 3 Mbps UDP policer | 1.35 s to relay | 2 s |
-| Return to UDP, 20 Mbps requested | 7.05 s, largest decoded-picture gap 146 ms | 9 s, gap below 250 ms |
-| Return to UDP, 60 Mbps requested | 7.05 s, largest decoded-picture gap 147 ms | 9 s, gap below 250 ms |
+| Return to UDP, 20 Mbps requested | After full-rate relay warmup, 3.14 s, 22.25 Mbps probe, 22.17 Mbps measured hold, largest picture gap 112 ms | 9 s, gap below 250 ms |
+| Return to UDP, 60 Mbps requested | After full-rate relay warmup, 2.96 s, 64.85 Mbps probe, 64.93 Mbps measured hold, largest picture gap 64 ms | 9 s, gap below 250 ms |
 | Return probe sharing a 25 Mbps uplink | Largest decoded-picture gap 132 ms, one grant | Gap below 250 ms, one grant |
 | Silent relay TCP black hole | Fresh relay picture in 702 ms, two grants total | 1 s |
 | Clean daemon stop while UDP is blocked | Fresh relay picture in 292 ms | 950 ms after local relay restart |
@@ -1256,6 +1262,16 @@ passed. The tests retain the same timing and delivery bounds on every OS.
 | Healthy 150/300 ms one-way delay | Zero grants while decoded video progresses | Zero grants |
 | Repeated UDP flaps | Three returns to UDP, four grants, held key retained | Three returns per rolling minute |
 | Healthy UDP | Zero additional relay grants/connections | Checked during decoded video and ordered input |
+
+The two full-rate return rows were repeated with Rust 1.100.0 and nine CPU
+workers on twelve cores, leaving about three cores for the test. The fixture
+uses 64×64 real H.264 pictures plus elapsed-time-sized filler. It waits for
+five seconds of ceiling-rate relay delivery before restoring UDP, asserts
+the announced peak and measures actual UDP datagrams during the hold phase.
+Its local relay quota and grant credit cover that full-rate warmup.
+Statistics snapshots preserve the independent congestion-feedback byte
+counter. The shared TLS pump stages ready plaintext before its bounded
+socket write, avoiding an idle polling tick per outgoing chunk.
 
 The audio result includes loss concealment during a forced transport close.
 The clean-stop result measures EOF. The silent black-hole test drops bytes

@@ -186,6 +186,7 @@ A silently stalled relay is detected from video ACK progress. Before the
 first video ACK, Latch uses the connection setup timing and a floor of at
 least 750 ms. Later ACKs set the estimate with a 350 ms floor. Both deadlines
 also allow for the pending frame's size at the current relay send rate.
+The complete first-ACK deadline is capped at three seconds.
 Fresh authorization or usable UDP restores media. Active failures have a 100 ms retry cooldown, recovery
 allows a UDP keyframe round trip, and three consecutive failures wait thirty
 seconds. Setup failures wait two seconds. A grant reaching its time or

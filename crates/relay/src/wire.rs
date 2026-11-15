@@ -259,6 +259,17 @@ impl TlsSocket {
         self.sending = Some(Instant::now());
         Ok(())
     }
+    fn write_pending(&mut self) -> io::Result<()> {
+        if self.written < self.pending.len() {
+            match self.conn.writer().write(&self.pending[self.written..]) {
+                Ok(n) => self.written += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     pub fn pump(&mut self, quota: Option<&mut crate::quota::Quota>) -> io::Result<()> {
         if let Some(quota) = quota {
             match quota.credit(&mut self.credit, &mut self.credit_epoch) {
@@ -268,6 +279,11 @@ impl TlsSocket {
             }
         }
         let was_handshaking = self.conn.is_handshaking();
+        if !was_handshaking {
+            // Stage ready plaintext before the bounded TCP write. Staging it
+            // afterwards made the owner sleep an idle tick for every chunk.
+            self.write_pending()?;
+        }
         let early_close = |kind| {
             io::Error::new(
                 kind,
@@ -366,14 +382,7 @@ impl TlsSocket {
                     self.set_pending(response);
                 }
             }
-            if self.written < self.pending.len() {
-                match self.conn.writer().write(&self.pending[self.written..]) {
-                    Ok(0) => (),
-                    Ok(n) => self.written += n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
-                    Err(e) => return Err(e),
-                }
-            }
+            self.write_pending()?;
             if self.written == self.pending.len() {
                 self.pending.clear();
                 self.written = 0;
@@ -613,6 +622,28 @@ mod tests {
     fn tls_hostname_verification_remains_enabled() {
         assert!(matches!(tls_pair("wrong.example"),Err(e) if e.kind()==io::ErrorKind::InvalidData));
     }
+    #[test]
+    fn fresh_plaintext_is_flushed_during_the_same_tls_pump() {
+        let (mut sender, mut receiver) = tls_pair("localhost").unwrap();
+        let record = vec![7; 1024];
+        sender.queue(&record).unwrap();
+        assert!(!sender.idle_write());
+        sender.pump(None).unwrap();
+        assert!(
+            sender.idle_write(),
+            "ready TLS work must precede the idle wait"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(Instant::now() < deadline);
+            receiver.pump(None).unwrap();
+            if let Some(received) = receiver.read_record().unwrap() {
+                assert_eq!(received, record);
+                break;
+            }
+        }
+    }
+
     #[test]
     fn partial_tls_writes_preserve_record_framing() {
         let (mut sender, mut receiver) = tls_pair("localhost").unwrap();

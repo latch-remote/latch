@@ -1356,6 +1356,7 @@ fn run_lane(
     let mut pending_acks: VecDeque<u32> = VecDeque::new();
     let mut last_sent = Instant::now();
     let mut last_peer = Instant::now();
+    let mut last_video_ack = Instant::now();
     let lifetime = Instant::now() + Duration::from_secs(attachment.session_seconds as u64);
     loop {
         shared.cancel.check()?;
@@ -1395,6 +1396,7 @@ fn run_lane(
                     return Err(invalid("unexpected video acknowledgment"));
                 }
                 let elapsed = queued.elapsed();
+                last_video_ack = Instant::now();
                 video_rtt.sample(elapsed);
                 let mut state = shared.state.lock().unwrap();
                 state.frame_ack_elapsed = Some(
@@ -1412,7 +1414,13 @@ fn run_lane(
             }
         }
         if unacked.front().is_some_and(|(_, queued)| {
-            queued.elapsed() >= video_ack_deadline(&video_rtt, config.limits.stall_timeout)
+            video_ack_stalled(
+                &video_rtt,
+                config.limits.stall_timeout,
+                *queued,
+                last_video_ack,
+                Instant::now(),
+            )
         }) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1528,6 +1536,18 @@ fn run_lane(
     }
 }
 
+fn video_ack_stalled(
+    rtt: &latch_proto::rtt::RttEstimator,
+    floor: Duration,
+    queued: Instant,
+    progress: Instant,
+    now: Instant,
+) -> bool {
+    // ACKs are ordered. Recent authenticated progress proves the lane is
+    // delivering, even when earlier queueing has aged the next pending frame.
+    now.saturating_duration_since(queued.max(progress)) >= video_ack_deadline(rtt, floor)
+}
+
 fn video_ack_deadline(rtt: &latch_proto::rtt::RttEstimator, floor: Duration) -> Duration {
     // An authenticated ACK proves that the frame arrived. Use that lane's
     // measured round trip and variation for later ACKs, rather than closing a
@@ -1554,6 +1574,35 @@ mod tests {
             reply,
             refresh: false,
         }
+    }
+
+    #[test]
+    fn ordered_video_ack_progress_keeps_an_aged_frame_alive_until_progress_stops() {
+        let start = Instant::now();
+        let rtt = latch_proto::rtt::RttEstimator::new();
+        let floor = Duration::from_millis(750);
+        let progress = start + Duration::from_secs(1);
+        assert!(!video_ack_stalled(
+            &rtt,
+            floor,
+            start,
+            progress,
+            progress + Duration::from_millis(10)
+        ));
+        assert!(video_ack_stalled(
+            &rtt,
+            floor,
+            start,
+            progress,
+            progress + floor
+        ));
+        assert!(!video_ack_stalled(
+            &rtt,
+            floor,
+            progress,
+            start,
+            progress + Duration::from_millis(10)
+        ));
     }
 
     #[test]

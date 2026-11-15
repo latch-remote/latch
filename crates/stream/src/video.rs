@@ -891,6 +891,48 @@ mod tests {
     }
 
     #[test]
+    fn real_picture_reassembles_byte_exactly_across_576_byte_fragments() {
+        use latch_proto::video::{OutFrame, Packetizer, Reassembled, Reassembler};
+        use latch_proto::wire::{self, Datagram};
+        let capture = include_bytes!("../tests/fixtures/vt-ltr-overflow.h264");
+        let pictures = latch_codec::h264::nal::access_units(capture);
+        let picture = pictures[0];
+        assert!(latch_codec::h264::nal::nal_units(picture)
+            .iter()
+            .any(|nal| nal[0] & 31 == 5 && nal.len() > 576));
+        let mut packetizer = Packetizer::new(7);
+        packetizer.set_datagram_size(576);
+        let mut packets = Vec::new();
+        packetizer
+            .packetize(
+                &OutFrame {
+                    data: picture,
+                    keyframe: true,
+                    host_delay: 0,
+                },
+                |packet| packets.push(packet.to_vec()),
+            )
+            .unwrap();
+        assert!(packets.len() > 1);
+        assert!(packets.iter().all(|packet| packet.len() <= 576));
+        let now = std::time::Instant::now();
+        let mut reassembler = Reassembler::new(7);
+        // Reordered and duplicated real picture fragments retain every byte.
+        for packet in packets.iter().rev() {
+            let Datagram::Video { shard, .. } = wire::parse(packet).unwrap() else {
+                panic!("video shard");
+            };
+            reassembler.push(&shard, now);
+            reassembler.push(&shard, now);
+        }
+        let Some(Reassembled::Frame(frame)) = reassembler.poll(now) else {
+            panic!("complete picture");
+        };
+        assert!(frame.keyframe);
+        assert_eq!(frame.data, picture);
+    }
+
+    #[test]
     fn a_platform_decoder_that_shows_nothing_hands_over_to_software() {
         let mut encoder = latch_codec::h264::Encoder::new(latch_codec::h264::EncoderConfig {
             width: 64,

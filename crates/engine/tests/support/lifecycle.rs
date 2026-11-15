@@ -1417,14 +1417,7 @@ fn synthetic_dxgi_session_delivers_cursor_while_video_waits() {
             anyhow::bail!("synthetic video stopped before producing a frame")
         }
     }
-    let server = Server::bind(
-        0,
-        Options {
-            relay: None,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let mut session = session("127.0.0.1:9".parse().unwrap());
     let state = Arc::get_mut(&mut session).unwrap();
     state.cursor_supported = true;
