@@ -184,7 +184,8 @@ build inputs, the release packaging workflow, and third-party notices while
 excluding other repository automation, site assets and private operational
 records. Consumer update requests are
 anonymous. Installed Mac and Windows copies update from this manifest.
-Linux hosts show a notice.
+User-owned Linux release binaries update through the local service, while
+package-managed and image installs show deployment-specific instructions.
 
 The publisher uses `vars.RELEASE_APP_ID` and
 `secrets.RELEASE_APP_PRIVATE_KEY`, with the App installed only on

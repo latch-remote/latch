@@ -384,9 +384,14 @@ switch and a **Check now** button.
   version-specific public manifest and installs the file only if its exact
   version, URL, size and SHA-256 match. A PC that cannot reach GitHub refuses
   the update.
-- **Linux.** Latch says a newer version exists and links to it. Install the
-  tarball as in [deploy/native/README.md](../deploy/native/README.md), or
-  rebuild the Docker node.
+- **Linux.** A release binary owned by your user in a writable directory
+  downloads the matching x64 or arm64 tarball when the window is open. It
+  waits for viewing and hosting streams to end, then asks the local service
+  to install it. Reopen the window after the service restarts. A headless
+  user-owned install can request the same update with `latch-host --self-update`
+  while its local service is running. Settings' automatic-update switch
+  controls window checks. The CLI is an explicit update request and refuses
+  installation during a hosted stream. Run it again after disconnecting.
 
 Version 6 downloads and update checks need no GitHub login. Legacy
 `github_token` and `LATCH_GITHUB_TOKEN` settings are ignored by this public
@@ -397,6 +402,124 @@ SSH installation of a current release: a Latch 5 viewer cannot stream the
 retired protocol to upgrade them. Mac builds are ad-hoc signed, so macOS may
 ask for Screen Recording and Accessibility again after an update
 ([why](ROADMAP.md#signing-and-notarization)).
+
+### Linux installation ownership and recovery
+
+The updater resolves installation symlinks and replaces their target. It
+leaves the symlink in place. These installations show a notice with the
+appropriate update instructions.
+
+- Pacman-owned files, including AUR packages, and paths under `/usr/bin` or
+  `/usr/lib` use the package manager. Pacman ownership is queried with `pacman -Qo`.
+- Resolved paths under `/nix/store` use the Nix package or flake rebuild.
+- Docker/Podman markers (`/.dockerenv`, `/run/.containerenv`), `container` or
+  `LATCH_CONTAINER_INSTALL` environment markers, and OverlayFS, squashfs or
+  EROFS filesystems use an image rebuild and container recreation. The
+  headless container kit sets `LATCH_CONTAINER_INSTALL=1`.
+- Read-only mounts use the installation's deployment tool.
+- Root-owned installs, files or parent directories owned by another user,
+  unwritable files/directories, group/world-writable install directories or
+  files, privileged executables and unsafe ancestor directories require the
+  installation owner to replace the binary. Ancestors must belong to root
+  or the user and prevent other users from renaming entries, allowing sticky
+  directories such as `/tmp`. Running as root also selects this notice.
+
+For a user-owned release, the service authenticates the archive using its
+own version-specific public manifest and the shared version, size and SHA-256
+checks. Its separate supervisor fetches that manifest independently, copies the
+private upload into a `0700` sibling directory and re-hashes it against the
+manifest. The archive is downloaded once. Linux self-update archive and manifest
+transfers have a size-derived deadline of expected bytes / 32 KiB/s + 60 seconds,
+a 30-second socket timeout, and a 32 KiB/s minimum average rate after 30 seconds.
+Manifests use a 1 MiB size allowance. The 32 KiB/s floor also applies to
+manifests, so a stalled small manifest normally fails the first rate check after
+30 seconds. A blocked read can add the 30-second socket timeout. The size-derived
+92-second manifest deadline is an upper bound. Redirect hops have separate byte
+counts and share elapsed time. The underlying TLS transport additionally
+checks a 128 B/s floor. Other downloads retain their existing transport behavior. Only the selected binary member is
+written, initially `0600`. After digest and ELF architecture verification,
+it becomes `0755` and must report the exact release version with `--version`.
+The updater holds an exclusive file lock, hard-links the old executable for
+recovery and atomically renames the new executable over the install path.
+
+The supervisor starts in its own transient systemd user unit, without a
+`systemd-run --wait` client inside `latch.service`. The service waits for a
+fsynced supervisor-start acknowledgement before accepting the request. The
+unit has a 240-second runtime limit. Linux 5.3+ (`pidfd_open`) is checked before
+offering or downloading an update. Systemd-supervised services also require a
+working user manager. An unsupervised service uses a separate supervisor
+process and a pinned process handle for its handover, preserving the service's
+session environment, without requiring a systemd user manager.
+
+The new service must report the expected version continuously for 15 seconds
+within 60 seconds. Its systemd MainPID, executable inode and ownership of the
+listening control socket are checked on both sides of each health request.
+A restart or health failure restores the previous binary and restarts it.
+The fsynced `linux-update.json` journal records progress, inode identities,
+staging location and outcome. On startup, a service detects an unfinished
+update whose supervisor died and restores the previous inode deterministically.
+A running service also monitors for this failure. CI covers recovery both at
+the next service start and while the service keeps running. If restoration
+itself fails, the update becomes terminal Failed with the recovery copy retained
+and its path reported. The next update can proceed. A journal flock and phase
+compare-and-set serialize writers. Unsafe or unparsable journals are moved aside
+with at most three diagnostic copies, pruning the oldest modification times.
+A journal read I/O error retains the journal for a later retry. Unknown fields and missing fields are
+tolerated, and unknown phases become terminal failures. Maintenance failures
+appear in service setup/status and logs while the service continues starting.
+
+The window reads the local service version before downloading. Supervisor
+installation and recovery failures persist with their reason and suppress only
+the exact failed version. A newer release remains eligible. Transport failures
+use persisted per-release exponential retry delays of 15 minutes, 30 minutes,
+1 hour, 2 hours, 4 hours, 8 hours, 16 hours and then a 24-hour ceiling. Successful
+installation, a newly offered release and **Check now** reset the delay. The
+window rechecks manifests at least every six hours while archive retries wait.
+Verified cached archives are rechecked and reused. Transient errors keep the
+release eligible. **Check now** or `latch-host --self-update`
+explicitly retries it. The window, service status and CLI report the outcome.
+Reopen the window after a successful update. Locks live in the data directory.
+At startup, cleanup checks directory names, ownership, private permissions,
+installation markers and age before removing abandoned staging directories
+and private upload directories older than a day that no live journal references.
+Legacy private upload files use their filename, ownership, permissions and age.
+Recovery copies remain until the journal proves they can be discarded. Old
+empty updater lock files beside the binary are removed only when owned,
+private, at least one day old and unlocked.
+
+Streams accepted during the health window can be cut off by a rollback, as on
+Windows. This remains a follow-up. Toolbox/distrobox installs remain refused
+through their container markers. Snap uses `snap refresh`, the native kit
+requires rerunning its installer, and AppImages are refused even with
+`--appimage-extract-and-run` when `APPIMAGE` is set and the executable lives
+under `APPDIR`. Snap environment detection likewise requires the executable
+under `SNAP`, so a native install launched from a packaged terminal remains eligible.
+
+The authenticated `/v1/update` endpoint accepts a Linux host's matching
+release tarball with the existing version and digest headers. Automatic
+cross-machine Linux pushes await an architecture capability in discovery.
+Current hosts advertise their OS, so automatic Mac pushes continue to select
+Windows executables. No streaming protocol or manifest format changes are
+required for local Linux updates.
+
+Linux updater validation uses local HTTP manifest/artifact fixtures and
+compiled ELF programs on native x64 and arm64 CI. Local development uses
+Docker with Ubuntu 24.04/glibc 2.39. No Linux machine outside CI and containers is available for
+this work. The `Linux updater systemd` CI jobs passed at `5d2959f` on x64 and arm64 Ubuntu 24.04 runners. They install a fixture `latch.service`, launch the real supervisor from its control group, and check successful probation, wrong-version rollback and rollback after the supervisor is killed following the swap.
+The fixture adds a replacement that crashes on start, including the start
+limit and `reset-failed`, and monitor recovery while the service keeps running.
+Both added cases passed at `5570388` on x64 and arm64. The fixture gates its crash
+on a new MainPID with ActiveState=active and SubState=running. The start-limit
+check requires a failed unit, at least three fixture starts, a stable restart
+counter and exit status 7. It accepts exit-code and start-limit-hit results.
+Timeouts print full service/supervisor unit state, recent journals and fixture
+history.
+The test is ignored during ordinary test runs and requires explicit opt-in
+through the dedicated script, which refuses an existing `latch.service`.
+The fixture bypasses supervisor argv parsing, self-pinning, installation ownership
+checks and real GitHub manifest fetching. The real `latch-host` binary under
+systemd is untested. Real GUI reopening and stream continuity across an update
+remain untested because no Linux desktop machine was available.
 
 ### Moving from 5.x to 6.0.0
 

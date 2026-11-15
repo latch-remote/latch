@@ -41,7 +41,8 @@ COPY deploy/node/bootstrap.py /opt/latch/bootstrap.py
 RUN chmod +x /entrypoint.sh \
     && mkdir -p /root/.config /var/lib/tailscale
 
-ENV DISPLAY=:1 \
+ENV LATCH_CONTAINER_INSTALL=1 \
+    DISPLAY=:1 \
     HOME=/root
 
 EXPOSE 47850/tcp 47850/udp

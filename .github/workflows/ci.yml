@@ -196,6 +196,33 @@ jobs:
       - name: bundle
         run: bash scripts/bundle-macos.sh
 
+  test-linux-update-systemd:
+    permissions:
+      contents: read
+    name: Linux updater systemd (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ${{ vars.LINUX_X64_RUNNER || 'ubuntu-24.04' }}
+            arch: x64
+          - runner: ${{ vars.LINUX_ARM64_RUNNER || 'ubuntu-24.04-arm' }}
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: native deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: real systemd restart, health rollback and killed supervisor recovery
+        run: bash scripts/test-linux-update-systemd.sh
+
   # Set each runner variable only after verifying its Ubuntu 24.04 image
   # and architecture with the provider (including optional Blacksmith).
   # Unset variables use GitHub-hosted runners.
@@ -236,6 +263,8 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --locked --workspace --all-targets
+      - name: Linux updater local-manifest fixture and rollback
+        run: cargo test --locked -p latch-core -j 4 linux_release_fixture_updates_and_rolls_back -- --nocapture
       - name: X11 capture recovery and media replay
         run: |
           set -o pipefail

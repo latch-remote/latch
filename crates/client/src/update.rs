@@ -369,9 +369,9 @@ fn prune_updates(root: &std::path::Path, keep: &str) {
     }
 }
 
-fn desktop_offer(rel: &Release, windows: bool) -> Option<String> {
+fn desktop_offer(rel: &Release, can_update: bool) -> Option<String> {
     rel.is_newer_than(&update::current()).then(|| {
-        if windows {
+        if can_update {
             format!(
                 "Latch {} is available; installs when no stream is running.",
                 rel.version
@@ -387,7 +387,119 @@ fn desktop_offer(rel: &Release, windows: bool) -> Option<String> {
     })
 }
 
-/// Windows pulls the bare release asset; Linux only advertises manual updates.
+fn desktop_can_update() -> bool {
+    #[cfg(target_os = "linux")]
+    return std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| update::linux::owned(&exe).is_ok());
+    #[cfg(not(target_os = "linux"))]
+    cfg!(windows)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_manual_offer(rel: &Release) -> String {
+    let why = std::env::current_exe()
+        .context("locate this installation")
+        .and_then(|exe| update::linux::owned(&exe))
+        .err()
+        .map(|e| format!("{e:#}"))
+        .unwrap_or_else(|| "replace this installation through its deployment tool".into());
+    format!(
+        "Latch {} is available; {why}. https://github.com/{}/releases/tag/{}",
+        rel.version,
+        update::REPO,
+        rel.tag
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_download_due(
+    addr: SocketAddr,
+    offered: &Version,
+    previous: Option<&update::linux::UpdateState>,
+    explicit: bool,
+    now: Instant,
+    next: Instant,
+) -> Result<(Version, bool)> {
+    let status: Status = http::get_json(addr, "/v1/status", Duration::from_secs(2))
+        .context("read local service version before downloading")?;
+    let running = Version::parse(&status.version)?;
+    let due = update::linux::automatic_update_due(offered, &running, previous, explicit, now, next);
+    Ok((running, due))
+}
+
+#[cfg(target_os = "linux")]
+const LINUX_RETRY_FILE: &str = "linux-update-retry.toml";
+
+#[cfg(target_os = "linux")]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct LinuxRetry {
+    version: Option<Version>,
+    attempts: u32,
+    retry_at: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxRetry {
+    fn offer(&mut self, version: &Version, explicit: bool) {
+        if explicit || self.version.as_ref() != Some(version) {
+            *self = Self {
+                version: Some(version.clone()),
+                ..Self::default()
+            };
+        }
+    }
+
+    fn after_attempt(&mut self, now: std::time::SystemTime) -> Duration {
+        self.attempts = self.attempts.saturating_add(1).min(8);
+        let delay = RETRY_AFTER
+            .saturating_mul(1 << (self.attempts - 1))
+            .min(Duration::from_secs(24 * 3600));
+        self.retry_at = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_add(delay.as_secs());
+        delay
+    }
+
+    fn attempted(&mut self) -> Duration {
+        let delay = self.after_attempt(std::time::SystemTime::now());
+        self.persist();
+        delay
+    }
+
+    fn remaining(&self, now: std::time::SystemTime) -> Duration {
+        let seconds = self.retry_at.saturating_sub(
+            now.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
+        // Recheck after a clock rollback or an invalid persisted deadline.
+        if seconds > 24 * 3600 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(seconds)
+        }
+    }
+
+    fn succeeded(&mut self) {
+        if self.attempts != 0 {
+            self.attempts = 0;
+            self.retry_at = 0;
+            self.persist();
+        }
+    }
+
+    fn persist(&self) {
+        if let Err(error) = latch_core::config::save(LINUX_RETRY_FILE, self) {
+            tracing::warn!("could not persist Linux update retry back-off: {error:#}");
+        }
+    }
+}
+
+/// Desktop pulls use the local service to serialize installation with streams.
 fn spawn_desktop(
     state: Arc<Mutex<State>>,
     live: Arc<Mutex<Option<Live>>>,
@@ -397,29 +509,114 @@ fn spawn_desktop(
     std::thread::spawn(move || {
         let mut next = Instant::now() + FIRST_CHECK;
         let mut pending: Option<Release> = None;
+        #[cfg(target_os = "linux")]
+        let mut explicit = false;
+        #[cfg(target_os = "linux")]
+        let mut offered_at = Instant::now();
+        #[cfg(target_os = "linux")]
+        let mut retry: LinuxRetry = latch_core::config::load(LINUX_RETRY_FILE);
+        #[cfg(target_os = "linux")]
+        let mut observed_success: Option<String> = None;
         loop {
             std::thread::sleep(TICK);
             let cfg = ClientConfig::load();
             if !cfg.auto_update {
                 continue;
             }
+            #[cfg(target_os = "linux")]
+            if let Ok(Some(outcome)) =
+                update::linux::state_path().and_then(|path| update::linux::UpdateState::load(&path))
+            {
+                let mut st = state.lock();
+                if st.latest.as_ref() == Some(&outcome.version) {
+                    if outcome.phase == update::linux::Phase::Succeeded
+                        && observed_success.as_deref() != Some(&outcome.unit)
+                    {
+                        observed_success = Some(outcome.unit.clone());
+                        if retry.attempts != 0
+                            && runs_at_least(
+                                SocketAddr::from((Ipv4Addr::LOCALHOST, CONTROL_PORT)),
+                                &outcome.version,
+                                Duration::ZERO,
+                            )
+                        {
+                            retry.succeeded();
+                        }
+                    }
+                    st.message = outcome.reason;
+                    st.notice = Some((
+                        if outcome.phase == update::linux::Phase::Failed {
+                            Tone::Warning
+                        } else {
+                            Tone::Info
+                        },
+                        st.message.clone(),
+                    ));
+                    ctx.request_repaint();
+                }
+            }
             if state.lock().check_now || Instant::now() >= next {
+                #[cfg(target_os = "linux")]
+                {
+                    explicit = state.lock().check_now;
+                    if explicit {
+                        retry = LinuxRetry::default();
+                        retry.persist();
+                    }
+                }
                 state.lock().check_now = false;
-                match update::latest(None) {
+                #[cfg(target_os = "linux")]
+                let latest = update::linux::latest();
+                #[cfg(not(target_os = "linux"))]
+                let latest = update::latest(None);
+                match latest {
                     Ok(rel) => {
                         next = Instant::now() + CHECK_EVERY;
+                        #[cfg(target_os = "linux")]
+                        {
+                            retry.offer(&rel.version, explicit);
+                            retry.persist();
+                            let remaining = retry.remaining(std::time::SystemTime::now());
+                            offered_at = Instant::now() + remaining;
+                            if !remaining.is_zero() {
+                                next = Instant::now() + CHECK_EVERY.min(remaining);
+                            }
+                        }
                         let newer = rel.is_newer_than(&update::current());
+                        let can_update = desktop_can_update();
                         let mut st = state.lock();
                         st.checked = Some(Instant::now());
                         st.latest = Some(rel.version.clone());
                         st.release = Some(rel.clone());
-                        st.message = desktop_offer(&rel, cfg!(windows))
+                        st.message = desktop_offer(&rel, can_update)
                             .unwrap_or_else(|| format!("Up to date (v{}).", update::current()));
                         st.notice = newer.then(|| (Tone::Info, st.message.clone()));
-                        pending = (newer && cfg!(windows)).then_some(rel);
+                        #[cfg(target_os = "linux")]
+                        if newer
+                            && runs_at_least(
+                                SocketAddr::from((Ipv4Addr::LOCALHOST, CONTROL_PORT)),
+                                &rel.version,
+                                Duration::ZERO,
+                            )
+                        {
+                            st.message =
+                                format!("Latch {} is installed. Reopen Latch.", rel.version);
+                            st.notice = Some((Tone::Info, st.message.clone()));
+                        } else if newer && !can_update {
+                            st.message = linux_manual_offer(&rel);
+                            st.notice = Some((Tone::Info, st.message.clone()));
+                        }
+                        pending = (newer && can_update).then_some(rel);
                     }
                     Err(e) => {
-                        next = Instant::now() + RETRY_AFTER;
+                        #[cfg(target_os = "linux")]
+                        {
+                            next = Instant::now() + retry.attempted().min(CHECK_EVERY);
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            next = Instant::now() + RETRY_AFTER;
+                        }
                         pending = None;
                         let mut st = state.lock();
                         st.checked = Some(Instant::now());
@@ -442,10 +639,75 @@ fn spawn_desktop(
                 if !idle {
                     continue;
                 }
-                let result = (|| -> Result<()> {
-                    let path = fetch_asset(rel, HOST_EXE)?;
-                    let bytes = std::fs::read(path)?;
-                    update::verify_host(rel, &rel.version, &bytes)?;
+                let result = (|| -> Result<bool> {
+                    #[cfg(target_os = "linux")]
+                    {
+                        if !explicit && Instant::now() < offered_at {
+                            state.lock().message = format!(
+                                "Update retry in {} minutes.",
+                                retry
+                                    .remaining(std::time::SystemTime::now())
+                                    .as_secs()
+                                    .div_ceil(60)
+                            );
+                            return Ok(false);
+                        }
+                        // Recheck immediately before any archive download. The
+                        // service can have updated while this old window stayed open.
+                        let previous =
+                            update::linux::UpdateState::load(&update::linux::state_path()?)?;
+                        let (running, due) = linux_download_due(
+                            SocketAddr::from((Ipv4Addr::LOCALHOST, CONTROL_PORT)),
+                            &rel.version,
+                            previous.as_ref(),
+                            explicit,
+                            Instant::now(),
+                            offered_at,
+                        )?;
+                        if !due {
+                            let mut st = state.lock();
+                            st.message = if running >= rel.version {
+                                retry.succeeded();
+                                format!("Latch {} is installed. Reopen Latch.", rel.version)
+                            } else {
+                                previous
+                                    .as_ref()
+                                    .map(|s| s.reason.clone())
+                                    .unwrap_or_else(|| {
+                                        format!(
+                                            "Update retry in {} minutes.",
+                                            retry
+                                                .remaining(std::time::SystemTime::now())
+                                                .as_secs()
+                                                .div_ceil(60)
+                                        )
+                                    })
+                            };
+                            st.notice = Some((Tone::Info, st.message.clone()));
+                            return Ok(false);
+                        }
+                        if previous.as_ref().is_some_and(|s| !s.terminal()) {
+                            return Ok(false);
+                        }
+                    }
+                    #[cfg(target_os = "linux")]
+                    let bytes = {
+                        update::linux::owned(&std::env::current_exe()?)?;
+                        let name = update::linux::asset_name()?;
+                        let asset = rel.asset(name).context("Linux release asset")?;
+                        let path = updates_dir(rel)?.join(name);
+                        update::linux::download_asset(asset, &path)?;
+                        let bytes = std::fs::read(path)?;
+                        update::verify_host_asset(rel, &rel.version, &bytes, name)?;
+                        bytes
+                    };
+                    #[cfg(not(target_os = "linux"))]
+                    let bytes = {
+                        let path = fetch_asset(rel, HOST_EXE)?;
+                        let bytes = std::fs::read(path)?;
+                        update::verify_host(rel, &rel.version, &bytes)?;
+                        bytes
+                    };
                     // The service independently authenticates the same bytes and serializes
                     // installation with incoming streams and peer pushes.
                     send_host(
@@ -454,14 +716,23 @@ fn spawn_desktop(
                         &update::sha256_hex(&bytes),
                         &bytes,
                     )?;
-                    Ok(())
+                    Ok(true)
                 })();
                 match result {
-                    Ok(()) => {
+                    Ok(true) => {
+                        #[cfg(target_os = "linux")]
+                        {
+                            next = Instant::now() + retry.attempted().min(CHECK_EVERY);
+                        }
                         state.lock().message = format!(
                             "Installing Latch {}. Reopen Latch after the service restarts.",
                             rel.version
                         );
+                        #[cfg(target_os = "linux")]
+                        {
+                            let mut st = state.lock();
+                            st.notice = Some((Tone::Info, st.message.clone()));
+                        }
                         #[cfg(windows)]
                         if runs_at_least(
                             SocketAddr::from((Ipv4Addr::LOCALHOST, CONTROL_PORT)),
@@ -482,9 +753,19 @@ fn spawn_desktop(
                         }
                         pending = None;
                     }
+                    Ok(false) => {
+                        pending = None;
+                    }
                     Err(e) => {
                         state.lock().message = format!("Could not update this PC: {e:#}");
-                        next = Instant::now() + RETRY_AFTER;
+                        #[cfg(target_os = "linux")]
+                        {
+                            next = Instant::now() + retry.attempted().min(CHECK_EVERY);
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            next = Instant::now() + RETRY_AFTER;
+                        }
                         pending = None;
                     }
                 }
@@ -839,8 +1120,8 @@ pub fn old_host_message(name: &str, version: &Version) -> String {
 }
 
 /// What to say about a host this Mac cannot update when a newer release is
-/// out: a Linux machine or a container, whose Latch Host is installed by
-/// hand. `None` for a Windows PC (it is sent the update), a Mac (its own
+/// out. Linux copies use their local updater or deployment tool.
+/// `None` for a Windows PC (it is sent the update), a Mac (its own
 /// app updates it) and a host already on the release.
 pub fn manual_update_message(
     name: &str,
@@ -853,7 +1134,7 @@ pub fn manual_update_message(
     }
     rel.is_newer_than(running).then(|| {
         format!(
-            "{name} runs Latch Host {running}, and {} is out. This Mac sends updates to Windows PCs only: install the new Latch Host on {name} by hand, the way it was set up (a Linux machine: the release's latch-host-linux tarball).",
+            "{name} runs Latch Host {running}, and {} is out. This Mac sends updates to Windows PCs only. On {name}, open Latch or run latch-host --self-update for a headless user-owned Linux host, or update through its package manager or deployment kit.",
             rel.version
         )
     })
@@ -1354,6 +1635,92 @@ mod tests {
         addr
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linux_service_already_updated_is_never_downloaded_again_with_an_injected_clock() {
+        let now = Instant::now();
+        let addr = status_server("999.0.0");
+        let offered = Version::new(999, 0, 0);
+        let mut downloads = 0;
+        for elapsed in [0, 6 * 3600, 6 * 3600 + 900, 12 * 3600] {
+            let (_, due) = linux_download_due(
+                addr,
+                &offered,
+                None,
+                false,
+                now + Duration::from_secs(elapsed),
+                now,
+            )
+            .unwrap();
+            if due {
+                downloads += 1;
+            }
+        }
+        assert_eq!(downloads, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_retry_backoff_persists_and_resets_on_an_injected_clock() {
+        let root = std::env::temp_dir().join(format!(
+            "latch-retry-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "update::tests::linux_retry_fixture",
+                "--nocapture",
+            ])
+            .env("LATCH_LINUX_RETRY_FIXTURE", "1")
+            .env("LATCH_DATA_DIR", &root)
+            .status()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(result.success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_retry_fixture() {
+        if std::env::var_os("LATCH_LINUX_RETRY_FIXTURE").is_none() {
+            return;
+        }
+        let version = Version::new(999, 0, 0);
+        let mut policy = LinuxRetry::default();
+        policy.offer(&version, false);
+        let mut now = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        for minutes in [15, 30, 60, 120, 240, 480, 960, 1440, 1440] {
+            let delay = policy.after_attempt(now);
+            assert_eq!(delay, Duration::from_secs(minutes * 60));
+            policy.persist();
+            policy = latch_core::config::try_load(LINUX_RETRY_FILE).unwrap();
+            policy.offer(&version, false);
+            assert_eq!(policy.remaining(now), delay);
+            assert_eq!(
+                policy.remaining(now + delay - Duration::from_secs(1)),
+                Duration::from_secs(1)
+            );
+            assert_eq!(policy.remaining(now + delay), Duration::ZERO);
+            now += delay;
+        }
+        policy.offer(&version, true);
+        assert_eq!(policy.remaining(now), Duration::ZERO);
+        assert_eq!(policy.after_attempt(now), RETRY_AFTER);
+        policy.offer(&Version::new(999, 0, 1), false);
+        assert_eq!(policy.after_attempt(now), RETRY_AFTER);
+        policy.after_attempt(now);
+        policy.succeeded();
+        let cleared: LinuxRetry = latch_core::config::try_load(LINUX_RETRY_FILE).unwrap();
+        assert_eq!(cleared.attempts, 0);
+        assert_eq!(cleared.remaining(now), Duration::ZERO);
+        assert_eq!(policy.after_attempt(now), RETRY_AFTER);
+        policy.retry_at = u64::MAX;
+        assert_eq!(policy.remaining(now), Duration::ZERO);
+    }
+
     #[test]
     fn a_host_already_on_the_release_counts_as_updated() {
         let want = Version::new(4, 0, 3);
@@ -1377,6 +1744,7 @@ mod tests {
         let old = Version::new(4, 1, 1);
         let msg = manual_update_message("studio", "linux", &old, &r).expect("a line");
         assert!(msg.contains("studio") && msg.contains("4.1.1") && msg.contains("4.1.2"));
+        assert!(msg.contains("latch-host --self-update"));
         assert_eq!(
             manual_update_message("studio", "linux", &Version::new(4, 1, 2), &r),
             None
