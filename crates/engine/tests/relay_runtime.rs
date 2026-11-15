@@ -116,7 +116,7 @@ impl Running {
             0,
             Options {
                 relay: Some(config.clone()),
-                ..listeners::options::options()
+                ..listeners::options()
             },
         )
         .unwrap();
@@ -830,7 +830,7 @@ fn relay_audio_and_microphone_pipeline(config: ClientConfig, policy: bool) {
                     }),
                 })
             })),
-            ..listeners::options::options()
+            ..listeners::options()
         },
     )
     .unwrap();

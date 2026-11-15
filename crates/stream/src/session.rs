@@ -40,6 +40,13 @@ pub fn relay_config(settings: &control::RelaySettings) -> Option<latch_relay::Cl
     }
     latch_relay::Endpoint::new(settings.host.clone(), settings.port)
         .and_then(latch_relay::ClientConfig::production)
+        .map(|mut config| {
+            let host = settings.host.clone();
+            config.set_proxy_discovery(move || {
+                crate::network::proxy_selection(&crate::network::diagnosis(&host))
+            });
+            config
+        })
         .map_err(|error| tracing::warn!(%error, "relay unavailable"))
         .ok()
 }
@@ -234,6 +241,8 @@ struct RelayAttempt {
     grant_bytes: u64,
     traffic_bytes: u64,
     media_delivered: bool,
+    failure: Option<latch_relay::Failure>,
+    connection_info: Option<latch_relay::ConnectionInfo>,
     cancel: latch_relay::Cancel,
     preparing: Option<(
         mpsc::Receiver<std::io::Result<PreparedRelay>>,
@@ -308,6 +317,8 @@ impl RelayRoute {
                 grant_bytes: 0,
                 traffic_bytes: 0,
                 media_delivered: false,
+                failure: None,
+                connection_info: None,
                 cancel: latch_relay::Cancel::new(),
                 preparing: None,
             }),
@@ -353,8 +364,22 @@ impl RelayRoute {
         }
     }
     pub fn path_state(&self) -> MediaPathState {
+        let status = self.network_status();
         let state = self.state.lock();
         let mut path = state.path.clone();
+        if status.needs_sign_in {
+            path.reason = PathReason::CaptivePortal;
+        } else if state.connection_info.is_none() {
+            match &state.failure {
+                Some(latch_relay::Failure::TlsInterception { .. }) => {
+                    path.reason = PathReason::TlsInterception;
+                }
+                Some(latch_relay::Failure::ProxyAuthenticationRequired) => {
+                    path.reason = PathReason::ProxyAuth;
+                }
+                _ => {}
+            }
+        }
         if self.policy_enabled() {
             path.udp_probe_kbps = state.udp_probe.as_ref().map(|probe| probe.kbps);
             path.activity = if state.udp_probe.is_some() {
@@ -398,6 +423,31 @@ impl RelayRoute {
     pub fn pending(&self) -> bool {
         self.state.lock().phase != RelayPhase::Idle
     }
+    pub fn failure(&self) -> Option<latch_relay::Failure> {
+        self.state.lock().failure.clone()
+    }
+    pub fn connection_info(&self) -> Option<latch_relay::ConnectionInfo> {
+        self.state.lock().connection_info.clone()
+    }
+    fn retry_after_network_change(&self) {
+        let mut state = self.state.lock();
+        state.failures = 0;
+        state.retry_at = Instant::now();
+        state.failure = None;
+    }
+    pub fn network_status(&self) -> crate::network::NetworkStatus {
+        let diagnosis = self
+            .config
+            .as_ref()
+            .map(|config| crate::network::diagnosis(config.endpoint.host()))
+            .unwrap_or_default();
+        let state = self.state.lock();
+        crate::network::status(
+            &diagnosis,
+            state.failure.as_ref(),
+            state.connection_info.as_ref(),
+        )
+    }
     pub fn number(&self) -> u64 {
         self.state.lock().number
     }
@@ -410,12 +460,25 @@ impl RelayRoute {
     }
     fn activate(&self, state: &mut RelayAttempt) {
         tracing::info!(role = ?self.role, attempt = state.number, "using Latch TLS relay");
+        if let Some(info) = &state.connection_info {
+            tracing::info!("{}", crate::network::carrier_label(info));
+        }
         state.path = MediaPathState {
             path: MediaPath::LatchRelay,
             reason: state.reason.clone(),
             activity: None,
             udp_probe_kbps: None,
-            carrier: Some(Carrier::Tls),
+            carrier: state
+                .connection_info
+                .as_ref()
+                .map(|info| match info.carrier {
+                    latch_relay::Carrier::Native => Carrier::Tls,
+                    latch_relay::Carrier::WebSocket => Carrier::WebSocket,
+                }),
+            via_proxy: state
+                .connection_info
+                .as_ref()
+                .is_some_and(|info| info.via_proxy),
             since: Instant::now(),
         };
         state.phase = RelayPhase::Active;
@@ -460,6 +523,7 @@ impl RelayRoute {
                 activity: None,
                 udp_probe_kbps: None,
                 carrier: None,
+                via_proxy: false,
                 since: Instant::now(),
             };
         }
@@ -489,6 +553,7 @@ impl RelayRoute {
         state.paused = false;
         state.frame_pending = None;
         state.video_backpressure = None;
+        state.connection_info = None;
         state.phase = RelayPhase::Idle;
         state.udp_probe = None;
         state.returning_direct = false;
@@ -944,12 +1009,33 @@ impl RelayRoute {
         state.media_delivered |= matches!(event, latch_relay::Event::Frame(_));
         match event {
             latch_relay::Event::Ready => {
+                state.connection_info = state
+                    .transport
+                    .as_ref()
+                    .and_then(|transport| transport.connection_info(latch_relay::Lane::Video));
+                state.failure = None;
                 state.ready = true;
                 None
             }
             latch_relay::Event::Closed { kind, message } => {
                 tracing::warn!(role = ?self.role, ?kind, %message, "relay closed, falling back to UDP");
                 state.close_reason = RelayFailure::Closed;
+                if let Some(transport) = &state.transport {
+                    state.failure = transport.failure().map(|error| error.failure);
+                    if let Some(config) = &self.config {
+                        crate::network::relay_failed(config.endpoint.host());
+                    }
+                }
+                for message in crate::network::status(
+                    &latch_core::netenv::NetworkDiagnosis::default(),
+                    state.failure.as_ref(),
+                    None,
+                )
+                .messages
+                {
+                    tracing::warn!("{message}");
+                }
+                state.connection_info = None;
                 self.failed.store(true, Ordering::Release);
                 None
             }
@@ -986,6 +1072,7 @@ impl RelayRoute {
         if self.fatal.load(Ordering::Acquire) {
             return false;
         }
+        let waiting_for_sign_in = self.network_status().needs_sign_in;
         let mut state = self.state.lock();
         Self::refresh_ack(&mut state);
         if self.policy_enabled()
@@ -1159,6 +1246,10 @@ impl RelayRoute {
                     }
                     Err(error) => {
                         tracing::warn!(%error, "relay preparation failed");
+                        state.failure = Some(latch_relay::ConnectError::from_io(&error).failure);
+                        if let Some(config) = &self.config {
+                            crate::network::relay_failed(config.endpoint.host());
+                        }
                         let number = state.number;
                         state.close_reason = RelayFailure::Preparation;
                         self.reset(&mut state);
@@ -1171,6 +1262,7 @@ impl RelayRoute {
         }
         if self.role == latch_relay::Role::Viewer
             && wanted
+            && (!waiting_for_sign_in || state.failures == 0)
             && self.config.is_some()
             && state.phase == RelayPhase::Idle
             && state.preparing.is_none()
@@ -1591,6 +1683,8 @@ pub enum Event {
     /// Something the host wants the person to know (it cannot inject
     /// input, say).
     Notice(String),
+    /// Current local network diagnosis. An empty message list clears earlier facts.
+    Network(crate::network::NetworkStatus),
 }
 
 /// Where the host is.
@@ -2368,6 +2462,14 @@ impl Session {
         self.inner.relay.lock().active()
     }
 
+    pub fn relay_connection_info(&self) -> Option<latch_relay::ConnectionInfo> {
+        self.inner.relay.lock().connection_info()
+    }
+
+    pub fn network_status(&self) -> crate::network::NetworkStatus {
+        self.inner.relay.lock().network_status()
+    }
+
     pub fn stats(&self) -> Stats {
         let mut stats = self.inner.stats.lock().clone();
         stats.video_problem = self.inner.video_health.lock().problem(Instant::now());
@@ -2937,7 +3039,8 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 }
             });
     }
-    let accepted = Instant::now();
+    let mut accepted = Instant::now();
+    let mut portal_since = None;
     let mut last_report = Instant::now();
     let mut last_keepalive = Instant::now();
     let mut policy = Policy::default();
@@ -2946,6 +3049,7 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
     let mut healthy_since = None;
     let mut notices = PathNotices::new(inner.relay.lock().path_state());
     let mut legacy = LegacyFallback::default();
+    let mut last_network_status = crate::network::NetworkStatus::default();
     loop {
         if inner.stopping() {
             if let Some(w) = inner.control_writer.lock().as_mut() {
@@ -3208,12 +3312,57 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 }
             }
         }
+        let mut status = inner.relay.lock().network_status();
+        let portal_reported = status.needs_sign_in;
+        let media_arrived = inner.video_health.lock().last_encoded.is_some();
+        status.media_arrived(media_arrived);
+        if media_arrived {
+            if let Some(config) = &inner.relay.lock().config {
+                crate::network::media_received(config.endpoint.host());
+            }
+        }
+        if status.recovered_from(&last_network_status) {
+            accepted = Instant::now();
+            inner.relay.lock().retry_after_network_change();
+            status = inner.relay.lock().network_status();
+            status.media_arrived(media_arrived);
+        }
+        if status != last_network_status {
+            inner.emit(Event::Network(status.clone()));
+            last_network_status = status.clone();
+        }
+        // Signing in can take longer than the first-picture watchdog. Keep the
+        // authorized control session alive while the portal is confirmed captive.
+        let waiting_for_sign_in = portal_reported && !media_arrived;
+        if status.sign_in_timed_out(&mut portal_since, now) {
+            return Outcome::Failed(
+                "network".into(),
+                "Latch still cannot reach the relay after network sign-in. Check that sign-in completed and ask the network administrator to allow the relay on port 443, then reconnect."
+                    .into(),
+            );
+        }
         let health = inner.video_health.lock();
         if health.stalled(now) {
             return Outcome::Ended(-1, health.stall_message().into());
         }
         drop(health);
-        if !inner.connected.load(Ordering::Acquire) && accepted.elapsed() >= MEDIA_TIMEOUT {
+        if !waiting_for_sign_in
+            && !inner.connected.load(Ordering::Acquire)
+            && accepted.elapsed() >= MEDIA_TIMEOUT
+        {
+            if matches!(
+                inner.relay.lock().failure(),
+                Some(
+                    latch_relay::Failure::TlsInterception { .. }
+                        | latch_relay::Failure::TlsRejected
+                        | latch_relay::Failure::ProxyAuthenticationRequired
+                        | latch_relay::Failure::ProxyRefused { .. }
+                )
+            ) {
+                if let Some(message) = status.messages.first() {
+                    return Outcome::Failed("network".into(), message.clone());
+                }
+            }
             if inner.video_health.lock().last_encoded.is_some() {
                 return Outcome::Failed(
                     "decoding".into(),
@@ -4724,6 +4873,78 @@ mod tests {
     }
 
     #[test]
+    fn portal_with_flowing_media_keeps_normal_host_stall_deadline() {
+        let now = Instant::now();
+        let mut health = VideoHealth::default();
+        let mut status = crate::network::NetworkStatus {
+            needs_sign_in: true,
+            messages: vec!["This network needs a sign-in.".into()],
+            ..Default::default()
+        };
+        health.last_encoded = Some(now);
+        health.frame(now, false);
+        assert!(!health.stalled(now + MEDIA_STALL_TIMEOUT - Duration::from_millis(1)));
+        assert!(health.stalled(now + MEDIA_STALL_TIMEOUT));
+        status.media_arrived(health.last_encoded.is_some());
+        assert!(!status.needs_sign_in);
+        assert!(status.messages.is_empty());
+        assert!(health.stalled(now + MEDIA_STALL_TIMEOUT));
+    }
+
+    #[test]
+    fn control_loop_reports_stall_after_media_despite_a_portal_and_receives_host_notice() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let (events, received) = mpsc::channel();
+        let inner = Arc::new(Inner::new(
+            events,
+            Arc::new(FrameSlot::default()),
+            Box::new(|| {}),
+        ));
+        *inner.control_writer.lock() = Some(tcp.try_clone().unwrap());
+        inner.connected.store(true, Ordering::Release);
+        inner.relay.lock().state.lock().failure = Some(latch_relay::Failure::CaptivePortal);
+        let last_frame = Instant::now() - MEDIA_STALL_TIMEOUT;
+        inner.video_health.lock().last_encoded = Some(last_frame);
+        inner.video_health.lock().frame(last_frame, false);
+        let notice = crate::network::host_notice(
+            &crate::network::NetworkStatus {
+                needs_sign_in: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        control::write_message(&mut peer, &Message::Notice(notice.clone())).unwrap();
+        let accept: Accept = serde_json::from_value(serde_json::json!({
+            "session": 7, "token": "00000000000000000000000000000000",
+            "codec": "h264-baseline", "width": 64, "height": 64, "fps": 30,
+            "bitrate_kbps": 2000, "encoder": "test", "audio": null, "relay": false
+        }))
+        .unwrap();
+        let (done, timeout) = mpsc::channel();
+        let stop_inner = inner.clone();
+        let watchdog = std::thread::spawn(move || {
+            if timeout.recv_timeout(Duration::from_secs(1)).is_err() {
+                stop_inner.stop.store(true, Ordering::Release);
+            }
+        });
+        let outcome = control_loop(&inner, &mut tcp, &accept);
+        let _ = done.send(());
+        watchdog.join().unwrap();
+        let _ = tcp.shutdown(Shutdown::Both);
+        assert!(
+            matches!(outcome, Outcome::Ended(-1, ref message) if message.contains("Video stopped arriving"))
+        );
+        let events: Vec<_> = received.try_iter().collect();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, Event::Notice(message) if message == &notice.message)));
+        assert!(events.iter().all(|event| !matches!(event, Event::Network(status) if status.needs_sign_in || status.portal_url.is_some())));
+    }
+
+    #[test]
     fn media_deadline_tracks_pictures_even_while_complete_frames_arrive() {
         let start = Instant::now();
         let mut health = VideoHealth::default();
@@ -5510,6 +5731,64 @@ mod media_policy_tests {
             route.path_state().reason,
             PathReason::RelayUnavailable(RelayFailure::Stalled)
         );
+    }
+
+    #[test]
+    fn network_diagnoses_refine_path_reason_and_clear_after_network_change() {
+        let route = RelayRoute::new(7, latch_relay::Role::Viewer, None);
+        let since = route.path_state().since;
+        for (failure, reason) in [
+            (
+                latch_relay::Failure::CaptivePortal,
+                PathReason::CaptivePortal,
+            ),
+            (
+                latch_relay::Failure::TlsInterception {
+                    issuer: "Test CA".into(),
+                },
+                PathReason::TlsInterception,
+            ),
+            (
+                latch_relay::Failure::ProxyAuthenticationRequired,
+                PathReason::ProxyAuth,
+            ),
+        ] {
+            route.state.lock().failure = Some(failure);
+            assert_eq!(route.path_state().reason, reason);
+            assert_eq!(route.path_state().since, since);
+        }
+        route.retry_after_network_change();
+        assert_eq!(route.path_state().reason, PathReason::Initial);
+    }
+
+    #[test]
+    fn activation_preserves_carrier_and_proxy_and_reset_clears_connection_info() {
+        let route = RelayRoute::new(7, latch_relay::Role::Viewer, None);
+        for (relay_carrier, carrier) in [
+            (latch_relay::Carrier::Native, Carrier::Tls),
+            (latch_relay::Carrier::WebSocket, Carrier::WebSocket),
+        ] {
+            for via_proxy in [false, true] {
+                {
+                    let mut state = route.state.lock();
+                    state.connection_info = Some(latch_relay::ConnectionInfo {
+                        carrier: relay_carrier,
+                        via_proxy,
+                        reduced_mss: false,
+                        reduced_mss_reason: None,
+                        reduced_mss_value: None,
+                        earlier_failures: Vec::new(),
+                    });
+                    route.activate(&mut state);
+                }
+                assert_eq!(route.path_state().carrier, Some(carrier));
+                assert_eq!(route.path_state().via_proxy, via_proxy);
+                route.reset(&mut route.state.lock());
+                assert!(route.connection_info().is_none());
+                assert_eq!(route.path_state().carrier, None);
+                assert!(!route.path_state().via_proxy);
+            }
+        }
     }
 
     #[test]

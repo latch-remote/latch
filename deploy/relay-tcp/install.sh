@@ -21,7 +21,7 @@ openssl x509 -in "$cert" -pubkey -noout > "$tmp/cert-public.pem"
 openssl pkey -in "$key" -passin pass: -pubout > "$tmp/key-public.pem" 2>/dev/null || die 'key must be a valid unencrypted PEM'
 cmp -s "$tmp/cert-public.pem" "$tmp/key-public.pem" || die 'certificate and key do not match'
 "$binary" --help > "$tmp/help"
-grep -q -- '--monthly-bytes' "$tmp/help" || die 'binary lacks the relay CLI contract'
+grep -q -- '--http-listen' "$tmp/help" || die 'binary lacks the relay CLI contract'
 if getent passwd latch-relay >/dev/null; then
     [[ $(id -u latch-relay) != 0 && $(id -gn latch-relay) == latch-relay ]] || die 'existing service account has unexpected identity'
     shell=$(getent passwd latch-relay | cut -d: -f7)
@@ -33,6 +33,8 @@ fi
 [[ ! -L /var/lib/latch-relay && ! -L /etc/latch-relay ]] || die 'service directories must not be symlinks'
 install -d -o root -g latch-relay -m 0750 /etc/latch-relay
 install -d -o latch-relay -g latch-relay -m 0700 /var/lib/latch-relay
+[[ ! -L /var/www/latch-relay ]] || die 'ACME webroot must not be a symlink'
+install -d -o root -g latch-relay -m 0750 /var/www/latch-relay /var/www/latch-relay/.well-known /var/www/latch-relay/.well-known/acme-challenge
 if [[ $# == 5 ]]; then
     [[ ! -e /var/lib/latch-relay/quota && ! -L /var/lib/latch-relay/quota ]] || die 'quota already exists. Retain the ledger on upgrades'
 fi

@@ -89,8 +89,9 @@ macOS Keychain and Windows Credential Manager are outside this module.
   resolve that case. Shell and service environments can differ.
 
 `ProbeTarget::new` makes the HTTP destination, expected status and body
-explicit. No external HTTP probe is enabled by default. Windows uses its
-native connectivity profile and Linux uses NetworkManager's cached
+explicit. The product configures an anonymous probe on its relay host by default.
+Core callers with an empty `Options::probes` use native signals only. Windows
+uses its native connectivity profile and Linux uses NetworkManager's cached
 connectivity signal when available. macOS has no public, general-purpose
 portal-status API, so it needs a probe. Probes use direct cleartext HTTP
 with no credentials, cookies, redirects or device identifiers, and bounded
@@ -105,13 +106,13 @@ network or a failed endpoint can produce the same observation. An ordered
 fallback target can reduce that ambiguity. These checks cannot authenticate
 a cleartext response or prove every internet service is reachable.
 
-A project-controlled primary probe would require
-`http://relay.latch.rune.foo/netenv/probe` on port 80 to return HTTP 204,
-an empty body, `Content-Length: 0` and `Cache-Control: no-store`, without
-redirecting to HTTPS or requiring authentication. An HTTP front end can
-serve it. The existing native TLS relay on 443 does not serve this endpoint.
-The wiring layer chooses and supplies any fallback explicitly. Probe
-operators see public source IP and timing. DNS64 discovery queries only
+The product probes `http://CONFIGURED_RELAY_HOST/netenv/probe` on port 80,
+expecting HTTP 204, an empty body, `Content-Length: 0` and
+`Cache-Control: no-store`. The daemon's optional `--http-listen` serves it
+alongside an ACME webroot, without HTTPS redirection or authentication.
+Older relays lacking the listener degrade silently. No third-party fallback
+is configured. Probe operators see public source IP and timing, and the
+probe listener records no request addresses. DNS64 discovery queries only
 `ipv4only.arpa` through the system resolver, following RFC 7050 and RFC 6052.
 Either well-known IPv4 constant identifies an RFC 6052 prefix length.
 Answers matching multiple legal positions or repeating the same constant
@@ -1193,7 +1194,9 @@ from 1,200 kbps by `1000 / datagram_size` below 1,000 bytes, covering the
 additional packet overhead alongside the existing surround reservation.
 
 `Session::media_path()` returns `MediaPathState { path, reason, carrier,
-since }`. `MediaPath` identifies `TailscaleUdp(UdpPath)` or `LatchRelay`.
+via_proxy, since, activity, udp_probe_kbps }`. `MediaPath` identifies
+`TailscaleUdp(UdpPath)` or `LatchRelay`. The `via_proxy` flag preserves CONNECT
+use independently of the TLS or WebSocket carrier.
 `UdpPath` distinguishes Unknown, Direct, PeerRelay and Derp. Non-exhaustive
 `Carrier` values Native, Tls, WebSocket and HttpConnect expose stable
 `as_str()` identifiers. Non-exhaustive `PathReason` carries typed UDP causes,
@@ -1307,3 +1310,51 @@ cargo test -p latch-engine -j 4 --test relay_runtime -- --test-threads=1 --nocap
 cargo test -p latch-stream -p latch-proto -p latch-client -j 4 -- --test-threads=1
 cargo test -p latch-engine -j 4 --lib --test impaired --test recovery --test lifecycle --test ceiling -- --test-threads=1
 ```
+
+## Restrictive-network integration
+
+`latch_stream::session::relay_config` is the common configuration entry point
+for the engine, viewer and measurement examples. It attaches a nonblocking
+proxy-discovery callback to the relay configuration. App/service startup warms
+the discovery cache. The relay re-reads it for fresh connections, including
+recovery attempts. Netenv publishes partial observations so an environment
+proxy can be used while other checks continue. OS discovery has a six-second
+deadline. The eight-host cache samples local routes/environment settings at most
+four times a second. Discovery refreshes on network changes and relay connection
+failures. A relay failure requests a refresh within two seconds and retains the
+previous proxy when PAC/WPAD discovery is incomplete. Only confirmed portals
+double their retry backoff from 1 to 4 seconds. Returning to the app or opening
+sign-in requests an immediate portal recheck. Healthy
+sessions send no periodic HTTP probes. No session/UI
+thread waits for PAC/WPAD, DNS or an HTTP probe.
+
+`RelayRoute` retains typed terminal failures and the selected lane's
+`ConnectionInfo`. `Session::network_status` combines them with local netenv facts.
+`Event::Network` carries changing local facts and an empty message list clears
+an earlier diagnosis. The viewer and examples use these events. Host-local details
+stay in the host log. Fixed host-labelled portal, CONNECT-refusal and TLS-
+interception notices use the existing version-1 Notice and contain no URL or
+browser action. The viewer renders a
+small shared diagnosis surface and opens a `PortalUrl` only after a button click.
+The first-picture watchdog waits for at most three minutes from the first
+positive portal observation, resetting that timer after the portal clears. Delivered media clears the portal banner and retains the
+normal eight-second mid-stream watchdog. The first-picture watchdog restarts
+when the portal opens or a delayed proxy result becomes available. Relay
+attempts continue with fresh grants and normal backoff. A successful carrier clears the earlier
+relay error. Unavailable checks and an old relay's missing HTTP probe stay silent.
+
+MSS hints live in the cloned relay configuration. Transport stalls with packet-size
+evidence step down from 1200 to 512 bytes for 30 seconds. Two silent TLS
+handshake deadlines after TCP connects permit the same bounded probe within a
+connection attempt. Healthy paths retain their MSS. `ConnectionInfo` reports the
+applied value and reason. Each failed socket records its applied MSS so concurrent lanes step
+down from their own value. Refusals, resets and policy denials skip recovery.
+TCP_MAXSEG is applied before connect on Linux, shrinking the relay certificate
+flight. macOS accepts it only after connect, affecting outgoing data, and relies
+on the relay's Linux TCP MTU probing for the certificate flight. Windows skips
+client MSS recovery rungs and also relies on relay-side TCP MTU probing.
+
+The media-path indicator uses the selected relay carrier and CONNECT proxy
+status. Captive-portal, TLS-interception and proxy-authentication diagnoses also
+refine the local media-path reason. The network diagnosis surface owns these
+notifications and the sign-in action. These additions require no wire changes.

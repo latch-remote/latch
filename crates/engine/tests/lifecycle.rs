@@ -64,7 +64,7 @@ fn preparation_stays_reserved_until_run_or_drop_and_takeover_waits_for_slow_undo
                     })))
                 }
             })),
-            ..listeners::options::options()
+            ..listeners::options()
         },
     )
     .unwrap();

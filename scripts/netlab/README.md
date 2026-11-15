@@ -151,9 +151,11 @@ assertions.
 | g | Start with UDP denied, restore at 12 s, black-hole relay TCP at 14 s | Relay observed during 12–14 s, UDP observed during 14–20 s, continued session |
 | h | Silently drop UDP datagrams with UDP length >600 bytes | First frame ≤4 s, MTU-safe UDP recovered for final 6 s, common health criteria |
 | i | Explicit tinyproxy CONNECT proxy, direct viewer internet blocked | First frame ≤7 s, final 6 s on relay |
+| i2 | CONNECT proxy requires credentials absent from environment | Zero decoded frames, specific proxy-authentication message within 8 s |
 | j | Reset TLS ClientHello unless every ALPN is h2 or http/1.1 | First frame ≤7 s, final 6 s on relay |
 | k | Campus TLS interceptor with an untrusted private CA | Zero decoded frames, explicit certificate/trust error to viewer within 8 s |
 | l | DNAT all viewer TCP 80/443 to a 302 sign-in redirect, local catch-all DNS | Zero decoded frames, explicit captive-portal/sign-in error to viewer within 8 s |
+| l2 | Captive portal opens at 10 s | Sign-in notice within 8 s, first frame in 10–14 s, same session, final 6 s on relay |
 | m | Both endpoints IPv6-only for internet, DNS64 and well-known NAT64 /96 | First frame ≤7 s, final 6 s on relay, media counters at both endpoints |
 | m2 | Both endpoints through global-looking network-specific NAT64 /96 | Same criteria as m |
 | n | Relay TCP silently drops IPv4 packets >600 bytes in either direction, TCP MTU probing disabled | First frame ≤4 s, final 6 s on relay, common health criteria |
@@ -193,7 +195,9 @@ connection logs and counted MSS-black-hole drops respectively. These guards
 are required for both PASS and EXPECTED-FAILURE. Preflight bytes and log
 entries are excluded. Scenario i additionally requires a successful product
 CONNECT request. Native direct TLS attempts are redirected to the same
-HTTP-only proxy for a logged rejection while CONNECT wiring is pending.
+HTTP-only proxy for a logged rejection. Discovered proxy-only settings select
+CONNECT first. Scenario i2 supplies no credentials while its independent preflight
+uses disposable lab credentials to prove the proxy's tunnel is usable.
 
 The security scenarios require connection within 3 s and a complete
 sampler trace. Their rejection may terminate the session. They must expose
@@ -204,10 +208,9 @@ Scenario h deliberately checks recovery to usable UDP with smaller
 datagrams. Existing native relay recovery alone cannot satisfy that MTU
 probing requirement. Scenario n covers a TCP PMTU black hole after SYN/MSS
 negotiation. Kernel TCP MTU probing is disabled in each namespace to make
-the product's behavior reproducible. PR #95 currently retries with a
-1,200-byte MSS. Scenario n requires a smaller retry, such as 512 bytes,
-to fit its 600-byte IP-packet budget. The expected-failure reference covers
-that carrier change and the session wiring that applies the retry hint.
+the product's behavior reproducible. The relay retries two stalled TLS carriers using fresh connections with
+1200-byte then 512-byte MSS. The 512-byte retry fits this path's 600-byte
+IP-packet budget. The connection diagnostics retain the applied MSS and cause.
 
 ## Results and expected failures
 
@@ -232,7 +235,11 @@ for expected-failure cases. Test probes are excluded from relay SYN counts.
 fix reference. The comparison requires the recorded failure signature and the recorded
 error pattern where supplied.
 
-d1 and d2 require the recorded requested-video-bitrate failure. Their
+The joined media-policy and restrictive-network implementation requires all
+18 scenarios to pass. `expected-failures.json` is empty. CI's Linux `netlab`
+job verifies the joined behavior, including portal waiting and recovery in l/l2.
+
+Previously, d1 and d2 required the recorded requested-video-bitrate failure. Their
 `related_failures` list names accompanying quality failures observed across
 stochastic runs. FPS, audio and stall counts vary, and d2 can also remain on
 UDP with delayed input. Every numeric assertion still runs and is
@@ -275,28 +282,22 @@ replaces only its TLS roots using `ClientConfig::with_tls_roots`. The
 production public-address policy and transport settings survive this step.
 Hostname verification remains enabled.
 
-### Proxy wiring contract for i
+### Shared proxy configuration for i and i2
 
-The wiring PR must make `latch_stream::session::relay_config(&RelaySettings)`
-discover the environment for `settings.host` using PR #96's
-`latch_core::netenv::Options::new` and bounded discovery. It must map the
-selected HTTP proxy candidate, including credentials when present, to
-PR #95's `ProxyConfig` and set `ClientConfig::proxy` before returning.
-Both the product session and these measurement examples must use this same
-entry point. If discovery moves to an asynchronous worker, the wiring PR
-must provide an equivalent shared configuration entry point and update both
-callers together. The lab supplies `HTTPS_PROXY=http://10.77.2.1:3128` and
-`NO_PROXY=100.64.0.1` to the viewer. The relay must use CONNECT while the
-control connection retains its direct tailnet route.
+`latch_stream::session::relay_config(&RelaySettings)` attaches cached, asynchronous
+`latch_core::netenv` discovery for the configured relay host. Product sessions and
+measurement examples share this entry point. A discovered proxy is mapped to
+`ProxyConfig`, with supplied credentials only, then re-evaluated on fresh relay
+connections. The lab supplies `HTTPS_PROXY=http://10.77.2.1:3128` and
+`NO_PROXY=100.64.0.1` to the viewer. The control connection keeps its direct
+tailnet route. The private-root helper preserves both discovery and the TLS
+verifier. The lab daemon serves `/netenv/probe` on its isolated port 80.
 
-The example preserves the configured proxy when applying private roots.
-PR #95 adds a separate `ClientConfig::verifier` for certificate diagnostics.
-Its integration must update `with_tls_roots` to replace that verifier from
-the same private roots alongside `tls`. Both TLS verification paths must
-use the supplied lab CA while retaining production address filtering.
-Scenario i keeps its CONNECT and media assertions until #95, #96 and the
-wiring PR land. Its post-preflight proxy-access guard also proves native
-attempts reach the HTTP proxy on the current product.
+Scenario l2 removes portal redirection at 10 seconds, after the ordinary
+first-picture timeout. It retains denied UDP, proving that a fresh relay grant
+starts media through the original session without restarting the viewer.
+The original scenarios' assertions remain. The media-policy implementation
+addresses d1/d2/h, so those expected-failure entries have been removed.
 
 `view --events PATH` uses the existing session, frame slot, media path
 query, audio probe and synthetic input APIs. It samples every 250 ms,

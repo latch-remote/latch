@@ -71,10 +71,14 @@ impl Path {
 
     pub fn media_label(&self, state: &latch_stream::path::MediaPathState) -> String {
         match state.path {
-            latch_stream::path::MediaPath::LatchRelay => match &state.carrier {
-                Some(carrier) => format!("Latch relay · {carrier}"),
-                None => "Latch relay".into(),
-            },
+            latch_stream::path::MediaPath::LatchRelay => {
+                let carrier = state
+                    .carrier
+                    .map(|carrier| format!(" · {carrier}"))
+                    .unwrap_or_default();
+                let proxy = if state.via_proxy { " via proxy" } else { "" };
+                format!("Latch relay{carrier}{proxy}")
+            }
             latch_stream::path::MediaPath::TailscaleUdp(_) => {
                 format!("Tailscale UDP · {}", self.label())
             }
@@ -502,6 +506,22 @@ mod tests {
 mod media_path_tests {
     use super::*;
     use latch_stream::path::{MediaPath, MediaPathState, PathReason};
+
+    #[test]
+    fn relay_labels_distinguish_websocket_and_connect_proxy() {
+        let path = Path::default();
+        let mut state = MediaPathState::default();
+        state.path = MediaPath::LatchRelay;
+        state.carrier = Some(latch_stream::path::Carrier::WebSocket);
+        assert_eq!(path.media_label(&state), "Latch relay · WebSocket");
+        state.via_proxy = true;
+        assert_eq!(
+            path.media_label(&state),
+            "Latch relay · WebSocket via proxy"
+        );
+        state.carrier = Some(latch_stream::path::Carrier::Tls);
+        assert_eq!(path.media_label(&state), "Latch relay · TLS via proxy");
+    }
 
     #[test]
     fn media_transport_labels_preserve_tailscale_wording_and_name_the_latch_relay() {

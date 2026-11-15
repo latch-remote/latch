@@ -21,7 +21,8 @@ def main():
         raw = socket.create_connection(("10.77.2.1", 3128) if proxy else (host, 443), timeout=2)
         with raw:
             if proxy:
-                raw.sendall(b"CONNECT relay.netlab.test:443 HTTP/1.1\r\nHost: relay.netlab.test:443\r\n\r\n")
+                auth = b"Proxy-Authorization: Basic bGFiOnRlc3Q=\r\n" if scenario == "i2" else b""
+                raw.sendall(b"CONNECT relay.netlab.test:443 HTTP/1.1\r\nHost: relay.netlab.test:443\r\n" + auth + b"\r\n")
                 response = b""
                 while b"\r\n\r\n" not in response:
                     chunk = raw.recv(1)
@@ -37,7 +38,7 @@ def main():
                 observations.append({"tls": secure.version(), "alpn": secure.selected_alpn_protocol(), "peer": secure.getpeername()})
 
     # Services have bounded startup time. A failure still fails setup, never becomes an xfail.
-    if scenario == "i":
+    if scenario in ("i", "i2"):
         deadline = time.monotonic() + 5
         while True:
             try:
@@ -47,7 +48,7 @@ def main():
                 if time.monotonic() > deadline:
                     raise
                 time.sleep(0.05)
-    blocked = scenario in ("f", "i", "j", "k", "l", "n")
+    blocked = scenario in ("f", "i", "i2", "j", "k", "l", "l2", "n")
     try:
         tls()
         assert not blocked, "middlebox unexpectedly allowed native TLS"
@@ -58,7 +59,7 @@ def main():
         assert blocked, error
         assert scenario != "k", "interceptor must reach certificate verification"
         observations.append({"native_tls_blocked": str(error)})
-    if scenario == "l":
+    if scenario in ("l", "l2"):
         connection = http.client.HTTPConnection(host, 80, timeout=2)
         connection.request("GET", "/generate_204")
         response = connection.getresponse()

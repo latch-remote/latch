@@ -116,8 +116,14 @@ impl Drop for ClipboardStream {
 
 impl Service {
     pub fn new() -> Self {
+        #[cfg(test)]
+        std::env::set_var("LATCH_NETENV_PROBE", "0");
+        let cfg = HostConfig::load();
+        if cfg.relay.enabled {
+            latch_stream::network::diagnosis(&cfg.relay.host);
+        }
         Self {
-            cfg: Mutex::new(HostConfig::load()),
+            cfg: Mutex::new(cfg),
             local_secret: crate::local_control::token().ok(),
             clipboard_lease: Arc::new(Mutex::new(None)),
             name: Mutex::new(latch_core::config::machine_name()),

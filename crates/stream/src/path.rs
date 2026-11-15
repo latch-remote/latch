@@ -163,6 +163,8 @@ pub struct MediaPathState {
     pub path: MediaPath,
     pub reason: PathReason,
     pub carrier: Option<Carrier>,
+    /// The relay carrier is tunneled through an HTTP CONNECT proxy.
+    pub via_proxy: bool,
     pub since: Instant,
     pub activity: Option<PathActivity>,
     /// Announced peak wire rate of the current UDP return probe.
@@ -248,6 +250,7 @@ impl Default for MediaPathState {
             path: MediaPath::TailscaleUdp(UdpPath::Unknown),
             reason: PathReason::Initial,
             carrier: None,
+            via_proxy: false,
             since: Instant::now(),
             activity: None,
             udp_probe_kbps: None,

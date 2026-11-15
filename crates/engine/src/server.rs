@@ -91,6 +91,8 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
+        #[cfg(test)]
+        std::env::set_var("LATCH_NETENV_PROBE", "0");
         Self {
             relay: latch_stream::session::relay_config(&control::RelaySettings::default()),
             prepare: None,
@@ -831,6 +833,7 @@ impl Server {
         let mut relay_messages = VecDeque::new();
         let mut mtu = latch_stream::path::MtuProbe::new(Instant::now());
         let mut mtu_settle_until = Instant::now();
+        let mut network_status = latch_stream::network::NetworkStatus::default();
         let reason = loop {
             let ended = session.ended.lock().clone();
             if let Some(e) = ended {
@@ -885,6 +888,18 @@ impl Server {
                 .update_relay(|relay| relay.maintain(false, |message| session.send_tcp(message)))
             {
                 break "the viewer's connection broke".to_string();
+            }
+            let status = session.relay.network_status();
+            if status != network_status {
+                for message in &status.messages {
+                    self.log(message.clone());
+                }
+                if let Some(notice) =
+                    latch_stream::network::host_notice(&status, session.relay.failure().as_ref())
+                {
+                    let _ = session.send_tcp(&Message::Notice(notice));
+                }
+                network_status = status;
             }
             if route_revision != session.relay.revision() {
                 route_revision = session.relay.revision();

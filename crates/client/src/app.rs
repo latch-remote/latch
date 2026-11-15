@@ -241,7 +241,12 @@ impl ClientApp {
         progress: Arc<Mutex<Progress>>,
         cfg: ClientConfig,
     ) -> Self {
+        #[cfg(test)]
+        std::env::set_var("LATCH_NETENV_PROBE", "0");
         ui::apply(&cc.egui_ctx);
+        if cfg.stream.relay.enabled {
+            latch_stream::network::diagnosis(&cfg.stream.relay.host);
+        }
         if let Some(rs) = &cc.wgpu_render_state {
             crate::video::install(&cc.egui_ctx, rs);
         }
@@ -320,6 +325,8 @@ impl ClientApp {
         progress: Progress,
         cfg: ClientConfig,
     ) -> Self {
+        #[cfg(test)]
+        std::env::set_var("LATCH_NETENV_PROBE", "0");
         Self::with_shared(
             cc,
             Arc::new(Mutex::new(discovery)),
@@ -775,13 +782,26 @@ impl ClientApp {
                         };
                     }
                     Event::PathChanged(state) => {
-                        let route = live.path.media_label(&state);
-                        self.view.toast(
-                            Tone::Info,
-                            format!("{route}. {}", state.reason.description()),
-                        );
+                        // The persistent diagnosis surface already presents
+                        // network restrictions and the selected fallback carrier.
+                        if !matches!(
+                            state.reason,
+                            latch_stream::path::PathReason::CaptivePortal
+                                | latch_stream::path::PathReason::TlsInterception
+                                | latch_stream::path::PathReason::ProxyAuth
+                        ) && live.session.network_status().messages.is_empty()
+                        {
+                            let route = live.path.media_label(&state);
+                            self.view.toast(
+                                Tone::Info,
+                                format!("{route}. {}", state.reason.description()),
+                            );
+                        }
                     }
                     Event::Notice(text) => self.view.toast(Tone::Warning, text),
+                    // The persistent network surface reads current facts and clears
+                    // immediately on recovery, including after a backgrounded window.
+                    Event::Network(_) => {}
                     Event::Poor(p) => self.view.set_poor(p),
                     Event::NoAudio(e) => self
                         .view
@@ -1073,6 +1093,14 @@ fn spawn_tailscale_probe(ok: Arc<AtomicBool>, ctx: egui::Context, stop: Arc<Atom
 
 impl eframe::App for ClientApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::WindowFocused(true)))
+        }) {
+            latch_stream::network::recheck_portals();
+        }
         crate::video::begin_frame(_frame);
         // A test host stands in for a PC: connect to it once, at start.
         static TEST_SERVE: std::sync::Once = std::sync::Once::new();
@@ -1390,6 +1418,10 @@ impl ClientApp {
             ui::small_print(ui, summary);
         });
         self.tailscale_banner(ui, disc);
+        if self.cfg.stream.relay.enabled {
+            let diagnosis = latch_stream::network::diagnosis(&self.cfg.stream.relay.host);
+            crate::network::show(ui, &latch_stream::network::status(&diagnosis, None, None));
+        }
         if let Some((tone, text, _)) = self.notice.clone() {
             ui::notice(ui, tone, &text);
         }

@@ -281,7 +281,7 @@ pub mod end {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Notice {
-    /// "audio" or "video".
+    /// "audio", "video", "input" or "network". Unknown kinds are plain-text notices.
     pub kind: String,
     /// Empty clears an earlier notice of this kind.
     pub message: String,

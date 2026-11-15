@@ -632,6 +632,17 @@ impl View {
             &mut actions,
         );
 
+        let network = live.session.network_status();
+        if !waiting && !network.messages.is_empty() {
+            egui::Area::new(Id::new("stream-network-diagnosis"))
+                .order(egui::Order::Foreground)
+                .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -space::LG))
+                .show(ctx, |ui| {
+                    ui.set_width(overlay_width(440.0, screen.width()));
+                    crate::network::show(ui, &network);
+                });
+        }
+
         // Panels keep clear of the toolbar while it shows.
         let below_bar = bar_rect
             .map(|b| Rect::from_min_max(Pos2::new(screen.left(), b.bottom()), screen.max))
@@ -692,6 +703,7 @@ impl View {
                             .font(theme::mono(theme::text::MONO - 0.5))
                             .color(P.text_tertiary),
                     );
+                    crate::network::show(ui, &live.session.network_status());
                     if elapsed >= Duration::from_secs(10) {
                         ui.add_space(space::SM);
                         ui.label(

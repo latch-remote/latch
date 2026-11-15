@@ -266,7 +266,8 @@ the requested rate for five seconds can also trigger recovery, even when
 error correction repairs the lost packets. Quiet desktops do not trigger
 this bandwidth check. This can help when UDP media
 is unusable and the authorized Tailscale control connection still works.
-The toolbar shows **Latch TLS relay** when that route is active.
+The toolbar shows **Latch relay · TLS** or **Latch relay · WebSocket** when that route is active,
+with **via proxy** when a CONNECT tunnel carries it.
 
 Open **Settings → Stream relay** to change **Recover automatically through
 the Latch relay** or **Relay hostname** and its port. The default is
@@ -479,3 +480,65 @@ IME acceptance has yet to be verified on hardware. Microsoft's definitions
 identify Hangul and Hanja as IME keys and document the injection flag behavior.
 [Virtual-key codes](https://learn.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes),
 [KEYBDINPUT](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-keybdinput).
+
+## Restrictive networks
+
+Latch discovers this network's OS, PAC/WPAD and environment proxy settings in
+background. A cached result is used immediately. Slow discovery continues while
+the connection tries direct access. Changing networks or signing in to a portal
+invalidates the cached result. Relay connection failures refresh discovery within
+two seconds. A failed PAC/WPAD lookup retains a previously working proxy until
+successful discovery replaces it.
+A confirmed portal retries after 1 second with exponential backoff up to 4
+seconds. Opening sign-in or returning to Latch rechecks promptly. Healthy
+sessions send no periodic HTTP probes. An in-flight check can
+take up to six seconds.
+
+- **This network needs a sign-in** appears when a portal redirects the anonymous
+  connectivity check. Choose **Open network sign-in**, complete the browser's
+  sign-in, and leave Latch open. The pending stream resumes automatically.
+  Portal waiting ends three minutes after detection with a reachability message
+  that also covers a completed sign-in. Media
+  arriving clears the banner and keeps the normal eight-second stall watchdog.
+- **This network inspects encrypted traffic** means the relay presented an
+  untrusted certificate. Latch refuses the substituted certificate and shows its
+  issuer when available. Ask the network administrator to permit the relay's
+  genuine TLS connection, or use another network.
+- **Proxy required** means Latch is using this network's HTTP CONNECT proxy.
+  **Proxy authentication required** means its supplied credentials are absent
+  or were rejected. Sign in through your OS's proxy configuration or contact the
+  network administrator. Latch never prompts for or guesses proxy credentials.
+- **Latch could not verify the relay's encrypted connection** means TLS
+  certificate verification failed. Check the machine's clock and the network's
+  certificate policy, then ask the administrator to allow the genuine relay
+  certificate or use another network.
+- **Automatic proxy settings could not be resolved** means OS PAC/WPAD settings
+  could not produce a usable proxy. Check the OS proxy configuration and ask the
+  network administrator for working automatic settings or a CONNECT proxy.
+- **Proxy refused the CONNECT tunnel** means the proxy explicitly denied access.
+  Ask the network administrator to allow CONNECT to the configured relay host
+  on port 443.
+- **Using the WebSocket carrier** means native relay TLS was blocked. The path
+  indicator says **Latch relay · WebSocket**, with **via proxy** when applicable.
+- **Tailscale is blocked** or **Tailscale is using DERP only** describes the
+  network evidence reported by Tailscale. Check that Tailscale is signed in and
+  allowed by this network. DERP adds latency.
+
+A notice starting **The host's network** describes a problem on the sharing
+machine. Complete sign-in or check the proxy/certificate policy on that machine.
+These notices have fixed text and carry no sign-in URL or button.
+
+Healthy networks show no network warning. The relay can retry a stalled TCP
+path with 1200-byte and then 512-byte MSS on Linux, applied before connect to
+shrink the relay certificate flight. On macOS TCP_MAXSEG is accepted only after
+connect, so client hints affect outgoing data but cannot shrink that flight.
+macOS and Windows rely on the relay's Linux TCP MTU probing for its sending
+path. Windows skips client MSS recovery rungs. The hint expires after 30 seconds.
+
+The portal check sends an anonymous plain-HTTP `GET /netenv/probe` to the
+configured relay hostname on port 80. It includes Host, Connection and cache
+control headers. It sends no cookies, authorization, grant material, device or
+account identifier, or User-Agent, and follows no redirects. The relay sees the
+source address as with any connection and does not log probe addresses. A missing
+endpoint on an older relay degrades silently. Set `LATCH_NETENV_PROBE=0` to
+suppress active HTTP checks and use OS portal signals only.
