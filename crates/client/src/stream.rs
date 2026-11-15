@@ -1908,6 +1908,14 @@ impl View {
                                 } else {
                                     live.requested.0
                                 };
+                                let pos = cursor_state.position.map_or(pos, |[x, y]| {
+                                    let vh = stats.height.max(1);
+                                    video.min
+                                        + Vec2::new(
+                                            x as f32 * video.width() / vw.max(1) as f32,
+                                            y as f32 * video.height() / vh as f32,
+                                        )
+                                });
                                 let cursor_rect = host_cursor_rect(
                                     pos,
                                     video,

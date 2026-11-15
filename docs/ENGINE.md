@@ -62,8 +62,32 @@ KeyframeRequest (fallback, older hosts) ────▶ next frame is IDR
 | Host | Capture | Encode |
 | --- | --- | --- |
 | macOS | ScreenCaptureKit, NV12 IOSurface at the stream size and up to the display's refresh, cursor included | VideoToolbox (HEVC, H.264 High, or Constrained Baseline; negotiated HEVC Main10 from P010), real time, no frame reordering, two frames in flight ([MACOS.md](MACOS.md#sharing-this-mac-the-video-pipeline)) |
-| Windows | DXGI Output5 Desktop Duplication (BGRA or scRGB FP16); GPU cursor/colour pass and D3D11 video processor to NV12/P010 | AMF HEVC on AMD, or the GPU's Media Foundation HEVC/AV1/H.264 encoder (Microsoft's CPU encoder for H.264 if needed) ([WINDOWS.md](WINDOWS.md#the-video-pipeline)); `latch-codec` if neither works |
+| Windows | DXGI Output5 Desktop Duplication (BGRA or scRGB FP16); separate DXGI cursor plane or GPU cursor/colour pass, and D3D11 video processor to NV12/P010 | AMF HEVC on AMD, or the GPU's Media Foundation HEVC/AV1/H.264 encoder (Microsoft's CPU encoder for H.264 if needed) ([WINDOWS.md](WINDOWS.md#the-video-pipeline)); `latch-codec` if neither works |
 | Linux (X11) | MIT-SHM `GetImage` through `x11rb` of only the rectangles X Damage reports, cursor from XFixes | NVENC or VA-API from NV12 the CPU converts, when a probe at start finds one ([below](#linux-hardware-encoding)); else `latch-codec`, threads by slice |
+
+Windows negotiates separate cursor drawing through `cursor` and `DrawCursor`.
+DXGI colour shapes retain straight sRGB alpha. Monochrome AND/XOR and masked
+colour shapes use transparent/copy pixels directly, with white inverted regions
+and a one-pixel dark outline. Arbitrary colour XOR remains in the GPU compositor.
+Malformed shapes, unknown visibility and desktop-embedded pointers also keep
+composition enabled. If DXGI shape retrieval fails, GetIconInfo/GetDIBits recover
+a system cursor for composition, with the shared system arrow as the final
+readable-shape fallback. Hidden/suppressed and off-output cursors stay hidden.
+
+Shapes already contain the host's physical DPI sizing. The Linux scaler scales
+Windows shapes and hotspots to the stream content, including the 96×96 wire
+bound. Positions are hotspot coordinates relative to the output, fitted into the
+stream including letterboxing. Pointer-only DXGI acquisitions publish through
+a coalescing mailbox and a separate control sender before conversion/encoding.
+They leave the retained video picture alone while the separate plane is active.
+Shape data is sent only when the converted/scaled shape changes.
+
+Separate cursor bytes remain sRGB on SDR and HDR desktops/sessions. The viewer
+renders them with its SDR UI white, including over native HDR presentation. The
+host's SDR white level is used by the existing scRGB tone mapping and composited
+HDR cursor pass, without applying that luminance multiplier to the RGBA bytes.
+Live HDR cursor appearance and mixed-DPI multi-output transitions still need
+interactive hardware qualification.
 
 | Viewer | Decode |
 | --- | --- |

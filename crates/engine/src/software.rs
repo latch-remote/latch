@@ -811,7 +811,7 @@ impl<C: CpuCapture> VideoPipeline for SoftwarePipeline<C> {
 /// The separate plane's shape and hotspot are in output pixels. Position is
 /// the viewer's local pointer, whose events map through DisplayRect::map;
 /// no absolute X11 cursor position is sent by this protocol.
-fn scale_cursor(
+pub(crate) fn scale_cursor(
     shape: &mut latch_proto::control::CursorShape,
     source: (u32, u32),
     content: (u32, u32),

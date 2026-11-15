@@ -27,6 +27,7 @@ fn request(name: &str) -> StreamRequest {
         audio: false,
         name: name.into(),
         cursor: false,
+        cursor_position: false,
         gamepads: false,
         reference_invalidation: false,
         audio_channels: 0,

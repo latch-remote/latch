@@ -22,6 +22,8 @@ pub mod server;
 pub mod software;
 pub mod testmode;
 pub mod video;
+#[cfg(any(windows, test))]
+mod windows_cursor;
 
 #[cfg(target_os = "linux")]
 pub mod linux;

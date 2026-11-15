@@ -3,6 +3,7 @@
 mod amf;
 mod audio;
 mod capture;
+mod cursor;
 mod display;
 mod elevated;
 mod encode;
@@ -24,7 +25,7 @@ use encode::Encoder as MfEncoder;
 use runtime::Runtime;
 use std::{
     collections::VecDeque,
-    sync::mpsc,
+    sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
 };
@@ -313,8 +314,13 @@ enum Pipeline {
     Failed(VideoInfo),
 }
 impl Pipeline {
-    fn new(config: &VideoConfig, mf: bool) -> Result<Self> {
-        let capture = Capture::new_color(config.color)?;
+    fn new(
+        config: &VideoConfig,
+        mf: bool,
+        cursor: Arc<crate::windows_cursor::Control>,
+    ) -> Result<Self> {
+        let mut capture = Capture::new_color(config.color)?;
+        capture.cursor_control(cursor, (config.width, config.height));
         let mut config = config.clone();
         if config.color.is_hdr() && !capture.hdr_output {
             config.color = latch_proto::color::ColorDescription {
@@ -495,6 +501,7 @@ enum Request {
     Shutdown,
 }
 struct VideoProxy {
+    cursor: Arc<crate::windows_cursor::Control>,
     requests: mpsc::Sender<Request>,
     info: VideoInfo,
     /// Whether the pipeline makes recovery frames, as of the last answer.
@@ -510,6 +517,15 @@ impl Drop for VideoProxy {
     }
 }
 impl VideoPipeline for VideoProxy {
+    fn set_cursor_drawn(&mut self, drawn: bool) -> bool {
+        self.cursor
+            .drawn
+            .store(drawn, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+    fn set_cursor_sink(&mut self, sink: crate::video::CursorSink) {
+        *self.cursor.sink.lock() = Some(sink);
+    }
     fn info(&self) -> VideoInfo {
         self.info.clone()
     }
@@ -567,6 +583,8 @@ pub fn open_video(config: &VideoConfig) -> Result<Box<dyn VideoPipeline>> {
     {
         bail!("Windows codec is unavailable");
     }
+    let cursor = crate::windows_cursor::Control::composited();
+    let worker_cursor = cursor.clone();
     let config = config.clone();
     let (requests, receive) = mpsc::channel();
     let (ready, startup) = mpsc::sync_channel(1);
@@ -579,15 +597,16 @@ pub fn open_video(config: &VideoConfig) -> Result<Box<dyn VideoPipeline>> {
                 let mf = Runtime::new(true)
                     .map_err(|e| tracing::warn!("Media Foundation startup: {e:#}"))
                     .ok();
-                let pipeline = Pipeline::new(&config, mf.is_some()).or_else(|e| {
-                    if config.color.bit_depth != 10 {
-                        return Err(e);
-                    }
-                    tracing::warn!("Main10 unavailable; negotiating SDR8: {e:#}");
-                    let mut fallback = config.clone();
-                    fallback.color = Default::default();
-                    Pipeline::new(&fallback, mf.is_some())
-                })?;
+                let pipeline = Pipeline::new(&config, mf.is_some(), worker_cursor.clone())
+                    .or_else(|e| {
+                        if config.color.bit_depth != 10 {
+                            return Err(e);
+                        }
+                        tracing::warn!("Main10 unavailable; negotiating SDR8: {e:#}");
+                        let mut fallback = config.clone();
+                        fallback.color = Default::default();
+                        Pipeline::new(&fallback, mf.is_some(), worker_cursor.clone())
+                    })?;
                 Ok::<_, anyhow::Error>((runtime, mf, pipeline))
             })();
             let (_runtime, _mf, mut pipeline) = match initialized {
@@ -637,6 +656,7 @@ pub fn open_video(config: &VideoConfig) -> Result<Box<dyn VideoPipeline>> {
         }
     };
     Ok(Box::new(VideoProxy {
+        cursor,
         requests,
         info,
         recovers,
@@ -746,7 +766,8 @@ mod tests {
             bitrate_kbps: 50_000,
             codec: Codec::Hevc,
         };
-        let mut pipeline = Pipeline::new(&config, true)?;
+        let mut pipeline =
+            Pipeline::new(&config, true, crate::windows_cursor::Control::composited())?;
         for i in 0..96 {
             let force = i % 7 == 0;
             let frame = pipeline.next(force, Duration::ZERO)?;
@@ -765,6 +786,7 @@ mod tests {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         drop(VideoProxy {
+            cursor: crate::windows_cursor::Control::composited(),
             requests,
             info: VideoInfo {
                 color: Default::default(),

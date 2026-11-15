@@ -79,6 +79,7 @@ fn session(addr: SocketAddr) -> Arc<Session> {
         surround_kbps: 0,
         mic: Mutex::new(None),
         cursor_supported: false,
+        cursor_position: false,
         probe_trains: false,
         draw_cursor: AtomicBool::new(true),
         control_writer: Mutex::new(None),
@@ -896,6 +897,7 @@ fn reopen_refuses_an_old_picture_held_in_the_send_queue() {
         config(),
         |_| Ok(Box::new(open(true))),
         tx,
+        Arc::new(|_| {}),
     );
     let old = rx.recv().unwrap();
     let new = rx.recv().unwrap();
@@ -1257,4 +1259,137 @@ fn fallback_refits_geometry_and_prepares_the_final_mode() {
     let last = calls.last().unwrap();
     assert_eq!((last.width, last.height, last.fps), expected);
     assert_eq!(prepared_sizes.lock().last(), Some(&expected));
+}
+
+#[test]
+fn cursor_mailbox_retains_shape_when_moves_are_coalesced() {
+    let mailbox = CursorMailbox::default();
+    let shape = control::CursorShape::new(1, 1, 1, 0, 0, &[255; 4]);
+    mailbox.publish(control::Cursor {
+        visible: true,
+        position: Some([1, 2]),
+        shape: Some(shape.clone()),
+    });
+    for x in 2..100 {
+        mailbox.publish(control::Cursor {
+            visible: true,
+            position: Some([x, 2]),
+            shape: None,
+        });
+    }
+    let latest = mailbox.pending.lock().take().unwrap();
+    assert_eq!(latest.position, Some([99, 2]));
+    assert_eq!(latest.shape, Some(shape));
+    mailbox.publish(control::Cursor {
+        visible: false,
+        position: Some([99, 2]),
+        shape: None,
+    });
+    assert!(mailbox.pending.lock().as_ref().unwrap().shape.is_none());
+}
+
+#[test]
+fn synthetic_dxgi_session_delivers_cursor_while_video_waits() {
+    use crate::windows_cursor::{Control, Plane, ShapeInfo};
+    struct PointerVideo {
+        plane: Plane,
+        commands: mpsc::Receiver<u8>,
+    }
+    impl VideoPipeline for PointerVideo {
+        fn info(&self) -> VideoInfo {
+            info()
+        }
+        fn set_cursor_sink(&mut self, sink: video::CursorSink) {
+            *self.plane.control.sink.lock() = Some(sink);
+        }
+        fn set_cursor_drawn(&mut self, drawn: bool) -> bool {
+            self.plane.control.drawn.store(drawn, Ordering::Relaxed);
+            true
+        }
+        fn next(&mut self, _: bool, _: Duration) -> anyhow::Result<EncodedVideo> {
+            let metadata = ShapeInfo {
+                kind: 1,
+                width: 32,
+                height: 64,
+                pitch: 4,
+                hot_x: 2,
+                hot_y: 4,
+            };
+            let mut bytes = vec![255; 256];
+            bytes[128..].fill(0);
+            bytes[128] = 192; // A 2×2 inverting region survives half-size scaling.
+            bytes[132] = 192;
+            self.plane.shape(metadata, &bytes, (64, 64), (32, 32));
+            while let Ok(command) = self.commands.recv() {
+                match command {
+                    0 => self
+                        .plane
+                        .publish(true, [10, 20], self.plane.separate(true, false)),
+                    1 => self
+                        .plane
+                        .publish(true, [11, 21], self.plane.separate(true, false)),
+                    2 => self
+                        .plane
+                        .publish(false, [11, 21], self.plane.separate(true, false)),
+                    3 => self.plane.invalidate(),
+                    _ => break,
+                }
+            }
+            anyhow::bail!("synthetic video stopped before producing a frame")
+        }
+    }
+    for positions in [false, true] {
+        let server = Server::bind(
+            0,
+            Options {
+                relay: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut session = session("127.0.0.1:9".parse().unwrap());
+        let state = Arc::get_mut(&mut session).unwrap();
+        state.cursor_supported = true;
+        state.cursor_position = positions;
+        state.draw_cursor.store(false, Ordering::Relaxed);
+        let (host, mut viewer) = sockets();
+        *session.control_writer.lock() = Some(host);
+        let (commands, receive) = mpsc::channel();
+        let pipeline = PointerVideo {
+            plane: Plane::new(Control::composited()),
+            commands: receive,
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                send_video(&server, &session, Box::new(pipeline), config(), |_| {
+                    anyhow::bail!("unused reopen")
+                })
+            });
+            let read_cursor = |viewer: &mut TcpStream| match control::read_message(viewer).unwrap()
+            {
+                Message::Cursor(cursor) => cursor,
+                other => panic!("expected cursor, received {other:?}"),
+            };
+            commands.send(0).unwrap();
+            let first = read_cursor(&mut viewer);
+            assert!(first.visible);
+            assert_eq!(first.position, positions.then_some([10, 20]));
+            let shape = first.shape.unwrap();
+            assert_eq!(
+                (shape.width, shape.height, shape.hot_x, shape.hot_y),
+                (17, 17, 1, 2)
+            );
+            commands.send(1).unwrap();
+            let moved = read_cursor(&mut viewer);
+            assert_eq!(moved.position, positions.then_some([11, 21]));
+            assert!(moved.shape.is_none());
+            commands.send(2).unwrap();
+            assert!(!read_cursor(&mut viewer).visible);
+            commands.send(3).unwrap();
+            assert!(!read_cursor(&mut viewer).visible);
+            assert_eq!(session.frames.load(Ordering::Relaxed), 0);
+            session.stop.store(true, Ordering::Release);
+            commands.send(4).unwrap();
+        });
+    }
 }

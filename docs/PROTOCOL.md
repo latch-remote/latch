@@ -50,6 +50,7 @@ Content-Length: <n>
 | `audio` | bool | send desktop audio |
 | `name` | string | the viewer's machine name, for the host's log |
 | `cursor` | bool | optional, default false; viewer can draw pointer locally and handle shape updates |
+| `cursor_position` | bool | optional, default false; viewer accepts optional host hotspot positions in `Cursor` messages |
 | `gamepads` | bool | optional, default false; the viewer sends gamepads (see [Gamepads](#gamepads-912)) |
 | `reference_invalidation` | bool | optional, default false; after a loss the viewer asks for a recovery frame (see [RecoveryRequest](#recoveryrequest-14-and-recoveryack-15)) |
 | `audio_channels` | u32 | optional; most channels the viewer plays (6 for 5.1, 8 for 7.1). Absent, or below 3, means stereo |
@@ -88,7 +89,7 @@ type byte and the payload and is at most 65 536. Payloads are JSON objects.
 | 3 | `Keepalive` | either | `{}` |
 | 4 | `Notice` | host → viewer | `{"kind": "audio" \| "video" \| "input", "message": string}`; `message` empty clears it |
 | 5 | `Report` | either | `{"fps", "loss_pct", "decode_ms", "rtt_ms"}`, every 50 ms (older viewers: 250 ms or once a second), for bitrate and FEC feedback |
-| 6 | `Cursor` | host → viewer | `{"visible": bool, "shape": null \| {"serial": u32, "width": u32, "height": u32, "hot_x": u32, "hot_y": u32, "rgba": "<base64>"}}`; only after an `Accept` with `cursor` true; sent when visibility or shape changes (`shape` null: unchanged); straight-alpha RGBA, at most 96×96 |
+| 6 | `Cursor` | host → viewer | `{"visible": bool, "shape": null \| {"serial": u32, "width": u32, "height": u32, "hot_x": u32, "hot_y": u32, "rgba": "<base64>"}}`; only after an `Accept` with `cursor` true; sent when visibility, shape or offered position changes (`shape` null: unchanged); straight-alpha sRGB RGBA, at most 96×96; optional `position: [x, y]` gives the hotspot in stream pixels, including letterboxing |
 | 7 | `DrawCursor` | viewer → host | `{"draw": bool}`; tells host whether to composite pointer into video |
 | 8 | `Relay` | either | `{"session": u32, "attempt": u64, "action": RelayAction}`; negotiated only when request and accept both set `relay` |
 
@@ -97,6 +98,20 @@ active. Codes 0 (intentional end), 1 (takeover), and 5 (host stopping) stop
 automatic reconnect. Code 6 is a recoverable transport failure, including
 priority backpressure or a full bounded control inbox. Every cursor update
 uses the original ordered connection, regardless of its serialized size.
+
+`Cursor.position` is sent only when the request offers `cursor_position`, and
+cursor messages still require `Accept.cursor`. An absent position retains the
+local-pointer placement used by 6.0.0 hosts/viewers. Both new fields default to
+absent/false, and 6.0.0 peers ignore unknown JSON fields. Shapes/visibility and
+`DrawCursor` retain their existing meanings and protocol version 1.
+
+Windows publishes pointer-only DXGI updates independently of video frames.
+Colour cursors use straight sRGB alpha, monochrome inversion uses white pixels
+with a dark outline, and masked colour uses copy/transparent pixels plus the
+same outlined inversion. Arbitrary colour XOR and unreadable shapes stay
+composited, with plane visibility false during fallback. Hidden and off-output
+pointers are reported invisible. Separate RGBA uses the viewer's SDR UI white
+on SDR and HDR sessions, while the composited HDR path uses host SDR white.
 
 `Accept`:
 

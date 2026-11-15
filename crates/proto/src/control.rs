@@ -121,6 +121,9 @@ pub struct StreamRequest {
     pub name: String,
     #[serde(default)]
     pub cursor: bool,
+    /// Accept optional host hotspot positions in Cursor updates.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cursor_position: bool,
     /// The viewer sends gamepads (`docs/PROTOCOL.md`, "Gamepads").
     #[serde(default)]
     pub gamepads: bool,
@@ -309,10 +312,14 @@ impl CursorShape {
     }
 }
 
-/// Host → viewer pointer update. Sent when visibility or shape changes;
+/// Host → viewer pointer update. Sent when visibility, shape or position changes;
 /// `shape: None` means the shape has not changed since the last update.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Cursor {
+    /// Hotspot in stream pixels relative to the captured output. Older hosts
+    /// omit this and viewers position the shape at their local pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<[i32; 2]>,
     pub visible: bool,
     #[serde(default)]
     pub shape: Option<CursorShape>,
@@ -629,6 +636,7 @@ mod tests {
     fn cursor_messages_wire_roundtrip() {
         let shape = CursorShape::new(101, 2, 2, 0, 0, &[255; 16]);
         let msg = Message::Cursor(Cursor {
+            position: None,
             visible: true,
             shape: Some(shape),
         });
@@ -641,6 +649,7 @@ mod tests {
         assert_eq!(msg, decoded);
 
         let msg_noshape = Message::Cursor(Cursor {
+            position: None,
             visible: false,
             shape: None,
         });
@@ -662,10 +671,31 @@ mod tests {
     }
 
     #[test]
+    fn cursor_position_extension_preserves_600_json() {
+        let old: Cursor = serde_json::from_str(r#"{"visible":true,"shape":null}"#).unwrap();
+        assert_eq!(old.position, None);
+        let update = Cursor {
+            position: Some([-10, 20]),
+            ..old
+        };
+        let json = serde_json::to_string(&update).unwrap();
+        #[derive(Deserialize)]
+        struct Cursor600 {
+            visible: bool,
+            shape: Option<CursorShape>,
+        }
+        let old: Cursor600 = serde_json::from_str(&json).unwrap();
+        assert!(old.visible);
+        assert!(old.shape.is_none());
+        assert_eq!(serde_json::from_str::<Cursor>(&json).unwrap(), update);
+    }
+
+    #[test]
     fn cursor_max_shape_fits_max_message() {
         let raw_pixels = vec![255u8; 96 * 96 * 4];
         let shape = CursorShape::new(1, 96, 96, 10, 10, &raw_pixels);
         let msg = Message::Cursor(Cursor {
+            position: None,
             visible: true,
             shape: Some(shape),
         });
@@ -678,6 +708,7 @@ mod tests {
     fn cursor_json_format_matches_spec() {
         let shape = CursorShape::new(1, 1, 1, 0, 0, &[1, 2, 3, 4]);
         let cursor = Cursor {
+            position: None,
             visible: true,
             shape: Some(shape),
         };
@@ -687,6 +718,7 @@ mod tests {
         assert!(s.contains("\"serial\":1"));
 
         let cursor_null = Cursor {
+            position: None,
             visible: false,
             shape: None,
         };

@@ -6,6 +6,15 @@ GitHub release notes, so each version gets a heading of the form
 
 ## Unreleased
 
+### Windows streaming
+
+- Send a separate Windows cursor plane with scaled hotspots, output-relative
+  position and visibility, including pointer movement on a static desktop.
+  Convert DXGI colour, monochrome and masked-colour shapes, outline inverted
+  regions, and retain GPU composition for unsupported XOR or unreadable data.
+  Older viewers keep host-composited cursors. Add cross-platform buffer tests
+  and a synthetic cursor-control session independent of video production.
+
 ### Relay connectivity
 
 - Add HTTPS WebSocket relay fallback on TCP 443 alongside native

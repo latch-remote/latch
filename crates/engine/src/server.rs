@@ -501,6 +501,7 @@ impl Server {
                 )
             })),
             cursor_supported,
+            cursor_position: prepared.req.cursor_position,
             probe_trains: prepared.req.probe_trains,
             draw_cursor: AtomicBool::new(!cursor_supported),
             control_writer: Mutex::new(None),
@@ -1171,6 +1172,7 @@ struct Session {
     /// The viewer's microphone: its packets put in order, and where they play.
     mic: Mutex<Option<(AudioReceiver, crate::mic::MicOut)>>,
     cursor_supported: bool,
+    cursor_position: bool,
     /// The viewer measures probe trains (`docs/PROTOCOL.md`, "Probe").
     probe_trains: bool,
     draw_cursor: AtomicBool,
@@ -1638,6 +1640,24 @@ fn play_mic(session: &Session, packet: Option<&latch_proto::wire::AudioPacket<'_
     }
 }
 
+/// Latest cursor state with pending shapes retained across coalesced moves.
+/// The capture worker never waits for a socket write or an encoded picture.
+#[derive(Default)]
+struct CursorMailbox {
+    pending: Mutex<Option<control::Cursor>>,
+    ready: Condvar,
+}
+impl CursorMailbox {
+    fn publish(&self, mut cursor: control::Cursor) {
+        let mut pending = self.pending.lock();
+        if cursor.shape.is_none() {
+            cursor.shape = pending.as_mut().and_then(|old| old.shape.take());
+        }
+        *pending = Some(cursor);
+        self.ready.notify_one();
+    }
+}
+
 fn send_video(
     server: &Server,
     session: &Session,
@@ -1645,10 +1665,46 @@ fn send_video(
     config: VideoConfig,
     mut reopen: impl FnMut(&VideoConfig) -> anyhow::Result<Box<dyn VideoPipeline>>,
 ) {
+    let mailbox = Arc::new(CursorMailbox::default());
+    let done = AtomicBool::new(false);
     std::thread::scope(|scope| {
+        let sink: video::CursorSink = {
+            let mailbox = mailbox.clone();
+            let positions = session.cursor_position;
+            Arc::new(move |mut cursor| {
+                if !positions {
+                    cursor.position = None;
+                }
+                mailbox.publish(cursor)
+            })
+        };
+        let mailbox = &mailbox;
+        let done = &done;
+        if session.cursor_supported {
+            scope.spawn(move || {
+                while !done.load(Ordering::Acquire) && !session.stopping() {
+                    let mut pending = mailbox.pending.lock();
+                    if pending.is_none() {
+                        mailbox
+                            .ready
+                            .wait_for(&mut pending, Duration::from_millis(100));
+                    }
+                    let cursor = pending.take();
+                    drop(pending);
+                    if let Some(cursor) = cursor {
+                        if !session.send_control(&Message::Cursor(cursor)) {
+                            session.end(end::TRANSPORT_FAILED, "Cursor control connection failed.");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
         let (tx, rx) = mpsc::sync_channel(2);
         scope.spawn(move || paced_video(server, session, rx));
-        encode_video(server, session, pipeline, config, &mut reopen, tx);
+        encode_video(server, session, pipeline, config, &mut reopen, tx, sink);
+        done.store(true, Ordering::Release);
+        mailbox.ready.notify_one();
     });
 }
 
@@ -1664,8 +1720,12 @@ fn encode_video(
     mut config: VideoConfig,
     mut reopen: impl FnMut(&VideoConfig) -> anyhow::Result<Box<dyn VideoPipeline>>,
     tx: mpsc::SyncSender<(video::EncodedVideo, Instant)>,
+    cursor_sink: video::CursorSink,
 ) {
     crate::priority::media_thread();
+    if session.cursor_supported {
+        pipeline.set_cursor_sink(cursor_sink.clone());
+    }
     let mut generation = 0;
     let mut last_keyframe: Option<Instant> = None;
     let mut info = pipeline.info();
@@ -1751,6 +1811,9 @@ fn encode_video(
                     match reopen(&config) {
                         Ok(p) => {
                             pipeline = p;
+                            if session.cursor_supported {
+                                pipeline.set_cursor_sink(cursor_sink.clone());
+                            }
                             // Queued frames can still arrive from the old pipeline.
                             generation += 1;
                             session.recovery.sent.lock().clear();
@@ -1784,6 +1847,7 @@ fn encode_video(
         frame.generation = generation;
         if let Some(update) = pipeline.take_cursor().filter(|_| session.cursor_supported) {
             session.send_control(&Message::Cursor(control::Cursor {
+                position: None,
                 visible: update.visible,
                 shape: update.shape,
             }));

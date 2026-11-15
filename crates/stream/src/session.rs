@@ -945,6 +945,7 @@ pub type FeedbackFn = Box<dyn Fn(u8, Feedback) + Send + Sync>;
 
 #[derive(Debug, Clone, Default)]
 pub struct CursorState {
+    pub position: Option<[i32; 2]>,
     pub visible: bool,
     pub shape: Option<Arc<latch_proto::control::CursorShape>>,
 }
@@ -1804,6 +1805,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         audio: settings.audio,
         name: settings.name.clone(),
         cursor: settings.cursor,
+        cursor_position: settings.cursor,
         gamepads: settings.gamepads,
         reference_invalidation: recovery_wanted(),
         mic: settings.mic,
@@ -2224,6 +2226,7 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 let prev_shape = state.as_ref().and_then(|s| s.shape.clone());
                 let shape = c.shape.map(Arc::new).or(prev_shape);
                 *state = Some(CursorState {
+                    position: c.position,
                     visible: c.visible,
                     shape,
                 });
@@ -3483,6 +3486,7 @@ mod tests {
                 message: "stop".into(),
             }),
             Message::Cursor(control::Cursor {
+                position: None,
                 visible: true,
                 shape: None,
             }),
