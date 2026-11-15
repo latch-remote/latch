@@ -1673,6 +1673,7 @@ impl View {
         }
         #[cfg(test)]
         if let Some(tap) = self.tap.clone() {
+            self.early.listen(tap.clone());
             let connected = tap.connected.get();
             if let Some(gate) = self.forward(ctx, live, cfg, video, bar, &*tap, connected) {
                 self.early.arm(gate.with(tap));
@@ -1683,6 +1684,7 @@ impl View {
         if crate::session::test_serve().is_some() {
             return;
         }
+        self.early.listen(Rc::new(live.input.clone()));
         let gate = self.forward(
             ctx,
             live,
@@ -2036,6 +2038,7 @@ impl View {
                 }
                 EarlyGate {
                     keys,
+                    local_focus: !keys_belong_to_pc,
                     mouse,
                     cmd_is_ctrl: self.cmd_is_ctrl(cfg),
                     motion_scale,
@@ -2325,6 +2328,7 @@ impl View {
 /// What a frame lets the OS event hook send, before the sink is known.
 struct EarlyGate {
     keys: bool,
+    local_focus: bool,
     mouse: bool,
     cmd_is_ctrl: bool,
     motion_scale: f32,
@@ -2341,6 +2345,7 @@ impl EarlyGate {
     fn with(self, out: Rc<dyn Sink>) -> early::Gate {
         early::Gate {
             keys: self.keys,
+            local_focus: self.local_focus,
             mouse: self.mouse,
             cmd_is_ctrl: self.cmd_is_ctrl,
             motion_scale: self.motion_scale,
@@ -4608,6 +4613,59 @@ pub(crate) mod tests {
                 Sent::Key(VK_SHIFT, false, 0),
             ]
         );
+    }
+
+    #[test]
+    fn focus_loss_releases_held_input_while_a_paste_disables_early_dispatch() {
+        let (mut h, tap) = recording(View::default(), true);
+        frame(&mut h, vec![], Modifiers::NONE);
+        assert!(os(&h, os_key(Key::W, true, Modifiers::NONE)));
+        h.state_mut().view.pending = Some(PendingPaste {
+            id: 1,
+            until: Instant::now() + Duration::from_secs(60),
+            queued: Vec::new(),
+        });
+        frame(
+            &mut h,
+            vec![key(Key::W, true, Modifiers::NONE)],
+            Modifiers::NONE,
+        );
+        // Another frame must not discard the release path either.
+        frame(&mut h, vec![], Modifiers::NONE);
+        assert!(!h.state().view.early.armed());
+        assert!(h.state().view.held.is_down(VK_W));
+        tap.take();
+        h.state().view.early.on_event(
+            Some(&egui_winit::winit::event::WindowEvent::Focused(false)),
+            &[],
+            Modifiers::NONE,
+        );
+        assert_eq!(tap.take(), [Sent::Key(VK_W, false, 0), Sent::ReleaseAll]);
+        assert!(!h.state().view.held.any_down());
+    }
+
+    #[test]
+    fn toolbar_tab_from_the_os_event_waits_for_local_focus() {
+        for mods in [Modifiers::NONE, Modifiers::SHIFT] {
+            let (mut h, tap) = recording(view_with_bar(), true);
+            frame(&mut h, vec![], mods);
+            assert!(h.ctx.memory(|m| m.focused()).is_none());
+            assert!(h.state().view.early.armed());
+            tap.take();
+            assert!(!os(&h, os_key(Key::Tab, true, mods)));
+            assert!(!os(&h, os_key(Key::Tab, false, mods)));
+            assert!(tap.take().is_empty());
+            frame(
+                &mut h,
+                vec![key(Key::Tab, true, mods), key(Key::Tab, false, mods)],
+                mods,
+            );
+            assert!(h.ctx.memory(|m| m.focused()).is_some());
+            assert!(!tap
+                .take()
+                .iter()
+                .any(|s| matches!(s, Sent::Key(VK_TAB, _, _))));
+        }
     }
 
     #[test]

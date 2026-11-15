@@ -67,6 +67,8 @@ pub enum Ahead {
 pub struct Gate {
     /// Keys and modifiers go to the PC.
     pub keys: bool,
+    /// Visible local controls may take focus on a navigation key.
+    pub local_focus: bool,
     /// The mouse is captured: buttons and movement go to the PC.
     pub mouse: bool,
     pub cmd_is_ctrl: bool,
@@ -110,6 +112,8 @@ const LOG_EVERY: Duration = Duration::from_secs(10);
 #[derive(Default)]
 struct State {
     gate: Option<Gate>,
+    /// Focus loss must release input even while the frame owns dispatch.
+    out: Option<Rc<dyn Sink>>,
     active: bool,
     over_stream: bool,
     held: SharedHeld,
@@ -181,20 +185,26 @@ impl Early {
         })))
     }
 
+    /// Keep the focus-loss release path available while dispatch is disabled.
+    pub fn listen(&self, out: Rc<dyn Sink>) {
+        self.0.borrow_mut().out = Some(out);
+        CURRENT.with(|c| *c.borrow_mut() = Rc::downgrade(&self.0));
+    }
+
     /// Let the hook send under `gate` until the frame says otherwise.
     pub fn arm(&self, gate: Gate) {
+        self.listen(gate.out.clone());
         let mut s = self.0.borrow_mut();
         s.over_stream = gate.over_stream;
         s.gate = Some(gate);
         s.active = true;
-        drop(s);
-        CURRENT.with(|c| *c.borrow_mut() = Rc::downgrade(&self.0));
     }
 
     /// Stop the hook sending: everything goes through the frame.
     pub fn disarm(&self) {
         let mut s = self.0.borrow_mut();
         s.gate = None;
+        s.out = None;
         s.active = false;
         s.motion = (0.0, 0.0);
         s.scroll = (0.0, 0.0);
@@ -256,8 +266,8 @@ impl Early {
             )
         ) {
             let mut s = self.0.borrow_mut();
-            if let Some(gate) = &s.gate {
-                s.held.release_all(&*gate.out);
+            if let Some(out) = &s.out {
+                s.held.release_all(&**out);
             }
             s.declined();
             return;
@@ -449,6 +459,19 @@ impl State {
                 if !gate.keys
                     || host_key(mods)
                     || stays_local(mods, physical, logical)
+                    || (down
+                        && gate.local_focus
+                        && [physical, logical].into_iter().flatten().any(|key| {
+                            matches!(
+                                key,
+                                Key::Tab
+                                    | Key::ArrowUp
+                                    | Key::ArrowDown
+                                    | Key::ArrowLeft
+                                    | Key::ArrowRight
+                                    | Key::Escape
+                            )
+                        }))
                     || (!down && repeat)
                 {
                     return Outcome::Declined;
@@ -558,6 +581,7 @@ mod tests {
         out.connected.set(true);
         early.arm(Gate {
             keys,
+            local_focus: false,
             mouse,
             cmd_is_ctrl: true,
             motion_scale: 1.0,
@@ -725,6 +749,7 @@ mod tests {
         out.connected.set(true);
         e.arm(Gate {
             keys: false,
+            local_focus: false,
             mouse: true,
             cmd_is_ctrl: true,
             motion_scale: 2.0,
@@ -817,6 +842,45 @@ mod tests {
         assert!(!held.any_down());
         assert!(!e.armed());
         assert!(!deliver(&e, key(Key::A, true, Modifiers::NONE)));
+    }
+
+    #[test]
+    fn focus_loss_releases_frame_input_without_ever_arming() {
+        let held = SharedHeld::default();
+        let e = Early::new(held.clone());
+        let out = Rc::new(Recorder::default());
+        out.connected.set(true);
+        e.listen(out.clone());
+        held.key(&*out, 0x57, true);
+        out.take();
+        assert!(!e.armed());
+        e.on_event(Some(&WindowEvent::Focused(false)), &[], Modifiers::NONE);
+        assert_eq!(out.take(), [Sent::Key(0x57, false, 0), Sent::ReleaseAll]);
+        assert!(!held.any_down());
+    }
+
+    #[test]
+    fn navigation_keys_wait_only_when_local_controls_can_take_focus() {
+        for k in [
+            Key::Tab,
+            Key::ArrowUp,
+            Key::ArrowDown,
+            Key::ArrowLeft,
+            Key::ArrowRight,
+            Key::Escape,
+        ] {
+            for local_focus in [true, false] {
+                let (e, _, out) = armed(true, false);
+                e.0.borrow_mut().gate.as_mut().unwrap().local_focus = local_focus;
+                assert_eq!(deliver(&e, key(k, true, Modifiers::NONE)), !local_focus);
+                if local_focus {
+                    assert!(out.take().is_empty());
+                    assert!(!e.armed());
+                } else {
+                    assert_eq!(out.take(), [Sent::Key(input::vk(k).unwrap(), true, 0)]);
+                }
+            }
+        }
     }
 
     #[test]
