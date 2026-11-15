@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 fn request(name: &str) -> StreamRequest {
     StreamRequest {
+        startup_timeout_secs: 0,
         relay: false,
         prefer_color: false,
         color: Default::default(),

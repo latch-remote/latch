@@ -28,6 +28,8 @@ optdepends=(
   'tailscale: required unless Tailscale is installed some other way'
   'libva: VA-API video encoding'
   'nvidia-utils: NVENC video encoding'
+  'pipewire: Wayland screen sharing'
+  'xdg-desktop-portal: Wayland screen sharing and input'
 )
 provides=('latch-remote')
 conflicts=('latch-remote')

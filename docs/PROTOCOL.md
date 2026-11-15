@@ -42,6 +42,7 @@ Content-Length: <n>
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `protocol` | u32 | 1 |
+| `startup_timeout_secs` | u32 | optional total startup budget, currently 180 seconds. Absence retains the older viewer's 60-second budget. Wayland hosts reserve 45 seconds for preparation and allow at most 90 seconds for portal approval |
 | `width`, `height` | u32 | picture size the viewer wants (even numbers) |
 | `fps` | u32 | frames per second wanted |
 | `bitrate_kbps` | u32 | video bitrate wanted (a ceiling: the host's rate control comes down from it) |
