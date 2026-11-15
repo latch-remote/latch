@@ -727,7 +727,7 @@ a /64 bucket.
 
 ### Carrier ladder and diagnostics
 
-Cold connections have a two-second DNS/TCP/TLS/upgrade budget. Native gets 750
+Each cold route has a two-second DNS/TCP/TLS/upgrade budget. Native gets 750
 ms and WebSocket gets the remaining time, including at least 1.25 s after a full
 native timeout. Cloned configurations cache the winning carrier/address for 30
 seconds, scoped to relay/proxy endpoints and the locally selected source
@@ -736,8 +736,10 @@ changes. Other route changes are detected by connection failure. Concurrent
 lanes share initial fallback selection. Cached native probes get 750 ms and
 cached WebSocket probes get 1.25 s. Failure clears the shortcut, refreshes DNS
 and runs both cold rungs with a new two-second budget. Worst-case open bounds
-are 2 s cold, 2.75 s after stale native and 3.25 s after stale WebSocket. The
-caller's earlier deadline bounds every probe and fallback.
+are 2 s cold, 2.75 s after stale native and 3.25 s after stale WebSocket before
+MSS recovery. Two blocked TLS handshakes permit an additional 500 ms for
+1200- and 512-byte MSS probes. All routes share a four-second hard open bound.
+The caller's earlier deadline bounds every probe and fallback.
 
 Stable caching at 200 ms RTT gives 2 s cold grant + 1.25 s warm attach cohort +
 four exchanges (0.8 s) = 4.05 s. Fresh attach configurations share fallback and
@@ -778,10 +780,12 @@ portal and proxy failures end the ladder. Public-root verification stays enabled
 An abrupt pre-handshake close cannot distinguish exhausted relay admission
 from a network filter. `ClosedBeforeHandshake` displays "blocked or relay busy".
 
-A silent drop after ClientHello is classified as blocked. Automatic 1200-byte MSS
-hints require small-record receive progress followed by a stalled large write or
-partial large record, carried by private typed timeout payloads. Hints expire after
-30 seconds and are shared by clones. DNS, connect, handshake-only, idle, ACK and
+A silent drop after ClientHello is classified as blocked. Two blocked TLS
+handshakes allow fresh 1200- then 512-byte MSS probes. A single blocked native
+handshake followed by a working WebSocket retains normal MSS. Later automatic
+MSS hints require small-record progress followed by a stalled large write or
+partial large record, carried by private typed timeout payloads. Hints expire
+after 30 seconds and are shared by clones. DNS, connect, idle, ACK and
 session-lifetime timeouts leave the hint untouched. `reduce_mss_after_stall()`
 records an external path-MTU stall. `ConnectionInfo::reduced_mss_reason` emits
 `MssReason::{ExplicitStall, WriteStall, RecordStall}`. The `TlsHandshakeStall`

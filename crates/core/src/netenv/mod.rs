@@ -1,4 +1,4 @@
-//! Local network facts for future transport selection and troubleshooting.
+//! Local network facts for transport selection and troubleshooting.
 //!
 //! [`discover`] blocks only its caller, for at most [`Options::timeout`]
 //! (clamped to 100 ms–15 s). Use [`NetworkEnvironment`] from a UI. It runs
@@ -336,6 +336,11 @@ impl NetworkEnvironment {
                 self.queued = Some((key, options));
             }
         }
+    }
+
+    /// Partial observations remain usable while the remaining checks run.
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some() || self.queued.is_some()
     }
 
     /// Only returns a result for these exact inputs, never a stale network.

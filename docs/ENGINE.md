@@ -89,8 +89,9 @@ macOS Keychain and Windows Credential Manager are outside this module.
   resolve that case. Shell and service environments can differ.
 
 `ProbeTarget::new` makes the HTTP destination, expected status and body
-explicit. No external HTTP probe is enabled by default. Windows uses its
-native connectivity profile and Linux uses NetworkManager's cached
+explicit. The product configures an anonymous probe on its relay host by default.
+Core callers with an empty `Options::probes` use native signals only. Windows
+uses its native connectivity profile and Linux uses NetworkManager's cached
 connectivity signal when available. macOS has no public, general-purpose
 portal-status API, so it needs a probe. Probes use direct cleartext HTTP
 with no credentials, cookies, redirects or device identifiers, and bounded
@@ -105,13 +106,13 @@ network or a failed endpoint can produce the same observation. An ordered
 fallback target can reduce that ambiguity. These checks cannot authenticate
 a cleartext response or prove every internet service is reachable.
 
-A project-controlled primary probe would require
-`http://relay.latch.rune.foo/netenv/probe` on port 80 to return HTTP 204,
-an empty body, `Content-Length: 0` and `Cache-Control: no-store`, without
-redirecting to HTTPS or requiring authentication. An HTTP front end can
-serve it. The existing native TLS relay on 443 does not serve this endpoint.
-The wiring layer chooses and supplies any fallback explicitly. Probe
-operators see public source IP and timing. DNS64 discovery queries only
+The product probes `http://CONFIGURED_RELAY_HOST/netenv/probe` on port 80,
+expecting HTTP 204, an empty body, `Content-Length: 0` and
+`Cache-Control: no-store`. The daemon's optional `--http-listen` serves it
+alongside an ACME webroot, without HTTPS redirection or authentication.
+Older relays lacking the listener degrade silently. No third-party fallback
+is configured. Probe operators see public source IP and timing, and the
+probe listener records no request addresses. DNS64 discovery queries only
 `ipv4only.arpa` through the system resolver, following RFC 7050 and RFC 6052.
 Either well-known IPv4 constant identifies an RFC 6052 prefix length.
 Answers matching multiple legal positions or repeating the same constant
@@ -923,7 +924,7 @@ for the engine, viewer and measurement examples. It attaches a nonblocking
 proxy-discovery callback to the relay configuration. App/service startup warms
 the discovery cache. The relay re-reads it for fresh connections, including
 recovery attempts. Netenv publishes partial observations so an environment
-proxy can be used while other checks continue. OS discovery has a three-second
+proxy can be used while other checks continue. OS discovery has a six-second
 deadline. The eight-host cache samples local routes/environment settings at most
 four times a second and refreshes discovery every five seconds. No session/UI
 thread waits for PAC/WPAD, DNS or an HTTP probe.

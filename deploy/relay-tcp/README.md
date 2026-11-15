@@ -125,7 +125,7 @@ quota. Local `limits.json` changes survive reinstalling the kit.
 `network.sh` persists BBR/fq, 16-MiB TCP/UDP socket ceilings, always-on TCP
 packet-size probing (`net.ipv4.tcp_mtu_probing=2`, which Linux applies to IPv4
 and IPv6, so the daemon's sending path survives networks that drop ICMP Packet
-Too Big; client Unix retries can also request a 1200-byte MSS),
+Too Big; client Unix retries can request 1200- then 512-byte MSS),
 128-KiB unsent low-water mark, idle-window preservation and a 131,072-entry
 conntrack ceiling. It installs a boot-time UDP GRO forwarding unit and daemon
 drop-ins with 65,536-file limits. Tailscaled receives 384/512-MiB memory

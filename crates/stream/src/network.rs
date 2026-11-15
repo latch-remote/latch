@@ -14,6 +14,9 @@ struct Entry {
     environment: NetworkEnvironment,
     latest: NetworkDiagnosis,
     checked: Instant,
+    network_key: u64,
+    generation: u64,
+    refresh_at: Instant,
 }
 
 /// Latest local facts. Refresh every five seconds so signing in or changing the
@@ -22,7 +25,6 @@ struct Entry {
 /// each kind are retained, including when an OS API stalls indefinitely.
 pub fn diagnosis(host: &str) -> NetworkDiagnosis {
     static CACHE: OnceLock<Mutex<Vec<Entry>>> = OnceLock::new();
-    static START: OnceLock<Instant> = OnceLock::new();
     let mut cache = CACHE.get_or_init(Mutex::default).lock().unwrap();
     if let Some(entry) = cache.iter().find(|entry| entry.host == host) {
         if entry.checked.elapsed() < Duration::from_millis(250) {
@@ -30,7 +32,7 @@ pub fn diagnosis(host: &str) -> NetworkDiagnosis {
         }
     }
     let mut options = netenv::Options::new(host);
-    options.timeout = Duration::from_secs(3);
+    options.timeout = Duration::from_secs(6);
     if std::env::var("LATCH_NETENV_PROBE").as_deref() != Ok("0") {
         if let Ok(probe) =
             netenv::ProbeTarget::new(&format!("http://{host}/netenv/probe"), 204, b"")
@@ -58,9 +60,8 @@ pub fn diagnosis(host: &str) -> NetworkDiagnosis {
         });
         source.hash(&mut fingerprint);
     }
-    let elapsed = START.get_or_init(Instant::now).elapsed();
-    (elapsed.as_secs() / 5).hash(&mut fingerprint);
-    let generation = fingerprint.finish();
+    let network_key = fingerprint.finish();
+    let now = Instant::now();
     if !cache.iter().any(|entry| entry.host == host) {
         if cache.len() == 8 {
             cache.remove(0);
@@ -69,23 +70,43 @@ pub fn diagnosis(host: &str) -> NetworkDiagnosis {
             host: host.into(),
             environment: NetworkEnvironment::default(),
             latest: NetworkDiagnosis::default(),
-            checked: Instant::now(),
+            checked: now,
+            network_key,
+            generation: 0,
+            refresh_at: now + Duration::from_secs(5),
         });
     }
     let entry = cache.iter_mut().find(|entry| entry.host == host).unwrap();
-    entry.checked = Instant::now();
-    entry.environment.request(generation, options.clone());
+    entry.checked = now;
     entry.environment.poll();
-    if let Some(mut latest) = entry.environment.get(generation, &options).cloned() {
-        if latest.captive_portal == CaptivePortal::Unknown {
-            latest.captive_portal = entry.latest.captive_portal.clone();
+    if entry.network_key != network_key {
+        entry.network_key = network_key;
+        entry.generation = entry.generation.wrapping_add(1);
+        entry.refresh_at = now + Duration::from_secs(5);
+        entry.latest = NetworkDiagnosis::default();
+    } else {
+        if let Some(mut latest) = entry.environment.get(entry.generation, &options).cloned() {
+            if latest.captive_portal == CaptivePortal::Unknown {
+                latest.captive_portal = entry.latest.captive_portal.clone();
+            }
+            if latest.proxies.candidates.is_empty() {
+                latest.proxies = entry.latest.proxies.clone();
+            }
+            entry.latest = latest;
         }
-        if latest.proxies.candidates.is_empty() {
-            latest.proxies = entry.latest.proxies.clone();
+        // Never discard a slow PAC result just because its refresh interval
+        // elapsed. Consume the completed snapshot before starting a refresh.
+        if refresh_due(now, entry.refresh_at, entry.environment.is_pending()) {
+            entry.generation = entry.generation.wrapping_add(1);
+            entry.refresh_at = now + Duration::from_secs(5);
         }
-        entry.latest = latest;
     }
+    entry.environment.request(entry.generation, options);
     entry.latest.clone()
+}
+
+fn refresh_due(now: Instant, refresh_at: Instant, pending: bool) -> bool {
+    now >= refresh_at && !pending
 }
 
 pub fn proxy_selection(diagnosis: &NetworkDiagnosis) -> (Option<ProxyConfig>, bool) {
@@ -252,5 +273,17 @@ mod tests {
         assert!(status(&diagnosis, None, None).messages[0].contains("sign-in"));
         diagnosis.captive_portal = CaptivePortal::OpenInternet;
         assert!(status(&diagnosis, None, None).messages.is_empty());
+    }
+    #[test]
+    fn slow_discovery_survives_refresh_interval_with_injected_clock() {
+        let now = Instant::now();
+        let refresh_at = now + Duration::from_secs(5);
+        assert!(!refresh_due(
+            now + Duration::from_secs(4),
+            refresh_at,
+            false
+        ));
+        assert!(!refresh_due(now + Duration::from_secs(6), refresh_at, true));
+        assert!(refresh_due(now + Duration::from_secs(6), refresh_at, false));
     }
 }
