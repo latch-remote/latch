@@ -770,6 +770,13 @@ impl ClientApp {
                             error: error.then_some(message),
                         };
                     }
+                    Event::PathChanged(state) => {
+                        let route = live.path.media_label(&state);
+                        self.view.toast(
+                            Tone::Info,
+                            format!("{route}. {}", state.reason.description()),
+                        );
+                    }
                     Event::Notice(text) => self.view.toast(Tone::Warning, text),
                     Event::Poor(p) => self.view.set_poor(p),
                     Event::NoAudio(e) => self

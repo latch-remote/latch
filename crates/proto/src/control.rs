@@ -99,6 +99,9 @@ impl Codec {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamRequest {
+    /// Negotiates media policy controls, sized probes and high-rate reassessment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub media_path_policy: bool,
     /// Both peers support authenticated, two-lane relay attempts.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub relay: bool,
@@ -171,6 +174,8 @@ pub struct AudioFormat {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Accept {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub media_path_policy: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub relay: bool,
     #[serde(default)]
@@ -400,6 +405,16 @@ pub enum RelayAction {
         received: u32,
         span_us: u32,
     },
+    /// Sized, high-rate reassessment, only with media_path_policy.
+    UdpProbeSized {
+        first: u16,
+        kbps: u32,
+        datagram_size: u16,
+    },
+    /// The sized-probe receiver is installed before host padding starts.
+    UdpProbeReady {
+        first: u16,
+    },
     Direct,
     DirectReady,
     /// The authority's retry clock can lag the viewer's after a transition.
@@ -411,9 +426,24 @@ pub enum RelayAction {
     Abort,
 }
 
+/// Negotiated with StreamRequest.media_path_policy and Accept.media_path_policy.
+/// Always carried by the original authorized TCP connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathControl {
+    pub session: u32,
+    pub action: PathAction,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PathAction {
+    MtuProbe { serial: u16 },
+    MtuResult { serial: u16, received: [u8; 4] },
+    MtuApplied { datagram_size: u16 },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     Relay(RelayControl),
+    Path(PathControl),
     Accept(Accept),
     End(End),
     Keepalive,
@@ -428,6 +458,7 @@ pub enum Message {
 /// Writes one message (`u32 length | u8 type | JSON`).
 pub fn write_message(w: &mut impl Write, message: &Message) -> std::io::Result<()> {
     let (kind, payload) = match message {
+        Message::Path(v) => (9, serde_json::to_vec(v)),
         Message::Relay(v) => (8, serde_json::to_vec(v)),
         Message::Accept(v) => (1, serde_json::to_vec(v)),
         Message::End(v) => (2, serde_json::to_vec(v)),
@@ -471,6 +502,7 @@ pub fn read_message(r: &mut impl Read) -> std::io::Result<Message> {
         5 => Message::Report(serde_json::from_slice(&bytes[1..]).map_err(invalid)?),
         6 => Message::Cursor(serde_json::from_slice(&bytes[1..]).map_err(invalid)?),
         7 => Message::DrawCursor(serde_json::from_slice(&bytes[1..]).map_err(invalid)?),
+        9 => Message::Path(serde_json::from_slice(&bytes[1..]).map_err(invalid)?),
         8 => Message::Relay(serde_json::from_slice(&bytes[1..]).map_err(invalid)?),
         t => Message::Unknown(t),
     })

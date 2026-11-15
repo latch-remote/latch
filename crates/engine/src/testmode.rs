@@ -17,6 +17,13 @@ use std::time::{Duration, Instant};
 /// One per process: the session that opened last takes all test-mode
 /// input, so tests that stream in parallel must take turns.
 static CURRENT: Mutex<Option<Arc<Mutex<Pattern>>>> = Mutex::new(None);
+static HELD_KEYS: Mutex<std::collections::BTreeSet<u16>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+/// Keys currently held by the synthetic input sink, for transport regressions.
+pub fn held_keys() -> Vec<u16> {
+    HELD_KEYS.lock().iter().copied().collect()
+}
 
 #[cfg(target_os = "macos")]
 pub fn native_encoder() -> bool {
@@ -80,6 +87,7 @@ pub fn open_video(config: &VideoConfig, motion: Motion) -> anyhow::Result<Box<dy
 }
 
 pub fn open_input() -> anyhow::Result<Box<dyn InputSink>> {
+    HELD_KEYS.lock().clear();
     Ok(Box::new(PatternInput))
 }
 
@@ -143,6 +151,18 @@ struct PatternInput;
 
 impl InputSink for PatternInput {
     fn apply(&mut self, event: &Event, _display: DisplayRect) -> anyhow::Result<()> {
+        match event {
+            Event::Key { vk, down: true, .. } => {
+                HELD_KEYS.lock().insert(*vk);
+            }
+            Event::Key {
+                vk, down: false, ..
+            } => {
+                HELD_KEYS.lock().remove(vk);
+            }
+            Event::ReleaseAll => HELD_KEYS.lock().clear(),
+            _ => {}
+        }
         if let Some(p) = CURRENT.lock().as_ref() {
             let mut pattern = p.lock();
             if let Event::MousePosition {
@@ -167,7 +187,9 @@ impl InputSink for PatternInput {
         Ok(())
     }
 
-    fn release_all(&mut self) {}
+    fn release_all(&mut self) {
+        HELD_KEYS.lock().clear();
+    }
 }
 
 /// `LATCH_TEST_AUDIO=clicks` (or `clicks:<ms>` for a device period other

@@ -608,12 +608,23 @@ fn write_audio_kind(out: &mut Vec<u8>, kind: u8, session: u32, p: &AudioPacket<'
 }
 
 pub fn write_input(out: &mut Vec<u8>, session: u32, first: u32, events: &[Event]) -> usize {
+    write_input_with_limit(out, session, first, events, crate::MAX_DATAGRAM)
+}
+
+pub fn write_input_with_limit(
+    out: &mut Vec<u8>,
+    session: u32,
+    first: u32,
+    events: &[Event],
+    datagram_size: usize,
+) -> usize {
+    let datagram_size = datagram_size.clamp(576, crate::MAX_DATAGRAM);
     header(out, kind::INPUT, 0, 0, session);
     out.extend(first.to_le_bytes());
     out.push(0);
     let mut count = 0;
     for event in events {
-        if count == 255 || out.len() + event.wire_len() > crate::MAX_DATAGRAM {
+        if count == 255 || out.len() + event.wire_len() > datagram_size {
             break;
         }
         event.write(out);

@@ -66,7 +66,11 @@ fn surround_kbps(channels: usize) -> u32 {
 }
 
 fn audio_packet_samples(channels: usize) -> usize {
-    let fits = latch_codec::audio::frame_samples_within(channels, latch_proto::audio::MAX_PAYLOAD);
+    audio_packet_samples_with_limit(channels, latch_proto::MAX_DATAGRAM)
+}
+
+fn audio_packet_samples_with_limit(channels: usize, datagram_size: usize) -> usize {
+    let fits = latch_codec::audio::frame_samples_within(channels, datagram_size - 18);
     audio::FRAME / audio::FRAME.div_ceil(fits.max(1))
 }
 
@@ -504,6 +508,7 @@ impl Server {
             draw_cursor: AtomicBool::new(!cursor_supported),
             control_writer: Mutex::new(None),
         });
+        session.relay.enable_policy(prepared.req.media_path_policy);
         // prepare owns the reservation until installation, so a second
         // prepare must see this session and wait for its undo before opening.
         *self.current.lock() = Some(session.clone());
@@ -526,6 +531,7 @@ impl Server {
         }
         let audio = prepared.audio.take();
         let accept = Accept {
+            media_path_policy: prepared.req.media_path_policy,
             relay: relay_enabled,
             color: info.color,
             session: id,
@@ -539,7 +545,11 @@ impl Server {
             audio: audio.as_ref().map(|capture| AudioFormat {
                 rate: audio::RATE,
                 channels: capture.channels() as u32,
-                frame_samples: audio_packet_samples(capture.channels()) as u32,
+                frame_samples: if prepared.req.media_path_policy {
+                    audio_packet_samples_with_limit(capture.channels(), 576)
+                } else {
+                    audio_packet_samples(capture.channels())
+                } as u32,
                 codec: "lpcm-rice".into(),
             }),
             audio_problem: prepared.audio_problem.clone(),
@@ -657,6 +667,9 @@ impl Server {
             Option<std::thread::JoinHandle<()>>,
         ),
     ) -> String {
+        // This owner also paces UDP reassessment. Keep it on the same scheduling
+        // class as media so a busy machine can produce the requested probe rate.
+        crate::priority::media_thread();
         if let Err(e) = tcp.set_write_timeout(Some(Duration::from_secs(2))) {
             return format!("cannot bound control writes: {e}");
         }
@@ -709,6 +722,7 @@ impl Server {
         let mut sent_mark = (Instant::now(), session.bytes.load(Ordering::Relaxed));
         let mut route_revision = session.relay.revision();
         let mut relay_messages = VecDeque::new();
+        let mut mtu = latch_stream::path::MtuProbe::new(Instant::now());
         let reason = loop {
             let ended = session.ended.lock().clone();
             if let Some(e) = ended {
@@ -796,6 +810,26 @@ impl Server {
                     .unwrap_or_else(|| inbox.recv_timeout(Duration::from_millis(5))),
             };
             match incoming {
+                Ok(Message::Path(message))
+                    if accept.media_path_policy && message.session == session.id =>
+                {
+                    if let control::PathAction::MtuResult { serial, received } = message.action {
+                        if let Some(bytes) = mtu.result(serial, received) {
+                            if bytes != session.relay.datagram_size() {
+                                session.relay.set_datagram_size(bytes);
+                                session.keyframe.store(true, Ordering::Release);
+                                if !session.send_tcp(&Message::Path(control::PathControl {
+                                    session: session.id,
+                                    action: control::PathAction::MtuApplied {
+                                        datagram_size: bytes as u16,
+                                    },
+                                })) {
+                                    break "the viewer's connection broke".to_string();
+                                }
+                            }
+                        }
+                    }
+                }
                 Ok(Message::Relay(message)) if accept.relay => {
                     if !session.update_relay(|relay| {
                         relay.handle(message, |message| session.send_tcp(message))
@@ -928,6 +962,25 @@ impl Server {
                 }
             }
             let now = Instant::now();
+            if accept.media_path_policy
+                && !mtu.send(
+                    now,
+                    session.id,
+                    |action| {
+                        session.send_tcp(&Message::Path(control::PathControl {
+                            session: session.id,
+                            action,
+                        }))
+                    },
+                    |bytes| {
+                        let _ = self
+                            .udp
+                            .send_to(bytes, (*session.addr.lock()).unwrap_or(session.announced));
+                    },
+                )
+            {
+                break "the viewer's connection broke".to_string();
+            }
             if now - last_keepalive >= KEEPALIVE {
                 if !session.send_control(&Message::Keepalive)
                     || (session.relay.active() && !session.send_tcp(&Message::Keepalive))
@@ -955,7 +1008,8 @@ impl Server {
                 }
                 _ => {}
             }
-            if let Some(addr) = *session.addr.lock() {
+            let probe_addr = *session.addr.lock();
+            if let Some(addr) = probe_addr {
                 if !session
                     .relay
                     .reassess_udp(&self.udp, addr, requested_bitrate, |message| {
@@ -1309,22 +1363,11 @@ impl TransportState {
 
 impl Session {
     fn update_relay(&self, update: impl FnOnce(&RelayRoute) -> bool) -> bool {
-        // Stop old input before the first packet on the new route can be
-        // applied and acknowledged. Cleaning up on the next control-loop turn
-        // could unplug a pad whose replacement snapshot was already ACKed.
-        let mut input = self.input.lock();
-        let mut pads = self.pads.lock();
-        let was_active = self.relay.active();
-        let ok = update(&self.relay);
-        if was_active && !self.relay.active() {
-            if let Some(sink) = input.sink.as_mut() {
-                sink.release_all();
-            }
-            if let Some(sink) = pads.sink.as_mut() {
-                sink.unplug_all();
-            }
-        }
-        ok
+        // Both routes belong to the same authorized session. Keep held keys
+        // and virtual devices alive, with input ordered across the transition.
+        let _input = self.input.lock();
+        let _pads = self.pads.lock();
+        update(&self.relay)
     }
 
     fn queue_relay_control(
@@ -1689,7 +1732,7 @@ fn encode_video(
         }
         let protected =
             session.keyframe.load(Ordering::Relaxed) || session.recovery.asked.lock().is_some();
-        let target = crate::congestion::video_budget(
+        let target = crate::congestion::video_budget_sized(
             session
                 .transport
                 .budget
@@ -1700,6 +1743,7 @@ fn encode_video(
             config.fps,
             audio,
             protected,
+            session.relay.datagram_size(),
         );
         if applied == 0 || target.abs_diff(applied) >= (applied / 20).max(1) {
             pipeline.set_bitrate(target);
@@ -1960,6 +2004,7 @@ fn paced_video(
             }
             continue;
         }
+        packetizer.set_datagram_size(session.relay.datagram_size());
         packetizer.set_fec_percent(session.fec.load(Ordering::Relaxed));
         packetizer.set_fec_burst(session.fec_burst.load(Ordering::Relaxed));
         let recovery = &session.recovery;
@@ -2105,7 +2150,11 @@ fn send_audio(
     crate::priority::media_thread();
     let mut packetizer = AudioPacketizer::new(session.id);
     let channels = capture.channels();
-    let samples = audio_packet_samples(channels);
+    let samples = if session.relay.policy_enabled() {
+        audio_packet_samples_with_limit(channels, 576)
+    } else {
+        audio_packet_samples(channels)
+    };
     let packet_us = (samples as u64 * 1_000_000 / u64::from(audio::RATE)) as u32;
     let mut pcm = Vec::with_capacity(audio::FRAME * channels);
     let mut coded = Vec::with_capacity(2048);

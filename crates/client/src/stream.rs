@@ -542,6 +542,8 @@ impl View {
 
     pub fn show(&mut self, ctx: &egui::Context, env: &Env<'_>) -> Vec<Action> {
         let live = env.live;
+        live.session
+            .set_udp_path(env.path.as_ref().unwrap_or(&live.path).udp_path());
         let mut actions = Vec::new();
         self.host_mac = is_mac_os(&env.os);
         let screen = ctx.screen_rect();
@@ -938,14 +940,14 @@ impl View {
                 ui::clipped_scroll(ui, "stream-performance", room, |ui| {
                     let path = env.path.as_ref().unwrap_or(&live.path);
                     ui.horizontal_wrapped(|ui| {
-                        let route = if live.session.relay_active() {
-                            "Latch TLS relay".into()
-                        } else {
-                            path.label()
-                        };
-                        ui::tag(ui, Some(path.tone()), &route);
+                        let state = live.session.media_path();
+                        let route = path.media_label(&state);
+                        ui::tag(ui, Some(path.media_tone(&state)), &route);
                         ui::tag(ui, None, &profile_label(&live.settings));
                     });
+                    let state = live.session.media_path();
+                    ui::small_print(ui, state.reason.description());
+                    ui::small_print(ui, format!("Current media path for {} s", state.since.elapsed().as_secs()));
                     ui.add_space(space::SM);
                     let rows = [
                         Kv::new("Resolution", format!("{} × {}", stats.width, stats.height)),
@@ -991,8 +993,10 @@ impl View {
                     }
                     ui.add_space(space::XS);
                     if ui::secondary_button(ui, "Copy diagnostics").clicked() {
-                        ctx.copy_text(format!("Latch {}\n{}\nRequested: {} × {}, {} fps, {} Mbps\n{stats:#?}",
-                            env!("CARGO_PKG_VERSION"), path.label(), live.requested.0, live.requested.1,
+                        let state = live.session.media_path();
+                        ctx.copy_text(format!("Latch {}\n{}\n{}\nMedia path for {} s\nRequested: {} × {}, {} fps, {} Mbps\n{stats:#?}",
+                            env!("CARGO_PKG_VERSION"), path.media_label(&state), state.reason.description(),
+                            state.since.elapsed().as_secs(), live.requested.0, live.requested.1,
                             live.requested.2, live.settings.bitrate_kbps / 1000));
                     }
                 });
@@ -1014,7 +1018,16 @@ impl View {
         env: &Env<'_>,
         stats: &latch_stream::Stats,
     ) {
-        let rows = overlay_rows(env.live, stats, &self.presented);
+        let mut rows = overlay_rows(env.live, stats, &self.presented);
+        let path = env.path.as_ref().unwrap_or(&env.live.path);
+        rows.insert(
+            0,
+            row(
+                "Media path",
+                path.media_label(&env.live.session.media_path()),
+                false,
+            ),
+        );
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Middle,
             Id::new(video::PAINTED_OVERLAYS[0]),
@@ -1122,16 +1135,20 @@ impl View {
                                 );
                             }
                             if !overflow {
-                                let relay = live.session.relay_active();
-                                let route = if relay { "Latch TLS relay".into() } else { path.label() };
-                                let tag = ui::tag(ui, Some(path.tone()), &route);
-                                if relay {
-                                    tag.on_hover_text("Video, sound and input use the Latch TLS relay.");
-                                } else if path.relayed() {
-                                    tag.on_hover_text("The route in use right now. A relay adds delay; Latch never lowers the bitrate for it.");
-                                } else if path.direct == Some(true) {
-                                    tag.on_hover_text("Packets go straight to the machine.");
-                                }
+                                let state = live.session.media_path();
+                                let route = match &state.path {
+                                    latch_stream::path::MediaPath::LatchRelay => "Latch relay",
+                                    latch_stream::path::MediaPath::TailscaleUdp(_) => {
+                                        "Tailscale UDP"
+                                    }
+                                };
+                                ui::tag(ui, Some(path.media_tone(&state)), route).on_hover_text(
+                                    format!(
+                                        "{}. {}",
+                                        path.media_label(&state),
+                                        state.reason.description()
+                                    ),
+                                );
                             }
                             if rect.width() >= HINT_BELOW {
                                 ui.add_space(space::XS);
@@ -4079,6 +4096,12 @@ pub(crate) mod tests {
                 None,
             ),
             (
+                "media-path",
+                View { details: true, ..view_with_bar() },
+                windows(),
+                None,
+            ),
+            (
                 "stats",
                 View {
                     stats: true,
@@ -4153,6 +4176,7 @@ pub(crate) mod tests {
             for &(size, ppp) in sizes {
                 let view = View {
                     settings: view.settings.clone(),
+                    details: view.details,
                     stats: view.stats,
                     bar_shown: view.bar_shown,
                     confirm: view.confirm,

@@ -1034,6 +1034,7 @@ impl FecPolicy {
 
 /// The encoder budget accounts for rounded FEC and Latch/IP/tunnel headers.
 /// Audio is reserved separately; at tiny rates keep a usable video floor.
+#[cfg(test)]
 pub(crate) fn video_budget(
     wire_kbps: u32,
     fec: u8,
@@ -1041,6 +1042,26 @@ pub(crate) fn video_budget(
     fps: u32,
     audio: bool,
     protected: bool,
+) -> u32 {
+    video_budget_sized(
+        wire_kbps,
+        fec,
+        burst,
+        fps,
+        audio,
+        protected,
+        latch_proto::MAX_DATAGRAM,
+    )
+}
+
+pub(crate) fn video_budget_sized(
+    wire_kbps: u32,
+    fec: u8,
+    burst: u8,
+    fps: u32,
+    audio: bool,
+    protected: bool,
+    datagram_size: usize,
 ) -> u32 {
     let available = wire_kbps
         .saturating_sub(if audio { 1200 } else { 0 })
@@ -1055,7 +1076,15 @@ pub(crate) fn video_budget(
     // more than half the ordinary target for it. The excess is one frame's
     // burst, which the pacer and FEC headroom absorb.
     let least = if protected {
-        video_budget(wire_kbps, fec, burst, fps as u32, audio, false) / 2
+        video_budget_sized(
+            wire_kbps,
+            fec,
+            burst,
+            fps as u32,
+            audio,
+            false,
+            datagram_size,
+        ) / 2
     } else {
         0
     };
@@ -1066,7 +1095,11 @@ pub(crate) fn video_budget(
     while low < high {
         let mid = low + (high - low).div_ceil(2);
         let bytes = u64::from(mid) * 1000 / 8 / fps;
-        let len = bytes.clamp(1, latch_proto::MAX_SHARD_LEN as u64);
+        let len = bytes.clamp(
+            1,
+            (datagram_size.clamp(576, latch_proto::MAX_DATAGRAM) - latch_proto::VIDEO_HEADER_LEN)
+                as u64,
+        );
         let shards = bytes.div_ceil(len).max(1);
         let blocks = shards.div_ceil(latch_proto::MAX_BLOCK_DATA as u64);
         let mut packets = shards;

@@ -105,17 +105,31 @@ different bounded limits. These are implementation defaults, with deployed
 limits set by the operator. Quota exhaustion or admission rejection prevents
 a new relay route. The monthly ledger survives daemon restarts.
 
-Relay setup and frame stalls have deadlines and retries have cooldowns.
-A failed relay attempt leaves or returns routing to UDP. If that path
-still cannot deliver usable video, the media watchdog ends the session and
-the reconnect overlay appears. After a minute on relay, a bounded UDP load
-probe can return the stream to a healthy direct path. This probe currently
-covers requests up to 40 Mbps. At the relay's time or traffic limit, Latch
-returns briefly to UDP and starts a fresh relay connection. On a network
-where UDP is blocked, video can pause for several seconds during renewal.
-Priority queue exhaustion ends the
-session to release held keys and buttons. Local acceptance of a packet
-into a queue does not guarantee remote delivery.
+The toolbar names the current media transport. “Tailscale UDP” uses Tailscale's
+reported path, shown as Direct, Via your relay, or Relayed via a DERP city.
+“Latch relay” uses the public relay for video, sound and input. Open
+Stream performance for its Tailscale route or relay carrier, the reason, and how long that media path has been in
+use. A brief notice appears when the path changes, for example “UDP is losing
+17% of packets”, “UDP is blocked on this network”, or “UDP recovered”.
+Path changes keep the session and held input alive.
+
+Latch starts relay preparation after 250 ms without UDP packets and detects
+persistent video damage or a busy reduced-rate stream within a trailing
+one-second window. It measures UDP recovery while video stays on relay,
+starting after five seconds, including for requests above 40 Mbps. Repeated
+failures back off, and at most three measured returns to UDP occur per minute.
+If large UDP packets disappear while smaller ones arrive, Latch measures the
+working size and reduces video and input datagrams. The notice reports the
+selected size. Audio packets fit the smallest tested size.
+
+Relay setup and frame stalls have deadlines. A relay close restores UDP
+and retries after 100 ms when UDP has not delivered a fresh picture. Three
+consecutive failed attempts wait thirty seconds. Setup failures wait two
+seconds between attempts. At a relay grant's time or
+traffic limit Latch briefly returns to UDP for fresh authorization. If neither
+path can deliver usable video within the session's eight-second watchdog,
+the reconnect overlay appears. Local queue acceptance alone cannot establish
+remote delivery.
 
 The network must allow native TLS with ALPN `latch-relay/1`. HTTP-only
 proxies, TLS inspection and captive portals may prevent it. This path

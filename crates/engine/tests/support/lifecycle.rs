@@ -127,7 +127,7 @@ fn route_changes_finish_before_new_udp_pad_updates_are_acknowledged() {
         }));
         entered.recv_timeout(Duration::from_secs(1)).unwrap();
         // The new route may already be visible, but delivery must wait until
-        // its transition has released the previous route's virtual devices.
+        // the input lock has ordered the transition with device updates.
         let error = udp.recv(&mut [0; 1500]).unwrap_err();
         assert!(matches!(
             error.kind(),
@@ -194,6 +194,7 @@ fn a_viewer_that_does_not_read_cannot_block_the_control_writer() {
     }
     host.set_nonblocking(false).unwrap();
     let accept = Accept {
+        media_path_policy: false,
         relay: false,
         color: Default::default(),
         cursor: false,
@@ -675,6 +676,7 @@ fn audio_reports_failure_retries_with_backoff_clears_notice_and_fits_the_mtu() {
     };
     let (host, mut client) = sockets();
     let accept = Accept {
+        media_path_policy: false,
         relay: false,
         color: Default::default(),
         cursor: false,
@@ -788,6 +790,11 @@ fn audio_reports_failure_retries_with_backoff_clears_notice_and_fits_the_mtu() {
 
 #[test]
 fn audio_packets_split_the_frame_evenly_and_always_fit() {
+    for channels in [1, 2, 6, 8] {
+        let samples = audio_packet_samples_with_limit(channels, 576);
+        assert_eq!(audio::FRAME % samples, 0);
+        assert!(latch_codec::audio::max_coded_len(channels, samples) + 18 <= 576);
+    }
     for (channels, samples) in [(1, 240), (2, 240), (6, 80), (8, 60)] {
         assert_eq!(audio_packet_samples(channels), samples, "{channels} ch");
         assert_eq!(audio::FRAME % samples, 0);

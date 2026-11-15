@@ -748,3 +748,200 @@ process-wide; reopen failures feed the existing Baseline software fallback or
 modern-codec renegotiation. Driver resources stay owned by the abandoned
 worker until its call returns. This recovery has not run against a hung
 driver on Windows hardware.
+
+
+## Media path policy
+
+### Audit of 6.0.0 before this change
+
+This audit follows `bf5da0d` in `crates/stream/src/session.rs` and
+`crates/engine/src/server.rs`. Both peers must advertise `relay`, and both
+must have a configured relay endpoint. The viewer alone requests fallback.
+The authorized Tailscale TCP connection remains required on both paths.
+
+- The viewer samples its decoded-picture publication clock every control-loop
+  turn, normally within 5 ms. One second after acceptance without a decoded
+  picture, or one second after the last decoded picture, requests relay.
+  Traffic, control keepalives and complete undecoded frames do not reset this
+  particular clock.
+- Viewer feedback is published every 50 ms. Any lost frame or more than 1%
+  unrecovered packet loss starts a damage timer. A positive-fps window without
+  either clears it. Two uninterrupted seconds requests relay. Alternating
+  clean and damaged windows can therefore postpone this trigger indefinitely,
+  even at sustained 15–18% raw loss.
+- A separate five-second timer requests relay when busy video has a positive
+  wire budget below 60% of the requested rate, a request of at least 4 Mbps,
+  a positive encoder target and receive frame rate, and useful video filling
+  at least 75% of that encoder target. Other windows clear this timer.
+  Successfully repaired FEC loss alone does not trigger fallback.
+- `Request` starts the host's single cancellable grant worker. Fresh grant,
+  keys and attachment tickets precede `Offer`, both endpoints' two-lane E2E
+  readiness, then `Ready`, `Commit`, `Committed`. The viewer activates on
+  `Commit`, the host on `Committed`. The entire application negotiation has a
+  six-second deadline. Route revisions discard queued old-route frames and
+  request an IDR. Encoding, audio sequencing and the authorized session survive.
+- Preparation errors, transport close events, ordinary send failures and a
+  six-second negotiation or direct-handoff timeout reset routing to UDP and
+  send `Abort`. The first two failures wait two seconds before retry. The
+  third and later wait thirty seconds. A relay active for thirty seconds, or
+  ending with its finite grant spent, resets the failure history. The host
+  answers an early request with `RetryAfter`, clamped to 250–30,000 ms.
+  Priority queue exhaustion is fatal and ends the session to release input.
+- The host proactively renews at 250 ms before grant expiry, or after delivered
+  video and 75% of the advertised combined byte allowance. `Renew` restores
+  UDP, resets the failure count to one, and waits two seconds for fresh
+  authorization. This is a break-before-make renewal.
+- Only the host reassesses UDP. After a minimum sixty-second relay dwell it
+  announces `UdpProbe`, waits 100 ms, and sends one second of 1,200-byte UDP
+  padding at 125% of requested kbps, with a 2 Mbps minimum. The 50 Mbps
+  probe ceiling excludes requests above 40 Mbps. At most 64 packets leave
+  per control turn. Each probe start doubles the next interval up to 600 seconds, including
+  successful attempts.
+  Viewer reports arrive after two seconds. Host expires a missing report
+  after three seconds. Qualification requires every local send attempted,
+  at least 99.5% of unique packet positions received, a receive span of
+  800–1,200 ms, and measured wire delivery at least 90% of the probe rate.
+  Duplicates and missing tails count correctly. `Direct` makes the viewer
+  close relay and reply `DirectReady`, after which the host returns to UDP.
+  A successful handoff resets failures and sets a two-second retry cooldown.
+- Host transitions out of relay release all held keyboard/mouse input and
+  unplug virtual gamepads. The viewer resends pad snapshots. Acknowledged
+  held keyboard events have no equivalent replay.
+- The viewer toolbar and performance panel display “Latch TLS relay” while
+  active. Otherwise they display discovery's Tailscale path label. There is
+  no typed path-change event or visible fallback reason.
+- Independent watchdogs still end a session after eight seconds without its
+  first decoded picture, an eight-second decoded-picture stall, five seconds
+  without reliable-input ACK progress, or ten seconds without host traffic.
+  Reliable input is bounded at 4,096 events. Explicit Stop and takeover retain
+  their original end codes.
+
+The field report recorded approximately 1.81 seconds from UDP denial to
+relay selection and 4.96 seconds from a video-ACK close to a fresh active
+relay. Video ACK expiry itself belongs to `crates/relay`, whose lane RTT
+plus four variations is bounded between its stall deadline and five seconds.
+[Field measurements](measurements/2026-11-14-latch6-field/REPORT.md)
+
+### Policy in this revision
+
+The viewer requests preparation after 250 ms with no valid UDP datagram.
+A healthy first exchange allocates no relay grant or connections. A previously
+working stream requests recovery after 700 ms without a complete encoded
+video frame. Complete incoming frames keep a slow or failed decoder from
+allocating relay capacity on a healthy network. Before its first complete
+frame, small-packet connectivity allows one second for MTU measurement.
+Both grace periods allow at least two frame intervals for low-frame-rate
+requests. The independent eight-second decoded-picture watchdog remains.
+
+Damage is integrated over a trailing second of actual 50 ms receive windows.
+At least 800 ms of evidence and damage in at least one quarter of that time
+requests recovery. Alternatively, three lost frames making up at least 10%
+of delivered-plus-lost frames qualify with at least 10% mean raw loss and
+damage reports spanning 250 ms. This counts several frame losses batched into
+one receive report. Damage must remain fresh within 250 ms, so a burst that
+FEC has already resolved cannot trigger a late switch. Brief clean windows
+contribute to the denominator. The reported reason includes the window-weighted raw loss percentage. Repaired
+loss with requested-quality delivery keeps UDP. The busy-video rate test
+retains its 60% budget and 75% encoder-utilization gates, and requests relay
+after at least 800 ms of evidence with the gate met in three quarters of
+the trailing window. If FEC overhead leaves busy useful video below 60% of
+request despite a full wire budget, the same 75%-of-window quality gate
+requires at least 10% mean raw loss before requesting relay. Thus repaired
+packets can still establish a quality deficit, while FEC that preserves the
+requested quality keeps UDP. Relay media feedback never feeds these decisions.
+
+Negotiation keeps the six-second application deadline and one grant worker.
+Established-path failures and grant renewal use a 100 ms cooldown. Setup
+failures retain two seconds between attempts. Three consecutive
+failed attempts still open the thirty-second circuit breaker. After a relay
+close the viewer retries if no decoded UDP picture has arrived in 100 ms.
+A working UDP path cancels this extra retry reason. With the new capability
+negotiated, priority queue backpressure returns routing to UDP and uses the same recovery policy. Invalid control packets and
+bounded control-inbox exhaustion still terminate the session. The relay's
+internal ACK algorithm and deadlines are unchanged by this PR.
+
+Fresh receive reports are consumed on the control owner's 5 ms cadence.
+A separate 50 ms sampling clock can miss whole receive windows repeatedly.
+
+UDP reassessment starts after five seconds. Probe backoff doubles to sixty
+seconds, including across short-lived recoveries. Three measured returns to
+UDP per rolling minute bound repeated flapping. Emergency relay failures
+remain free to restore UDP. Negotiated sized probes support up to 1,250 Mbps
+of padding, including the 75 Mbps check for a 60 Mbps request. The legacy
+50 Mbps ceiling is retained when the peer lacks `media_path_policy`.
+Padding remains one second, with at most 2,048 datagrams per turn. Qualification
+keeps the original delivery and span thresholds. The host control owner uses
+the existing media scheduling priority. Padding socket writes hold neither
+the route-state lock nor the UDP-address lock, so media and input can proceed.
+For sized probes the viewer acknowledges that its receiver is installed with
+`UdpProbeReady` before the host starts the 100 ms settle timer and padding.
+The viewer's two-second result window starts at the first UDP arrival, or the
+announcement if nothing arrives. The host expires a pending readiness or
+result after three seconds, restarting that deadline on readiness. This
+prevents early UDP or control scheduling delay from truncating a probe.
+Media stays on relay until
+handoff. Fresh route revisions request an IDR. Held input, virtual devices,
+input sequence numbers, audio playback and audio sequence numbers survive
+both directions of handoff. Session teardown releases held input.
+
+With `media_path_policy` negotiated, the host also tests 1,200, 1,000, 800
+and 576-byte datagrams in three interleaved rounds, 100 ms apart, initially
+and every ten seconds. The viewer reports after 600 ms. Duplicate indexes
+count once. Positions for the next serial that arrive ahead of its TCP
+announcement are cached for up to one second and applied after announcement.
+At least two deliveries at a smaller size and zero deliveries
+at every larger size identify a size black hole. The sender uses the largest
+qualifying size on subsequent video frames and requests an IDR. Existing
+video shard lengths describe the new layout. Input batches use the same bound.
+Audio is negotiated once to fit 576 bytes even at the codec's worst case,
+including parity headers, so changing video MTU cannot strand sound. A fresh
+successful size test can restore larger datagrams.
+
+`Session::media_path()` returns `MediaPathState`, and `Event::PathChanged`
+publishes changes. It carries `MediaPath`, `PathReason`, `since` and an
+optional carrier display name. `Session::set_udp_path` accepts discovered
+`UdpPath` classifications independently. The viewer maps discovery's direct,
+peer relay and DERP classifications into that API, shows the route and reason
+in Stream performance, and displays a five-second informational notice on
+change. `PathReason::Environment { code, detail }` and the carrier name are
+the extension points for subsequent network-environment and relay-carrier
+wiring. No network discovery or proxy transport is implemented here.
+
+### Loopback validation
+
+Measured on an Apple M3 Pro, macOS arm64, Rust 1.99.0, with the optimized
+test profile and four Cargo jobs. TLS uses the existing local test daemon
+and test CA. UDP uses the in-process impairment simulator. These runs use
+synthetic video, with low-complexity 128×128 video for the high requested
+rates and real padding at 25 and 75 Mbps for UDP reassessment.
+
+| Case | Observed | Enforced bound |
+| --- | --- | --- |
+| UDP blocked from startup | First decoded picture in 464 ms, with a separate cold run at 1.07 s | 2 s |
+| UDP denied mid-stream | Fresh decoded relay picture in 872 ms, held key retained | 2 s |
+| Mixed random and burst loss | 1.86 s to relay, 168 of 971 UDP packets lost, 17.3% | 2 s |
+| 3 Mbps UDP policer | 774 ms to relay | 2 s |
+| Return to UDP, 20 Mbps requested | 7.06 s, largest decoded-picture gap 143 ms | 9 s, gap below 250 ms |
+| Return to UDP, 60 Mbps requested | 7.03 s, largest decoded-picture gap 129 ms | 9 s, gap below 250 ms |
+| Relay close while UDP is blocked | Fresh relay picture in 244 ms | 950 ms after local relay restart |
+| Relay close with working UDP audio | Ten PCM frames resumed in 29 ms, with 10 concealed packets | 1 s |
+| 850-byte UDP black hole | Selected 800-byte video/input datagrams, no relay grant | First picture within 2 s |
+| Repeated UDP flaps | Three returns to UDP, four grants, held key retained | Three returns per rolling minute |
+| Healthy UDP | Zero additional relay grants/connections | Checked during decoded video and ordered input |
+
+The audio result includes loss concealment during a forced transport close.
+These measurements establish local policy and recovery bounds. Campus,
+Windows and Linux field performance require their own runs. Relay ACK expiry
+itself remains the transport crate's existing behavior. The engine and stream
+handle its close through the same fast recovery path as other relay closes.
+
+Run the same runtime scenarios with the following command. The protocol and
+stream unit suites also cover legacy negotiation, exact 15/17/18% feedback,
+FEC-preserved quality, batched frame loss, stale damage, low frame rates,
+size-probe deduplication, and maximum-rate probe negotiation.
+
+```sh
+cargo test -p latch-engine -j 4 --test relay_runtime -- --test-threads=1 --nocapture
+cargo test -p latch-stream -p latch-proto -p latch-client -j 4 -- --test-threads=1
+cargo test -p latch-engine -j 4 --lib --test impaired --test recovery --test lifecycle --test ceiling -- --test-threads=1
+```

@@ -131,6 +131,12 @@ impl Packetizer {
         }
     }
 
+    /// Change subsequent frames' datagram size. Existing shard headers describe
+    /// their individual lengths, so reassembly needs no new wire fields.
+    pub fn set_datagram_size(&mut self, bytes: usize) {
+        self.shard_len = bytes.clamp(576, crate::MAX_DATAGRAM) - crate::VIDEO_HEADER_LEN;
+    }
+
     /// Clamped to [`MIN_FEC_PERCENT`]..=[`MAX_FEC_PERCENT`].
     pub fn set_fec_percent(&mut self, percent: u8) {
         self.fec_percent = percent.clamp(MIN_FEC_PERCENT, MAX_FEC_PERCENT);

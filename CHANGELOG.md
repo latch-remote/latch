@@ -39,6 +39,21 @@ GitHub release notes, so each version gets a heading of the form
   offload, descriptor and memory tuning, with bounded before/after measurements,
   bundle and transfer cost estimates, IPv6 findings and completed EC2 teardown.
 
+### Streaming and recovery
+
+- Prepare relay recovery after 250 ms without UDP and detect bursty damage
+  and busy UDP rate limits using a trailing feedback window. Keep repaired
+  loss on UDP and bound repeated path changes.
+- Reassess recovered UDP after five seconds, including 60 Mbps requests.
+  Preserve held input, virtual gamepads and sound across media handoffs.
+- Negotiate datagram-size tests and reduce video and input packet sizes for
+  path-MTU black holes. Keep audio packets within the tested size floor.
+- Shorten active-relay retry and grant-renewal cooldowns to 100 ms. Recover
+  priority backpressure through UDP and fresh relay authorization.
+- Show the media path, reason and elapsed time in Stream performance, with
+  a brief notice when the path changes. Preserve protocol-1 compatibility
+  with 6.0.0 hosts and viewers.
+
 ## 6.0.0 (2026-11-14)
 
 ### Streaming and recovery

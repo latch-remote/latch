@@ -14,6 +14,7 @@ mod ports;
 
 fn request(name: &str) -> StreamRequest {
     StreamRequest {
+        media_path_policy: false,
         relay: false,
         prefer_color: false,
         color: Default::default(),
@@ -138,6 +139,7 @@ fn post_accept_end_close_and_missing_media_are_reported_as_failures() {
             control::write_message(
                 &mut tcp,
                 &Message::Accept(Accept {
+                    media_path_policy: false,
                     relay: false,
                     color: Default::default(),
                     session: 123,
@@ -256,6 +258,7 @@ fn impaired_host(mode: &'static str) -> (u16, std::thread::JoinHandle<()>) {
         control::write_message(
             &mut tcp,
             &Message::Accept(Accept {
+                media_path_policy: false,
                 relay: false,
                 color: Default::default(),
                 session: 123,
