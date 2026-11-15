@@ -677,6 +677,16 @@ fn connect_tcp(
 fn direct_first(direct_allowed: bool, proxy_won: bool) -> bool {
     direct_allowed && !proxy_won
 }
+fn rung_budget(budget_ms: u64, mss_hint: Option<(Instant, MssReason, u32)>) -> Duration {
+    // Both lanes share this intermediate probe. A concurrent lane must not
+    // spend its full normal handshake budget on the already suspect 1200 MSS.
+    let milliseconds = if matches!(mss_hint, Some((_, MssReason::TlsHandshakeStall, 1200))) {
+        budget_ms.min(150)
+    } else {
+        budget_ms
+    };
+    Duration::from_millis(milliseconds)
+}
 fn bounded_deadline(deadline: Instant, now: Instant, budget: Duration) -> Instant {
     deadline.min(now + budget)
 }
@@ -800,7 +810,6 @@ fn open_carriers(
     let mut mss_recovery = false;
     let mut cached_probe = winning.is_some();
     while let Some((carrier, preferred, budget)) = rungs.pop_front() {
-        let rung_end = bounded_deadline(end, Instant::now(), Duration::from_millis(budget));
         let mss_reason = config
             .hints
             .lock()
@@ -808,6 +817,7 @@ fn open_carriers(
             .reduced_mss
             .filter(|(until, _, _)| *until > Instant::now());
         let reduced_mss = mss_reason.map(|(_, _, value)| value);
+        let rung_end = bounded_deadline(end, Instant::now(), rung_budget(budget, mss_reason));
         match open_carrier(
             config,
             cancel,
@@ -2351,5 +2361,22 @@ mod tests {
             ),
             end
         );
+    }
+    #[test]
+    fn concurrent_lanes_share_the_short_intermediate_mss_probe_budget() {
+        let until = Instant::now() + Duration::from_secs(30);
+        assert_eq!(
+            rung_budget(750, Some((until, MssReason::TlsHandshakeStall, 1200))),
+            Duration::from_millis(150)
+        );
+        assert_eq!(
+            rung_budget(750, Some((until, MssReason::ExplicitStall, 1200))),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            rung_budget(750, Some((until, MssReason::TlsHandshakeStall, 512))),
+            Duration::from_millis(750)
+        );
+        assert_eq!(rung_budget(750, None), Duration::from_millis(750));
     }
 }
