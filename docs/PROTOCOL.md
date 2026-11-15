@@ -98,6 +98,11 @@ type byte and the payload and is at most 65 536. Payloads are JSON objects.
 | 8 | `Relay` | either | `{"session": u32, "attempt": u64, "action": RelayAction}`; negotiated only when request and accept both set `relay` |
 | 9 | `Path` | either | negotiated `media_path_policy` controls described below |
 
+Host network notices retain the version-1 type-4 `{"kind", "message"}` shape.
+Each control session emits the active notice once, then emits only changed
+kind/text. A new viewer receives the active notice independently. Clearing a
+condition rearms it locally and preserves 6.0.0 frame compatibility.
+
 `End` always uses the original control connection, including while relay is
 active. Codes 0 (intentional end), 1 (takeover), and 5 (host stopping) stop
 automatic reconnect. Code 6 is a recoverable transport failure, including
@@ -1115,13 +1120,26 @@ timeout or unavailable probe from an older relay produces no warning by itself.
 This endpoint is independent of the TLS relay framing and version-1 peer protocol.
 Healthy sessions reuse discovery until the network key changes or a relay
 connection fails. Confirmed portals retry with 1-to-4-second exponential
-backoff. Relay failures refresh within two seconds and incomplete PAC/WPAD
-results retain the prior proxy. Opening sign-in or returning to the app rechecks
-promptly. Delivered media clears the portal banner. Waiting before media ends
-three minutes after portal detection, and the normal media-stall deadline remains active once
-pictures flow. Browser sign-in actions reject loopback and unspecified IPs,
-localhost and its subdomains while
-allowing private portal addresses.
+backoff. The first portal observation and first open result from a new discovery
+round take effect immediately. After open has been observed on the current
+network key, re-entry requires two consecutive redirect observations from
+separate rounds. A returning portal adds one discovery round under the existing
+backoff and discovery deadlines. Cached reads and partial unknown results
+cannot confirm re-entry. Alternating redirect/open results clear the banner
+once and preserve backoff. Relay failures refresh discovery within two seconds.
+Incomplete PAC/WPAD results retain the prior proxy. After 60 seconds without a
+successful verified connection through a retained proxy, new opens force direct
+first, then try that proxy under the shared deadline. Successful proxy opens
+restart the retention timer, including grants, renewals and attachment lanes.
+The timer starts with the first incomplete result. Successful discovery replaces
+the settings immediately. Monotonic clocks can
+count system sleep differently, which can change ordering while retaining the
+proxy fallback. Opening sign-in or returning to the app rechecks promptly.
+Delivered media clears the portal banner. Waiting before media ends three
+minutes after portal detection, and the normal media-stall deadline remains
+active once pictures flow. Browser sign-in actions reject loopback and
+unspecified IPs, localhost and its subdomains while allowing private portal
+addresses.
 
 `GET /.well-known/acme-challenge/<token>` serves a bounded regular file from
 `WEBROOT/.well-known/acme-challenge`. Tokens use ASCII letters, digits, hyphens
@@ -1131,9 +1149,14 @@ bytes and two seconds per connection. Normal admissions have global 120/minute
 and per-source 30/minute caps, using the port-443 IPv4 /32 and IPv6 /64 keys.
 Two request slots and 16 challenge admissions per minute form an ACME-only
 reserve for existing challenge files under ordinary traffic. Missing files use
-ordinary credit. Headers expire after 250 ms. A source holds at most one idle
-request and two total pending requests. Idle requests cannot occupy the reserved
-slots. These bounds reduce ordinary-traffic starvation and cannot guarantee
+ordinary credit. Headers expire after 1.5 seconds from acceptance, allowing
+300 ms one-way request delivery on a 600 ms RTT path plus a one-second initial
+retransmission delay. Arriving bytes never extend the deadline. A source holds
+at most one idle request and two total pending requests. Under slot pressure,
+the oldest incomplete header yields to a new arrival. Completed responses keep
+their slots. Once ordinary global or source admission credits are exhausted,
+incomplete headers get a 250 ms grace for ACME classification. Idle requests
+cannot occupy the two reserved slots. These bounds reduce ordinary-traffic starvation and cannot guarantee
 availability under deliberate resource exhaustion. Monitor renewal failures and
 certificate expiry. Accept errors log once and back off for one second while
 port 443 continues.

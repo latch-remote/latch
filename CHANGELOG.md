@@ -97,6 +97,18 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Relay connectivity
 
+- After 60 seconds without retained-proxy success, try direct access first and
+  keep the proxy as fallback. Renew its preference on every successful proxy
+  connection and replace settings on successful discovery.
+- Allow 1.5 seconds for anonymous probe headers on high-latency, lossy paths
+  with bounded connection lifetimes and admission/byte limits. Evict the oldest
+  incomplete header under slot pressure and use 250 ms ACME classification
+  grace after ordinary admission credits are exhausted.
+- Deduplicate host network notices per viewer. Clear portals on the first fresh
+  open result and require two redirect rounds for re-entry after open, preserving
+  retry backoff across flapping and immediate first-time detection.
+- State relay maintenance interruption estimates and explain standalone renewal
+  and loss of the port-80 probe after rollback.
 - Keep relay connections usable when local wake notifications are unavailable,
   and preserve short-timer precision on Windows.
 - Keep anonymous connectivity checks and certificate challenges responsive

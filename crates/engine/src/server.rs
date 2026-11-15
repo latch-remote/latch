@@ -856,6 +856,7 @@ impl Server {
         let mut mtu = latch_stream::path::MtuProbe::new(Instant::now());
         let mut mtu_settle_until = Instant::now();
         let mut network_status = latch_stream::network::NetworkStatus::default();
+        let mut network_notice = None;
         let reason = loop {
             let ended = session.ended.lock().clone();
             if let Some(e) = ended {
@@ -916,12 +917,14 @@ impl Server {
                 for message in &status.messages {
                     self.log(message.clone());
                 }
-                if let Some(notice) =
-                    latch_stream::network::host_notice(&status, session.relay.failure().as_ref())
-                {
-                    let _ = session.send_tcp(&Message::Notice(notice));
-                }
-                network_status = status;
+                network_status = status.clone();
+            }
+            if let Some(notice) = latch_stream::network::changed_host_notice(
+                &mut network_notice,
+                &status,
+                session.relay.failure().as_ref(),
+            ) {
+                let _ = session.send_tcp(&Message::Notice(notice));
             }
             if route_revision != session.relay.revision() {
                 route_revision = session.relay.revision();

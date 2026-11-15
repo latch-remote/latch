@@ -372,6 +372,7 @@ On the live host, inspect recent metrics and active TCP connections. Metrics are
 printed every 30 seconds. Pick a quiet moment with `sessions=0` and no active
 stream connections, then confirm the latest sample immediately before proceeding.
 If sessions remain active, arrange their interruption with the users.
+The inspection block below causes no relay interruption (0 seconds).
 
 ```sh
 sudo journalctl -u latch-relay.service --since '2 minutes ago' --no-pager | tail -20
@@ -386,7 +387,8 @@ the executable, unit and drop-ins, environment/configuration including the TLS
 identity, renewal configuration, and a consistent stopped quota ledger. Keep an
 off-host copy with private keys excluded as described in the general upgrade
 instructions above. Rollback retains the current ledger, including reservations
-spent after the backup.
+spent after the backup. The variable-setting block causes no relay interruption
+(0 seconds).
 
 ```sh
 export RELAY_HOST='your-relay-hostname'
@@ -403,6 +405,15 @@ restores the prior executable, unit, config
 and renewal settings, restarts it, and checks both carriers. Retain the printed
 backup directory for a later rollback. An unsuccessful rollback or timer restart
 exits with an error and needs operator attention.
+
+For this upgrade block, plan 5–10 seconds of relay interruption between the stop
+and start commands on a healthy host, plus client reconnection time. Certificate
+reconfiguration and staging validation can take minutes after the relay starts.
+If automatic rollback runs, allow another 5–10 seconds for restoring the saved
+files and restarting. A failed restart needs manual recovery and can extend the
+interruption beyond these estimates. The automatic rollback also restores
+standalone authentication and removes the port-80 probe until the upgrade is
+successfully repeated.
 
 ```bash
 sudo env RELAY_HOST="$RELAY_HOST" RELAY_CERT_NAME="$RELAY_CERT_NAME" \
@@ -536,6 +547,27 @@ upgrade. A renewal since then makes that copy older than the current one, and
 Certbot would not replace it until its own next renewal. The block therefore
 reinstalls the current certificate after restoring the configuration.
 
+For this later rollback block, plan 5–10 seconds of relay interruption between
+stop and start on a healthy host, plus client reconnection time. The standalone
+renewal dry-run adds a second interruption for HTTP-01 validation, typically
+tens of seconds. Backup, certificate validity and key matching are checked
+before stopping. A failed restart needs manual recovery and can extend the
+interruption beyond those estimates. If a command fails after stopping the
+relay, the block can leave it stopped. Repair the reported problem and rerun
+the block with the same backup to restore service safely.
+
+The saved `renewal.conf` points back at standalone authentication, including its
+relay stop/start hooks. Restoring the saved binary and unit also makes the
+port-80 probe unavailable again. Native TLS and WebSocket validation below
+checks port 443. The dry-run then exercises the restored standalone renewal
+and stop/start hooks while the interruption is still arranged. To restore the
+probe, repeat the upgrade and webroot conversion above with the current
+certificate and a reviewed probe-capable binary. Keep standalone renewal's
+port-80 ownership and stop/start hooks while running the restored unit. Those
+renewals interrupt relay service for the HTTP-01 validation and restart,
+typically tens of seconds, with longer interruptions if validation fails.
+Plan that maintenance with connected users.
+
 ```bash
 sudo env RELAY_HOST="$RELAY_HOST" RELAY_CERT_NAME="$RELAY_CERT_NAME" \
   backup="$backup" RELAY_KIT="$PWD/deploy/relay-tcp" bash <<'BASH'
@@ -559,6 +591,9 @@ case "$certbot_state" in inactive|failed) ;; *) echo 'Certbot is running' >&2; e
 # Check the backup and the current certificate before interrupting service.
 sha256sum --check "$backup/SHA256SUMS"
 openssl x509 -in "$lineage/fullchain.pem" -noout -checkend 86400
+openssl pkey -in "$lineage/privkey.pem" -passin pass: -check -noout >/dev/null
+cmp -s <(openssl x509 -in "$lineage/fullchain.pem" -pubkey -noout) \
+    <(openssl pkey -in "$lineage/privkey.pem" -passin pass: -pubout)
 systemctl stop latch-relay.service
 cp -a /var/lib/latch-relay/quota "$backup/quota.at-rollback" \
     || echo 'The audit copy of the quota failed. Continuing with the rollback.' >&2
@@ -577,6 +612,8 @@ systemctl start latch-relay.service
 systemctl is-active --quiet latch-relay.service
 openssl x509 -in /etc/latch-relay/fullchain.pem -noout -enddate
 python3 "$RELAY_KIT/selftest.py" --live "$RELAY_HOST"
+certbot renew --cert-name "$RELAY_CERT_NAME" --dry-run
+systemctl is-active --quiet latch-relay.service
 BASH
 ```
 
@@ -588,8 +625,10 @@ failures and remaining validity explicitly. The relay serves its own copy,
 renewal, so check that copy as well as Certbot's: a fresh Certbot certificate
 does not prove the relay is serving it. Each `-checkend` command exits nonzero
 when fewer than 30 days remain, and `is-failed` exits zero when the last
-renewal run failed. Run them daily through the operator's monitoring or
-scheduler and alert on those results.
+renewal run failed. A monitoring wrapper must capture each status individually
+and avoid `set -e` around this block so every check runs. Run them daily through
+the operator's monitoring or scheduler and alert on those results. The checks
+below cause no relay interruption (0 seconds).
 
 ```sh
 sudo openssl x509 -in /etc/latch-relay/fullchain.pem -noout -enddate
@@ -604,8 +643,11 @@ The HTTP listener bounds request size/time, concurrent connections and per-sourc
 (IPv4 /32, IPv6 /64) plus global admission. Normal traffic has 120 global and
 30 per-source admissions per minute. Two slots and 16 admissions per minute
 reserve capacity for existing challenge files during ordinary traffic. Headers
-have a 250-ms deadline and each source can hold one idle connection. Idle
-requests cannot occupy the reserved slots. This reduces ordinary-traffic
+have an absolute 1.5-second deadline and each source can hold one idle connection.
+Under slot pressure the oldest incomplete header yields to a new arrival.
+Completed responses retain their slots. After normal admission credits are
+exhausted, incomplete headers have a 250 ms grace for ACME classification.
+Idle requests cannot occupy the reserved slots. This reduces ordinary-traffic
 starvation. A bounded unauthenticated listener remains susceptible to deliberate
 resource exhaustion, so renewal failures and certificate expiry need monitoring.
 The listener logs no request paths or addresses. A missing probe on an older
