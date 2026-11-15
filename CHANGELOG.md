@@ -48,6 +48,17 @@ GitHub release notes, so each version gets a heading of the form
   captive-portal and MTU-limited networks. Record decoded video, sound,
   input and path recovery in CI, with strict expected-failure tracking.
 
+### Networking
+
+- Add core network-environment discovery for system proxies, captive portals,
+  Tailscale reachability and IPv4/IPv6/NAT64, with bounded worker calls,
+  credential redaction and a standalone diagnostic example.
+- Keep proxy credentials scoped to their configured host and port, expose
+  typed network warnings, coalesce each network check independently, bound
+  subprocess output and Windows WPAD waits, and validate ambiguous DNS64
+  answers. Refresh the latest requested network generation automatically.
+  Add macOS and Windows system-API smoke tests.
+
 ### Packaging
 
 - Add a Scoop manifest, AUR packages (`latch-remote-bin` from the release
