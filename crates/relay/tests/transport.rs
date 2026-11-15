@@ -1567,3 +1567,54 @@ fn discovered_proxy_only_environment_uses_connect_before_direct() {
     assert_eq!(info.carrier, latch_relay::Carrier::Native);
     assert!(info.earlier_failures.is_empty());
 }
+
+#[test]
+fn forced_carrier_overrides_cached_path_for_grant_and_lanes() {
+    use latch_relay::{create_grant_with_info, Carrier, Lane};
+    let mut pilot = Pilot::start();
+    let (_, info) = create_grant_with_info(&pilot.config, &Cancel::new()).unwrap();
+    assert_eq!(info.carrier, Carrier::Native);
+    for carrier in [Carrier::WebSocket, Carrier::Native] {
+        pilot.config.carrier = Some(carrier);
+        let (host, viewer) = pilot.pair();
+        for transport in [&host, &viewer] {
+            for lane in [Lane::Priority, Lane::Video] {
+                assert_eq!(transport.connection_info(lane).unwrap().carrier, carrier);
+            }
+        }
+        host.try_send_control(b"forced carrier").unwrap();
+        assert!(
+            matches!(viewer.recv_timeout(Duration::from_secs(2)), Some(Event::Control(b)) if b == b"forced carrier")
+        );
+        host.shutdown();
+        viewer.shutdown();
+    }
+}
+
+#[test]
+fn forced_native_does_not_fall_back_through_http_only_gateway() {
+    use latch_relay::{create_grant_with_info, Carrier};
+    let pilot = Pilot::start();
+    let gateway = Gateway::start(
+        pilot.config.endpoint.port(),
+        GatewayMode::Connect {
+            auth: false,
+            status: 200,
+            intercept: false,
+            http_only: true,
+        },
+    );
+    let mut config = proxy_config(&gateway, false);
+    config.carrier = Some(Carrier::Native);
+    let error = create_grant_with_info(&config, &Cancel::new()).unwrap_err();
+    let error = latch_relay::ConnectError::from_io(&error);
+    assert!(!error.attempts.is_empty());
+    assert!(error
+        .attempts
+        .iter()
+        .all(|attempt| attempt.carrier == Carrier::Native));
+    config.carrier = Some(Carrier::WebSocket);
+    let (_, info) = create_grant_with_info(&config, &Cancel::new()).unwrap();
+    assert_eq!(info.carrier, Carrier::WebSocket);
+    assert!(info.earlier_failures.is_empty());
+}

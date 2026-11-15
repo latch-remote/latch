@@ -136,11 +136,24 @@ multipath, removable-media and firmware services on this dedicated host.
 The deployment report explains each value and the retained no-swap profile.
 [Applied tuning](DEPLOYED.md#persistent-relay-tuning)
 
-For an upgrade, schedule a brief interruption, stop the native relay, repeat
+For an upgrade, back up the executable, unit and drop-ins, operator limits,
+budget and quota to a dated root-only directory. Keep an off-host copy with
+private keys excluded and verify the rollback executable and hashes. Schedule
+a brief interruption, stop `latch-relay`, capture the stopped ledger, repeat
 the installer with the same ledger and omit `--initialize-quota`, then start it.
-The installer refuses an active native service. Back up local operator limits
-before editing them. A reinstall preserves the quota and local limits while
-replacing the binary, unit, certificates and explicitly supplied budget.
+Verify native ALPN immediately and restore the previous executable/unit if it
+fails. Rollback must retain the current ledger, including reservations spent
+since the backup. The installer refuses an active native service. A reinstall
+preserves the quota and local limits while replacing the binary, unit,
+certificates and explicitly supplied budget.
+
+On the shared peer-relay host, keep tailscaled and network management running
+throughout maintenance. Apply only changed sysctls directly. For the WebSocket
+upgrade, replace `net.ipv4.tcp_mtu_probing = 1` with `2` in
+`/etc/sysctl.d/90-latch-relay.conf` and run
+`sudo sysctl -w net.ipv4.tcp_mtu_probing=2`. Keep the existing offloads and daemon
+limits in place. Validate the replacement Linux binary in a matching container
+on the build machine, using `-j 4` on the shared Mac.
 
 ## Limits and durable budget
 
@@ -283,10 +296,18 @@ target/release/examples/paired_probe relay.latch.rune.foo 600 5 60
 target/release/examples/paired_probe relay.latch.rune.foo 60 5 120
 # Optional 30-second quarter-bitrate warm-up, retaining 60 fps throughout.
 target/release/examples/paired_probe relay.latch.rune.foo 3600 20 60 30
+# Force each carrier and print grant/lane carrier diagnostics.
+target/release/examples/paired_probe relay.latch.rune.foo 40 5 60 10 native
+target/release/examples/paired_probe relay.latch.rune.foo 40 20 60 10 websocket
+# Optional explicit local HTTP CONNECT proxy, with public relay TLS verification.
+target/release/examples/paired_probe relay.latch.rune.foo 6 1 30 0 websocket 127.0.0.1:3128
 ```
 
-The arguments are hostname, total seconds, target Mbps, source fps, and optional
-warm-up seconds per fresh pair. A run is capped at one hour and a modeled
+The arguments are hostname, total seconds, target Mbps, source fps, optional
+warm-up seconds per fresh pair, optional carrier (`auto`, `native`, `websocket`),
+and optional CONNECT proxy `HOST:PORT`. Automatic selection is the default.
+Forced selection applies to the grant and all four lanes, including cached
+paths. A run is capped at one hour and a modeled
 50 GB combined transfer ceiling with headroom. Received payload Mbps, complete
 frame age, authenticated ACK age, unsent queue age, source drops and priority/
 control echoes are emitted every 30 seconds. The probe checks frame contents

@@ -125,6 +125,8 @@ pub struct ClientConfig {
     pub endpoint: Endpoint,
     pub limits: TransportLimits,
     pub proxy: Option<ProxyConfig>,
+    /// Restrict diagnostics to one carrier. None retains automatic fallback.
+    pub carrier: Option<Carrier>,
     tls: Arc<rustls::ClientConfig>,
     public_only: bool,
     verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
@@ -138,6 +140,7 @@ impl fmt::Debug for ClientConfig {
             .field("endpoint", &self.endpoint)
             .field("limits", &self.limits)
             .field("proxy", &self.proxy)
+            .field("carrier", &self.carrier)
             .finish()
     }
 }
@@ -204,6 +207,7 @@ impl ClientConfig {
             tls: Arc::new(tls),
             public_only: false,
             proxy: None,
+            carrier: None,
             verifier,
             hints: Arc::new(Mutex::new(PathHints::default())),
             opening: Arc::new(Mutex::new(())),
@@ -237,6 +241,7 @@ struct WinningPath {
 impl WinningPath {
     fn matches(&self, config: &ClientConfig) -> bool {
         self.expires > Instant::now()
+            && config.carrier.is_none_or(|carrier| carrier == self.carrier)
             && self.local_ip == self.address.and_then(route_source)
             && self.host == config.endpoint.host()
             && self.port == config.endpoint.port()
@@ -790,6 +795,7 @@ fn open_carriers(
     }
     rungs.push_back((Carrier::Native, None, 750));
     rungs.push_back((Carrier::WebSocket, None, 2000));
+    rungs.retain(|(carrier, _, _)| config.carrier.is_none_or(|forced| forced == *carrier));
     let mut attempts = Vec::new();
     let mut mss_recovery = false;
     let mut cached_probe = winning.is_some();
@@ -868,7 +874,11 @@ fn open_carriers(
                     cached_probe = false;
                     refresh_dns = true;
                 }
-                if !terminal && carrier == Carrier::Native && _initial_open.is_some() {
+                if !terminal
+                    && carrier == Carrier::Native
+                    && config.carrier.is_none()
+                    && _initial_open.is_some()
+                {
                     // Waiting lanes can start fallback together as soon as native fails.
                     // This short-lived scheduling hint grants no address/TLS exception.
                     config.hints.lock().unwrap().winning = Some(WinningPath {
@@ -897,8 +907,9 @@ fn open_carriers(
                     mss_recovery = true;
                     config.remember_mss_stall(MssReason::TlsHandshakeStall);
                     end = deadline.min(Instant::now() + Duration::from_millis(500));
-                    rungs.push_back((Carrier::Native, None, 150));
-                    rungs.push_back((Carrier::Native, None, 350));
+                    let retry_carrier = config.carrier.unwrap_or(Carrier::Native);
+                    rungs.push_back((retry_carrier, None, 150));
+                    rungs.push_back((retry_carrier, None, 350));
                 } else if mss_recovery && !rungs.is_empty() {
                     config.remember_mss_stall(MssReason::TlsHandshakeStall);
                 }
