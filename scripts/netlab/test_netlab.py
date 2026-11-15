@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from middlebox import alpns
 from netlab import classify, evaluate, main, run_scenario
+from stage_artifacts import stage
 
 
 def healthy_events():
@@ -21,6 +22,24 @@ def healthy_events():
 
 
 class VerdictTests(unittest.TestCase):
+    def test_artifact_copies_are_readable_and_exclude_private_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            output = Path(directory) / "artifact"
+            scenario = source / "i"
+            scenario.mkdir(parents=True)
+            for name in ("proxy-access.log", "result.json", "events.jsonl", "quota", "relay-key.pem"):
+                path = scenario / name
+                path.write_text("test")
+                path.chmod(0o600)
+            stage(source, output)
+            self.assertEqual(sorted(path.name for path in (output / "i").iterdir()),
+                             ["events.jsonl", "proxy-access.log", "result.json"])
+            for path in (output / "i").iterdir():
+                self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+            for path in scenario.iterdir():
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
     def test_real_decode_and_input_required(self):
         events = healthy_events()
         result = evaluate("a", events, 18, 0)

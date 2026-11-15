@@ -126,9 +126,10 @@ firewall counters, and independent preflight results. JSON includes
 connection (accepted control negotiation) and first-frame times, decoded fps over time, media paths and
 switches, session terminations, input round trips, audio samples, errors,
 and each assertion verdict. Private keys are deleted during cleanup. Artifact
-upload explicitly selects only logs, JSON/JSONL results and Markdown summaries,
-excluding private keys and the daemon’s mode-0600 quota ledger even when setup
-or cleanup fails. `summary.md` is copied into the GitHub job summary.
+staging copies only logs, JSON/JSONL results and Markdown summaries into a
+runner-readable directory. Original file permissions are preserved, and
+private keys and the daemon’s mode-0600 quota ledger are excluded even when
+setup or cleanup fails. `summary.md` is copied into the GitHub job summary.
 
 Before measurement, probes validate real TLS/ALPN, CONNECT tunneling,
 interceptor certificate rejection, the portal redirect, and DNS64/NAT64

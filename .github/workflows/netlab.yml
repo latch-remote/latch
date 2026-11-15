@@ -37,14 +37,13 @@ jobs:
         run: bash scripts/netlab/build.sh
       - name: Run isolated hostile networks
         run: sudo --preserve-env=GITHUB_STEP_SUMMARY python3 scripts/netlab/netlab.py --jobs 2 --output "$RUNNER_TEMP/netlab"
+      - name: Stage readable diagnostics
+        if: always()
+        run: sudo python3 scripts/netlab/stage_artifacts.py "$RUNNER_TEMP/netlab" "$RUNNER_TEMP/netlab-artifact"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: netlab-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/netlab/**/*.log
-            ${{ runner.temp }}/netlab/**/*.json
-            ${{ runner.temp }}/netlab/**/*.jsonl
-            ${{ runner.temp }}/netlab/**/*.md
+          path: ${{ runner.temp }}/netlab-artifact/
           if-no-files-found: error
           retention-days: 7
