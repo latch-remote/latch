@@ -1,0 +1,65 @@
+# Maintainer: Latch Contributors <https://github.com/latch-remote/latch>
+#
+# Built from the release's source archive. `latch` on the AUR is an
+# unrelated program.
+
+pkgname=latch-remote
+pkgver=6.0.0
+pkgrel=1
+pkgdesc='Low-latency desktop and game streaming between your own computers over Tailscale'
+arch=('x86_64' 'aarch64')
+url='https://github.com/latch-remote/latch'
+license=('GPL-3.0-or-later')
+# Linked: alsa-lib, glibc, gcc-libs. The rest is loaded at run time.
+depends=(
+  'alsa-lib'
+  'gcc-libs'
+  'glibc'
+  'libglvnd'
+  'libx11'
+  'libxcursor'
+  'libxi'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'vulkan-icd-loader'
+  'wayland'
+)
+makedepends=('cargo' 'pkgconf')
+optdepends=(
+  'tailscale: required unless Tailscale is installed some other way'
+  'libva: VA-API video encoding'
+  'nvidia-utils: NVENC video encoding'
+)
+source=("https://github.com/latch-remote/latch-releases/releases/download/v${pkgver}/latch-${pkgver}-source.tar.gz"
+        'latch-host.desktop')
+sha256sums=('fe9ca42e1b2ab563be49236a964bfb3a40f5df194ad565893f72b92711475bc7'
+            '67aaa4ce442653e4b39eac30974a894ea561854f9b665d1aedb12218d12a2aa0')
+
+prepare() {
+  cd "latch-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "latch-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p latch-host
+}
+
+check() {
+  cd "latch-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # A quick subset of the suite; CI runs all of it on every change.
+  cargo test --frozen --release -p latch-core -p latch-proto -p latch-codec --lib
+}
+
+package() {
+  cd "latch-${pkgver}"
+  install -Dm755 target/release/latch-host "$pkgdir/usr/bin/latch-host"
+  install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+  install -Dm644 ../latch-host.desktop "$pkgdir/usr/share/applications/latch-host.desktop"
+  install -Dm644 crates/core/assets/logo-1024.png "$pkgdir/usr/share/pixmaps/latch-host.png"
+}

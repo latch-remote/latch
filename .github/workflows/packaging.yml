@@ -1,0 +1,195 @@
+name: packaging
+
+# The Scoop manifest, the AUR packages and the Nix flake in packaging/ and
+# flake.nix. Nothing here publishes; see packaging/README.md.
+on:
+  push:
+    branches: [main, master]
+    paths: &paths
+      - packaging/**
+      - flake.nix
+      - flake.lock
+      - scripts/bump-packaging.py
+      - .github/workflows/packaging.yml
+      # The flake builds this tree.
+      - Cargo.toml
+      - Cargo.lock
+      - .cargo/**
+      - crates/**/Cargo.toml
+      - crates/**/build.rs
+  pull_request:
+    paths: *paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packaging-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  manifests:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+      # Every hash against the release's SHA256SUMS and the tagged icon.
+      - name: manifests match their published release
+        run: python3 scripts/bump-packaging.py --check
+      - name: Scoop manifest schema
+        run: |
+          python3 -m pip install --quiet check-jsonschema==0.39.0
+          curl -fsSL -o "$RUNNER_TEMP/scoop-schema.json" \
+            https://raw.githubusercontent.com/ScoopInstaller/Scoop/e6aa3b366bdee8ed138c1e0f7b85192ebdd35d0f/schema.json
+          check-jsonschema --schemafile "$RUNNER_TEMP/scoop-schema.json" packaging/scoop/latch.json
+      - name: desktop entry
+        run: |
+          cmp packaging/aur/latch-remote/latch-host.desktop packaging/aur/latch-remote-bin/latch-host.desktop
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends desktop-file-utils
+          desktop-file-validate packaging/aur/latch-remote/latch-host.desktop
+
+  aur:
+    permissions:
+      contents: read
+    name: aur (${{ matrix.package }})
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [latch-remote-bin, latch-remote]
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    timeout-minutes: 60
+    steps:
+      # pacman's download sandbox cannot start in some container runtimes.
+      - name: tools
+        run: |
+          sed -i 's/^\[options\]$/[options]\nDisableSandbox/' /etc/pacman.conf
+          pacman -Syu --noconfirm --needed git namcap python
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # makepkg refuses to run as root.
+      - name: build user
+        run: |
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          cp -r "packaging/aur/${{ matrix.package }}" /home/builder/pkg
+          chown -R builder: /home/builder/pkg
+      - name: .SRCINFO matches the PKGBUILD
+        working-directory: /home/builder/pkg
+        run: sudo -u builder makepkg --printsrcinfo | diff -u .SRCINFO -
+      # The bump script writes .SRCINFO itself; check it does so as makepkg would.
+      - name: a version bump keeps .SRCINFO consistent
+        run: |
+          work="$(mktemp -d)"
+          cp -r . "$work/tree"
+          cd "$work/tree"
+          from="$(python3 -c 'import json; print(json.load(open("packaging/scoop/latch.json"))["version"])')"
+          curl -fsSL "https://github.com/latch-remote/latch-releases/releases/download/v$from/SHA256SUMS" \
+            | sed "s/$from/9.9.9/g" > sums
+          python3 scripts/bump-packaging.py 9.9.9 --sums sums --icon crates/core/assets/logo-1024.png
+          chown -R builder: "$work"
+          cd "packaging/aur/${{ matrix.package }}"
+          grep -q '^pkgver=9.9.9$' PKGBUILD
+          sudo -u builder makepkg --printsrcinfo | diff -u .SRCINFO -
+      - name: namcap PKGBUILD
+        working-directory: /home/builder/pkg
+        run: |
+          namcap PKGBUILD | tee namcap.log
+          ! grep ' E: ' namcap.log
+      - name: build
+        working-directory: /home/builder/pkg
+        run: sudo -u builder makepkg --syncdeps --noconfirm
+      - name: namcap package
+        working-directory: /home/builder/pkg
+        run: |
+          namcap -i ./*.pkg.tar.zst | tee namcap.log
+          ! grep ' E: ' namcap.log
+      - name: install and run
+        working-directory: /home/builder/pkg
+        run: |
+          pacman -U --noconfirm ./*.pkg.tar.zst
+          latch-host --version | tee version.log
+          grep -Fx "latch-host $(sed -n 's/^pkgver=//p' PKGBUILD)" version.log
+          pacman -Qlq "${{ matrix.package }}"
+
+  nix:
+    permissions:
+      contents: read
+    name: nix (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+      - name: format
+        run: nix fmt -- --check flake.nix packaging/nix/*.nix
+      # Builds both packages and runs each one's --version.
+      - name: flake check
+        run: nix flake check -L --all-systems --no-build && nix flake check -L
+      - name: nix run
+        run: nix run . -- --version
+
+  scoop:
+    permissions:
+      contents: read
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install Scoop
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'install-scoop.ps1'
+          Invoke-WebRequest -UseBasicParsing -OutFile $installer `
+            https://raw.githubusercontent.com/ScoopInstaller/Install/1e2f334083d609986d8c8bc9e31ae8e87c39fab4/install.ps1
+          & $installer -RunAsAdmin
+          Join-Path $env:USERPROFILE 'scoop\shims' | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: install the manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          scoop install .\packaging\scoop\latch.json
+          if ($LASTEXITCODE -ne 0) { throw 'scoop install failed' }
+          $version = (Get-Content packaging\scoop\latch.json -Raw | ConvertFrom-Json).version
+          $exe = Join-Path $env:LOCALAPPDATA 'Latch\latch-host.exe'
+          $have = (Get-Item -LiteralPath $exe).VersionInfo.ProductVersion
+          if ($have -ne $version) { throw "installed $have, expected $version" }
+          $app = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Latch'
+          if ($app.DisplayVersion -ne $version) { throw "Settings > Apps lists $($app.DisplayVersion)" }
+          $run = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          if ($run.LatchHost -ne "`"$exe`" --background") { throw "unexpected Run entry: $($run.LatchHost)" }
+      # The autoupdate block regenerates the manifest as committed.
+      - name: checkver and autoupdate
+        shell: pwsh
+        env:
+          SCOOP_CHECKVER_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $checkver = Join-Path (scoop prefix scoop) 'bin\checkver.ps1'
+          & $checkver -App latch -Dir packaging\scoop -ForceUpdate
+          git diff --exit-code -- packaging/scoop
+      - name: stop Latch
+        if: always()
+        shell: pwsh
+        run: Get-Process latch-host -ErrorAction SilentlyContinue | Stop-Process -Force
