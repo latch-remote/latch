@@ -6,6 +6,7 @@ pub(crate) struct Pacer {
     updated: Instant,
     kbps: u32,
     waiting: bool,
+    wake_gap: Duration,
 }
 // Preserve the tested 16/30-ms wakes while a train waits. Longer stalls
 // restart with the ordinary one-ms allowance, including within a frame.
@@ -18,6 +19,7 @@ impl Pacer {
             updated: now,
             kbps: 0,
             waiting: false,
+            wake_gap: Duration::ZERO,
         }
     }
     pub(crate) fn begin_frame(&mut self, now: Instant, kbps: u32) {
@@ -54,7 +56,13 @@ impl Pacer {
         let burst = if self.kbps != kbps || elapsed > MAX_CREDIT {
             small
         } else if self.waiting {
-            BURST.max(rate * MAX_CREDIT.as_secs_f64() + (latch_proto::MAX_DATAGRAM + 80) as f64)
+            // Repay a late wake only when recent waiting wakes were this late.
+            let gap = self.wake_gap.max(Duration::from_millis(1));
+            let allowed = elapsed.min(gap);
+            if !elapsed.is_zero() {
+                self.wake_gap = (self.wake_gap * 7 / 8).max(elapsed);
+            }
+            BURST.max(rate * allowed.as_secs_f64() + (latch_proto::MAX_DATAGRAM + 80) as f64)
         } else {
             small.max(self.tokens)
         };
@@ -272,6 +280,43 @@ mod batch_tests {
             assert!(stalled);
             assert_eq!(link.counts().0, packets.len() as u64);
             assert_eq!(link.counts().1, 0, "post-stall burst at {kbps} kbps");
+        }
+    }
+
+    #[test]
+    fn isolated_late_wake_fits_a_shallow_bottleneck() {
+        use latch_proto::sim::{Impairment, Link};
+
+        let packets = vec![vec![0; 1200]; 400];
+        for (kbps, link_kbps, queue_ms) in [(20_000, 50_000, 4), (60_000, 100_000, 5)] {
+            for late_ms in [10, 16, 25] {
+                let start = Instant::now();
+                let mut now = start;
+                let mut pacer = Pacer::new(start);
+                let mut link = Link::new(Impairment::NONE, 11);
+                link.set_bandwidth(link_kbps, Duration::from_millis(queue_ms));
+                let mut sent = 0;
+                let mut late = false;
+                while sent < packets.len() {
+                    let (count, wait) = pacer.batch(now, &packets[sent..], kbps);
+                    for packet in &packets[sent..sent + count] {
+                        link.send(now, packet);
+                    }
+                    sent += count;
+                    now += wait.max(Duration::from_nanos(1));
+                    if count == 0 && sent >= 100 && !late {
+                        now += Duration::from_millis(late_ms);
+                        late = true;
+                    }
+                    link.receive(now);
+                }
+                assert!(late);
+                assert_eq!(
+                    link.counts().1,
+                    0,
+                    "one {late_ms} ms late wake at {kbps} kbps"
+                );
+            }
         }
     }
 }

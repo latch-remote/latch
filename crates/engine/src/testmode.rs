@@ -92,6 +92,7 @@ pub fn open_video(config: &VideoConfig, motion: Motion) -> anyhow::Result<Box<dy
             kbps: config.bitrate_kbps,
             fps: config.fps,
             last_frame: None,
+            padding: Duration::ZERO,
         }));
     }
     Ok(pipeline)
@@ -104,6 +105,7 @@ struct LoadPattern {
     kbps: u32,
     fps: u32,
     last_frame: Option<Instant>,
+    padding: Duration,
 }
 impl VideoPipeline for LoadPattern {
     fn info(&self) -> crate::video::VideoInfo {
@@ -117,6 +119,7 @@ impl VideoPipeline for LoadPattern {
         // Repeat at frame cadence. Filler establishes the wire load while
         // unchanged pictures keep capture and encoding cheap on CI runners.
         let mut frame = self.pipeline.next(keyframe, Duration::ZERO)?;
+        let padding_started = Instant::now();
         let now = Instant::now();
         let interval = Duration::from_secs(1) / self.fps.max(1);
         // Preserve the offered bitrate when capture wakes late. Bound credit
@@ -131,10 +134,14 @@ impl VideoPipeline for LoadPattern {
             frame.data.resize(bytes - 1, 0xff);
             frame.data.push(0x80);
         }
+        self.padding = padding_started.elapsed();
         Ok(frame)
     }
     fn software_timings(&self) -> Option<crate::software::SoftwareTimings> {
-        self.pipeline.software_timings()
+        self.pipeline.software_timings().map(|mut timings| {
+            timings.padding = self.padding;
+            timings
+        })
     }
     fn set_bitrate(&mut self, kbps: u32) {
         self.kbps = kbps;
@@ -194,7 +201,7 @@ impl CpuCapture for Shared {
             if now >= deadline {
                 return Ok(false);
             }
-            std::thread::sleep((self.next.min(deadline) - now).min(Duration::from_millis(2)));
+            crate::video::sleep((self.next.min(deadline) - now).min(Duration::from_millis(2)));
         }
     }
 

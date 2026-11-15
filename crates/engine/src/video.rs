@@ -167,7 +167,7 @@ impl Pacer {
             .due
             .and_then(|due| due.checked_duration_since(Instant::now()))
         {
-            std::thread::sleep(wait);
+            sleep(wait);
         }
     }
 
@@ -178,6 +178,14 @@ impl Pacer {
             _ => at + self.interval,
         });
     }
+}
+
+/// Wait for a live media deadline without discretionary timer coalescing.
+pub(crate) fn sleep(wait: Duration) {
+    #[cfg(target_os = "macos")]
+    crate::mac::timer::sleep(wait);
+    #[cfg(not(target_os = "macos"))]
+    std::thread::sleep(wait);
 }
 
 /// The grid runs this much of a nominal interval per frame: 1% fast.

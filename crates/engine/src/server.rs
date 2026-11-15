@@ -109,6 +109,7 @@ pub struct VideoDiagnostics {
     pub frames_sent: u64,
     pub encoded_bytes: u64,
     pub produce_time: Duration,
+    pub total_produce_time: Duration,
     pub max_produce_time: Duration,
     pub software: Option<crate::software::SoftwareTimings>,
     pub pacing_waits: u64,
@@ -2081,7 +2082,7 @@ fn encode_video(
             if session.stopping() {
                 return;
             }
-            std::thread::sleep(Duration::from_micros(200));
+            video::sleep(Duration::from_micros(200));
         }
         let protected =
             session.keyframe.load(Ordering::Relaxed) || session.recovery.asked.lock().is_some();
@@ -2137,10 +2138,19 @@ fn encode_video(
         {
             let mut diagnostics = session.video.lock();
             diagnostics.producing_since = None;
-            diagnostics.produce_time = producing.elapsed();
+            let elapsed = producing.elapsed();
+            diagnostics.produce_time = elapsed;
+            diagnostics.total_produce_time += elapsed;
             diagnostics.max_produce_time =
                 diagnostics.max_produce_time.max(diagnostics.produce_time);
             diagnostics.software = pipeline.software_timings();
+            if diagnostics.produce_time >= Duration::from_millis(50) {
+                tracing::debug!(
+                    produce_ms = diagnostics.produce_time.as_secs_f64() * 1000.0,
+                    software = ?diagnostics.software,
+                    "slow video frame production"
+                );
+            }
             if let Ok(frame) = &produced {
                 diagnostics.frames_produced += 1;
                 diagnostics.encoded_bytes += frame.data.len() as u64;
@@ -2538,7 +2548,7 @@ fn send_paced_batch(
         if count == 0 {
             let deadline = Instant::now() + wait;
             let started = Instant::now();
-            std::thread::sleep(deadline.saturating_duration_since(started));
+            video::sleep(deadline.saturating_duration_since(started));
             let now = Instant::now();
             let mut diagnostics = session.video.lock();
             diagnostics.pacing_waits += 1;

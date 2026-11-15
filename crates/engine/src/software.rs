@@ -56,12 +56,17 @@ pub trait CpuCapture: Send {
 }
 
 /// Time spent in each stage of the last frame. Capture includes waiting
-/// for damage; frame pacing happens outside these measurements.
+/// for damage. Pacing and idle waits are reported separately from CPU work.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SoftwareTimings {
+    pub pace: Duration,
+    pub pace_lateness: Duration,
     pub capture: Duration,
+    pub capture_calls: u32,
+    pub idle: Duration,
     pub convert: Duration,
     pub encode: Duration,
+    pub padding: Duration,
 }
 
 /// Turns converted pictures into access units.
@@ -428,12 +433,21 @@ impl<C: CpuCapture> SoftwarePipeline<C> {
 
     fn acquire(&mut self, keyframe: bool, idle: Duration) -> anyhow::Result<bool> {
         let interval = self.pacer.interval();
+        self.timings = SoftwareTimings::default();
+        let started = Instant::now();
+        let requested = self
+            .pacer
+            .due()
+            .map_or(Duration::ZERO, |due| due.saturating_duration_since(started));
         self.pacer.wait();
+        self.timings.pace = started.elapsed();
+        self.timings.pace_lateness = self.timings.pace.saturating_sub(requested);
         let deadline = self.last_sent.unwrap_or_else(Instant::now) + idle.max(interval);
         loop {
             let started = Instant::now();
             let changed = self.capture.grab(&mut self.frame, Duration::ZERO)?;
-            self.timings.capture = started.elapsed();
+            self.timings.capture += started.elapsed();
+            self.timings.capture_calls += 1;
             if changed {
                 validate_frame(&self.frame)?;
                 self.captured = Instant::now();
@@ -452,14 +466,19 @@ impl<C: CpuCapture> SoftwarePipeline<C> {
             // Polling also lets a source without damage notifications honour the deadline.
             let wait = interval.min(deadline.saturating_duration_since(now));
             let started = Instant::now();
-            if self.capture.grab(&mut self.frame, wait)? {
-                self.timings.capture = started.elapsed();
+            let changed = self.capture.grab(&mut self.frame, wait)?;
+            self.timings.capture += started.elapsed();
+            self.timings.capture_calls += 1;
+            if changed {
                 validate_frame(&self.frame)?;
                 self.captured = Instant::now();
                 self.pacer.taken(self.captured);
                 return Ok(true);
             }
-            std::thread::sleep(wait.saturating_sub(started.elapsed()));
+            let remaining = wait.saturating_sub(started.elapsed());
+            let started = Instant::now();
+            crate::video::sleep(remaining);
+            self.timings.idle += started.elapsed();
         }
     }
 }

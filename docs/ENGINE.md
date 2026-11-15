@@ -705,20 +705,32 @@ media. Audio, input acknowledgements and pings bypass the video queue.
 
 Video uses a wire-byte token bucket at its current pacing rate. A new frame
 starts with at most two datagrams or 1 ms of credit plus one datagram,
-whichever is larger. While a batch has packets left to send, elapsed send
-credit survives ordinary late scheduler wakes, capped at 30 ms plus one
-datagram. The 30 ms bound is the smallest that preserves the existing
-16 ms and 30 ms injected-clock rate checks at 2, 20 and 60 Mbps. Once a
-batch completes, new accrual has the ordinary one-ms cap and unspent tokens
-remain available. A gap longer than 30 ms restarts with the ordinary burst,
-even mid-frame. A rate change also clamps saved credit immediately.
+whichever is larger. While a batch has packets left, credit follows elapsed
+time up to a slowly decaying maximum of recent waiting-wake gaps, bounded
+at 30 ms. An isolated late wake gets the previous clock allowance. Repeated
+16 ms or 30 ms wakes establish the corresponding allowance on the next wake.
+Zero-elapsed retries do not decay that history, and it survives frame boundaries.
+Once a batch completes, new accrual has the ordinary one-ms cap and unspent
+tokens remain available. A gap longer than 30 ms restarts with the ordinary
+burst, even mid-frame. A rate change also clamps saved credit immediately.
 
 With 1,200-byte datagrams and the 80-byte tunnel allowance, the ordinary
-burst ceilings at pacing rates of 2, 20 and 60 Mbps are 2,560, 3,780 and
-8,780 bytes. The corresponding ordinary-late-wake ceilings are 8,780,
-76,280 and 226,280 bytes. These are wire-byte credit ceilings before
-rounding down to whole datagrams. Every gap longer than the credit bound
-uses the ordinary ceilings. The Windows sender uses `std::thread::sleep`.
+credit ceilings at pacing rates of 2, 20 and 60 Mbps are 2,560, 3,780 and
+8,780 bytes. Those ceilings also apply to an isolated hiccup on a fine clock.
+The learned 16 ms ceilings are 5,280, 41,280 and 121,280 bytes. At the 30 ms
+bound they are 8,780, 76,280 and 226,280 bytes. These are wire-byte credit
+ceilings before rounding down to whole datagrams. Every gap longer than the
+bound uses the ordinary ceilings. A consistently coarse clock sends its
+allowance in a batch, which requires a queue that can absorb that batch.
+
+On macOS, live frame, idle-repeat and video-send waits use a thread-local
+one-shot kqueue timer with `NOTE_CRITICAL`, avoiding discretionary timer
+coalescing even when the process or producer thread is backgrounded. The
+ordinary sleep remains the fallback if the timer cannot be used. Interactive
+thread QoS alone does not prevent coalescing. Software diagnostics report
+pacing duration and lateness, cumulative capture calls, idle waits, conversion,
+encoding and filler time separately. Production duration includes intentional
+frame-cadence waits. The Windows sender uses `std::thread::sleep`.
 Rust attempts a high-resolution waitable timer on Windows 10 version 1803
 and later, with a fallback to `Sleep`.
 [Rust's Windows sleep implementation](https://github.com/rust-lang/rust/blob/1.99.0/library/std/src/sys/thread/windows.rs#L117)

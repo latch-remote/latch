@@ -276,14 +276,19 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Streaming and recovery
 
-- Preserve elapsed UDP pacing credit across late scheduler wakes, bounded to
-  30 ms while a packet train is waiting. Bound idle credit, reset long-stall
-  credit even mid-frame, and apply rate cuts immediately.
+- Preserve elapsed UDP pacing credit when recent waiting wakes establish a
+  coarse clock, bounded to 30 ms. Keep isolated hiccups and long stalls at
+  the ordinary one-ms burst and apply rate cuts immediately.
+- Prevent macOS timer coalescing from delaying live frame production and
+  video pacing, including backgrounded media threads. Report individual
+  production-stage waits and CPU work in failure diagnostics.
 - Weight reduced-offer UDP loss evidence by covered receive time so coarse
   feedback windows across at least two reports can qualify a damaged path for
   relay recovery. Retain relay preparation while damage evidence is active
   and bitrate or FEC still limits a busy picture after loss clears. Release
-  preparation on clean slow UDP after that evidence expires.
+  the retained damage reason on clean slow UDP after that evidence expires.
+  Let an already-requested, quality-limited preparation finish within its
+  six-second negotiation bound, then withdraw a clean UDP path's offer.
 - Preserve the 100 ms idle-picture repeat phase across late wakes and restart
   the phase after a long stall.
 - Prepare relay recovery after 350 ms without UDP. Distinguish persistent

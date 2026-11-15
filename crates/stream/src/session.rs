@@ -446,10 +446,15 @@ impl RelayRoute {
     pub fn connection_info(&self) -> Option<latch_relay::ConnectionInfo> {
         self.state.lock().connection_info.clone()
     }
+    #[cfg(test)]
     fn retry_after_network_change(&self) {
+        self.retry_after_network_change_at(Instant::now());
+    }
+
+    fn retry_after_network_change_at(&self, now: Instant) {
         let mut state = self.state.lock();
         state.failures = 0;
-        state.retry_at = Instant::now();
+        state.retry_at = now;
         state.failure = None;
     }
     pub fn network_status(&self) -> crate::network::NetworkStatus {
@@ -537,6 +542,10 @@ impl RelayRoute {
         self.active.store(true, Ordering::Release);
     }
     fn reset(&self, state: &mut RelayAttempt) {
+        self.reset_at(state, Instant::now());
+    }
+
+    fn reset_at(&self, state: &mut RelayAttempt, now: Instant) {
         let was_active = state.phase == RelayPhase::Active;
         // A close polled just before a TCP handoff/Abort belongs to this reset.
         // Leaving it pending would reset Idle again and move its retry deadline.
@@ -553,7 +562,7 @@ impl RelayRoute {
                 udp_probe_kbps: None,
                 carrier: None,
                 via_proxy: false,
-                since: Instant::now(),
+                since: now,
             };
         }
         state.cancel.cancel();
@@ -564,11 +573,12 @@ impl RelayRoute {
         // attempt cannot allocate another worker while this one is unwinding.
         let grant_spent = state
             .grant_deadline
-            .is_some_and(|deadline| Instant::now() + Duration::from_millis(250) >= deadline)
+            .is_some_and(|deadline| now + Duration::from_millis(250) >= deadline)
             || (state.grant_bytes > 0
                 && state.traffic_bytes >= state.grant_bytes - state.grant_bytes / 10);
         if state.phase == RelayPhase::Active
-            && (state.started.elapsed() >= Duration::from_secs(30) || grant_spent)
+            && (now.saturating_duration_since(state.started) >= Duration::from_secs(30)
+                || grant_spent)
         {
             // A finite grant ending normally earns a fresh grant, even when a
             // small byte allowance runs out sooner than the healthy dwell.
@@ -596,7 +606,7 @@ impl RelayRoute {
         } else {
             Duration::from_secs(2)
         };
-        state.retry_at = Instant::now() + cooldown;
+        state.retry_at = now + cooldown;
     }
 
     fn handoff_cooldown(&self) -> Duration {
@@ -1096,7 +1106,16 @@ impl RelayRoute {
     }
 
     /// Runs on the TCP control owner. Return false for an authority write failure.
-    pub fn maintain(&self, wanted: bool, mut send: impl FnMut(&Message) -> bool) -> bool {
+    pub fn maintain(&self, wanted: bool, send: impl FnMut(&Message) -> bool) -> bool {
+        self.maintain_at(Instant::now(), wanted, send)
+    }
+
+    fn maintain_at(
+        &self,
+        now: Instant,
+        wanted: bool,
+        mut send: impl FnMut(&Message) -> bool,
+    ) -> bool {
         use control::RelayAction as A;
         if self.fatal.load(Ordering::Acquire) {
             return false;
@@ -1106,9 +1125,9 @@ impl RelayRoute {
         Self::refresh_ack(&mut state);
         if self.policy_enabled()
             && state.phase == RelayPhase::Active
-            && state
-                .frame_pending
-                .is_some_and(|since| since.elapsed() >= self.ack_deadline(&state))
+            && state.frame_pending.is_some_and(|since| {
+                now.saturating_duration_since(since) >= self.ack_deadline(&state)
+            })
         {
             state.close_reason = RelayFailure::Stalled;
             self.failed.store(true, Ordering::Release);
@@ -1123,27 +1142,26 @@ impl RelayRoute {
         {
             let number = state.number;
             tracing::warn!(role = ?self.role, attempt = number, reason = "UDP no longer requires relay recovery", "relay attempt withdrawn before activation");
-            self.reset(&mut state);
+            self.reset_at(&mut state, now);
             state.cancels = state.cancels.saturating_add(1);
-            state.retry_at =
-                Instant::now() + Duration::from_secs((1u64 << state.cancels.min(5)).min(30));
+            state.retry_at = now + Duration::from_secs((1u64 << state.cancels.min(5)).min(30));
             if !send(&self.message(number, A::Pause)) {
                 return false;
             }
         }
         if state.paused
-            && (state.started.elapsed() >= Duration::from_secs(20)
+            && (now.saturating_duration_since(state.started) >= Duration::from_secs(20)
                 || state
                     .grant_deadline
-                    .is_some_and(|deadline| Instant::now() + Duration::from_secs(1) >= deadline))
+                    .is_some_and(|deadline| now + Duration::from_secs(1) >= deadline))
         {
-            self.reset(&mut state);
+            self.reset_at(&mut state, now);
         }
         let renewing = self.role == latch_relay::Role::Host
             && state.phase == RelayPhase::Active
             && (state
                 .grant_deadline
-                .is_some_and(|deadline| Instant::now() + Duration::from_millis(250) >= deadline)
+                .is_some_and(|deadline| now + Duration::from_millis(250) >= deadline)
                 || (state.media_delivered
                     && state.grant_bytes > 0
                     && state.traffic_bytes >= state.grant_bytes - state.grant_bytes / 4));
@@ -1151,12 +1169,12 @@ impl RelayRoute {
             // Application bytes omit TLS overhead. Leave a quarter of the
             // advertised combined allowance for records and in-flight media.
             let number = state.number;
-            self.reset(&mut state);
+            self.reset_at(&mut state, now);
             if self.policy_enabled() {
                 state.path.reason = PathReason::RelayRenewal;
             }
             state.failures = 1;
-            state.retry_at = Instant::now() + self.handoff_cooldown();
+            state.retry_at = now + self.handoff_cooldown();
             if !send(&self.message(number, A::Renew)) {
                 return false;
             }
@@ -1177,7 +1195,7 @@ impl RelayRoute {
                     .take(positions / 16)
                     .map(|bits| bits.count_ones())
                     .sum();
-                first.elapsed() >= Duration::from_millis(100)
+                now.saturating_duration_since(first) >= Duration::from_millis(100)
                     && positions >= 64
                     && received * 100 < positions as u32 * 99
             });
@@ -1195,7 +1213,7 @@ impl RelayRoute {
                 } else {
                     p.started
                 };
-                started.elapsed()
+                now.saturating_duration_since(started)
                     >= UDP_PROBE_REPORT
                         + if self.role == latch_relay::Role::Host {
                             Duration::from_secs(1)
@@ -1229,19 +1247,20 @@ impl RelayRoute {
         }
         let failed = self.failed.swap(false, Ordering::AcqRel);
         if failed
-            || (state.returning_direct && state.started.elapsed() >= Duration::from_secs(6))
+            || (state.returning_direct
+                && now.saturating_duration_since(state.started) >= Duration::from_secs(6))
             || (!state.paused
                 && state.phase != RelayPhase::Idle
                 && state.phase != RelayPhase::Active
-                && state.started.elapsed() >= Duration::from_secs(6))
+                && now.saturating_duration_since(state.started) >= Duration::from_secs(6))
         {
             let number = state.number;
             let healthy_handoff = failed && state.returning_direct;
-            self.reset(&mut state);
+            self.reset_at(&mut state, now);
             if healthy_handoff {
                 state.path.reason = PathReason::UdpRecovered;
                 state.failures = 0;
-                state.retry_at = Instant::now() + self.handoff_cooldown();
+                state.retry_at = now + self.handoff_cooldown();
             }
             if !send(&self.message(number, A::Abort)) {
                 return false;
@@ -1283,7 +1302,7 @@ impl RelayRoute {
                         }
                         let number = state.number;
                         state.close_reason = RelayFailure::Preparation;
-                        self.reset(&mut state);
+                        self.reset_at(&mut state, now);
                         if !send(&self.message(number, A::Abort)) {
                             return false;
                         }
@@ -1297,14 +1316,14 @@ impl RelayRoute {
             && self.config.is_some()
             && state.phase == RelayPhase::Idle
             && state.preparing.is_none()
-            && Instant::now() >= state.retry_at
+            && now >= state.retry_at
         {
             let Some(number) = state.number.checked_add(1) else {
                 return true;
             };
             state.number = number;
             state.phase = RelayPhase::Preparing;
-            state.started = Instant::now();
+            state.started = now;
             state.cancel = latch_relay::Cancel::new();
             if !send(&self.message(number, A::Request)) {
                 return false;
@@ -3069,6 +3088,15 @@ impl LegacyFallback {
 }
 
 fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Outcome {
+    control_loop_at(inner, tcp, accept, Instant::now)
+}
+
+fn control_loop_at(
+    inner: &Arc<Inner>,
+    tcp: &mut TcpStream,
+    accept: &Accept,
+    mut clock: impl FnMut() -> Instant,
+) -> Outcome {
     let (messages, inbox) = mpsc::sync_channel(128);
     if let Ok(mut reader) = tcp.try_clone() {
         let _ = reader.set_read_timeout(None);
@@ -3085,11 +3113,11 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 }
             });
     }
-    let accepted = Instant::now();
+    let accepted = clock();
     let mut startup_wait_started = accepted;
     let mut portal_since = None;
-    let mut last_report = Instant::now();
-    let mut last_keepalive = Instant::now();
+    let mut last_report = accepted;
+    let mut last_keepalive = accepted;
     let mut policy = Policy::default();
     let mut feedback_revision = 0;
     let mut reason = None;
@@ -3220,7 +3248,7 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 };
             }
         }
-        let now = Instant::now();
+        let now = clock();
         let published = inner.published_us.load(Ordering::Relaxed);
         let relay = inner.relay.lock().clone();
         let wanted = if relay.policy_enabled() {
@@ -3229,8 +3257,8 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
             let mtu_settling = matches!(path.reason, PathReason::DatagramSize { .. })
                 && now.saturating_duration_since(path.since) < Duration::from_secs(1).max(rtt * 2);
             let udp_seen = inner.udp_heard_us.load(Ordering::Relaxed);
-            let blocked =
-                udp_seen == 0 && accepted.elapsed() >= Duration::from_millis(350).max(rtt);
+            let blocked = udp_seen == 0
+                && now.saturating_duration_since(accepted) >= Duration::from_millis(350).max(rtt);
             let stalled = inner
                 .video_health
                 .lock()
@@ -3295,11 +3323,23 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
             let recovering = matches!(
                 current.reason,
                 PathReason::RelayUnavailable(_) | PathReason::RelayRenewal
-            ) && current.since.elapsed()
+            ) && now.saturating_duration_since(current.since)
                 >= Duration::from_millis(100).max(rtt + Duration::from_millis(150))
                 && (published == 0
                     || inner.epoch + Duration::from_micros(published) < current.since);
-            blocked || missing && !mtu_settling || reason.is_some() || recovering
+            // A controller backing below a policer can temporarily forget its
+            // damage while the first grant is still in flight. Finish that
+            // preparation within its existing six-second negotiation bound,
+            // then reassess the offer against current evidence before use.
+            let finishing_preparation = relay.state.lock().phase == RelayPhase::Preparing && {
+                let stats = inner.stats.lock();
+                relay_bandwidth_limited(&stats) || relay_fec_limited(&stats)
+            };
+            blocked
+                || missing && !mtu_settling
+                || reason.is_some()
+                || recovering
+                || finishing_preparation
         } else {
             let picture_age = if published == 0 {
                 now.saturating_duration_since(accepted)
@@ -3317,7 +3357,7 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 },
             )
         };
-        if !relay.maintain(wanted, |message| send_tcp(inner, message)) {
+        if !relay.maintain_at(now, wanted, |message| send_tcp(inner, message)) {
             return Outcome::Ended(
                 control::end::TRANSPORT_FAILED as i32,
                 "The stream transport failed. Reconnecting…".into(),
@@ -3387,8 +3427,8 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
             // Network sign-in restarts the first-picture watchdog. UDP policy
             // keeps its session-start clock so this retry is not withdrawn on
             // the next turn as though UDP were still in its startup grace.
-            startup_wait_started = Instant::now();
-            inner.relay.lock().retry_after_network_change();
+            startup_wait_started = now;
+            inner.relay.lock().retry_after_network_change_at(now);
             status = inner.relay.lock().network_status();
             status.media_arrived(media_arrived);
         }
@@ -3413,7 +3453,7 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
         drop(health);
         if !waiting_for_sign_in
             && !inner.connected.load(Ordering::Acquire)
-            && startup_wait_started.elapsed() >= MEDIA_TIMEOUT
+            && now.saturating_duration_since(startup_wait_started) >= MEDIA_TIMEOUT
         {
             if matches!(
                 inner.relay.lock().failure(),
@@ -4985,31 +5025,31 @@ mod tests {
             "relay": true, "media_path_policy": true
         }))
         .unwrap();
-        let worker_inner = inner.clone();
-        let worker = std::thread::spawn(move || control_loop(&worker_inner, &mut tcp, &accept));
-        // Eight real 50 ms reports put UDP beyond its startup grace before
-        // the portal opens. Socket messages provide the synchronization.
-        let mut reports = 0;
-        while reports < 8 {
-            if matches!(
-                control::read_message(&mut peer).unwrap(),
-                Message::Report(_)
-            ) {
-                reports += 1;
+        // Drive the real control policy beyond startup grace on a virtual clock.
+        // The portal opens at 500 ms and the retry stays requested through 1 s.
+        let start = Instant::now();
+        route.state.lock().retry_at = start;
+        let mut turn = 0;
+        control_loop_at(&inner, &mut tcp, &accept, || {
+            let now = start + Duration::from_millis(turn * 50);
+            if turn == 10 {
+                route.state.lock().failure = None;
             }
-        }
-        route.state.lock().failure = None;
+            if turn == 20 {
+                inner.stop.store(true, Ordering::Release);
+            }
+            turn += 1;
+            now
+        });
         let mut actions = Vec::new();
-        while reports < 11 {
+        loop {
             match control::read_message(&mut peer).unwrap() {
-                Message::Report(_) => reports += 1,
+                Message::End(_) => break,
                 Message::Relay(message) => actions.push((message.attempt, message.action)),
                 _ => {}
             }
         }
-        inner.stop.store(true, Ordering::Release);
         let _ = peer.shutdown(Shutdown::Both);
-        worker.join().unwrap();
         assert_eq!(
             actions.len(),
             1,
@@ -5139,6 +5179,129 @@ mod tests {
         report.frames_lost = 0;
         report.fps = 0.0;
         assert!(!udp_quality_recovered(&stats, &report));
+    }
+
+    #[test]
+    fn slow_grant_survives_expired_policer_damage_but_clean_udp_withdraws_offer() {
+        for recurring_damage in [true, false] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let (events, _received) = mpsc::channel();
+            let inner = Arc::new(Inner::new(events, Arc::default(), Box::new(|| {})));
+            *inner.control_writer.lock() = Some(tcp.try_clone().unwrap());
+            inner.connected.store(true, Ordering::Release);
+            inner.udp_heard_us.store(1, Ordering::Relaxed);
+            inner.udp_video_us.store(u64::MAX, Ordering::Relaxed);
+            let config = latch_relay::ClientConfig::production(
+                latch_relay::Endpoint::new("localhost", 9).unwrap(),
+            )
+            .unwrap();
+            let route = Arc::new(RelayRoute::new(7, latch_relay::Role::Viewer, Some(config)));
+            route.enable_policy(true);
+            *inner.relay.lock() = route.clone();
+            let accept: Accept = serde_json::from_value(serde_json::json!({
+                "session": 7, "token": "00000000000000000000000000000000",
+                "codec": "h264-baseline", "width": 64, "height": 64, "fps": 30,
+                "bitrate_kbps": 20000, "encoder": "test", "audio": null,
+                "relay": true, "media_path_policy": true
+            }))
+            .unwrap();
+            let start = Instant::now();
+            route.state.lock().retry_at = start;
+            let mut turn = 0;
+            control_loop_at(&inner, &mut tcp, &accept, || {
+                let now = start + Duration::from_millis(turn * 100);
+                // The controller backs below the policer, forgets damage at
+                // three seconds, then its capacity probe meets it again.
+                *inner.stats.lock() = Stats {
+                    requested_bitrate_kbps: 20_000,
+                    wire_budget_kbps: 2009,
+                    applied_bitrate_kbps: 844,
+                    received_fps: 30.0,
+                    mbps: 0.8,
+                    application_limited: false,
+                    udp_damage: turn < 30 || recurring_damage && turn >= 40,
+                    ..Default::default()
+                };
+                *inner.feedback.lock() = Report {
+                    fps: 30.0,
+                    window_ms: 100,
+                    ..Default::default()
+                };
+                inner.video_health.lock().last_encoded = Some(now);
+                inner.video_health.lock().frame(now, false);
+                inner.feedback_revision.fetch_add(1, Ordering::Release);
+                if turn == 35 {
+                    assert_eq!(
+                        route.state.lock().phase,
+                        RelayPhase::Preparing,
+                        "damage expiry withdrew the slow grant"
+                    );
+                }
+                if turn == 45 {
+                    // Model the grant arriving after 3.7 s in flight.
+                    let mut state = route.state.lock();
+                    assert_eq!(state.number, 1);
+                    assert_eq!(state.phase, RelayPhase::Preparing);
+                    state.phase = RelayPhase::Offered;
+                }
+                if turn == 50 {
+                    inner.stop.store(true, Ordering::Release);
+                }
+                turn += 1;
+                now
+            });
+            let mut actions = Vec::new();
+            loop {
+                match control::read_message(&mut peer).unwrap() {
+                    Message::End(_) => break,
+                    Message::Relay(message) => actions.push((message.attempt, message.action)),
+                    _ => {}
+                }
+            }
+            let _ = peer.shutdown(Shutdown::Both);
+            assert!(matches!(actions[0], (1, control::RelayAction::Request)));
+            if recurring_damage {
+                assert_eq!(actions.len(), 1, "slow grant flapped: {actions:?}");
+                assert_eq!(route.state.lock().phase, RelayPhase::Offered);
+            } else {
+                assert_eq!(actions.len(), 2, "clean UDP kept the offer: {actions:?}");
+                assert!(matches!(actions[1], (1, control::RelayAction::Pause)));
+                assert_eq!(route.state.lock().phase, RelayPhase::Idle);
+            }
+        }
+    }
+
+    #[test]
+    fn slow_preparation_keeps_the_six_second_negotiation_bound() {
+        let route = RelayRoute::new(7, latch_relay::Role::Viewer, None);
+        route.enable_policy(true);
+        let start = Instant::now();
+        {
+            let mut state = route.state.lock();
+            state.number = 1;
+            state.phase = RelayPhase::Preparing;
+            state.started = start;
+        }
+        assert!(
+            route.maintain_at(start + Duration::from_millis(5999), true, |_| {
+                panic!("preparation ended before its negotiation deadline")
+            })
+        );
+        let mut actions = Vec::new();
+        assert!(
+            route.maintain_at(start + Duration::from_secs(6), true, |message| {
+                if let Message::Relay(message) = message {
+                    actions.push((message.attempt, message.action.clone()));
+                }
+                true
+            })
+        );
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], (1, control::RelayAction::Abort)));
+        assert_eq!(route.state.lock().phase, RelayPhase::Idle);
     }
 
     #[test]

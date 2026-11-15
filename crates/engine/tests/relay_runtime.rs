@@ -393,7 +393,7 @@ impl Running {
 }
 impl Drop for Running {
     fn drop(&mut self) {
-        if thread::panicking() {
+        if thread::panicking() || std::env::var_os("LATCH_FRAME_DIAGNOSTICS").is_some() {
             eprintln!("host diagnostics {:?}; path {:?}; network {:?}; proxy buffers {:?}; proxy send retries {}; simulated UDP {:?}",
                 self.server.status(), self.session.media_path(), self.session.network_status(),
                 self.proxy_buffers, self.proxy_send_retries.load(Ordering::Relaxed),
