@@ -17,6 +17,125 @@ fn position(x: u16) -> Event {
     }
 }
 
+#[test]
+fn high_rate_pointer_input_stays_bounded_at_campus_rtt() {
+    for (rtt_ms, loss) in [(200, 0.0), (175, 0.2), (160, 0.2)] {
+        let impairment = Impairment {
+            delay: Duration::from_micros(rtt_ms * 500),
+            loss,
+            ..Impairment::NONE
+        };
+        let mut forward = Link::new(impairment, 1);
+        let mut backward = Link::new(impairment, 2);
+        let mut sender = InputSender::new(1);
+        let mut receiver = InputReceiver::new();
+        let start = Instant::now();
+        let mut progress = start;
+        let mut out = Vec::new();
+        let mut latest = None;
+        for ms in 0..31_000 {
+            let now = start + Duration::from_millis(ms);
+            if ms < 30_000 {
+                // A 1000 Hz mouse, flushed synchronously from each OS event.
+                sender.push(position(ms as u16));
+            }
+            assert!(sender.unacked() < 4096, "{rtt_ms} ms RTT, loss {loss}");
+            assert!(now.duration_since(progress) < Duration::from_secs(5));
+            if sender.poll(now, &mut out) {
+                forward.send(now, &out);
+            }
+            for dg in forward.receive(now) {
+                let Datagram::Input { first, events, .. } = wire::parse(&dg).unwrap() else {
+                    panic!()
+                };
+                let next = receiver.receive(first, events.iter(), |event| latest = Some(event));
+                wire::write_input_ack(&mut out, 1, next);
+                backward.send(now, &out);
+            }
+            for dg in backward.receive(now) {
+                let Datagram::InputAck { next, .. } = wire::parse(&dg).unwrap() else {
+                    panic!()
+                };
+                let before = sender.unacked();
+                sender.ack(next);
+                if sender.unacked() < before {
+                    progress = now;
+                }
+            }
+        }
+        assert_eq!(sender.unacked(), 0);
+        assert_eq!(latest, Some(position(29_999)));
+    }
+}
+
+#[test]
+fn coalesced_pointer_tail_waits_for_ack_or_resend() {
+    let mut sender = InputSender::new(1);
+    let now = Instant::now();
+    let mut out = Vec::new();
+    let capacity = (MAX_DATAGRAM - 13) / position(0).wire_len();
+    for x in 0..=capacity as u16 {
+        sender.push(position(x));
+        assert!(sender.poll(now, &mut out));
+    }
+    let oldest = out.clone();
+    sender.push(position(999));
+    assert!(!sender.poll(now, &mut out));
+    assert_eq!(sender.next_deadline(), Some(now + RESEND));
+    assert!(sender.poll(now + RESEND, &mut out));
+    assert_eq!(out, oldest, "in-flight payloads remain immutable");
+    sender.ack(capacity as u32);
+    assert!(sender.poll(now + RESEND, &mut out));
+    let Datagram::Input { first, events, .. } = wire::parse(&out).unwrap() else {
+        panic!()
+    };
+    assert_eq!(first, capacity as u32);
+    assert_eq!(events.iter().collect::<Vec<_>>(), [position(999)]);
+}
+
+#[test]
+fn unsent_positions_coalesce_between_reliable_events() {
+    let mut sender = InputSender::new(1);
+    let now = Instant::now();
+    let mut out = Vec::new();
+    sender.push(position(1));
+    assert!(sender.poll(now, &mut out));
+    let first_packet = out.clone();
+    let reliable = [
+        Event::MouseButton {
+            button: 1,
+            down: true,
+        },
+        Event::Key {
+            vk: 65,
+            down: true,
+            modifiers: 0,
+        },
+        Event::MouseMove { dx: 3, dy: -2 },
+        Event::Scroll {
+            vertical: 120,
+            horizontal: 0,
+        },
+        Event::Text("x".into()),
+        Event::ReleaseAll,
+    ];
+    let mut expected = vec![position(1)];
+    for (i, event) in reliable.into_iter().enumerate() {
+        sender.push(position(10 + i as u16));
+        sender.push(position(20 + i as u16));
+        sender.push(event.clone());
+        expected.extend([position(20 + i as u16), event]);
+    }
+    sender.push(position(99));
+    sender.push(position(100));
+    expected.push(position(100));
+    assert_eq!(drain_input(&mut sender, now), expected);
+    let Datagram::Input { events, .. } = wire::parse(&first_packet).unwrap() else {
+        panic!()
+    };
+    assert_eq!(events.iter().collect::<Vec<_>>(), [position(1)]);
+}
+
 fn drain_input(sender: &mut InputSender, now: Instant) -> Vec<Event> {
     let mut link = Link::new(Impairment::NONE, 1);
     let mut receiver = InputReceiver::new();
@@ -56,8 +175,9 @@ fn input_overflow_preserves_oldest_and_critical_events() {
     for i in 0..1034 {
         let now = start + Duration::from_millis(i * 8);
         sender.push(position(i as u16));
-        assert!(sender.poll(now, &mut out));
-        blackout.send(now, &out);
+        if sender.poll(now, &mut out) {
+            blackout.send(now, &out);
+        }
     }
     assert!(blackout.receive(start + Duration::from_secs(9)).is_empty());
     let critical = [
@@ -76,13 +196,15 @@ fn input_overflow_preserves_oldest_and_critical_events() {
     for event in &critical {
         sender.push(event.clone());
     }
-    assert_eq!(sender.unacked(), 1034 + critical.len());
+    let sent_positions = (MAX_DATAGRAM - 13) / position(0).wire_len();
+    assert_eq!(sender.unacked(), sent_positions + 1 + critical.len());
     let applied = drain_input(&mut sender, start + Duration::from_secs(9));
     assert_eq!(
-        &applied[..1034],
-        &(0..1034).map(position).collect::<Vec<_>>()
+        &applied[..sent_positions],
+        &(0..sent_positions as u16).map(position).collect::<Vec<_>>()
     );
-    assert_eq!(&applied[1034..], &critical);
+    assert_eq!(applied[sent_positions], position(1033));
+    assert_eq!(&applied[sent_positions + 1..], &critical);
 }
 
 #[test]
@@ -174,6 +296,7 @@ fn input_backlog_waits_for_ack_or_resend_without_spinning() {
     let mut sender = InputSender::new(1);
     for i in 0..500 {
         sender.push(position(i));
+        sender.push(Event::ReleaseAll);
     }
     let now = Instant::now();
     let mut out = Vec::new();
