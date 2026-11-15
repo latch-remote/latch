@@ -7,6 +7,19 @@ GitHub release notes, so each version gets a heading of the form
 ## Unreleased
 
 - Add Linux Wayland screen sharing through the desktop portal and runtime-loaded PipeWire, with linear DMA-BUF capture, shared-memory fallback, RemoteDesktop input, and persisted portal approvals in Sharing setup.
+
+### Deployment
+
+- Upgrade the single Seoul relay to native TLS and HTTPS WebSocket on TCP 443,
+  retain its durable quota, and apply always-on TCP MTU probing. Record the
+  verified backups, the initial 0.877-second upgrade and the 0.937-second
+  reinstallation. The before/after measurements ran on unstable campus Wi-Fi
+  and most timed out: sustained 20-Mbps and WebSocket throughput are unverified.
+- Enable Lightsail IPv6 and matching firewall scopes, verify public IPv6 TLS,
+  and publish a DNS-only AAAA while preserving the existing A record.
+- Add explicit carrier and CONNECT proxy options to the bounded paired probe,
+  with per-lane diagnostics and carrier-selection regression tests.
+
 ### Relay connectivity
 
 - Add HTTPS WebSocket relay fallback on TCP 443 alongside native
