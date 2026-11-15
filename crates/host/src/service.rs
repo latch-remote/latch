@@ -89,6 +89,8 @@ pub struct Service {
     nat: Mutex<Option<NatReport>>,
     nat_running: AtomicBool,
     update_running: Arc<AtomicBool>,
+    #[cfg(target_os = "linux")]
+    update_issues: Arc<Mutex<Vec<String>>>,
     admission: Arc<Mutex<()>>,
     power_pending: Arc<AtomicBool>,
 }
@@ -145,6 +147,8 @@ impl Service {
             nat: Mutex::new(None),
             nat_running: AtomicBool::new(false),
             update_running: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "linux")]
+            update_issues: Arc::new(Mutex::new(Vec::new())),
             admission: Arc::new(Mutex::new(())),
             power_pending: Arc::new(AtomicBool::new(false)),
         }
@@ -213,6 +217,18 @@ impl Service {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn record_linux_update_issue(&self, result: Result<()>) {
+        if let Err(error) = result {
+            let problem = format!("Linux updater maintenance failed: {error:#}");
+            self.log(&problem);
+            let mut issues = self.update_issues.lock();
+            if !issues.contains(&problem) {
+                issues.push(problem);
+            }
+        }
+    }
+
     pub fn run_arc(self, replacing: bool) -> Result<()> {
         Arc::new(self).run(replacing)
     }
@@ -222,6 +238,28 @@ impl Service {
     /// update just started: the old one is still answering its last request,
     /// so wait for the port rather than give up.
     pub fn run(self: Arc<Self>, replacing: bool) -> Result<()> {
+        self.run_at(replacing, CONTROL_PORT)
+    }
+
+    fn run_at(self: Arc<Self>, replacing: bool, port: u16) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.record_linux_update_issue(update::linux::reconcile().map(|_| ()));
+            match std::env::current_exe()
+                .context("locate Linux installation")
+                .and_then(|exe| exe.canonicalize().context("resolve Linux installation"))
+            {
+                Ok(exe) => {
+                    let now = std::time::SystemTime::now();
+                    self.record_linux_update_issue(latch_core::update::linux::cleanup(&exe, now));
+                    self.record_linux_update_issue(latch_core::config::data_dir().and_then(
+                        |data| latch_core::update::linux::cleanup_uploads(&exe, &data, now),
+                    ));
+                }
+                Err(error) => self.record_linux_update_issue(Err(error)),
+            }
+            update::linux::monitor(self.update_running.clone(), self.update_issues.clone());
+        }
         if !starts_with_window(&self.cfg.lock()) {
             // A Mac that is only a viewer: an older window (or anything else)
             // that starts the service must not share it. Exit 0, so launchd
@@ -229,7 +267,7 @@ impl Service {
             self.log("this Mac is not shared (Share this Mac is off); the service exits");
             return Ok(());
         }
-        let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, CONTROL_PORT));
+        let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
         let listener = if replacing {
             let deadline = Instant::now() + Duration::from_secs(60);
             loop {
@@ -251,11 +289,11 @@ impl Service {
                     // restarts on failure then leaves the running one alone
                     // instead of respawning this one every few seconds.
                     self.log(format!(
-                        "another Latch service already answers on TCP {CONTROL_PORT}; this copy exits ({e})"
+                        "another Latch service already answers on TCP {port}; this copy exits ({e})"
                     ));
                     return Ok(());
                 }
-                Err(e) => return Err(e).context(format!("bind TCP {CONTROL_PORT}")),
+                Err(e) => return Err(e).context(format!("bind TCP {port}")),
             }
         };
         if let Err(e) = crate::prep::migrate() {
@@ -265,7 +303,7 @@ impl Service {
         let owner = Arc::downgrade(&self);
         let log = self.log.clone();
         *self.server.lock() = Some(Server::bind(
-            CONTROL_PORT,
+            port,
             Options {
                 relay: latch_stream::session::relay_config(&self.cfg.lock().relay),
                 prepare: Some(Box::new(move |req| {
@@ -278,7 +316,7 @@ impl Service {
             },
         )?);
         self.log(format!(
-            "Latch Host {} listening on TCP and UDP {CONTROL_PORT}",
+            "Latch Host {} listening on TCP and UDP {port}",
             env!("CARGO_PKG_VERSION")
         ));
         // Measure the encoders now, not when the first viewer asks, and
@@ -471,6 +509,9 @@ impl Service {
     /// version did not change. Restart into the new program once nobody
     /// watches. (Windows swaps its executable through `update`.)
     fn follow_reinstall(self: &Arc<Self>) {
+        if self.update_running.load(Ordering::Acquire) {
+            return;
+        }
         let Some(stamp) = started_from().filter(|s| s.replaced()) else {
             return;
         };
@@ -549,6 +590,14 @@ impl Service {
             owner.tagged && !owner.tailnet.contains('@') && cfg.allowed_logins.is_empty()
         }) {
             setup.push("Tagged organisation host: set allowed_logins in host.toml. An email domain does not prove membership; remote control is refused until configured.".into());
+        }
+        #[cfg(target_os = "linux")]
+        setup.extend(self.update_issues.lock().iter().cloned());
+        #[cfg(target_os = "linux")]
+        if let Ok(Some(state)) = latch_core::update::linux::state_path()
+            .and_then(|path| latch_core::update::linux::UpdateState::load(&path))
+        {
+            setup.push(state.reason);
         }
         #[cfg(target_os = "macos")]
         setup.extend(crate::unix_setup::permission_items());
@@ -893,6 +942,14 @@ impl Service {
     /// A newer `latch-host.exe` from the Mac: stage it, answer, then swap
     /// it in and hand over. See [`crate::update`].
     fn update(&self, from: IpAddr, req: &Request) -> Response {
+        #[cfg(target_os = "linux")]
+        return self.update_linux(from, req);
+        #[cfg(not(target_os = "linux"))]
+        self.update_windows(from, req)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn update_windows(&self, from: IpAddr, req: &Request) -> Response {
         if !cfg!(windows) {
             // A Mac replaces its own app from GitHub and a container is
             // rebuilt; swapping a Windows executable in here would only
@@ -975,6 +1032,58 @@ impl Service {
                 self.update_running.store(false, Ordering::Release);
                 self.log(format!("update from {from} refused: {}", r.message()));
                 Response::json(r.status(), &Ack::err(r.message()))
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn update_linux(&self, from: IpAddr, req: &Request) -> Response {
+        self.update_linux_with(from, req, |req| {
+            let exe = std::env::current_exe()?;
+            let version = update::linux::authenticate(req, &exe)?;
+            update::linux::start(&exe, &version, &req.body)?;
+            Ok(version)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn update_linux_with(
+        &self,
+        from: IpAddr,
+        req: &Request,
+        install: impl FnOnce(&Request) -> Result<semver::Version>,
+    ) -> Response {
+        if !self.cfg.lock().accept_updates {
+            return Response::json(403, &Ack::err("the owner has turned pushed updates off"));
+        }
+        let _admission = self.admission.lock();
+        if self.update_running.swap(true, Ordering::AcqRel) {
+            return Response::json(409, &Ack::err("an update is already being installed"));
+        }
+        let result = (|| -> Result<()> {
+            let engine_running = self.server.lock().is_some();
+            anyhow::ensure!(
+                !update::refuse_self_update(engine_running, self.someone_watching()),
+                "a stream is running; the update is retried after it ends"
+            );
+            let version = install(req)?;
+            self.update_issues.lock().clear();
+            update::linux::monitor(self.update_running.clone(), self.update_issues.clone());
+            self.log(format!(
+                "installing Linux Latch {version}, requested by {from}"
+            ));
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Response::json(200, &Ack::ok()),
+            Err(e) => {
+                self.update_running.store(false, Ordering::Release);
+                let status = if e.to_string().contains("a stream is running") {
+                    409
+                } else {
+                    400
+                };
+                Response::json(status, &Ack::err(format!("{e:#}")))
             }
         }
     }
@@ -2132,7 +2241,7 @@ mod tests {
         let svc = Service::new();
         let req = Request::default();
         svc.update_running.store(true, Ordering::Release);
-        if cfg!(windows) {
+        if cfg!(any(windows, target_os = "linux")) {
             assert_eq!(svc.update(LOOPBACK, &req).status, 409);
         } else {
             // Not a Windows PC: refused before the slot is even looked at.
@@ -2145,12 +2254,255 @@ mod tests {
         assert!(!svc.update_running.load(Ordering::Acquire));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn updater_bookkeeping_errors_never_prevent_the_service_from_answering() {
+        use latch_core::update::linux::{FailureKind, Phase, UpdateState};
+        use std::fs;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+        struct Running(Child);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        // Exercise service startup on an ephemeral port with isolated user files.
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("latch-host");
+        fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let systemctl = root.path().join("systemctl");
+        fs::write(&systemctl, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(systemctl, fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        for case in [
+            "mode",
+            "owner",
+            "json",
+            "future",
+            "recovery",
+            "cleanup",
+            "data-path",
+        ] {
+            let dir = tempfile::tempdir_in(root.path()).unwrap();
+            let data = dir.path().join("data");
+            fs::create_dir(&data).unwrap();
+            let journal = data.join("linux-update.json");
+            if case == "data-path" {
+                fs::remove_dir(&data).unwrap();
+                fs::write(&data, b"blocked data directory").unwrap();
+            } else if case == "cleanup" {
+                fs::create_dir(data.join("linux-update.json.lock")).unwrap();
+            } else {
+                let mut state =
+                    UpdateState::request(&exe, &semver::Version::new(999, 0, 0), &[], &journal)
+                        .unwrap();
+                match case {
+                    "mode" => {
+                        fs::set_permissions(&journal, fs::Permissions::from_mode(0o644)).unwrap()
+                    }
+                    "owner" => {
+                        // An unprivileged runner can plant a foreign-owned journal via
+                        // a symlink. The root Docker run also exercises a regular file.
+                        if Command::new("id").arg("-u").output().unwrap().stdout == b"0\n" {
+                            assert!(Command::new("chown")
+                                .arg("65534:65534")
+                                .arg(&journal)
+                                .status()
+                                .unwrap()
+                                .success());
+                        } else {
+                            fs::remove_file(&journal).unwrap();
+                            std::os::unix::fs::symlink("/etc/passwd", &journal).unwrap();
+                        }
+                    }
+                    "json" => fs::write(&journal, b"{broken").unwrap(),
+                    "future" => {
+                        let mut value = serde_json::to_value(state).unwrap();
+                        value["phase"] = serde_json::json!("FuturePhase");
+                        value["future_field"] = serde_json::json!(true);
+                        fs::write(&journal, serde_json::to_vec(&value).unwrap()).unwrap();
+                    }
+                    "recovery" => {
+                        let stage = root.path().join(".latch-update-startup-recovery");
+                        fs::create_dir(&stage).unwrap();
+                        fs::set_permissions(&stage, fs::Permissions::from_mode(0o700)).unwrap();
+                        fs::write(stage.join("owner"), exe.as_os_str().as_encoded_bytes()).unwrap();
+                        fs::write(stage.join("previous"), b"retained recovery").unwrap();
+                        let installed = fs::metadata(&exe).unwrap();
+                        state.original = Some((installed.dev(), installed.ino() + 1));
+                        state.replacement = Some((installed.dev(), installed.ino() + 2));
+                        state.stage = Some(stage);
+                        state.phase = Phase::Swapping;
+                        state.supervisor = 1;
+                        state.save(&journal).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let mut command = Command::new(&exe);
+            command
+                .args([
+                    "--exact",
+                    "service::tests::startup_service_fixture_entry",
+                    "--nocapture",
+                ])
+                .env("LATCH_STARTUP_FIXTURE_PORT", port.to_string())
+                .env("PATH", root.path())
+                .env("LATCH_DATA_DIR", &data)
+                .env("HOME", dir.path())
+                .env("XDG_CONFIG_HOME", dir.path().join("config"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut service = Running(command.spawn().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                assert!(
+                    service.0.try_wait().unwrap().is_none(),
+                    "service exited for {case}"
+                );
+                let response = (|| -> Result<http::Response> {
+                    let mut tcp = std::net::TcpStream::connect(("127.0.0.1", port))?;
+                    tcp.set_read_timeout(Some(Duration::from_millis(500)))?;
+                    tcp.set_write_timeout(Some(Duration::from_millis(500)))?;
+                    http::exchange_with(
+                        &mut tcp,
+                        "GET",
+                        "/v1/status",
+                        &format!("127.0.0.1:{CONTROL_PORT}"),
+                        &[],
+                        &[],
+                    )
+                })();
+                if let Ok(response) = response {
+                    assert_eq!(response.status, 200, "{case}: {}", response.body);
+                    break response.body;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "service never answered for {case}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            let expected = match case {
+                "mode" | "owner" | "json" => "quarantined",
+                "future" => "FuturePhase",
+                "recovery" => "recovery failed",
+                "cleanup" | "data-path" => "updater maintenance failed",
+                _ => unreachable!(),
+            };
+            assert!(
+                status.contains(expected),
+                "{case} missing diagnostic {expected} in {status}"
+            );
+            drop(service);
+            if case == "data-path" {
+                fs::remove_file(&data).unwrap();
+                fs::create_dir(&data).unwrap();
+            }
+            if case == "cleanup" {
+                fs::remove_dir(data.join("linux-update.json.lock")).unwrap();
+            }
+            let mut later =
+                UpdateState::request(&exe, &semver::Version::new(999, 0, 1), &[], &journal)
+                    .unwrap();
+            later
+                .finish(&journal, &Ok(()), FailureKind::Installation)
+                .unwrap();
+            if case == "recovery" {
+                assert_eq!(
+                    fs::read(root.path().join(".latch-update-startup-recovery/previous")).unwrap(),
+                    b"retained recovery"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_service_fixture_entry() {
+        let Some(port) = std::env::var("LATCH_STARTUP_FIXTURE_PORT").ok() else {
+            return;
+        };
+        Arc::new(Service::new())
+            .run_at(false, port.parse().unwrap())
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_supervisor_start_failure_clears_busy_and_reaches_the_caller() {
+        let svc = Service::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("linux-update.json");
+        let state = latch_core::update::linux::UpdateState::request(
+            std::path::Path::new("/unused"),
+            &semver::Version::new(999, 0, 0),
+            &[],
+            &path,
+        )
+        .unwrap();
+        let response = svc.update_linux_with(LOOPBACK, &Request::default(), |_| {
+            update::linux::start_with(
+                &mut std::process::Command::new(dir.path().join("missing-supervisor")),
+                &state,
+                &path,
+            )
+            .map(|()| state.version.clone())
+        });
+        assert_eq!(response.status, 400);
+        assert!(response
+            .body
+            .contains("start the independent Linux update process"));
+        assert!(!svc.update_running.load(Ordering::Acquire));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hosted_stream_refuses_linux_updates_with_409() {
+        if std::env::var_os("LATCH_HOSTED_UPDATE_FIXTURE").is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "service::tests::a_hosted_stream_refuses_linux_updates_with_409",
+                    "--nocapture"
+                ])
+                .env("LATCH_HOSTED_UPDATE_FIXTURE", "1")
+                .env("LATCH_TEST_PATTERN", "still")
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        let svc = Service::new();
+        let server = Server::bind(0, Options::default()).unwrap();
+        let req: StreamRequest = serde_json::from_value(serde_json::json!({
+            "protocol": latch_proto::PROTOCOL, "width": 64, "height": 64, "fps": 1,
+            "bitrate_kbps": 500, "codecs": ["h264-baseline"], "udp_port": 12345, "audio": false,
+        }))
+        .unwrap();
+        let prepared = server
+            .prepare(req, "127.0.0.1:12345".parse().unwrap())
+            .unwrap();
+        assert!(server.busy());
+        *svc.server.lock() = Some(server);
+        let response = svc.update(LOOPBACK, &Request::default());
+        assert_eq!(response.status, 409);
+        assert!(response.body.contains("a stream is running"));
+        assert!(!svc.update_running.load(Ordering::Acquire));
+        drop(prepared);
+    }
+
     #[test]
     fn an_owner_can_turn_pushed_updates_off() {
         let svc = Service::new();
         svc.cfg.lock().accept_updates = false;
         let r = svc.update(LOOPBACK, &Request::default());
-        if cfg!(windows) {
+        if cfg!(any(windows, target_os = "linux")) {
             assert_eq!(r.status, 403, "{}", r.body);
             assert!(r.body.contains("turned pushed updates off"), "{}", r.body);
         } else {

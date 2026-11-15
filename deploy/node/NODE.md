@@ -88,8 +88,10 @@ The image builds one Rust `latch-host` with `--locked` from `Cargo.lock`,
 installs Ubuntu 24.04 desktop/runtime packages and copies the stable
 Tailscale client and daemon. There is no external streaming engine.
 To update Latch, pull the desired source revision and run the build command
-again. There is no in-app Linux binary updater. Native Linux GPU encoding
-remains unverified on hardware.
+again. The image sets `LATCH_CONTAINER_INSTALL=1`; Latch shows an image-rebuild
+notice for this kit. User-owned release binaries on Linux have an in-app
+updater. Container updates use image rebuild and recreation. Native Linux
+GPU encoding remains unverified on hardware.
 
 `.dockerignore` keeps every `.env` out of the build context: the build
 stage copies the whole repository, and a layer keeps what it copied, so an

@@ -64,6 +64,7 @@ winresource = "0.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
+tempfile = "3"
 toml.workspace = true
 # Renders the screens to PNGs without a display, so the UI can be reviewed
 # from any machine. See the `snapshots` test module in app.rs.
