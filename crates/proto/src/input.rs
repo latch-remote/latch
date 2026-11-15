@@ -208,8 +208,10 @@ impl InputSender {
     }
 
     /// Queues an event. Text longer than [`MAX_TEXT`] is split at character
-    /// boundaries. A relative move right after another not yet sent is
-    /// merged into it if the sum fits. Sent payloads remain immutable.
+    /// boundaries. Adjacent unsent absolute positions are latest-wins.
+    /// A relative move right after another not yet sent is merged into it
+    /// if the sum fits. Sent payloads remain immutable, and coalescing never
+    /// crosses another event, preserving click locations and input order.
     pub fn push(&mut self, event: Event) {
         if let Event::Text(text) = &event {
             if text.is_empty() {
@@ -225,6 +227,17 @@ impl InputSender {
                     self.push(Event::Text(text[start..end].to_owned()));
                     start = end;
                 }
+                return;
+            }
+        }
+        if matches!(event, Event::MousePosition { .. }) {
+            if let Some((_, previous @ Event::MousePosition { .. }, false)) = self.queue.back_mut()
+            {
+                *previous = event;
+                // Its wire length is unchanged. If the old position did
+                // not fit in the last packet, neither does its replacement.
+                // Wait for an ACK or RESEND instead of resending the same
+                // oldest packet at the mouse's polling rate.
                 return;
             }
         }

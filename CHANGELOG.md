@@ -7,6 +7,9 @@ GitHub release notes, so each version gets a heading of the form
 ## Unreleased
 
 - Add Linux Wayland screen sharing through the desktop portal and runtime-loaded PipeWire, with linear DMA-BUF capture, shared-memory fallback, RemoteDesktop input, and persisted portal approvals in Sharing setup.
+- Send viewer mouse and keyboard input directly from OS events on macOS,
+  Windows and Linux, preserving input ordering, capture, focus and local
+  shortcuts while avoiding the next UI frame for ordinary input.
 
 ### Packaging
 
@@ -23,6 +26,19 @@ GitHub release notes, so each version gets a heading of the form
 
 - Upgrade objc2 and AppKit bindings together, x11rb and libloading, preserving
   macOS integration and Linux X11 abstract-socket connections.
+
+### Documentation
+
+- Document host and viewer support on Windows, macOS and Linux, with code
+  evidence, verification scope, all six streaming directions and in-flight
+  work. Correct platform and cursor claims.
+
+### Deployment
+
+- Consolidate the Seoul native TCP/TLS and Tailscale UDP peer relays on the
+  existing Lightsail instance. Add reproducible socket, queue, forwarding
+  offload, descriptor and memory tuning, with bounded before/after measurements,
+  bundle and transfer cost estimates, IPv6 findings and completed EC2 teardown.
 
 ## 6.0.0 (2026-11-14)
 

@@ -1,0 +1,13 @@
+{
+  "utc": "2026-11-15T04:28:15.966346+00:00",
+  "elapsed_s": 33.986745375,
+  "exit_code": 0,
+  "stderr": "",
+  "bytes": 13172176,
+  "mbps": 3.100544251510285,
+  "sha256": "f6f275f67c7ef44fc2df2d828658fb31eaffd41018ac5a0fd9440e08d9912c30",
+  "cpu_core_seconds": 0.839595,
+  "cpu_one_core_percent": 2.4703601087310645,
+  "cpu_percent_per_forwarded_mbps": 0.7967504761551925,
+  "max_memory_bytes": 19386368
+}
