@@ -24,6 +24,9 @@ struct Entry {
 /// invalidate immediately. At most eight destination caches and one OS job of
 /// each kind are retained, including when an OS API stalls indefinitely.
 pub fn diagnosis(host: &str) -> NetworkDiagnosis {
+    if latch_relay::Endpoint::new(host, 443).is_err() {
+        return NetworkDiagnosis::default();
+    }
     static CACHE: OnceLock<Mutex<Vec<Entry>>> = OnceLock::new();
     let mut cache = CACHE.get_or_init(Mutex::default).lock().unwrap();
     if let Some(entry) = cache.iter().find(|entry| entry.host == host) {
@@ -289,5 +292,18 @@ mod tests {
         ));
         assert!(!refresh_due(now + Duration::from_secs(6), refresh_at, true));
         assert!(refresh_due(now + Duration::from_secs(6), refresh_at, false));
+    }
+    #[test]
+    fn invalid_relay_host_cannot_supply_a_probe_path_or_credentials() {
+        for host in [
+            "relay.test/private",
+            "user:password@relay.test",
+            "relay.test?secret",
+            "",
+        ] {
+            let result = diagnosis(host);
+            assert!(result.proxies.candidates.is_empty());
+            assert_eq!(result.captive_portal, CaptivePortal::Unknown);
+        }
     }
 }
