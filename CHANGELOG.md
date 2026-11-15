@@ -86,6 +86,11 @@ GitHub release notes, so each version gets a heading of the form
   offload, descriptor and memory tuning, with bounded before/after measurements,
   bundle and transfer cost estimates, IPv6 findings and completed EC2 teardown.
 
+### Streaming and recovery
+
+- Move relay quota persistence off the network loop and batch durable byte
+  reservations so credited video and priority lanes keep running during disk flushes.
+
 ## 6.0.0 (2026-11-14)
 
 ### Streaming and recovery
