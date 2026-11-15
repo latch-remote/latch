@@ -141,12 +141,17 @@ impl<D: ?Sized + Device> InputSink for WaylandInput<D> {
                     None if !down => return Ok(()),
                     None => keymap::vk_to_evdev(*vk).context("unmapped virtual key")?,
                 };
-                self.device.key(code, *down)?;
-                p.held.note(event);
+                // A press whose call failed or timed out may still have
+                // reached the compositor, so track it first: its release,
+                // or ReleaseAll, then lets it go.
                 if *down {
                     p.keys.insert(*vk, code);
-                } else {
+                    p.held.note(event);
+                }
+                self.device.key(code, *down)?;
+                if !*down {
                     p.keys.remove(vk);
+                    p.held.note(event);
                 }
             }
             Event::MousePosition {
@@ -162,8 +167,14 @@ impl<D: ?Sized + Device> InputSink for WaylandInput<D> {
             Event::MouseButton { button, down } => {
                 let code = button_code(*button)?;
                 if *down || p.held.buttons.contains(button) {
+                    // Tracked before the call, as keys are.
+                    if *down {
+                        p.held.note(event);
+                    }
                     self.device.button(code, *down)?;
-                    p.held.note(event);
+                    if !*down {
+                        p.held.note(event);
+                    }
                 }
             }
             Event::Scroll {
@@ -520,6 +531,59 @@ mod tests {
             self.0.push(format!("text {text}"));
             Ok(())
         }
+    }
+
+    /// A portal whose presses all fail (time out) although they may
+    /// have taken effect; releases succeed.
+    #[derive(Default)]
+    struct LatePresses(Vec<String>);
+
+    impl Device for LatePresses {
+        fn key(&mut self, code: u16, down: bool) -> anyhow::Result<()> {
+            ensure!(!down, "NotifyKeyboardKeycode timed out");
+            self.0.push(format!("key {code} up"));
+            Ok(())
+        }
+        fn button(&mut self, code: u16, down: bool) -> anyhow::Result<()> {
+            ensure!(!down, "NotifyPointerButton timed out");
+            self.0.push(format!("button {code:#x} up"));
+            Ok(())
+        }
+        fn absolute(&mut self, _: i32, _: i32, _: DisplayRect) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn relative(&mut self, _: i16, _: i16) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn scroll(&mut self, _: i32, _: i32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn text(&mut self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_press_whose_call_failed_is_still_released() {
+        let mut s = WaylandInput::<LatePresses> {
+            pressed: Pressed::default(),
+            device: Box::default(),
+            session: None,
+            release_on_drop: true,
+        };
+        let key = |down| Event::Key {
+            vk: 0x41,
+            down,
+            modifiers: 0,
+        };
+        let button = |down| Event::MouseButton { button: 1, down };
+        assert!(s.apply(&key(true), DISPLAY).is_err());
+        s.apply(&key(false), DISPLAY).unwrap();
+        assert!(s.apply(&button(true), DISPLAY).is_err());
+        s.apply(&Event::ReleaseAll, DISPLAY).unwrap();
+        assert_eq!(s.device.0, ["key 30 up", "button 0x110 up"]);
+        s.apply(&Event::ReleaseAll, DISPLAY).unwrap();
+        assert_eq!(s.device.0.len(), 2, "each is released once");
     }
 
     fn sink() -> WaylandInput<Recorder> {

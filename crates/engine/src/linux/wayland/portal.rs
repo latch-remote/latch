@@ -93,9 +93,10 @@ pub fn approval_budget(viewer_seconds: u32) -> Duration {
     ))
 }
 
-/// How long a startup D-Bus call may take.
+/// How long a startup or input D-Bus call may take. An input call keeps
+/// this long timeout: a slow compositor's reply is not a failure, and a
+/// stopping stream cancels the call instead (see [`cancellable`]).
 const REPLY: Duration = Duration::from_secs(10);
-const INPUT_REPLY: Duration = Duration::from_millis(250);
 const CLOSE: Duration = Duration::from_millis(250);
 
 /// `SelectDevices` device types.
@@ -634,17 +635,14 @@ impl Session {
     where
         B: serde::Serialize + zbus::zvariant::DynamicType,
     {
-        run(cancellable(
-            self.notify_call(method, INPUT_REPLY, args),
-            || {
-                check_startup()?;
-                ensure!(
-                    !stopping.load(Ordering::Acquire),
-                    "the stream stopped during input"
-                );
-                Ok(())
-            },
-        ))
+        run(cancellable(self.notify_call(method, REPLY, args), || {
+            check_startup()?;
+            ensure!(
+                !stopping.load(Ordering::Acquire),
+                "the stream stopped during input"
+            );
+            Ok(())
+        }))
     }
 
     pub fn notify_with_timeout<B>(
