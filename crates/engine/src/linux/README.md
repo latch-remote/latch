@@ -101,7 +101,12 @@ RemoteDesktop and ScreenCast are kept separately. Restoration requires
 RemoteDesktop version 2 or ScreenCast version 4 and a backend that supports
 persistence. Older backends, including some xdg-desktop-portal-wlr releases,
 ask again per session. Revocation or expired tokens can also prompt again.
-A viewer can wait up to 90 seconds while the owner approves locally.
+Session-only approval completes Sharing setup and enables autostart. The
+setup log explains that each connection needs approval on this screen.
+Current viewers allow 180 seconds for startup, including up to 90 seconds
+of portal approval. Older viewers retain their 60-second startup budget,
+with portal approval capped at 15 seconds to leave time for preparation.
+Closing the viewer dismisses its pending portal request.
 
 The background user service must have the desktop session's environment.
 GNOME and Plasma normally import it. For sway, run the following from the
@@ -129,14 +134,31 @@ and frame pacer. Missing damage metadata means a full update, and pending
 damage accumulates when the consumer skips pictures. The compositor draws
 the cursor when its portal supports embedded cursors. The selected monitor
 keeps its compositor resolution and scales to the negotiated stream size.
-Absolute portal input uses the stream's logical coordinates, including HiDPI.
+Absolute input follows the portal backend's coordinate convention. GNOME's
+Mutter-backed NotifyPointerMotionAbsolute consumes stream pixels and divides
+by monitor scale. KDE consumes logical coordinates. Latch identifies the
+backend object for the actual portal session. The uinput fallback reads the
+compositor's xdg-output logical layout, applies the selected monitor's origin,
+and normalizes across the whole desktop, including negative origins. Layout
+requests have a one-second deadline.
+
+SPA VideoTransform metadata is requested and its rotation/reflection is
+undone before encoding. Pointer mapping follows the oriented picture.
+Packed linear DMA-BUF mapping sizes come from stride and height, including
+exporters that report zero maxsize and a sentinel chunk size.
+
+Session.Closed and PipeWire termination end streaming with a reason for the
+viewer and release held input. PipeWire pauses have a two-second grace period
+for format renegotiation. The consumer requests graph processing while waiting
+for its initial picture, so an idle producer's queued first frame reaches it.
 
 ### Headless verification
 
 Linux CI runs `scripts/test-wayland.sh` on both native architectures after
 building `cargo build -p latch-engine --example wayland_smoke`. It creates a
 private sway desktop, session bus, PipeWire server and real ScreenCast portal,
-verifies changed background pixels and an H.264 encode/decode round trip,
+verifies idle startup, changed background pixels, an H.264 encode/decode round
+trip, asymmetric rotated-output pixels and producer shutdown,
 and cleans up its processes and state. The test forces SHM and uses an
 automatic monitor choice in its private portal configuration. Run it as an
 unprivileged user with sway, swaybg, PipeWire, WirePlumber,
@@ -145,7 +167,12 @@ script with a software renderer. Ubuntu 24.04's xdg-desktop-portal-wlr 0.7
 requires DMA-BUF even for SHM. CI builds upstream 0.7.1 at commit
 `74428f2a8fa7f252e2a46fdf5b697536c66c8a1c` with the explicit
 `scripts/wayland-portal-shm.patch` fixture workaround using Meson and Ninja, then passes
-its binary through `LATCH_TEST_PORTAL_WLR`. The CI workflow lists its build
+its binary through `LATCH_TEST_PORTAL_WLR`. The patch changes only the
+pre-negotiation DMA-BUF requirement. Product code handles initial graph
+processing. CI also runs the ignored live layout test under a fresh private
+two-output sway session, checking left and right monitor centers against
+the absolute device's whole-desktop range. Physical uinput injection still
+requires a machine with `/dev/uinput` access. The CI workflow lists its build
 dependencies. PipeWire development packages are installed for that fixture
 after the Rust compile and test steps.
 

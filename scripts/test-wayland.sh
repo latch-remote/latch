@@ -6,6 +6,7 @@ if [[ ${1:-} != --session ]]; then
 fi
 shift
 binary=$(realpath "${1:-target/debug/examples/wayland_smoke}")
+if (( $# > 0 )); then shift; fi
 fixture=$(mktemp -d)
 export XDG_RUNTIME_DIR="$fixture/runtime"
 export XDG_CONFIG_HOME="$fixture/config"
@@ -13,7 +14,7 @@ export XDG_STATE_HOME="$fixture/state"
 export XDG_DATA_HOME="$fixture/data"
 export LATCH_WAYLAND_TOKEN_FILE="$XDG_STATE_HOME/wayland-portal.json"
 export XDG_CURRENT_DESKTOP=sway XDG_SESSION_TYPE=wayland
-export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_HEADLESS_OUTPUTS=1
+export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_HEADLESS_OUTPUTS=2
 export LIBSEAT_BACKEND=noop LATCH_LINUX_BACKEND=wayland LATCH_WAYLAND_DMABUF=0
 export RUST_LOG=latch_engine=debug
 unset DISPLAY WAYLAND_DISPLAY SWAYSOCK
@@ -49,6 +50,8 @@ owns_bus_name() {
 cat > "$fixture/sway.conf" <<'CONFIG'
 output HEADLESS-1 mode 640x360
 output HEADLESS-1 bg #345678 solid_color
+output HEADLESS-1 pos 0 0
+output HEADLESS-2 mode 640x360 pos 640 0
 CONFIG
 cat > "$XDG_CONFIG_HOME/xdg-desktop-portal-wlr/config" <<'CONFIG'
 [screencast]
@@ -85,8 +88,9 @@ wireplumber > "$fixture/wireplumber.log" 2>&1 &
 pids+=("$!")
 "${LATCH_TEST_PORTAL_WLR:-/usr/libexec/xdg-desktop-portal-wlr}" -l DEBUG > "$fixture/portal-wlr.log" 2>&1 &
 pids+=("$!")
+export LATCH_TEST_PORTAL_PID="$!"
 wait_for "$!" owns_bus_name "$!" org.freedesktop.impl.portal.desktop.wlr
 /usr/libexec/xdg-desktop-portal -v > "$fixture/portal.log" 2>&1 &
 pids+=("$!")
 wait_for "$!" owns_bus_name "$!" org.freedesktop.portal.Desktop
-timeout 45 "$binary"
+timeout 45 "$binary" "$@"

@@ -11,9 +11,10 @@
 pub mod backend;
 mod frame;
 mod input;
+mod layout;
 mod pipewire;
 mod pod;
-mod portal;
+pub(crate) mod portal;
 pub mod token;
 
 use crate::input::{DisplayRect, InputSink};
@@ -52,6 +53,7 @@ pub struct WaylandCapture {
     first: bool,
     /// The monitor's logical size, where absolute pointer positions land.
     logical: Option<(i32, i32)>,
+    initial_size: (u32, u32),
     damage: Option<Vec<Rect>>,
     session: Arc<Session>,
 }
@@ -89,7 +91,11 @@ impl WaylandCapture {
         Ok(Self {
             consumer,
             first: true,
-            logical: stream.size,
+            logical: stream.size.map(|_| {
+                let (width, height) = pointer_size(false, stream.size, (w, h));
+                (width as i32, height as i32)
+            }),
+            initial_size: (w, h),
             damage: None,
             session,
         })
@@ -102,6 +108,7 @@ impl CpuCapture for WaylandCapture {
     }
 
     fn grab(&mut self, frame: &mut Bgra, timeout: Duration) -> anyhow::Result<bool> {
+        self.session.check()?;
         match self.consumer.lock().take(frame, timeout, self.first)? {
             Some(damage) => {
                 self.first = false;
@@ -119,10 +126,13 @@ impl CpuCapture for WaylandCapture {
 
     fn display(&self) -> DisplayRect {
         let (w, h) = self.consumer.lock().size();
-        let (width, height) = self
-            .logical
-            .map(|(w, h)| (w as u32, h as u32))
-            .unwrap_or((w, h));
+        let logical = self.logical.map(|(lw, lh)| {
+            (
+                (u64::from(w) * lw as u64 / u64::from(self.initial_size.0.max(1))) as i32,
+                (u64::from(h) * lh as u64 / u64::from(self.initial_size.1.max(1))) as i32,
+            )
+        });
+        let (width, height) = pointer_size(self.session.pixel_coordinates, logical, (w, h));
         DisplayRect {
             x: 0,
             y: 0,
@@ -174,12 +184,56 @@ pub fn approved() -> bool {
 
 /// Asks the owner to approve sharing (the portal's prompt, on this
 /// screen) and keeps the approval for the service's sessions.
-pub fn approve() -> anyhow::Result<()> {
+pub fn approve() -> anyhow::Result<Option<String>> {
     let session = Session::open(true, portal::APPROVAL)?;
-    anyhow::ensure!(
-        approved(),
-        "the desktop portal approved this session only; it will ask again at each connection"
-    );
+    let note = approval_note(session.kept_approval);
     drop(session);
-    Ok(())
+    Ok(note)
+}
+
+fn pointer_size(pixels: bool, logical: Option<(i32, i32)>, buffer: (u32, u32)) -> (u32, u32) {
+    if pixels {
+        buffer
+    } else {
+        logical
+            .map(|(w, h)| {
+                let (w, h) = (w as u32, h as u32);
+                if (w > h) != (buffer.0 > buffer.1) {
+                    (h, w)
+                } else {
+                    (w, h)
+                }
+            })
+            .unwrap_or(buffer)
+    }
+}
+
+fn approval_note(persistent: bool) -> Option<String> {
+    (!persistent).then(|| "The desktop portal approved this session only. Approve sharing on this screen at each connection.".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn session_only_approval_succeeds_with_a_setup_note() {
+        assert!(approval_note(false).unwrap().contains("each connection"));
+        assert!(approval_note(true).is_none());
+    }
+
+    #[test]
+    fn gnome_uses_buffer_pixels_and_kde_uses_logical_coordinates() {
+        let pixels = (3840, 2160);
+        let logical = Some((1920, 1080));
+        assert_eq!(pointer_size(true, logical, pixels), pixels);
+        assert_eq!(pointer_size(false, logical, pixels), (1920, 1080));
+        assert_eq!(pointer_size(false, logical, (2160, 3840)), (1080, 1920));
+        let gnome = DisplayRect {
+            x: 0,
+            y: 0,
+            width: pixels.0,
+            height: pixels.1,
+        };
+        assert_eq!(gnome.map(960, 540, 1920, 1080), (1920, 1080));
+    }
 }

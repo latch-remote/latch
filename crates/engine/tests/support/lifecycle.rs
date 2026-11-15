@@ -1258,3 +1258,38 @@ fn fallback_refits_geometry_and_prepares_the_final_mode() {
     assert_eq!((last.width, last.height, last.fps), expected);
     assert_eq!(prepared_sizes.lock().last(), Some(&expected));
 }
+
+#[test]
+fn portal_shutdown_ends_video_and_releases_input_without_reopening_capture() {
+    struct Sink(Arc<AtomicUsize>);
+    impl InputSink for Sink {
+        fn apply(&mut self, _: &input::Event, _: DisplayRect) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn release_all(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let server = Server::bind(0, Options::default()).unwrap();
+    let session = session("127.0.0.1:9".parse().unwrap());
+    let releases = Arc::new(AtomicUsize::new(0));
+    session.input.lock().sink = Some(Box::new(Sink(releases.clone())));
+    let pipeline = Box::new(Video {
+        info: info(),
+        held: Arc::new(AtomicBool::new(true)),
+        next: Box::new(|_, _, _| {
+            Err(anyhow::Error::from(video::CaptureEnded(
+                "sharing was stopped on this machine".into(),
+            ))
+            .context("grab"))
+        }),
+    });
+    send_video(&server, &session, pipeline, config(), |_| {
+        panic!("a revoked portal session must not reopen")
+    });
+    let ended = session.ended.lock().clone().unwrap();
+    assert_eq!(ended.code, end::CAPTURE_FAILED);
+    assert!(ended.message.contains("sharing was stopped"));
+    assert_eq!(releases.load(Ordering::Relaxed), 1);
+    assert!(session.input.lock().sink.is_none());
+}

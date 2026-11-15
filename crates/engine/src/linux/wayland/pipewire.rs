@@ -128,6 +128,7 @@ const _: () = {
 
 const STREAM_STATE_ERROR: c_int = -1;
 const STREAM_STATE_UNCONNECTED: c_int = 0;
+const STREAM_STATE_PAUSED: c_int = 2;
 const STREAM_STATE_STREAMING: c_int = 3;
 const DIRECTION_INPUT: c_int = 0;
 const FLAG_AUTOCONNECT: c_int = 1 << 0;
@@ -189,6 +190,7 @@ entry_points! {
     pw_stream_destroy: fn(Stream);
     pw_stream_add_listener: fn(Stream, *mut SpaHook, *const StreamEvents, Data);
     pw_stream_connect: fn(Stream, c_int, u32, c_int, *mut *const u8, u32) -> c_int;
+    pw_stream_trigger_process: fn(Stream) -> c_int;
     pw_stream_disconnect: fn(Stream) -> c_int;
     pw_stream_dequeue_buffer: fn(Stream) -> *mut PwBuffer;
     pw_stream_queue_buffer: fn(Stream, *mut PwBuffer) -> c_int;
@@ -223,6 +225,8 @@ struct State {
     format: Option<Negotiated>,
     error: Option<String>,
     streaming: bool,
+    paused: Option<Instant>,
+    transform: u32,
     /// A DMA-BUF that could not be mapped: offer shared memory only.
     dmabuf_failed: bool,
     frames: u64,
@@ -298,7 +302,11 @@ unsafe extern "C" fn on_state(data: Data, _old: c_int, state: c_int, error: *con
             s.error =
                 Some("the screencast stream ended (sharing was stopped on this machine)".into());
         }
-        STREAM_STATE_STREAMING => s.streaming = true,
+        STREAM_STATE_PAUSED if s.streaming => s.paused = Some(Instant::now()),
+        STREAM_STATE_STREAMING => {
+            s.streaming = true;
+            s.paused = None;
+        }
         _ => {}
     }
     shared.changed.notify_all();
@@ -335,7 +343,7 @@ unsafe extern "C" fn on_param(data: Data, id: u32, param: *const u8) {
                 state.format = Some(format);
                 state.full_frame = true;
             }
-            let [header, damage] = pod::metas();
+            let [header, damage, transform] = pod::metas();
             update(
                 shared.api,
                 stream,
@@ -343,6 +351,7 @@ unsafe extern "C" fn on_param(data: Data, id: u32, param: *const u8) {
                     pod::buffers(&format).build(),
                     header.build(),
                     damage.build(),
+                    transform.build(),
                 ],
             );
         }
@@ -357,6 +366,42 @@ unsafe extern "C" fn on_param(data: Data, id: u32, param: *const u8) {
     }
 }
 
+/// Our packed linear RGB formats have exactly one plane. DMA-BUF exporters
+/// may leave maxsize zero and use a sentinel chunk size (xdpw 0.7.1).
+fn mapping_layout(
+    d: &SpaData,
+    chunk: &SpaChunk,
+    format: &Negotiated,
+) -> anyhow::Result<(usize, usize, usize)> {
+    anyhow::ensure!(chunk.stride >= 0, "negative screencast stride");
+    let stride = if chunk.stride == 0 {
+        format.width as usize * 4
+    } else {
+        chunk.stride as usize
+    };
+    anyhow::ensure!(
+        stride >= format.width as usize * 4,
+        "short screencast stride"
+    );
+    let offset = chunk.offset as usize;
+    let len = if d.kind == pod::DATA_DMA_BUF {
+        stride
+            .checked_mul(format.height as usize)
+            .context("DMA-BUF size overflow")?
+    } else {
+        anyhow::ensure!(
+            offset <= d.maxsize as usize,
+            "screencast offset outside buffer"
+        );
+        (chunk.size as usize).min(d.maxsize as usize - offset)
+    };
+    let size = (d.mapoffset as usize)
+        .checked_add(offset)
+        .and_then(|n| n.checked_add(len))
+        .context("screencast mapping size overflow")?;
+    Ok((offset, len, size))
+}
+
 /// The pixels of one data plane, mapped for reading; unmapped on drop.
 struct Mapped {
     ptr: *const u8,
@@ -368,10 +413,9 @@ struct Mapped {
 impl Mapped {
     /// # Safety
     /// `d` is a live buffer's data plane, dequeued from the stream.
-    unsafe fn new(d: &SpaData) -> anyhow::Result<Self> {
+    unsafe fn new(d: &SpaData, format: &Negotiated) -> anyhow::Result<Self> {
         let chunk = unsafe { d.chunk.as_ref() }.context("buffer without a chunk")?;
-        let offset = chunk.offset as usize % (d.maxsize.max(1) as usize);
-        let len = (chunk.size as usize).min(d.maxsize as usize - offset);
+        let (offset, len, size) = mapping_layout(d, chunk, format)?;
         if !d.data.is_null() {
             return Ok(Self {
                 ptr: unsafe { (d.data as *const u8).add(offset) },
@@ -383,7 +427,6 @@ impl Mapped {
             bail!("a screencast buffer of type {} is not mapped", d.kind);
         }
         let fd = d.fd as c_int;
-        let size = d.mapoffset as usize + d.maxsize as usize;
         // SAFETY: a read-only shared mapping of the producer's DMA-BUF.
         let map = unsafe {
             libc::mmap(
@@ -471,7 +514,36 @@ unsafe fn header(buffer: &SpaBuffer) -> Option<&SpaMetaHeader> {
         .map(|m| unsafe { &*(m.data as *const SpaMetaHeader) })
 }
 
+/// # Safety
+/// `buffer` is live and dequeued.
+unsafe fn video_transform(buffer: &SpaBuffer) -> u32 {
+    if buffer.n_metas == 0 || buffer.metas.is_null() {
+        return 0;
+    }
+    let metas = unsafe { std::slice::from_raw_parts(buffer.metas, buffer.n_metas as usize) };
+    metas
+        .iter()
+        .find(|m| m.kind == pod::META_VIDEO_TRANSFORM && m.size >= 4 && !m.data.is_null())
+        .map_or(0, |m| unsafe { (m.data as *const u32).read_unaligned() })
+}
+
 impl State {
+    fn check(&self) -> anyhow::Result<()> {
+        if let Some(e) = &self.error {
+            return Err(crate::video::CaptureEnded(e.clone()).into());
+        }
+        if self
+            .paused
+            .is_some_and(|at| at.elapsed() >= Duration::from_secs(2))
+        {
+            return Err(crate::video::CaptureEnded(
+                "the screencast producer stopped sharing this screen".into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     fn note_header(&mut self, header: Option<&SpaMetaHeader>) {
         if let Some(header) = header {
             self.full_frame |= header.flags & META_HEADER_FLAG_DISCONT != 0
@@ -535,7 +607,7 @@ unsafe extern "C" fn on_process(data: Data) {
     let result = unsafe {
         let spa = &*(*newest).buffer;
         let plane = &*spa.datas;
-        Mapped::new(plane).and_then(|mapped| {
+        Mapped::new(plane, &format).and_then(|mapped| {
             let chunk = &*plane.chunk;
             anyhow::ensure!(chunk.stride >= 0, "negative screencast stride");
             let stride = if chunk.stride == 0 {
@@ -551,12 +623,14 @@ unsafe extern "C" fn on_process(data: Data) {
                 format: format.format,
             };
             let mut s = shared.state.lock();
-            let damage = if s.full_frame {
+            let transform = video_transform(spa);
+            let damage = if s.full_frame || transform != s.transform {
                 None
             } else {
                 changed.as_deref()
             };
-            s.desktop.put(&source, damage)?;
+            s.desktop.put_transformed(&source, damage, transform)?;
+            s.transform = transform;
             s.full_frame = false;
             s.frames += 1;
             Ok(())
@@ -682,7 +756,20 @@ impl Consumer {
             let deadline = Instant::now() + first;
             let mut s = shared.state.lock();
             while s.frames == 0 && s.error.is_none() {
-                if shared.changed.wait_until(&mut s, deadline).timed_out() {
+                // Request a graph cycle after the driver has been assigned.
+                // An idle xdpw producer may have queued its sole initial frame
+                // before PipeWire's implicit trigger could drive the graph.
+                drop(s);
+                (api.pw_thread_loop_lock)(thread);
+                (api.pw_stream_trigger_process)(stream);
+                (api.pw_thread_loop_unlock)(thread);
+                s = shared.state.lock();
+                if s.frames > 0 || s.error.is_some() {
+                    break;
+                }
+                let wake = deadline.min(Instant::now() + Duration::from_millis(100));
+                shared.changed.wait_until(&mut s, wake);
+                if Instant::now() >= deadline && s.frames == 0 {
                     bail!(
                         "the screencast sent no picture within {first:?}{}",
                         if s.format.is_none() {
@@ -718,9 +805,7 @@ impl Consumer {
         let deadline = Instant::now() + timeout;
         let mut s = self.shared.state.lock();
         loop {
-            if let Some(e) = &s.error {
-                bail!("{e}");
-            }
+            s.check()?;
             if first || s.desktop.fresh {
                 return Ok(Some(s.desktop.take(frame)));
             }
@@ -761,6 +846,93 @@ impl Drop for Consumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn producer_removal_ends_capture_after_transient_pause_grace() {
+        let mut state = State {
+            streaming: true,
+            paused: Some(Instant::now()),
+            ..Default::default()
+        };
+        assert!(
+            state.check().is_ok(),
+            "a format renegotiation may pause briefly"
+        );
+        state.paused = Some(Instant::now() - Duration::from_secs(3));
+        assert!(state
+            .check()
+            .unwrap_err()
+            .is::<crate::video::CaptureEnded>());
+        state.paused = None;
+        assert!(state.check().is_ok(), "streaming resumed");
+        state.error = Some("producer disconnected".into());
+        assert!(state
+            .check()
+            .unwrap_err()
+            .is::<crate::video::CaptureEnded>());
+    }
+
+    #[test]
+    fn wlroots_zero_maxsize_dmabuf_maps_its_packed_plane() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::fd::AsRawFd;
+        let path = std::env::temp_dir().join(format!("latch-dmabuf-{}", rand::random::<u64>()));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+        file.set_len(128).unwrap();
+        file.seek(SeekFrom::Start(16)).unwrap();
+        file.write_all(&[0x5a; 64]).unwrap();
+        let format = Negotiated {
+            format: PixelFormat::Bgrx,
+            width: 3,
+            height: 4,
+            modifier: Some(0),
+        };
+        let mut chunk = SpaChunk {
+            offset: 8,
+            size: u32::MAX,
+            stride: 16,
+            flags: 0,
+        };
+        let data = SpaData {
+            kind: pod::DATA_DMA_BUF,
+            flags: 0,
+            fd: i64::from(file.as_raw_fd()),
+            mapoffset: 8,
+            maxsize: 0,
+            data: std::ptr::null_mut(),
+            chunk: &mut chunk,
+        };
+        assert_eq!(mapping_layout(&data, &chunk, &format).unwrap(), (8, 64, 80));
+        // A regular shared descriptor exercises mmap offsets and length. Real
+        // exporters additionally implement DMA_BUF_IOCTL_SYNC.
+        let mapped = unsafe { Mapped::new(&data, &format) }.unwrap();
+        assert_eq!(mapped.bytes(), &[0x5a; 64]);
+    }
+
+    #[test]
+    fn transformed_metadata_has_the_spa_type_and_layout() {
+        let mut transform = 1u32;
+        let mut meta = SpaMeta {
+            kind: pod::META_VIDEO_TRANSFORM,
+            size: 4,
+            data: (&mut transform as *mut u32).cast(),
+        };
+        let buffer = SpaBuffer {
+            n_metas: 1,
+            n_datas: 0,
+            metas: &mut meta,
+            datas: std::ptr::null_mut(),
+        };
+        assert_eq!(unsafe { video_transform(&buffer) }, 1);
+        assert_eq!(pod::META_VIDEO_TRANSFORM, 8);
+        assert_eq!(pod::metas().len(), 3);
+    }
 
     #[test]
     fn absent_metadata_and_header_flags_follow_the_spa_abi() {

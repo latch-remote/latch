@@ -83,6 +83,7 @@ pub(super) trait Device: Send {
 pub(super) struct WaylandInput<D: ?Sized + Device> {
     pressed: Pressed,
     device: Box<D>,
+    session: Option<Arc<Session>>,
 }
 
 pub(super) type Sink = WaylandInput<dyn Device>;
@@ -90,23 +91,30 @@ pub(super) type Sink = WaylandInput<dyn Device>;
 impl Sink {
     /// Through `session` when it has input, else through uinput.
     pub fn open(session: Option<Arc<Session>>) -> anyhow::Result<Self> {
-        let device: Box<dyn Device> = match session {
+        let device: Box<dyn Device> = match session.clone() {
             Some(session) if session.kind == super::token::Kind::RemoteDesktop => {
                 Box::new(Portal::new(session)?)
             }
-            _ => Box::new(Uinput::new().context(
+            _ => Box::new(Uinput::new(session.as_deref()).context(
                 "this desktop's portal has no remote desktop, and the uinput fallback is unavailable",
             )?),
         };
         Ok(WaylandInput {
             pressed: Pressed::default(),
             device,
+            session,
         })
     }
 }
 
 impl<D: ?Sized + Device> InputSink for WaylandInput<D> {
     fn apply(&mut self, event: &Event, display: DisplayRect) -> anyhow::Result<()> {
+        if let Some(session) = &self.session {
+            if let Err(error) = session.check() {
+                self.release_all();
+                return Err(error);
+            }
+        }
         let p = &mut self.pressed;
         match event {
             Event::Key { vk, down, .. } => {
@@ -310,10 +318,15 @@ pub fn absolute_axis(at: i32, start: i32, extent: u32) -> i32 {
 struct Uinput {
     keyboard: evdev::uinput::VirtualDevice,
     pointer: evdev::uinput::VirtualDevice,
+    layout: super::layout::Layout,
 }
 
 impl Uinput {
-    fn new() -> anyhow::Result<Self> {
+    fn new(session: Option<&Session>) -> anyhow::Result<Self> {
+        let position = session
+            .and_then(|s| s.streams.first())
+            .and_then(|s| s.position);
+        let layout = super::layout::Layout::open(position)?;
         use evdev::{
             AbsInfo, AbsoluteAxisCode, AttributeSet, BusType, InputId, KeyCode, RelativeAxisCode,
             UinputAbsSetup,
@@ -354,7 +367,11 @@ impl Uinput {
         }
         let pointer = pointer.build().context("create the virtual pointer")?;
         tracing::info!("Wayland input through uinput (this portal has no remote desktop)");
-        Ok(Self { keyboard, pointer })
+        Ok(Self {
+            keyboard,
+            pointer,
+            layout,
+        })
     }
 
     fn emit(
@@ -380,13 +397,8 @@ impl Device for Uinput {
         Self::emit(&mut self.keyboard, &[(EV_KEY, code, i32::from(down))])
     }
     fn absolute(&mut self, x: i32, y: i32, display: DisplayRect) -> anyhow::Result<()> {
-        Self::emit(
-            &mut self.pointer,
-            &[
-                (EV_ABS, ABS_X, absolute_axis(x, display.x, display.width)),
-                (EV_ABS, ABS_Y, absolute_axis(y, display.y, display.height)),
-            ],
-        )
+        let (x, y) = self.layout.position(x, y, display)?;
+        Self::emit(&mut self.pointer, &[(EV_ABS, ABS_X, x), (EV_ABS, ABS_Y, y)])
     }
     fn relative(&mut self, dx: i16, dy: i16) -> anyhow::Result<()> {
         Self::emit(
@@ -452,6 +464,7 @@ mod tests {
         WaylandInput {
             pressed: Pressed::default(),
             device: Box::default(),
+            session: None,
         }
     }
 

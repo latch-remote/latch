@@ -829,8 +829,8 @@ impl Drop for RelayRoute {
     }
 }
 
-/// Includes takeover (up to 30 s), this viewer's prep (15 s), and capture open.
-const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// Includes takeover, preparation, and up to 90 seconds of portal approval.
+const START_TIMEOUT: Duration = Duration::from_secs(180);
 /// After the host accepts, its first decoded picture must arrive within this.
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(8);
 /// Still desktops produce idle frames every 100 ms. Give loss recovery and
@@ -1786,6 +1786,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         })
         .collect();
     let request = StreamRequest {
+        startup_timeout_secs: START_TIMEOUT.as_secs() as u32,
         relay: inner.configured_relay.lock().is_some(),
         prefer_color: settings.prefer_color,
         color: settings.color,

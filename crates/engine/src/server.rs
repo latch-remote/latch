@@ -214,6 +214,31 @@ impl Server {
         self.prepare_using(req, peer, video::encodable(), video::limits, video::open)
     }
 
+    /// Prepare after HTTP upgrade so an approval request can observe the
+    /// viewer closing its control connection, including older viewers.
+    pub fn prepare_connected(
+        &self,
+        req: StreamRequest,
+        peer: SocketAddr,
+        tcp: &TcpStream,
+    ) -> Result<Prepared, Refusal> {
+        #[cfg(target_os = "linux")]
+        {
+            // Reserve time for takeover, encoder and media setup. Older
+            // viewers advertise no deadline and still stop at 60 seconds.
+            let approval = crate::linux::wayland::portal::approval_budget(req.startup_timeout_secs);
+            crate::linux::wayland::portal::during_startup(tcp, approval, || self.prepare(req, peer))
+                .map_err(|e| {
+                    Refusal::new(500, format!("could not track the viewer connection: {e}"))
+                })?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = tcp;
+            self.prepare(req, peer)
+        }
+    }
+
     fn prepare_using(
         &self,
         mut req: StreamRequest,
@@ -1722,6 +1747,10 @@ fn encode_video(
             Ok(f) => f,
             Err(e) => {
                 if session.stopping() {
+                    return;
+                }
+                if e.is::<video::CaptureEnded>() {
+                    session.end(end::CAPTURE_FAILED, &format!("Screen sharing ended: {e:#}"));
                     return;
                 }
                 if video::Unencodable::is(&e) {

@@ -47,6 +47,7 @@ pub const META_SIZE: u32 = 2;
 
 pub const META_HEADER: u32 = 1;
 pub const META_VIDEO_DAMAGE: u32 = 3;
+pub const META_VIDEO_TRANSFORM: u32 = 8;
 
 pub const DATA_MEM_PTR: u32 = 1;
 pub const DATA_MEM_FD: u32 = 2;
@@ -509,7 +510,7 @@ pub fn buffers(format: &Negotiated) -> Object {
 }
 
 /// `SPA_PARAM_Meta` for buffer headers and damage rectangles.
-pub fn metas() -> [Object; 2] {
+pub fn metas() -> [Object; 3] {
     let meta = |kind, size| Object {
         kind: OBJECT_PARAM_META,
         id: PARAM_META,
@@ -531,6 +532,7 @@ pub fn metas() -> [Object; 2] {
                 ],
             },
         ),
+        meta(META_VIDEO_TRANSFORM, Value::Int(4)),
     ]
 }
 

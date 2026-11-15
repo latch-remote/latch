@@ -89,7 +89,7 @@ pub struct Service {
     nat: Mutex<Option<NatReport>>,
     nat_running: AtomicBool,
     update_running: Arc<AtomicBool>,
-    admission: Mutex<()>,
+    admission: Arc<Mutex<()>>,
     power_pending: Arc<AtomicBool>,
 }
 
@@ -139,7 +139,7 @@ impl Service {
             nat: Mutex::new(None),
             nat_running: AtomicBool::new(false),
             update_running: Arc::new(AtomicBool::new(false)),
-            admission: Mutex::new(()),
+            admission: Arc::new(Mutex::new(())),
             power_pending: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -982,28 +982,50 @@ impl Service {
                 &Ack::err("could not resolve the streaming peer's Tailscale address"),
             );
         }
-        match server.prepare(request, peer) {
-            Ok(prepared) => {
-                let lease = self.clipboard_lease.clone();
-                let id = Instant::now();
-                *lease.lock() = Some(ClipboardLease {
-                    peer: peer.ip(),
-                    generation: id,
-                    active: false,
-                });
-                Response::switching(control::UPGRADE, move |tcp| {
-                    if let Some(current) = lease.lock().as_mut().filter(|l| l.generation == id) {
-                        current.active = true;
-                    }
+        let lease = self.clipboard_lease.clone();
+        let admission = self.admission.clone();
+        let updating = self.update_running.clone();
+        let stopping = self.power_pending.clone();
+        Response::switching(control::UPGRADE, move |mut tcp| {
+            let prepared = {
+                let _admission = admission.lock();
+                if updating.load(Ordering::Acquire) || stopping.load(Ordering::Acquire) {
+                    let _ = control::write_message(
+                        &mut tcp,
+                        &control::Message::End(control::End {
+                            code: control::end::ENDED,
+                            message: "the host is updating or stopping".into(),
+                        }),
+                    );
+                    return;
+                }
+                server.prepare_connected(request, peer, &tcp)
+            };
+            match prepared {
+                Ok(prepared) => {
+                    let id = Instant::now();
+                    *lease.lock() = Some(ClipboardLease {
+                        peer: peer.ip(),
+                        generation: id,
+                        active: true,
+                    });
                     let _stream = ClipboardStream {
                         lease,
                         generation: id,
                     };
                     server.run(prepared, tcp);
-                })
+                }
+                Err(refusal) => {
+                    let _ = control::write_message(
+                        &mut tcp,
+                        &control::Message::End(control::End {
+                            code: control::end::CAPTURE_FAILED,
+                            message: refusal.message,
+                        }),
+                    );
+                }
             }
-            Err(refusal) => Response::json(refusal.status, &Ack::err(refusal.message)),
-        }
+        })
     }
 
     /// Everything that decides whether a capture can see the desktop.

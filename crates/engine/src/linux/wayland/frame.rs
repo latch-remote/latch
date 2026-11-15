@@ -76,6 +76,7 @@ pub struct Desktop {
     pub fresh: bool,
     /// The caller's buffer the last take filled, to give it only changes.
     filled: Option<(usize, usize)>,
+    oriented: Vec<u8>,
 }
 
 impl Desktop {
@@ -139,6 +140,62 @@ impl Desktop {
         Ok(())
     }
 
+    /// SPA's transform describes the buffer orientation. Undo it to present
+    /// the compositor's logical desktop, including reflected outputs.
+    pub fn put_transformed(
+        &mut self,
+        source: &Source<'_>,
+        damage: Option<&[Rect]>,
+        transform: u32,
+    ) -> anyhow::Result<()> {
+        if transform == 0 {
+            return self.put(source, damage);
+        }
+        anyhow::ensure!(transform < 8, "unknown screencast transform {transform}");
+        let (w, h) = (source.width as usize, source.height as usize);
+        anyhow::ensure!(
+            w > 0 && h > 0 && source.stride >= w * 4,
+            "invalid screencast stride"
+        );
+        anyhow::ensure!(
+            source.data.len() >= source.stride * (h - 1) + w * 4,
+            "short screencast buffer"
+        );
+        let (width, height) = if transform & 1 != 0 { (h, w) } else { (w, h) };
+        let mut data = std::mem::take(&mut self.oriented);
+        data.resize(width * height * 4, 0);
+        for y in 0..h {
+            for x in 0..w {
+                let (mut dx, dy) = match transform & 3 {
+                    0 => (x, y),
+                    1 => (h - 1 - y, x),
+                    2 => (w - 1 - x, h - 1 - y),
+                    _ => (y, w - 1 - x),
+                };
+                if transform & 4 != 0 {
+                    dx = width - 1 - dx;
+                }
+                let from = y * source.stride + x * 4;
+                let to = (dy * width + dx) * 4;
+                data[to..to + 4].copy_from_slice(&source.data[from..from + 4]);
+            }
+        }
+        // Buffer-space damage changes axes under rotation. A full copy also
+        // handles a transform change at the same negotiated buffer size.
+        let result = self.put(
+            &Source {
+                data: &data,
+                stride: width * 4,
+                width: width as u32,
+                height: height as u32,
+                format: source.format,
+            },
+            None,
+        );
+        self.oriented = data;
+        result
+    }
+
     /// Brings `frame` up to the latest picture: only what changed when
     /// `frame` is the buffer the last take filled. Returns the damage
     /// (`None`: all of it) for [`crate::software::CpuCapture::damage`].
@@ -198,6 +255,49 @@ mod tests {
             }
         }
         data
+    }
+
+    #[test]
+    fn all_output_transforms_restore_the_logical_picture() {
+        let pixels: Vec<u8> = (1..=6).flat_map(|v| [v, 0, 0, 255]).collect();
+        let source = Source {
+            data: &pixels,
+            stride: 12,
+            width: 3,
+            height: 2,
+            format: PixelFormat::Bgra,
+        };
+        let expected = [
+            vec![1, 2, 3, 4, 5, 6],
+            vec![4, 1, 5, 2, 6, 3],
+            vec![6, 5, 4, 3, 2, 1],
+            vec![3, 6, 2, 5, 1, 4],
+            vec![3, 2, 1, 6, 5, 4],
+            vec![1, 4, 2, 5, 3, 6],
+            vec![4, 5, 6, 1, 2, 3],
+            vec![6, 3, 5, 2, 4, 1],
+        ];
+        for (transform, expected) in expected.iter().enumerate() {
+            let mut desktop = Desktop::default();
+            desktop
+                .put_transformed(&source, None, transform as u32)
+                .unwrap();
+            assert_eq!(
+                desktop
+                    .picture
+                    .data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|p| p[0])
+                    .collect::<Vec<_>>(),
+                *expected
+            );
+            assert_eq!(
+                (desktop.picture.width, desktop.picture.height),
+                if transform & 1 == 0 { (3, 2) } else { (2, 3) }
+            );
+        }
     }
 
     #[test]

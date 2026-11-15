@@ -11,9 +11,75 @@
 use super::token::{self, Kind};
 use anyhow::{bail, ensure, Context};
 use futures::StreamExt as _;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::net::TcpStream;
+use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
+
+thread_local! {
+    static STARTUP: RefCell<Option<(TcpStream, Duration)>> = const { RefCell::new(None) };
+}
+
+/// Scope the portal prompt to the viewer's connection and advertised deadline.
+pub fn during_startup<T>(
+    tcp: &TcpStream,
+    limit: Duration,
+    start: impl FnOnce() -> T,
+) -> std::io::Result<T> {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            STARTUP.with(|s| {
+                s.borrow_mut().take();
+            });
+        }
+    }
+    let tcp = tcp.try_clone()?;
+    STARTUP.with(|s| *s.borrow_mut() = Some((tcp, limit)));
+    let _reset = Reset;
+    Ok(start())
+}
+
+fn viewer_gone() -> bool {
+    STARTUP.with(|s| {
+        s.borrow().as_ref().is_some_and(|(tcp, _)| {
+            let mut byte = 0u8;
+            // MSG_PEEK preserves protocol bytes. MSG_DONTWAIT affects this call
+            // only, so the shared socket stays blocking for the session.
+            let n = unsafe {
+                libc::recv(
+                    tcp.as_raw_fd(),
+                    (&mut byte as *mut u8).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            n == 0
+                || (n < 0
+                    && !matches!(
+                        std::io::Error::last_os_error().kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ))
+        })
+    })
+}
+
+async fn wait_for_viewer() -> anyhow::Result<()> {
+    loop {
+        ensure!(
+            !viewer_gone(),
+            "the viewer disconnected while waiting for screen-sharing approval"
+        );
+        async_io::Timer::after(Duration::from_millis(100)).await;
+    }
+}
+
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 const DESTINATION: &str = "org.freedesktop.portal.Desktop";
@@ -23,6 +89,14 @@ const REMOTE_DESKTOP: &str = "org.freedesktop.portal.RemoteDesktop";
 
 /// How long the owner has to answer the portal's prompt.
 pub const APPROVAL: Duration = Duration::from_secs(90);
+/// Leave 45 seconds for takeover and encoder setup within the viewer's
+/// deadline. Legacy viewers have a 60-second budget.
+pub fn approval_budget(viewer_seconds: u32) -> Duration {
+    Duration::from_secs(u64::from(
+        viewer_seconds.clamp(60, 180).saturating_sub(45).min(90),
+    ))
+}
+
 /// How long any other portal request may take.
 const REPLY: Duration = Duration::from_secs(10);
 
@@ -54,6 +128,9 @@ pub struct Session {
     /// Granted `SelectDevices` types (0 for a screencast).
     pub devices: u32,
     pub streams: Vec<Stream>,
+    pub pixel_coordinates: bool,
+    pub kept_approval: bool,
+    closed: Arc<AtomicBool>,
 }
 
 /// What the portal offers here.
@@ -285,10 +362,22 @@ where
         responses = request.receive_signal("Response").await?;
     }
     let response = timeout(limit, method, async {
-        responses
-            .next()
-            .await
-            .context("the portal closed the request without answering")
+        let response = async {
+            responses
+                .next()
+                .await
+                .context("the portal closed the request without answering")
+        };
+        futures::pin_mut!(response);
+        let gone = wait_for_viewer();
+        futures::pin_mut!(gone);
+        match futures::future::select(response, gone).await {
+            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Right((result, _)) => {
+                result?;
+                unreachable!()
+            }
+        }
     })
     .await
     .with_context(|| format!("{interface}.{method}"));
@@ -316,11 +405,76 @@ where
     }
 }
 
+async fn watch_closed(
+    conn: &zbus::Connection,
+    handle: OwnedObjectPath,
+    closed_state: &Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    let session_proxy =
+        zbus::Proxy::new(conn, DESTINATION, handle, "org.freedesktop.portal.Session").await?;
+    let mut closed = session_proxy.receive_signal("Closed").await?;
+    let alive = Arc::downgrade(closed_state);
+    std::thread::Builder::new()
+        .name("portal-session".into())
+        .spawn(move || {
+            zbus::block_on(async move {
+                loop {
+                    let signal = closed.next();
+                    let tick = async_io::Timer::after(Duration::from_millis(100));
+                    futures::pin_mut!(signal, tick);
+                    match futures::future::select(signal, tick).await {
+                        futures::future::Either::Left(_) => {
+                            if let Some(alive) = alive.upgrade() {
+                                alive.store(true, Ordering::Release);
+                            }
+                            break;
+                        }
+                        futures::future::Either::Right(_) if alive.strong_count() == 0 => break,
+                        _ => {}
+                    }
+                }
+            });
+        })?;
+    Ok(())
+}
+
+async fn gnome_session(conn: &zbus::Connection, handle: &OwnedObjectPath) -> bool {
+    timeout(REPLY, "identifying the session portal", async {
+        let bus = zbus::fdo::DBusProxy::new(conn).await?;
+        let name = zbus::names::BusName::try_from("org.freedesktop.impl.portal.desktop.gnome")?;
+        if !bus.name_has_owner(name).await? {
+            return Ok(false);
+        }
+        let reply = conn
+            .call_method(
+                Some("org.freedesktop.impl.portal.desktop.gnome"),
+                handle,
+                Some("org.freedesktop.DBus.Introspectable"),
+                "Introspect",
+                &(),
+            )
+            .await?;
+        let xml: String = reply.body().deserialize()?;
+        Ok(xml.contains("org.freedesktop.impl.portal.Session"))
+    })
+    .await
+    .unwrap_or(false)
+}
+
 impl Session {
     /// Starts a session, asking the owner unless a stored token restores
     /// one. `input`: with keyboard and pointer where the portal has them.
     pub fn open(input: bool, approval: Duration) -> anyhow::Result<Self> {
+        let approval = STARTUP.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map_or(approval, |(_, limit)| approval.min(*limit))
+        });
         run(async move {
+            ensure!(
+                !viewer_gone(),
+                "the viewer disconnected before screen-sharing approval"
+            );
             let conn = timeout(REPLY, "connecting to the session bus", async {
                 Ok(zbus::Connection::session().await?)
             })
@@ -352,7 +506,11 @@ impl Session {
                 kind,
                 devices: 0,
                 streams: Vec::new(),
+                pixel_coordinates: false,
+                kept_approval: false,
+                closed: Arc::new(AtomicBool::new(false)),
             };
+            watch_closed(&conn, handle.clone(), &session.closed).await?;
             if kind == Kind::RemoteDesktop {
                 request(&conn, REMOTE_DESKTOP, "SelectDevices", REPLY, |token| {
                     let mut options = device_options(offer, restore.as_deref());
@@ -382,11 +540,18 @@ impl Session {
                 // A token is good once: the one given replaces it, and a
                 // portal that gives none has forgotten it.
                 stored.set(kind, given.clone());
-                if let Err(e) = token::save(file, &stored) {
-                    tracing::warn!("could not keep the screen-sharing approval: {e:#}");
+                match token::save(file, &stored) {
+                    Ok(()) => session.kept_approval = given.is_some(),
+                    Err(e) => tracing::warn!("could not keep the screen-sharing approval: {e:#}"),
                 }
             }
             session.streams = streams(&started)?;
+            // GNOME 46–48 forwards absolute coordinates to Mutter, whose
+            // monitor stream divides buffer pixels by the monitor scale.
+            // Test this session's backend object, since desktop environment
+            // variables can disagree with portals.conf routing.
+            session.pixel_coordinates = gnome_session(&conn, &handle).await;
+            session.check()?;
             tracing::info!(
                 "{} session started: {} stream(s), devices {:#x}, {}",
                 match kind {
@@ -403,6 +568,14 @@ impl Session {
             );
             Ok(session)
         })
+    }
+
+    pub fn check(&self) -> anyhow::Result<()> {
+        ensure!(
+            !self.closed.load(Ordering::Acquire),
+            crate::video::CaptureEnded("screen sharing was stopped in the desktop portal".into())
+        );
+        Ok(())
     }
 
     /// A PipeWire connection that sees this session's streams.
@@ -473,6 +646,173 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_fits_both_current_and_legacy_viewer_deadlines() {
+        assert_eq!(approval_budget(0), Duration::from_secs(15));
+        assert_eq!(approval_budget(60), Duration::from_secs(15));
+        assert_eq!(approval_budget(180), APPROVAL);
+        assert_eq!(approval_budget(u32::MAX), APPROVAL);
+    }
+
+    struct Bus(std::process::Child, String);
+    impl Bus {
+        fn new() -> Self {
+            use std::io::BufRead;
+            let mut child = std::process::Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address=1"])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut address = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut address)
+                .unwrap();
+            Self(child, address.trim().to_string())
+        }
+    }
+    impl Drop for Bus {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    struct PendingRequest(Arc<AtomicBool>);
+    #[zbus::interface(name = "org.freedesktop.portal.Request")]
+    impl PendingRequest {
+        fn close(&self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    struct Prompt {
+        started: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
+    }
+    #[zbus::interface(name = "org.freedesktop.portal.ScreenCast")]
+    impl Prompt {
+        async fn start(
+            &self,
+            options: HashMap<String, OwnedValue>,
+            #[zbus(header)] header: zbus::message::Header<'_>,
+            #[zbus(object_server)] server: &zbus::ObjectServer,
+        ) -> zbus::fdo::Result<OwnedObjectPath> {
+            let token = String::try_from(options["handle_token"].try_clone().unwrap()).unwrap();
+            let path = OwnedObjectPath::try_from(format!(
+                "/org/freedesktop/portal/desktop/request/{}/{token}",
+                sender_path(header.sender().unwrap().as_str())
+            ))
+            .unwrap();
+            server
+                .at(path.clone(), PendingRequest(self.closed.clone()))
+                .await?;
+            self.started.store(true, Ordering::Release);
+            Ok(path)
+        }
+    }
+    struct TestSession;
+    #[zbus::interface(name = "org.freedesktop.portal.Session")]
+    impl TestSession {
+        fn close(&self) {}
+    }
+
+    #[test]
+    fn disconnect_cancels_the_actual_portal_request_and_dismisses_its_prompt() {
+        use std::net::{Shutdown, TcpListener};
+        let bus = Bus::new();
+        run(async {
+            let started = Arc::new(AtomicBool::new(false));
+            let closed = Arc::new(AtomicBool::new(false));
+            let _server = zbus::connection::Builder::address(bus.1.as_str())?
+                .name(DESTINATION)?
+                .serve_at(
+                    PATH,
+                    Prompt {
+                        started: started.clone(),
+                        closed: closed.clone(),
+                    },
+                )?
+                .build()
+                .await?;
+            let conn = zbus::connection::Builder::address(bus.1.as_str())?
+                .build()
+                .await?;
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let peer = TcpStream::connect(listener.local_addr()?)?;
+            let (tcp, _) = listener.accept()?;
+            let disconnect = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                while !started.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                peer.shutdown(Shutdown::Both).unwrap();
+            });
+            let now = std::time::Instant::now();
+            let result = during_startup(&tcp, APPROVAL, || {
+                run(request(&conn, SCREEN_CAST, "Start", APPROVAL, |token| {
+                    let mut options = no_options();
+                    options.insert("handle_token", token.into());
+                    (options,)
+                }))
+            })?;
+            disconnect.join().unwrap();
+            assert!(format!("{:#}", result.unwrap_err()).contains("viewer disconnected"));
+            assert!(
+                closed.load(Ordering::Acquire),
+                "Request.Close must dismiss the prompt"
+            );
+            assert!(now.elapsed() < Duration::from_secs(3));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn session_closed_is_observed_even_without_pipewire_activity() {
+        let bus = Bus::new();
+        run(async {
+            let path = OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/test")?;
+            let server = zbus::connection::Builder::address(bus.1.as_str())?
+                .name(DESTINATION)?
+                .serve_at(path.clone(), TestSession)?
+                .build()
+                .await?;
+            let conn = zbus::connection::Builder::address(bus.1.as_str())?
+                .build()
+                .await?;
+            let closed = Arc::new(AtomicBool::new(false));
+            watch_closed(&conn, path.clone(), &closed).await?;
+            let session = Session {
+                conn,
+                handle: path.clone(),
+                closed: closed.clone(),
+                kind: Kind::ScreenCast,
+                devices: 0,
+                streams: Vec::new(),
+                pixel_coordinates: false,
+                kept_approval: false,
+            };
+            server
+                .emit_signal(
+                    None::<&str>,
+                    path,
+                    "org.freedesktop.portal.Session",
+                    "Closed",
+                    &no_options(),
+                )
+                .await?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !closed.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                async_io::Timer::after(Duration::from_millis(5)).await;
+            }
+            assert!(session
+                .check()
+                .unwrap_err()
+                .is::<crate::video::CaptureEnded>());
+            Ok(())
+        })
+        .unwrap();
+    }
 
     fn offer(screen_cast: u32, remote_desktop: u32, cursor_modes: u32) -> Offer {
         Offer {

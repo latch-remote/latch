@@ -1130,6 +1130,7 @@ fn microphone_packets_are_kind_13_and_older_fields_stay_off_the_wire() {
 fn av1_offer_is_additive_and_unknown_codecs_still_fall_through() {
     use latch_proto::control::StreamRequest;
     let mut request: serde_json::Value = serde_json::to_value(StreamRequest {
+        startup_timeout_secs: 0,
         relay: false,
         prefer_color: false,
         color: Default::default(),

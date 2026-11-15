@@ -244,6 +244,8 @@ jobs:
           meson setup "$RUNNER_TEMP/xdpw/build" "$RUNNER_TEMP/xdpw" -Dman-pages=disabled -Dc_args="-include unistd.h"
           ninja -C "$RUNNER_TEMP/xdpw/build"
           LATCH_TEST_PORTAL_WLR="$RUNNER_TEMP/xdpw/build/xdg-desktop-portal-wlr" scripts/test-wayland.sh
+          layout_test=$(cargo test --locked -p latch-engine --lib --no-run --message-format=json | python3 -c 'import json,sys; print(next(m["executable"] for line in sys.stdin if (m := json.loads(line)).get("executable") and m.get("target", {}).get("name") == "latch_engine"))')
+          LATCH_TEST_PORTAL_WLR="$RUNNER_TEMP/xdpw/build/xdg-desktop-portal-wlr" scripts/test-wayland.sh "$layout_test" --ignored --exact linux::wayland::layout::tests::live_layout_maps_each_monitor_into_the_whole_desktop
       - name: native TCP relay deployment checks
         run: |
           cargo build --locked -p latch-relay

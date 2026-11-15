@@ -122,9 +122,20 @@ pub fn save(path: &Path, tokens: &Tokens) -> anyhow::Result<()> {
     result.with_context(|| format!("save {}", path.display()))
 }
 
+pub(super) struct Lock(std::fs::File);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // A concurrently spawned child can briefly inherit the open file
+        // description before exec closes it. Explicitly unlock so that child
+        // cannot keep a completed approval locked through our next update.
+        let _ = self.0.unlock();
+    }
+}
+
 /// Serializes restoring and rotating tokens across the panel and service.
 /// An approval already in progress returns a retry error immediately.
-pub(super) fn lock(path: &Path) -> anyhow::Result<std::fs::File> {
+pub(super) fn lock(path: &Path) -> anyhow::Result<Lock> {
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -140,7 +151,7 @@ pub(super) fn lock(path: &Path) -> anyhow::Result<std::fs::File> {
     let file = options.open(path.with_extension("lock"))?;
     file.try_lock()
         .context("another Latch process is approving screen sharing; retry when it finishes")?;
-    Ok(file)
+    Ok(Lock(file))
 }
 
 /// Applies `change` to what is on disk now (another process may have
@@ -247,9 +258,11 @@ mod tests {
         assert!(lock(&path).is_err());
         assert!(update(&path, |t| t.set(Kind::ScreenCast, Some("a".into()))).is_err());
         assert_eq!(load(&path), Tokens::default());
+        let inherited = guard.0.try_clone().unwrap();
         drop(guard);
         update(&path, |t| t.set(Kind::ScreenCast, Some("a".into()))).unwrap();
         assert_eq!(load(&path).get(Kind::ScreenCast), Some("a"));
+        drop(inherited);
         std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
     }
 }

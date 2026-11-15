@@ -59,7 +59,87 @@ fn main() -> anyhow::Result<()> {
         .decode(&encoded.data)?
         .context("no decoded picture")?;
     ensure!(decoded.width == 640 && decoded.height == 360);
-    println!("Wayland portal capture, changed pixels, and H.264 round trip passed");
+    // Change orientation while streaming. The source buffer keeps its raw
+    // landscape axes, and SPA_META_VideoTransform carries the output rotation.
+    let wallpaper =
+        std::path::PathBuf::from(std::env::var("XDG_RUNTIME_DIR")?).join("quadrants.ppm");
+    let mut image = b"P6\n32 32\n255\n".to_vec();
+    for y in 0..32 {
+        for x in 0..32 {
+            let colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
+            image.extend_from_slice(&colors[usize::from(x >= 16) + 2 * usize::from(y >= 16)]);
+        }
+    }
+    std::fs::write(&wallpaper, image)?;
+    ensure!(Command::new("swaymsg")
+        .args(["output", "HEADLESS-1", "transform", "90"])
+        .status()?
+        .success());
+    ensure!(Command::new("swaymsg")
+        .args([
+            "output",
+            "HEADLESS-1",
+            "bg",
+            wallpaper.to_str().context("wallpaper path")?,
+            "stretch"
+        ])
+        .status()?
+        .success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        capture.grab(&mut picture, Duration::from_millis(100))?;
+        if (picture.width, picture.height) == (360, 640) {
+            let corners: Vec<_> = [(10, 10), (350, 10), (10, 630), (350, 630)]
+                .into_iter()
+                .map(|(x, y)| {
+                    let at = y * picture.stride + x * 4;
+                    picture.data[at..at + 3].to_vec()
+                })
+                .collect();
+            let expected = [[0u8, 0, 255], [0, 255, 0], [255, 0, 0], [0, 255, 255]];
+            if corners.iter().zip(expected).all(|(pixel, expected)| {
+                pixel.iter().zip(expected).all(|(&a, b)| a.abs_diff(b) <= 8)
+            }) {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "rotated output corners differ from the logical desktop: {corners:?}"
+            );
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "rotated output never reached portrait dimensions"
+        );
+    }
+    ensure!(
+        (capture.display().width, capture.display().height) == (360, 640),
+        "pointer axes must follow the oriented picture"
+    );
+    std::fs::remove_file(wallpaper)?;
+    // End the actual producer. Both Session.Closed and a paused PipeWire
+    // consumer must terminate capture, even on an otherwise idle desktop.
+    let portal_pid = std::env::var("LATCH_TEST_PORTAL_PID")?;
+    ensure!(Command::new("kill").arg(portal_pid).status()?.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match capture.grab(&mut picture, Duration::from_millis(100)) {
+            Err(error) => {
+                ensure!(
+                    error.is::<latch_engine::video::CaptureEnded>(),
+                    "unexpected shutdown error: {error:#}"
+                );
+                break;
+            }
+            Ok(_) => ensure!(
+                Instant::now() < deadline,
+                "producer shutdown left capture alive"
+            ),
+        }
+    }
+    println!(
+        "Wayland idle startup, changed pixels, H.264, rotated output, and producer shutdown passed"
+    );
     Ok(())
 }
 

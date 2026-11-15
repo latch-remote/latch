@@ -61,16 +61,16 @@ pub fn backend_cached() -> Backend {
 /// without someone at it: approve the portal's prompt once.
 pub fn wayland_setup_item() -> Option<String> {
     (backend_cached() == Backend::Wayland && !wayland::approved()).then(|| {
-        "Wayland: approve screen sharing once with Run setup, or a viewer waits for someone to approve it on this screen.".into()
+        "Wayland screen sharing requires approval on this screen for each connection until the desktop portal grants persistent access. Run setup to request access.".into()
     })
 }
 
 /// Asks the owner to approve sharing this Wayland desktop (the portal's
 /// prompt) and keeps the approval, so a viewer's session needs nobody at
 /// this machine. Nothing to do on X11.
-pub fn approve_wayland() -> anyhow::Result<()> {
+pub fn approve_wayland() -> anyhow::Result<Option<String>> {
     if backend() != Backend::Wayland {
-        return Ok(());
+        return Ok(None);
     }
     wayland::approve()
 }
