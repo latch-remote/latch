@@ -221,6 +221,10 @@ GitHub release notes, so each version gets a heading of the form
   late-starting helper thread on a loaded runner no longer fails it. Judge the
   first return after the write, and fail when the housekeeping timeout ended
   that wait.
+- Repeat the relay probe's delayed-header test when the test itself
+  delivered the headers after the allowance on a loaded runner. A request
+  completed in time must still be answered, and a connection that fails
+  early still fails the test.
 
 ### Networking
 

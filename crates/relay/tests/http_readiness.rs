@@ -128,23 +128,48 @@ fn idle_daemon_expires_silent_http_headers_without_other_traffic() {
 #[test]
 fn delayed_loopback_headers_model_600_ms_rtt_and_a_lost_segment() {
     let daemon = HttpDaemon::start();
-    let mut peer = daemon.connect();
-    let start = Instant::now();
-    // Inject one-way travel after acceptance and a one-second initial RTO.
-    thread::sleep(Duration::from_millis(300));
-    peer.write_all(b"GET /netenv/probe HTTP/1.1\r\n").unwrap();
-    thread::sleep(Duration::from_secs(1));
-    let ready = Instant::now();
-    peer.write_all(b"Host: localhost\r\n\r\n").unwrap();
-    let mut response = String::new();
-    peer.read_to_string(&mut response).unwrap();
-    let readied = ready.elapsed();
-    eprintln!(
-        "delayed HTTP request completed after {:?}, header-ready-to-response={readied:?}",
-        start.elapsed()
-    );
-    assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
-    assert!(readied < Duration::from_millis(100), "{readied:?}");
+    // The request takes 1.3 seconds of real sleeps against the 1.5-second
+    // header deadline. A loaded machine can oversleep past the deadline, and
+    // the daemon then rightly closes the connection. Such an attempt did not
+    // exercise the case, so it is repeated. An attempt whose headers were
+    // complete in time must be answered, and a connection that fails before
+    // the deadline is a failure.
+    let on_time = Duration::from_millis(1400);
+    for attempt in 1..=5 {
+        // Take the start before connecting, so the daemon cannot have
+        // accepted the connection any earlier than this.
+        let start = Instant::now();
+        let mut peer = daemon.connect();
+        // Inject one-way travel after acceptance and a one-second initial RTO.
+        thread::sleep(Duration::from_millis(300));
+        let first = peer.write_all(b"GET /netenv/probe HTTP/1.1\r\n");
+        thread::sleep(Duration::from_secs(1));
+        let ready = Instant::now();
+        let mut response = String::new();
+        let result = first
+            .and_then(|()| peer.write_all(b"Host: localhost\r\n\r\n"))
+            .and_then(|()| {
+                let sent = start.elapsed();
+                peer.read_to_string(&mut response).map(|_| sent)
+            });
+        let readied = ready.elapsed();
+        let ended = start.elapsed();
+        eprintln!(
+            "delayed HTTP request attempt {attempt} ended after {ended:?}, \
+             header-ready-to-response={readied:?}, result={result:?}"
+        );
+        let answered = response.starts_with("HTTP/1.1 204 No Content\r\n");
+        // Headers completed, or a failure seen, only after the allowance.
+        let late = *result.as_ref().unwrap_or(&ended) > on_time;
+        if late && !answered {
+            continue;
+        }
+        result.unwrap();
+        assert!(answered, "{response:?}");
+        assert!(readied < Duration::from_millis(100), "{readied:?}");
+        return;
+    }
+    panic!("every attempt overslept the header deadline");
 }
 
 #[test]
