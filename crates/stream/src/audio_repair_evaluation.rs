@@ -7,6 +7,9 @@ use latch_proto::{
 #[path = "audio_repair_reference.rs"]
 mod reference;
 
+#[path = "audio_playback_reference.rs"]
+mod playback_reference;
+
 fn player() -> Player {
     let (stop, _) = mpsc::channel();
     Player {
@@ -48,6 +51,14 @@ fn random(state: &mut u64) -> f64 {
 }
 
 fn tape(scenario: Scenario) -> Vec<(u64, Vec<u8>)> {
+    tape_for(scenario, 25, 1_000_000..25_000_000)
+}
+
+fn tape_for(
+    scenario: Scenario,
+    seconds: u32,
+    loss_window: std::ops::Range<u64>,
+) -> Vec<(u64, Vec<u8>)> {
     let mut rng = 0x9e37_79b9_7f4a_7c15;
     let mut jitter_rng = 0x1234_5678_9abc_def0;
     let mut packetizer = AudioPacketizer::new(1);
@@ -56,7 +67,7 @@ fn tape(scenario: Scenario) -> Vec<(u64, Vec<u8>)> {
     let mut events = Vec::new();
     let mut last_capture = 0;
     let mut jitter = 0;
-    for seq in 0..5000u32 {
+    for seq in 0..seconds * 200 {
         let capture = if scenario.burst {
             (u64::from((seq + 1) * 240 - 1) / 1024 + 1) * 21_333
         } else {
@@ -68,7 +79,7 @@ fn tape(scenario: Scenario) -> Vec<(u64, Vec<u8>)> {
         }
         packetizer.packetize(seq * 5000, &coded, |bytes| {
             let draw = random(&mut rng);
-            let lose = capture >= 1_000_000
+            let lose = loss_window.contains(&capture)
                 && (draw < scenario.loss || (scenario.burst_loss && capture % 400_000 < 16_000));
             if !lose {
                 events.push((capture + 5000 + jitter, bytes.to_vec()));
@@ -77,6 +88,14 @@ fn tape(scenario: Scenario) -> Vec<(u64, Vec<u8>)> {
     }
     events.sort_by_key(|(at, _)| *at);
     events
+}
+
+#[derive(Debug, Default)]
+struct Second {
+    queued_ms: f64,
+    cushion_ms: f64,
+    margin_ms: f64,
+    pulls: u32,
 }
 
 #[derive(Debug, Default)]
@@ -89,6 +108,9 @@ struct Measurement {
     max_cushion_ms: f64,
     mean_queued_ms: f64,
     max_queued_ms: f64,
+    mean_margin_ms: f64,
+    cap_hits: u64,
+    seconds: Vec<Second>,
 }
 
 impl Measurement {
@@ -105,6 +127,17 @@ fn evaluate(
 ) -> Measurement {
     let mut p = player();
     let mut mixer = Mixer::new(
+        48_000,
+        2,
+        48_000,
+        2,
+        p.queue.clone(),
+        p.pulled.clone(),
+        fixed,
+        p.gain.clone(),
+    )
+    .linked(p.link.clone());
+    let mut original_mixer = playback_reference::Mixer::new(
         48_000,
         2,
         48_000,
@@ -134,7 +167,12 @@ fn evaluate(
         .collect();
     let mut events = events.iter().peekable();
     let mut out = [0.0; 240];
-    let mut result = Measurement::default();
+    let mut result = Measurement {
+        seconds: (0..window.end.div_ceil(1_000_000))
+            .map(|_| Second::default())
+            .collect(),
+        ..Default::default()
+    };
     let mut cushion_sum = 0.0;
     let mut queued_sum = 0.0;
     let mut pulls = 0;
@@ -180,11 +218,26 @@ fn evaluate(
         }
         if us % 2500 == 0 {
             let before = p.queue.lock().len();
-            mixer.fill_at(&mut out, now);
+            if old {
+                original_mixer.fill_at(&mut out, now);
+            } else {
+                mixer.fill_at(&mut out, now);
+            }
             if us >= window.start {
                 result.silence_ms += out.iter().filter(|&&s| s == 0.0).count() as f64 / 96.0;
-                let cushion = mixer.cushion(242) as f64 / 96.0;
+                let (cushion, margin) = if old {
+                    (original_mixer.cushion(242), original_mixer.margin_ms)
+                } else {
+                    (mixer.cushion(242), mixer.margin_ms)
+                };
+                let cushion = cushion as f64 / 96.0;
                 let queued = (before + p.queue.lock().len()) as f64 / 2.0 / 96.0 + 2.5;
+                let second = &mut result.seconds[(us / 1_000_000) as usize];
+                second.queued_ms += queued;
+                second.cushion_ms += cushion;
+                second.margin_ms += margin;
+                second.pulls += 1;
+                result.mean_margin_ms += margin;
                 queued_sum += queued;
                 result.max_queued_ms = result.max_queued_ms.max(queued);
                 cushion_sum += cushion;
@@ -205,6 +258,15 @@ fn evaluate(
     result.concealed = stats.2 - initial_stats.2;
     result.discarded_ms =
         (p.link.discarded_samples.load(Ordering::Relaxed) - initial_discarded) as f64 / 96.0;
+    result.cap_hits = p.link.queue_cap_hits.load(Ordering::Relaxed);
+    result.mean_margin_ms /= f64::from(pulls);
+    for second in &mut result.seconds {
+        if second.pulls > 0 {
+            second.queued_ms /= f64::from(second.pulls);
+            second.cushion_ms /= f64::from(second.pulls);
+            second.margin_ms /= f64::from(second.pulls);
+        }
+    }
     result.mean_cushion_ms = cushion_sum / f64::from(pulls);
     result.mean_queued_ms = queued_sum / f64::from(pulls);
     result
@@ -251,6 +313,9 @@ fn seeded_loss_replays_real_receiver_and_playback_for_twenty_three_seconds() {
             new.discarded_ms <= old.discarded_ms,
             "intact audio discarded"
         );
+        assert!(new.mean_queued_ms <= old.mean_queued_ms + 5.0);
+        assert_eq!(new.cap_hits, 0);
+        assert_eq!(old.cap_hits, 0);
         if scenario.burst {
             assert!(new.damage_ms() < old.damage_ms());
         }
@@ -422,4 +487,322 @@ fn reordered_originals_measure_network_lateness_once() {
     p.observe_packet(&packet(2), now + Duration::from_secs(3));
     assert_eq!(p.arrivals.block.unwrap(), block);
     assert_eq!(p.resume_until, resume);
+}
+
+fn mean_latency(measurement: &Measurement, range: std::ops::Range<usize>) -> (f64, f64, f64) {
+    let seconds = &measurement.seconds[range];
+    let n = seconds.len() as f64;
+    (
+        seconds.iter().map(|s| s.queued_ms).sum::<f64>() / n,
+        seconds.iter().map(|s| s.cushion_ms).sum::<f64>() / n,
+        seconds.iter().map(|s| s.margin_ms).sum::<f64>() / n,
+    )
+}
+
+fn assert_recovers(new: &Measurement, baseline: &Measurement, after: usize, name: &str) {
+    assert_eq!(new.cap_hits, 0, "{name} hit the queue cap");
+    for second in after..new.seconds.len() {
+        let measured = &new.seconds[second];
+        let clean = &baseline.seconds[second];
+        assert!(
+            (measured.queued_ms - clean.queued_ms).abs() <= 2.0,
+            "{name} at {second}s queued {:.3}, baseline {:.3}",
+            measured.queued_ms,
+            clean.queued_ms
+        );
+        assert!(
+            (measured.margin_ms - clean.margin_ms).abs() <= 2.0,
+            "{name} at {second}s margin {:.3}, baseline {:.3}",
+            measured.margin_ms,
+            clean.margin_ms
+        );
+    }
+}
+
+#[test]
+fn loss_stops_at_twelve_seconds_and_latency_recovers_within_ten_seconds() {
+    for (burst, cadence) in [(false, "steady"), (true, "21.333ms")] {
+        let clean = Scenario {
+            name: cadence,
+            burst,
+            loss: 0.0,
+            burst_loss: false,
+        };
+        let events = tape_for(clean, 97, 1_000_000..12_000_000);
+        let baseline = evaluate(&events, false, 1_000_000..96_000_000, None);
+        let old_baseline = evaluate(&events, true, 1_000_000..96_000_000, None);
+        println!(
+            "BASELINE {cadence} queued {:.3} -> {:.3}, margin {:.3} -> {:.3}",
+            old_baseline.mean_queued_ms,
+            baseline.mean_queued_ms,
+            old_baseline.mean_margin_ms,
+            baseline.mean_margin_ms
+        );
+        for at in [1, 12, 22, 32, 44, 72, 92] {
+            println!(
+                "BASELINE_AT {cadence} {at}s {:?} -> {:?}",
+                mean_latency(&old_baseline, at..at + 1),
+                mean_latency(&baseline, at..at + 1)
+            );
+        }
+        assert!(baseline.mean_queued_ms <= old_baseline.mean_queued_ms);
+        assert!(baseline.mean_margin_ms <= old_baseline.mean_margin_ms);
+        assert_eq!(baseline.cap_hits, 0);
+        assert_eq!(old_baseline.cap_hits, 0);
+        for loss in [0.01, 0.05, 0.15, 0.0] {
+            let scenario = Scenario {
+                loss,
+                burst_loss: loss == 0.0,
+                ..clean
+            };
+            let events = tape_for(scenario, 97, 1_000_000..12_000_000);
+            let old = evaluate(&events, true, 1_000_000..96_000_000, None);
+            let new = evaluate(&events, false, 1_000_000..96_000_000, None);
+            let name = format!(
+                "{cadence} {}",
+                if scenario.burst_loss {
+                    "burst loss".to_string()
+                } else {
+                    format!("{:.0}%", loss * 100.0)
+                }
+            );
+            for (label, range) in [
+                ("loss", 1..12),
+                ("+10s", 22..23),
+                ("+30s", 42..43),
+                ("+60s", 72..73),
+            ] {
+                println!(
+                    "RECOVERY {name} {label} {:?} -> {:?}",
+                    mean_latency(&old, range.clone()),
+                    mean_latency(&new, range)
+                );
+            }
+            assert!(
+                mean_latency(&new, 1..12).0 <= mean_latency(&old, 1..12).0 + 5.0,
+                "{name} loss latency"
+            );
+            assert_eq!(old.cap_hits, 0, "{name} reference cap");
+            assert_recovers(&new, &baseline, 22, &name);
+        }
+    }
+}
+
+#[test]
+fn isolated_loss_at_each_position_prioritizes_latency_with_bounded_damage() {
+    for (burst, name) in [(false, "steady"), (true, "21.333ms")] {
+        let clean = tape(Scenario {
+            name,
+            burst,
+            loss: 0.0,
+            burst_loss: false,
+        });
+        for position in 0..4 {
+            for lose_parity in [false, true] {
+                let mut losses = 0;
+                let events: Vec<_> = clean
+                    .iter()
+                    .filter(|(_, bytes)| {
+                        let Datagram::Audio { packet, .. } = wire::parse(bytes).unwrap() else {
+                            panic!()
+                        };
+                        let group = packet.seq / 4;
+                        let selected = group > 50 && group < 1200 && group.is_multiple_of(10);
+                        let lost = selected
+                            && ((!packet.parity && packet.seq % 4 == position)
+                                || (packet.parity && lose_parity));
+                        if lost && !packet.parity {
+                            losses += 1;
+                        }
+                        !lost
+                    })
+                    .cloned()
+                    .collect();
+                assert_eq!(losses, 114);
+                let old = evaluate(&events, true, 1_000_000..24_000_000, None);
+                let new = evaluate(&events, false, 1_000_000..24_000_000, None);
+                println!("ISOLATED {name} pos={} parity_lost={lose_parity} damage {:.3} -> {:.3}, queued {:.3} -> {:.3}, repaired {} -> {}, concealed {} -> {}",
+                    position+1, old.damage_ms(), new.damage_ms(), old.mean_queued_ms, new.mean_queued_ms,
+                    old.repaired, new.repaired, old.concealed, new.concealed);
+                assert!(
+                    new.mean_queued_ms <= old.mean_queued_ms,
+                    "{name} pos={} parity_lost={lose_parity} latency {:.3} -> {:.3}",
+                    position + 1,
+                    old.mean_queued_ms,
+                    new.mean_queued_ms
+                );
+                assert!(
+                    new.damage_ms() <= old.damage_ms() + 20.0,
+                    "{name} pos={} parity_lost={lose_parity} damage {:.3} -> {:.3}",
+                    position + 1,
+                    old.damage_ms(),
+                    new.damage_ms()
+                );
+                assert_eq!(new.cap_hits, 0);
+                assert_eq!(old.cap_hits, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn one_loss_followed_by_an_eighty_ms_network_stall_recovers() {
+    for (burst, name) in [(false, "steady"), (true, "21.333ms")] {
+        let clean = tape_for(
+            Scenario {
+                name,
+                burst,
+                loss: 0.0,
+                burst_loss: false,
+            },
+            97,
+            0..0,
+        );
+        let baseline = evaluate(&clean, false, 1_000_000..96_000_000, None);
+        let mut events: Vec<_> = clean
+            .iter()
+            .filter_map(|(at, bytes)| {
+                let Datagram::Audio { packet, .. } = wire::parse(bytes).unwrap() else {
+                    panic!()
+                };
+                // Lose the original and parity so the first event conceals.
+                if packet.seq == 400 {
+                    return None;
+                }
+                Some((
+                    if (6_000_000..6_080_000).contains(at) {
+                        6_080_000
+                    } else {
+                        *at
+                    },
+                    bytes.clone(),
+                ))
+            })
+            .collect();
+        events.sort_by_key(|(at, _)| *at);
+        let old = evaluate(&events, true, 1_000_000..96_000_000, None);
+        let new = evaluate(&events, false, 1_000_000..96_000_000, None);
+        for (label, range) in [
+            ("stall", 1..7),
+            ("+10s", 16..17),
+            ("+30s", 36..37),
+            ("+60s", 66..67),
+        ] {
+            println!(
+                "STALL {name} {label} {:?} -> {:?}",
+                mean_latency(&old, range.clone()),
+                mean_latency(&new, range)
+            );
+        }
+        assert!(mean_latency(&new, 1..7).0 <= mean_latency(&old, 1..7).0 + 5.0);
+        assert_eq!(old.cap_hits, 0);
+        assert_recovers(&new, &baseline, 16, name);
+    }
+}
+
+#[test]
+fn a_network_stall_outlasting_a_pending_repair_rebuilds_the_cushion() {
+    let p = player();
+    p.link.jitter_us.store(1, Ordering::Relaxed);
+    p.link.burst_us.store(5000, Ordering::Relaxed);
+    let mut mixer = Mixer::new(
+        48_000,
+        2,
+        48_000,
+        2,
+        p.queue.clone(),
+        p.pulled.clone(),
+        None,
+        p.gain.clone(),
+    )
+    .linked(p.link.clone());
+    let now = Instant::now();
+    let mut out = [0.0; 240];
+    p.queue.lock().extend([0.5; 96 * 20]);
+    mixer.fill_at(&mut out, now);
+    p.queue.lock().clear();
+    p.link.repairing.store(true, Ordering::Relaxed);
+    mixer.fill_at(&mut out, now + Duration::from_millis(10));
+    assert!(mixer.dry_repair);
+    p.link.repairing.store(false, Ordering::Relaxed);
+    p.queue.lock().extend([0.5; 96 * 80]);
+    mixer.fill_at(&mut out, now + Duration::from_millis(90));
+    assert!(!mixer.dry_repair);
+    assert!(p.queue.lock().len() < 96 * 10);
+    assert!(mixer.margin_ms <= MARGIN_MS + MAX_UNDERRUN_STEP_MS);
+}
+
+#[test]
+fn exact_1024_sample_callbacks_reproduce_main_growth_and_the_controller_fix() {
+    let mut events = tape_for(
+        Scenario {
+            name: "exact callback",
+            burst: true,
+            loss: 0.0,
+            burst_loss: false,
+        },
+        97,
+        0..0,
+    );
+    // Remove the rounded model's 15.6 ppm clock error. Keep the same
+    // callback batching and seeded transit jitter.
+    for (at, _) in &mut events {
+        let callback = (*at - 5000) / 21_333;
+        *at += callback * 1024 * 1_000_000 / 48_000 - callback * 21_333;
+    }
+    let old = evaluate(&events, true, 1_000_000..96_000_000, None);
+    let new = evaluate(&events, false, 1_000_000..96_000_000, None);
+    for second in [1, 12, 22, 32, 44, 72, 92] {
+        println!(
+            "EXACT_CALLBACK {second}s {:?} -> {:?}",
+            mean_latency(&old, second..second + 1),
+            mean_latency(&new, second..second + 1)
+        );
+    }
+    assert!(old.seconds[22].queued_ms >= old.seconds[1].queued_ms + 25.0);
+    assert!(new.seconds[22].queued_ms <= new.seconds[1].queued_ms + 2.0);
+    assert_eq!(new.cap_hits, 0);
+}
+
+#[test]
+fn a_stall_starting_during_a_real_receiver_wait_does_not_keep_the_backlog() {
+    let clean = tape_for(
+        Scenario {
+            name: "pending then stall",
+            burst: false,
+            loss: 0.0,
+            burst_loss: false,
+        },
+        97,
+        0..0,
+    );
+    let baseline = evaluate(&clean, false, 1_000_000..96_000_000, None);
+    let mut events: Vec<_> = clean
+        .iter()
+        .filter_map(|(at, bytes)| {
+            let Datagram::Audio { packet, .. } = wire::parse(bytes).unwrap() else {
+                panic!()
+            };
+            if packet.seq == 400 {
+                return None;
+            }
+            Some((
+                if (2_016_000..2_096_000).contains(at) {
+                    2_096_000
+                } else {
+                    *at
+                },
+                bytes.clone(),
+            ))
+        })
+        .collect();
+    events.sort_by_key(|(at, _)| *at);
+    let old = evaluate(&events, true, 1_000_000..96_000_000, None);
+    let new = evaluate(&events, false, 1_000_000..96_000_000, None);
+    println!(
+        "PENDING_STALL 12s {:?} -> {:?}",
+        mean_latency(&old, 12..13),
+        mean_latency(&new, 12..13)
+    );
+    assert_recovers(&new, &baseline, 12, "pending repair then stall");
 }

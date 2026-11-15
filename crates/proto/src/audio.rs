@@ -10,13 +10,12 @@ pub const GROUP: u32 = 4;
 pub const MAX_PAYLOAD: usize = crate::MAX_DATAGRAM - 16 - 2;
 /// Reordering allowance after a group's estimated parity arrival.
 pub const AUDIO_HOLD: Duration = Duration::from_millis(20);
-/// Fallback hold for callers without a playback deadline. Desktop output
-/// additionally applies its queue reserve and [`AUDIO_PLAYBACK_HOLD`].
-pub const AUDIO_MAX_HOLD: Duration = Duration::from_millis(60);
+/// Legacy hold from gap detection for callers without a playback deadline.
+pub const AUDIO_MAX_HOLD: Duration = AUDIO_HOLD;
 /// Desktop playback never waits longer than a capture callback and one
 /// small device pull, even when its queue has more room.
 pub const AUDIO_PLAYBACK_HOLD: Duration = Duration::from_millis(25);
-const PAUSE: Duration = AUDIO_MAX_HOLD;
+const PAUSE: Duration = Duration::from_millis(60);
 const SPACING_GROUPS: usize = 8;
 
 /// Numbers encoded audio frames and sends a parity packet after every
@@ -105,8 +104,9 @@ pub enum AudioOut {
 }
 
 /// Puts audio packets in order and rebuilds a lost one from its group's
-/// parity. Missing packets wait until [`AUDIO_HOLD`] after their group's
-/// estimated parity arrival, bounded by [`AUDIO_MAX_HOLD`] from detection.
+/// parity. With an output deadline, missing packets wait for estimated
+/// parity within that reserve and [`AUDIO_PLAYBACK_HOLD`]. Other callers
+/// retain [`AUDIO_MAX_HOLD`] from detection and the later-group cutoff.
 /// Intact packets are delivered immediately. After a gap beyond
 /// the 64-packet window, jumps to the arriving packet's group start and
 /// clears stale state, rather than playing a long backlog of concealment
@@ -229,7 +229,7 @@ impl AudioReceiver {
             .max()
             .unwrap_or(AUDIO_HOLD)
             .max(Duration::from_micros(u64::from(self.packet_us)))
-            .min(AUDIO_MAX_HOLD)
+            .min(PAUSE)
     }
 
     /// The output queue's latest safe release time. Update before each
@@ -325,28 +325,24 @@ impl AudioReceiver {
         let held = self.held?;
         let seq = self.next?;
         let group = seq - seq % GROUP;
-        let cap = self
-            .playout_deadline
-            .map_or(held + AUDIO_MAX_HOLD, |deadline| {
-                deadline.min(held + AUDIO_PLAYBACK_HOLD)
-            });
-        if self.playout_deadline.is_some()
-            && self
-                .latest
-                .is_some_and(|n| !crate::video::before(n, group.wrapping_add(GROUP + 1)))
+        if self
+            .latest
+            .is_some_and(|n| !crate::video::before(n, group.wrapping_add(GROUP + 1)))
         {
             // Retain main's progress cutoff in playback. Extra waiting
             // after two packets of the next group risks its intact audio.
             return Some(held);
         }
-        if let Some((arrival, _)) = self.parity.get(&group) {
-            if self.playout_deadline.is_some() {
-                // A single loss was already rebuilt by push. Playback
-                // conceals an unrepairable group immediately.
-                return Some(held);
-            }
-            // Parity is already here. Only reordered data can still help.
-            return Some((*arrival + AUDIO_HOLD).min(cap));
+        let Some(playout) = self.playout_deadline else {
+            // Preserve main's microphone/headless policy until the caller
+            // can supply its actual output reserve.
+            return Some(held + AUDIO_MAX_HOLD);
+        };
+        let cap = playout.min(held + AUDIO_PLAYBACK_HOLD);
+        if self.parity.contains_key(&group) {
+            // A single loss was already rebuilt by push. Playback
+            // conceals an unrepairable group immediately.
+            return Some(held);
         }
         let due = self
             .group_arrival

@@ -420,27 +420,47 @@ lets tests check audio bit for bit. Opus is gone.
   immediately. [Deadline details](PROTOCOL.md#audio-3)
 * **Repair timing stays out of network jitter.** Arrival measurement uses
   original datagrams and sequence distances. Buffered release and
-  concealment do not become arrival samples. After a repair-induced
-  underrun, playback resumes the intact backlog directly and preserves the
-  margin. After a confirmed loss, a genuine network underrun increases the
-  margin by its observed gap, bounded to 2–25 ms per event, with the existing
-  40 ms margin cap and
-  0.1 ms/s decay. Preserving intact sound can leave extra queued audio.
-  The queue retains its 120 ms safety limit and normal clock steering.
-  Controller cushion and actual queued latency are measured separately.
-* **Deterministic loss evaluation.** The test-only comparison runs the real
-  receiver, codec, queue and mixer against the receiver from main at
-  `45ad4b7`. Each trace has a one-second warmup and 23 measured seconds,
-  2.5 ms device pulls, up to 1 ms seeded arrival jitter, and either 5 ms
-  packets or modeled 21.333 ms capture callbacks. Independent loss of
-  1%, 5% and 15% includes parity. A fourth trace loses 16 ms every 400 ms.
-  Every trace has lower `silence + intact discard + 5 ms * concealments`
-  and mean controller cushion. Intact discard in every new trace is at most
-  the reference's. Burst-cadence mean cushion is 33.07, 35.05 and 35.56 ms,
-  against 41.63, 55.68 and 59.76 ms in the reference. Actual queued latency
-  can increase, including 34.30 to 47.44 ms mean in the steady burst-loss
-  trace. This simulated result does not measure physical audibility,
-  real network parity arrival or device scheduling.
+  concealment do not become arrival samples. A short repair-induced
+  underrun resumes intact backlog without raising the margin. An outage
+  longer than the 25 ms repair bound plus one pull rebuilds the normal
+  cushion. Its restart keeps at most the pre-outage target plus 2 ms,
+  preventing a late burst from preserving the whole stall as latency.
+* **The queue controller recovers after loss.** The remembered low point
+  recovers at 2 ms/s. Playback never slows while current slack meets its
+  plan, and a smoothed queue above the cushion requests catch-up. Ordinary
+  slowdown is bounded to 0.2%, with catch-up up to 0.4% (4 ms/s). After an
+  underrun, recovered reserve is kept for three seconds, refreshed by
+  observed sequence gaps, before catch-up removes it. A genuine network
+  underrun adds its observed shortage, bounded to 2–8 ms and a total margin
+  of 20 ms. The margin decays at 2 ms/s to its 2 ms floor. Larger device
+  pulls add `max(0, pull_ms - 2.5)` to planned slack for their wider callback
+  phase. The existing hour-long clock-drift tests retain zero gap samples
+  and zero cuts. This adaptation has no session-long loss flag. The
+  120 ms queue safety limit remains.
+* **Deterministic loss evaluation.** Tests compare the real receiver,
+  codec, queue and mixer with frozen main receiver and mixer behavior at
+  `fa8d6f1`. They use 2.5 ms pulls, seeded transit jitter up to 1 ms, and
+  either 5 ms packets or modeled 21.333 ms capture callbacks. Independent
+  1%, 5% and 15% loss includes parity. Burst loss drops 16 ms every 400 ms.
+  The original 23-second matrix has lower damage
+  (`silence + intact discard + 5 ms * concealments`), controller cushion
+  and actual mean queued audio in every scenario. Extended traces lose
+  packets from 1–12 s and continue clean until 96 s. During loss, mean
+  queued audio is below main in all eight traces. Within 10 s after loss
+  stops, every one-second queue and margin average is within 2 ms of its
+  same-trace no-loss baseline and stays there through 96 s. None reaches
+  the 120 ms cap. Sixteen isolated-loss cases cover all group positions,
+  with and without parity, at both cadences. Each loses 114 packets and
+  has lower mean queued audio. The largest damage increase is 5.10 ms
+  over those 114 events. A single-stall trace also recovers within 10 s.
+* **Capture cadence and measured limits.** A second no-loss replay uses
+  exact 1024-sample callback times at 48 kHz. Main's mean queued audio
+  grows from 18.00 ms at 1 s to 57.50 ms at 22 s, while the new controller
+  goes from 18.51 to 17.10 ms. Removing the rounded model's clock error
+  preserves main's growth, so the controller fix also resolves this
+  pre-existing behavior in simulation. Callback sample counts remain a
+  modeling assumption. Physical audibility, network parity timing and
+  output-device scheduling under loss remain unmeasured.
 * **Surround when both ends have it.** A viewer whose output device has
   more than two channels asks for them (`StreamRequest.audio_channels`);
   the host captures the device's own layout up to that (WASAPI channel
@@ -473,13 +493,11 @@ lets tests check audio bit for bit. Opus is gone.
   falls back to cpal on any failure (`LATCH_AUDIO_OUTPUT=cpal` forces
   it).
 * **A jitter buffer that follows the path.** The viewer measures arrival
-  jitter and capture bursts and steers the least audio left before each
-  device pull to a 2 ms margin plus whatever part of a burst the jitter
-  does not already spread, trimming playback speed by at most 0.2 % to
-  hold it. A real underrun (not the host going quiet: it sends nothing
-  for silence) widens the margin by at least 2 ms. After confirmed packet
-  loss it uses the observed shortage, capped at 25 ms per event. The margin
-  narrows again by 0.1 ms a second. Devices that state their range get a 2.5 ms buffer
+  jitter and capture bursts and steers its reserve toward a 2 ms margin
+  plus the part of a burst the jitter does not already spread. Slowdown
+  is at most 0.2%, with catch-up at most 0.4%. A genuine network underrun
+  widens the margin by 2–8 ms, up to 20 ms total. It narrows by 2 ms/s.
+  Devices that state their range get a 2.5 ms buffer
   (`LATCH_AUDIO_BUFFER` overrides it, in frames or `default`).
 * **The viewer's microphone, opt-in.** With **Send my microphone** on and
   a host that answers with `Accept.mic`, the default input is mixed to

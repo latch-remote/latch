@@ -317,19 +317,37 @@ releases concealment immediately in this playback policy.
 
 Callers must drain on arrivals and timer wakeups using `next_deadline`.
 A consecutive missing run shares its timer until an actual frame delivers.
-Callers without a playback deadline retain the bounded 60 ms transport
-fallback and 20 ms reordered-data allowance after parity. The host microphone
-currently uses this fallback and services deadlines on arrivals or its
-200 ms socket timeout. Its wall-clock release therefore remains coarse.
+Callers without a playback deadline use main's legacy policy, expiring
+20 ms after detection or when the next group's second data packet arrives,
+whichever comes first. Parity alone still allows reordered data within
+that bound. The host microphone uses this policy and services deadlines
+on arrivals or its 200 ms socket timeout. Its wall-clock release remains
+coarse.
 
-A hold stalls every later intact packet. If it drains the device queue,
-release can cause silence, catch-up discard and extra buffering. The viewer
-measures jitter before receiver buffering and excludes its own wait from the
-underrun margin. A repair-induced restart preserves the intact backlog.
-The controller cushion and actual queued latency have separate measurements
-in the deterministic evaluation described in [ENGINE.md](ENGINE.md#audio).
-The measured comparison includes cases with higher actual queued latency
-while the controller cushion decreases. Wire bytes and protocol-1 negotiation
+A hold stalls every later intact packet. A short repair-induced underrun
+resumes its intact backlog and contributes no jitter sample or margin
+increase. When a dry spell exceeds 25 ms plus one device pull, playback
+treats it as a network stall. Restart is capped at the pre-outage cushion
+plus 2 ms and discards the older stall backlog. Genuine underruns add
+2–8 ms of margin, capped at 20 ms, decaying at 2 ms/s to the 2 ms floor.
+Recovered reserve is kept for three seconds after an underrun or subsequent
+observed sequence gaps, then catch-up removes it. The low-point tracker
+recovers at 2 ms/s. Playback never slows above planned current slack and
+can speed up by 0.4% to drain excess queue.
+
+The receiver's 60 ms threshold excludes pauses from its cadence estimate.
+The player's 100 ms threshold starts a new audible epoch and tolerates
+shorter delivery stalls, so they serve different purposes.
+
+The evaluation reports actual queued audio separately from controller
+cushion. With loss from 1–12 s, both queue and margin return within 2 ms
+of their no-loss baseline by 22 s and stay there through 96 s, using
+one-second averages. No tested trace reaches the 120 ms queue cap. The
+isolated-loss sweep permits at most 20 ms additional damage over 114
+losses, with mean queue no higher than main. Its largest measured increase
+is 5.10 ms. These deterministic bounds cover the modeled cadences and
+traces. Physical audible results remain unmeasured. See the evaluation
+in [ENGINE.md](ENGINE.md#audio). Wire bytes and protocol-1 negotiation
 remain compatible with 6.0.0 peers in both directions.
 
 Each coded audio frame is at most `MAX_DATAGRAM - 18` (1 182) bytes,

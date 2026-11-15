@@ -4,6 +4,10 @@ use latch_proto::{
 };
 use std::time::{Duration, Instant};
 
+// Unbudgeted callers must retain main's exact 20 ms/progress policy.
+#[path = "../../stream/src/audio_repair_reference.rs"]
+mod reference;
+
 const GROUPS: u32 = 16;
 
 fn schedule(spacing: [u64; 4], period: u64) -> Vec<u64> {
@@ -41,6 +45,8 @@ fn replay(tape: Vec<(u64, Vec<u8>)>, lost: u32) {
     let start = Instant::now();
     let mut receiver = AudioReceiver::with_format(1, 240, 48_000);
     let mut output = Vec::new();
+    let mut original = reference::AudioReceiver::with_format(1, 240, 48_000);
+    let mut expected = Vec::new();
     let mut events = tape.iter().peekable();
     // Advance the injected clock even between arrivals, exercising quiet
     // receive-loop wakeups and expiry before a delayed parity arrives.
@@ -54,11 +60,20 @@ fn replay(tape: Vec<(u64, Vec<u8>)>, lost: u32) {
                 continue;
             }
             receiver.push(&packet, now);
+            original.push(&packet, now);
             drain(&mut receiver, now, &mut output);
+            while let Some(frame) = original.pop(now) {
+                expected.push(frame);
+            }
         }
         drain(&mut receiver, now, &mut output);
+        while let Some(frame) = original.pop(now) {
+            expected.push(frame);
+        }
     }
-    let expected: Vec<_> = (0..GROUPS * 4)
+    // Keep every cadence, delay and loss-position input, and require exact
+    // parity with main on the restored legacy path, including expiry.
+    let intact: Vec<_> = (0..GROUPS * 4)
         .map(|seq| AudioOut::Frame {
             seq,
             pts: seq * 5000,
@@ -66,10 +81,14 @@ fn replay(tape: Vec<(u64, Vec<u8>)>, lost: u32) {
         })
         .collect();
     assert_eq!(output, expected, "lost group position {}", lost + 1);
-    assert_eq!(
-        receiver.stats(),
-        (u64::from(GROUPS * 3), u64::from(GROUPS), 0)
-    );
+    assert_eq!(output.len(), intact.len());
+    for (actual, full) in output.iter().zip(&intact) {
+        if matches!(actual, AudioOut::Frame { .. }) {
+            assert_eq!(actual, full);
+        }
+    }
+    assert_eq!(receiver.stats(), original.stats());
+    assert_eq!(original.next_deadline(), None);
     assert_eq!(receiver.next_deadline(), None);
 }
 
@@ -134,34 +153,37 @@ fn audio_repair_lost_parity_releases_at_hard_bound() {
     let start = Instant::now();
     let mut receiver = AudioReceiver::with_format(1, 240, 48_000);
     let mut output = Vec::new();
-    // Packet zero and parity are lost. The growing capture intervals move
-    // the estimated parity deadline beyond the fixed 60 ms ceiling.
-    for (ms, bytes) in tape(&schedule([0, 0, 25, 45], 100), 0).into_iter().take(4) {
-        let Datagram::Audio { packet, .. } = wire::parse(&bytes).unwrap() else {
-            panic!()
-        };
-        if packet.parity || packet.seq == 0 {
-            continue;
-        }
+    // Packet zero and parity are lost. Even a growing capture interval
+    // cannot extend the unbudgeted path beyond main's 20 ms bound.
+    let packets = tape(&schedule([0, 0, 25, 45], 100), 0);
+    let mut events = packets.iter().peekable();
+    for ms in 0..20 {
         let now = start + Duration::from_millis(ms);
-        receiver.push(&packet, now);
+        while let Some((_, bytes)) = events.next_if(|(at, _)| *at == ms) {
+            let Datagram::Audio { packet, .. } = wire::parse(bytes).unwrap() else {
+                panic!()
+            };
+            if !packet.parity && packet.seq != 0 {
+                receiver.push(&packet, now);
+            }
+        }
         drain(&mut receiver, now, &mut output);
         assert!(output.is_empty());
     }
-    let bound = start + Duration::from_millis(60);
+    let bound = start + Duration::from_millis(20);
     assert_eq!(receiver.next_deadline(), Some(bound));
     assert_eq!(receiver.pop(bound - Duration::from_nanos(1)), None);
     assert_eq!(receiver.pop(bound), Some(AudioOut::Missing { seq: 0 }));
     drain(&mut receiver, bound, &mut output);
-    assert_eq!(output.len(), 3);
-    assert_eq!(receiver.stats(), (3, 0, 1));
+    assert_eq!(output.len(), 1);
+    assert_eq!(receiver.stats(), (1, 0, 1));
     assert_eq!(receiver.next_deadline(), None);
 }
 
 #[test]
 fn audio_repair_deadlines_follow_group_position() {
     let start = Instant::now();
-    for (lost, deadline_ms) in [(0, 35), (1, 35), (2, 35), (3, 40)] {
+    for (lost, deadline_ms) in [(0, 25), (1, 30), (2, 35), (3, 40)] {
         let mut receiver = AudioReceiver::with_format(1, 240, 48_000);
         let mut output = Vec::new();
         for (ms, bytes) in tape(&schedule([0, 5, 10, 15], 20), 0) {
@@ -292,10 +314,7 @@ fn audio_repair_pause_then_each_loss_position_with_and_without_parity() {
                 assert_eq!(output.len(), (GROUPS * 4) as usize);
                 assert_eq!(receiver.stats().1, u64::from(!lose_parity));
                 assert_eq!(receiver.stats().2, u64::from(lose_parity));
-                assert_eq!(
-                    concealed_at,
-                    lose_parity.then_some(160 + pause + if lost == 3 { 40 } else { 35 })
-                );
+                assert_eq!(concealed_at, lose_parity.then_some(160 + pause + 25));
                 assert_eq!(receiver.next_deadline(), None);
             }
         }
