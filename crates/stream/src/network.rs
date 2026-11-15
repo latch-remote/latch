@@ -9,6 +9,9 @@ use std::net::UdpSocket;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+const RETAINED_PROXY_MAX_AGE: Duration = Duration::from_secs(60);
+const PORTAL_OPEN_CONFIRMATION: Duration = Duration::from_secs(1);
+
 struct Entry {
     host: String,
     environment: NetworkEnvironment,
@@ -18,6 +21,8 @@ struct Entry {
     generation: u64,
     refresh_at: Instant,
     portal_backoff: Duration,
+    portal_open_since: Option<(u64, Instant)>,
+    retained_proxy_since: Option<Instant>,
     retry_requested: bool,
     media_usable: bool,
 }
@@ -29,7 +34,33 @@ impl Entry {
                 || matches!(self.latest.captive_portal, CaptivePortal::Captive { .. }))
     }
     fn observe(&mut self, mut latest: NetworkDiagnosis, now: Instant) {
+        let incomplete_proxy = proxy_observation_incomplete(&latest);
+        let portal_unknown = latest.captive_portal == CaptivePortal::Unknown;
         merge_observations(&mut latest, &self.latest, self.media_usable);
+        if incomplete_proxy {
+            let since = self.retained_proxy_since.get_or_insert(now);
+            if now.saturating_duration_since(*since) >= RETAINED_PROXY_MAX_AGE {
+                latest.proxies.candidates.clear();
+            }
+        } else {
+            self.retained_proxy_since = None;
+        }
+        if !self.media_usable
+            && matches!(self.latest.captive_portal, CaptivePortal::Captive { .. })
+            && latest.captive_portal == CaptivePortal::OpenInternet
+        {
+            let (generation, since) = *self.portal_open_since.get_or_insert_with(|| {
+                self.refresh_at = self.refresh_at.min(now + PORTAL_OPEN_CONFIRMATION);
+                (self.generation, now)
+            });
+            if self.generation == generation
+                || now.saturating_duration_since(since) < PORTAL_OPEN_CONFIRMATION
+            {
+                latest.captive_portal = self.latest.captive_portal.clone();
+            }
+        } else if !portal_unknown {
+            self.portal_open_since = None;
+        }
         if matches!(latest.captive_portal, CaptivePortal::Captive { .. })
             && !matches!(self.latest.captive_portal, CaptivePortal::Captive { .. })
         {
@@ -125,19 +156,23 @@ fn merge_observations(latest: &mut NetworkDiagnosis, previous: &NetworkDiagnosis
     } else if latest.captive_portal == CaptivePortal::Unknown {
         latest.captive_portal = previous.captive_portal.clone();
     }
-    // Only the proxy check's own warnings make its empty result incomplete.
-    // Another check timing out says nothing about the proxy settings.
-    let incomplete_proxy = latest.proxies.candidates.is_empty()
-        && latest.proxies.warnings.iter().any(|warning| {
-            !matches!(
-                warning,
-                netenv::NetworkWarning::WindowsServiceSettings
-                    | netenv::NetworkWarning::MacStaticFallback
-            )
-        });
-    if !latest.proxy_observed || incomplete_proxy {
+    if proxy_observation_incomplete(latest) {
         latest.proxies = previous.proxies.clone();
     }
+}
+
+fn proxy_observation_incomplete(latest: &NetworkDiagnosis) -> bool {
+    // Only the proxy check's own warnings make its empty result incomplete.
+    // Another check timing out says nothing about the proxy settings.
+    !latest.proxy_observed
+        || (latest.proxies.candidates.is_empty()
+            && latest.proxies.warnings.iter().any(|warning| {
+                !matches!(
+                    warning,
+                    netenv::NetworkWarning::WindowsServiceSettings
+                        | netenv::NetworkWarning::MacStaticFallback
+                )
+            }))
 }
 
 /// Local route/environment changes invalidate immediately. Healthy sessions use
@@ -197,6 +232,8 @@ pub fn diagnosis(host: &str) -> NetworkDiagnosis {
             generation: 0,
             refresh_at: now + Duration::from_secs(5),
             portal_backoff: Duration::from_secs(1),
+            portal_open_since: None,
+            retained_proxy_since: None,
             retry_requested: false,
             media_usable: false,
         });
@@ -209,6 +246,8 @@ pub fn diagnosis(host: &str) -> NetworkDiagnosis {
         entry.generation = entry.generation.wrapping_add(1);
         entry.refresh_at = now + Duration::from_secs(5);
         entry.portal_backoff = Duration::from_secs(1);
+        entry.portal_open_since = None;
+        entry.retained_proxy_since = None;
         entry.retry_requested = false;
         entry.latest = NetworkDiagnosis::default();
         entry.media_usable = false;
@@ -366,6 +405,21 @@ pub fn host_notice(
     })
 }
 
+/// Track the wire notice per control session, so a later viewer starts fresh.
+/// Clearing a condition rearms it without adding a frame older peers must handle.
+pub fn changed_host_notice(
+    previous: &mut Option<latch_proto::control::Notice>,
+    status: &NetworkStatus,
+    failure: Option<&Failure>,
+) -> Option<latch_proto::control::Notice> {
+    let current = host_notice(status, failure);
+    if *previous == current {
+        return None;
+    }
+    *previous = current.clone();
+    current
+}
+
 pub fn carrier_label(info: &ConnectionInfo) -> String {
     let carrier = match info.carrier {
         Carrier::Native => "native",
@@ -442,6 +496,180 @@ mod tests {
             self.worker.take().unwrap().join().unwrap();
             std::fs::remove_file(&self.quota).unwrap();
         }
+    }
+
+    fn entry_at(now: Instant) -> Entry {
+        Entry {
+            host: "relay.test".into(),
+            environment: NetworkEnvironment::default(),
+            latest: NetworkDiagnosis::default(),
+            checked: now,
+            network_key: 0,
+            generation: 0,
+            refresh_at: now,
+            portal_backoff: Duration::from_secs(1),
+            portal_open_since: None,
+            retained_proxy_since: None,
+            retry_requested: false,
+            media_usable: false,
+        }
+    }
+
+    #[test]
+    fn retained_proxy_expires_allows_direct_and_later_discovery_wins() {
+        let relay = LocalRelay::new();
+        let now = Instant::now();
+        let mut entry = entry_at(now);
+        let mut discovered = NetworkDiagnosis {
+            proxy_observed: true,
+            ..Default::default()
+        };
+        discovered.proxies.candidates.push(ProxyCandidate {
+            proxy: Proxy::parse("http://proxy.test:3128").unwrap(),
+            source: ProxySource::MacPac,
+        });
+        entry.observe(discovered.clone(), now);
+        let mut failed = NetworkDiagnosis {
+            proxy_observed: true,
+            ..Default::default()
+        };
+        failed
+            .proxies
+            .warnings
+            .push(netenv::NetworkWarning::PacFailed);
+        entry.observe(failed.clone(), now);
+        entry.observe(
+            failed.clone(),
+            now + RETAINED_PROXY_MAX_AGE - Duration::from_millis(1),
+        );
+        assert!(proxy_selection(&entry.latest).0.is_some());
+        assert!(!proxy_selection(&entry.latest).1);
+        entry.observe(failed.clone(), now + RETAINED_PROXY_MAX_AGE);
+        assert!(proxy_selection(&entry.latest).0.is_none());
+        assert!(proxy_selection(&entry.latest).1);
+        // Exercise the normal relay entry point after expiry with a real TLS relay.
+        let mut config = relay.config.clone();
+        let selection = proxy_selection(&entry.latest);
+        config.set_proxy_discovery(move || selection.clone());
+        let (_, info) = latch_relay::create_grant_with_info(&config, &relay.cancel).unwrap();
+        assert!(!info.via_proxy);
+        assert!(info.earlier_failures.is_empty());
+        entry.observe(failed, now + RETAINED_PROXY_MAX_AGE * 2);
+        assert!(proxy_selection(&entry.latest).0.is_none());
+        entry.observe(discovered.clone(), now + RETAINED_PROXY_MAX_AGE * 2);
+        assert!(proxy_selection(&entry.latest).0.is_some());
+        assert!(entry.retained_proxy_since.is_none());
+        // A successful empty discovery also overrides the retained proxy immediately.
+        discovered.proxies.candidates.clear();
+        entry.observe(discovered, now + RETAINED_PROXY_MAX_AGE * 2);
+        assert!(proxy_selection(&entry.latest).0.is_none());
+    }
+
+    #[test]
+    fn alternating_portal_probes_preserve_banner_and_backoff_on_injected_clock() {
+        let start = Instant::now();
+        let mut entry = entry_at(start);
+        let captive = NetworkDiagnosis {
+            captive_portal: CaptivePortal::Captive { portal_url: None },
+            ..Default::default()
+        };
+        let open = NetworkDiagnosis {
+            captive_portal: CaptivePortal::OpenInternet,
+            ..Default::default()
+        };
+        entry.observe(captive.clone(), start);
+        let mut now = entry.refresh_at;
+        let mut previous = status(&entry.latest, None, None);
+        for tick in 0..12 {
+            entry.refresh(now, false);
+            entry.observe(
+                if tick % 2 == 0 {
+                    open.clone()
+                } else {
+                    captive.clone()
+                },
+                now,
+            );
+            let current = status(&entry.latest, None, None);
+            assert_eq!(current, previous, "flap {tick} changed the banner");
+            assert!(!current.recovered_from(&previous));
+            assert_eq!(
+                entry.portal_backoff,
+                if tick == 0 {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_secs(4)
+                }
+            );
+            previous = current;
+            now = entry.refresh_at;
+        }
+        entry.refresh(now, false);
+        entry.observe(open.clone(), now);
+        // Re-reading the same cached result cannot confirm recovery.
+        entry.observe(open.clone(), now + PORTAL_OPEN_CONFIRMATION);
+        assert!(status(&entry.latest, None, None).needs_sign_in);
+        now += PORTAL_OPEN_CONFIRMATION;
+        entry.refresh(now, false);
+        // A new round can publish partial proxy/Tailscale results first.
+        entry.observe(NetworkDiagnosis::default(), now);
+        entry.observe(open, now);
+        let recovered = status(&entry.latest, None, None);
+        assert!(recovered.recovered_from(&previous));
+        assert!(!recovered.needs_sign_in);
+        assert_eq!(entry.portal_backoff, Duration::from_secs(1));
+        // Actual media remains an immediate override for an HTTP filter.
+        entry.observe(captive, now);
+        entry.media_usable = true;
+        entry.observe(NetworkDiagnosis::default(), now);
+        assert!(!status(&entry.latest, None, None).needs_sign_in);
+    }
+
+    #[test]
+    fn host_notice_changes_are_per_viewer_and_keep_the_6_0_0_wire_shape() {
+        let mut previous = None;
+        let mut status = NetworkStatus {
+            needs_sign_in: true,
+            ..Default::default()
+        };
+        let first = changed_host_notice(&mut previous, &status, None).unwrap();
+        // Local details and unrelated network changes leave the wire notice alone.
+        status.proxy_available = true;
+        status.messages.push("Tailscale is using DERP only.".into());
+        assert!(changed_host_notice(&mut previous, &status, None).is_none());
+        let failure = Failure::ProxyRefused { status: 403 };
+        let changed = changed_host_notice(&mut previous, &status, Some(&failure)).unwrap();
+        assert_ne!(first, changed);
+        assert!(changed_host_notice(&mut previous, &status, Some(&failure)).is_none());
+        // Each new viewer owns an empty history and receives the active notice once.
+        let mut later_viewer = None;
+        assert_eq!(
+            changed_host_notice(&mut later_viewer, &status, Some(&failure)),
+            Some(changed.clone())
+        );
+        assert!(changed_host_notice(&mut later_viewer, &status, Some(&failure)).is_none());
+        // 6.0.0 reads a length-prefixed type-4 frame with just kind and message.
+        for notice in [first, changed] {
+            let mut bytes = Vec::new();
+            latch_proto::control::write_message(
+                &mut bytes,
+                &latch_proto::control::Message::Notice(notice.clone()),
+            )
+            .unwrap();
+            let length = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+            assert_eq!(length, bytes.len() - 4);
+            assert_eq!(bytes[4], 4);
+            let legacy: serde_json::Value = serde_json::from_slice(&bytes[5..]).unwrap();
+            assert_eq!(
+                legacy,
+                serde_json::json!({"kind": "network", "message": notice.message})
+            );
+        }
+        status.needs_sign_in = false;
+        assert!(changed_host_notice(&mut previous, &status, None).is_none());
+        assert!(previous.is_none());
+        status.needs_sign_in = true;
+        assert!(changed_host_notice(&mut previous, &status, None).is_some());
     }
 
     #[test]
@@ -560,6 +788,8 @@ mod tests {
             generation: 1,
             refresh_at: now,
             portal_backoff: Duration::from_secs(1),
+            portal_open_since: None,
+            retained_proxy_since: None,
             retry_requested: false,
             media_usable: false,
         };
@@ -640,6 +870,8 @@ mod tests {
             generation: 0,
             refresh_at: now + Duration::from_secs(60),
             portal_backoff: Duration::from_secs(60),
+            portal_open_since: None,
+            retained_proxy_since: None,
             retry_requested: false,
             media_usable: false,
         };
@@ -765,7 +997,15 @@ mod tests {
             .proxies
             .warnings
             .push(netenv::NetworkWarning::PacFailed);
-        merge_observations(&mut latest, &previous, false);
+        let now = Instant::now();
+        let mut entry = entry_at(now);
+        entry.latest = previous;
+        entry.observe(latest.clone(), now);
+        entry.observe(
+            latest,
+            now + RETAINED_PROXY_MAX_AGE - Duration::from_millis(1),
+        );
+        let latest = entry.latest;
         let mut config = relay.config.clone();
         config.endpoint = latch_relay::Endpoint::new("localhost", 443).unwrap();
         let selection = proxy_selection(&latest);
@@ -794,6 +1034,8 @@ mod tests {
             generation: 0,
             refresh_at: start,
             portal_backoff: Duration::from_secs(1),
+            portal_open_since: None,
+            retained_proxy_since: None,
             retry_requested: false,
             media_usable: false,
         };

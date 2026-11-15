@@ -100,8 +100,8 @@ fn idle_daemon_serves_probe_after_accept_and_partial_header_waits() {
         "idle HTTP probe accept-to-response={accepted:?}, header-ready-to-response={readied:?}"
     );
     assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
-    // Allow hosted-runner scheduling, with a bound below the 250 ms header
-    // deadline and far below the empty relay's otherwise 60-second wait.
+    // Allow hosted-runner scheduling, with a bound below the header deadline
+    // and far below the empty relay's otherwise 60-second wait.
     assert!(accepted < Duration::from_millis(100), "{accepted:?}");
     assert!(readied < Duration::from_millis(100), "{readied:?}");
 }
@@ -118,8 +118,33 @@ fn idle_daemon_expires_silent_http_headers_without_other_traffic() {
     }
     let elapsed = start.elapsed();
     eprintln!("idle HTTP header expiry={elapsed:?}");
-    assert!(elapsed >= Duration::from_millis(250), "{elapsed:?}");
-    assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+    let header_deadline = Duration::from_millis(1500);
+    assert!(elapsed >= header_deadline, "{elapsed:?}");
+    // Preserve the original 250-ms scheduling tolerance above the deadline.
+    let overdue = elapsed - header_deadline;
+    assert!(overdue < Duration::from_millis(250), "{elapsed:?}");
+}
+
+#[test]
+fn delayed_loopback_headers_model_600_ms_rtt_and_a_lost_segment() {
+    let daemon = HttpDaemon::start();
+    let mut peer = daemon.connect();
+    let start = Instant::now();
+    // Inject one-way travel after acceptance and a one-second initial RTO.
+    thread::sleep(Duration::from_millis(300));
+    peer.write_all(b"GET /netenv/probe HTTP/1.1\r\n").unwrap();
+    thread::sleep(Duration::from_secs(1));
+    let ready = Instant::now();
+    peer.write_all(b"Host: localhost\r\n\r\n").unwrap();
+    let mut response = String::new();
+    peer.read_to_string(&mut response).unwrap();
+    let readied = ready.elapsed();
+    eprintln!(
+        "delayed HTTP request completed after {:?}, header-ready-to-response={readied:?}",
+        start.elapsed()
+    );
+    assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+    assert!(readied < Duration::from_millis(100), "{readied:?}");
 }
 
 #[test]

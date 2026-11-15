@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 const MAX_REQUEST: usize = 4096;
 const MAX_BODY: u64 = 4096;
 const TIMEOUT: Duration = Duration::from_secs(2);
-const HEADER_TIMEOUT: Duration = Duration::from_millis(250);
+// A 600-ms RTT needs roughly 300 ms after accept for the request, plus
+// about one second for an initial lost segment. Leave response time in TIMEOUT.
+const HEADER_TIMEOUT: Duration = Duration::from_millis(1500);
 const CONNECTIONS: usize = 8;
 const ACCEPTS_PER_MINUTE: u32 = 120;
 const PER_SOURCE: u32 = 30;
@@ -350,6 +352,59 @@ mod tests {
         assert!(request.step(None, now + HEADER_TIMEOUT, &mut 0).unwrap());
         assert!(request.step(None, now + TIMEOUT, &mut 0).unwrap());
     }
+    #[test]
+    fn delayed_headers_survive_600_ms_rtt_and_one_lost_segment() {
+        let mut server = ProbeServer::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let now = Instant::now();
+        let (stream, mut peer) = socket_pair();
+        server.accept_stream(stream, "192.0.2.1".parse().unwrap(), now);
+        // Model 300 ms one-way travel after accept, then a one-second initial
+        // retransmission delay for the rest of the header. Time is injected.
+        peer.write_all(b"GET /netenv/probe HTTP/1.1\r\n").unwrap();
+        server.poll_at(now + Duration::from_millis(300));
+        assert_eq!(server.requests.len(), 1);
+        peer.write_all(b"Host: localhost\r\n\r\n").unwrap();
+        server.poll_at(now + Duration::from_millis(1300));
+        let mut reply = String::new();
+        // poll again at the same injected instant if loopback delivery is pending.
+        peer.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            server.poll_at(now + Duration::from_millis(1300));
+            match peer.read_to_string(&mut reply) {
+                Ok(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("{error}"),
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(reply.starts_with("HTTP/1.1 204"));
+        assert!(server.requests.is_empty());
+    }
+
+    #[test]
+    fn trickling_headers_do_not_extend_the_absolute_deadline() {
+        let mut server = ProbeServer::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let now = Instant::now();
+        let (stream, mut peer) = socket_pair();
+        server.accept_stream(stream, "192.0.2.1".parse().unwrap(), now);
+        for millis in [300, 600, 900, 1200] {
+            peer.write_all(b"G").unwrap();
+            server.poll_at(now + Duration::from_millis(millis));
+            assert_eq!(server.requests.len(), 1);
+        }
+        server.poll_at(now + HEADER_TIMEOUT);
+        assert!(server.requests.is_empty());
+        let mut reply = String::new();
+        match peer.read_to_string(&mut reply) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+            Err(error) => panic!("{error}"),
+        }
+        assert!(reply.is_empty());
+    }
+
     fn exchange(server: &mut ProbeServer, path: &str, now: Instant) -> String {
         let mut peer = TcpStream::connect(server.local_addr().unwrap()).unwrap();
         peer.write_all(format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes())

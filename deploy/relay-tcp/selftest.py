@@ -12,6 +12,7 @@ import shutil
 import socket
 import ssl
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -60,6 +61,7 @@ def check_kit():
     )
     check_network(network)
     check_upgrade_runbook()
+    check_live_gate()
     print("PASS kit syntax, operator limits, privilege and persistent-ledger contract")
 
 
@@ -68,6 +70,14 @@ def check_upgrade_runbook():
     upgrade = text.split("## Enable the anonymous probe and switch Certbot to webroot", 1)[1]
     blocks = re.findall(r"```bash\n(.*?)\n```", upgrade, re.S)
     assert len(blocks) == 2
+    assert "inspection block below causes no relay interruption (0 seconds)" in upgrade
+    assert "variable-setting block causes no relay interruption" in upgrade
+    assert "For this upgrade block, plan 5–10 seconds" in upgrade
+    assert "For this later rollback block, plan 5–10 seconds" in upgrade
+    assert "saved `renewal.conf` points back at standalone authentication" in upgrade
+    assert "port-80 probe unavailable again" in upgrade
+    assert "repeat the upgrade and webroot conversion" in upgrade
+    assert "checks below cause no relay interruption" in upgrade
     for block in blocks:
         subprocess.run(["bash", "-n"], input=block, text=True, check=True)
     script = blocks[0].split("bash <<'BASH'\n", 1)[1].rsplit("\nBASH", 1)[0]
@@ -98,15 +108,33 @@ def check_upgrade_runbook():
     subprocess.run(["bash", "-n"], input=later, text=True, check=True)
     later_order = ["trap restore_timer EXIT", "systemctl stop certbot.timer",
                    'sha256sum --check "$backup/SHA256SUMS"',
+                   'openssl x509 -in "$lineage/fullchain.pem" -noout -checkend 86400',
+                   'openssl pkey -in "$lineage/privkey.pem" -passin pass: -check -noout',
+                   'cmp -s <(openssl x509',
                    "systemctl stop latch-relay.service",
+                   'cp -a /var/lib/latch-relay/quota "$backup/quota.at-rollback"',
                    'cp -a "$backup/config/." /etc/latch-relay/',
                    '"$lineage/fullchain.pem" /etc/latch-relay/fullchain.pem',
                    '"$lineage/privkey.pem" /etc/latch-relay/privkey.pem',
                    "systemctl start latch-relay.service",
-                   'python3 "$RELAY_KIT/selftest.py" --live "$RELAY_HOST"']
+                   'python3 "$RELAY_KIT/selftest.py" --live "$RELAY_HOST"',
+                   'certbot renew --cert-name "$RELAY_CERT_NAME" --dry-run']
     later_main = later[later.index("trap restore_timer EXIT"):]
     later_positions = [later_main.index(command) for command in later_order]
     assert later_positions == sorted(later_positions), "later rollback order changed"
+    assert ('cp -a /var/lib/latch-relay/quota "$backup/quota.at-rollback" \\\n'
+            "    || echo 'The audit copy of the quota failed. Continuing with the rollback.' >&2") in later
+    for name in ("fullchain.pem", "privkey.pem"):
+        assert f'install -o root -g latch-relay -m 0640 "$lineage/{name}" /etc/latch-relay/{name}' in later
+    for block in blocks:
+        assert "trap 'exit 130' INT" in block
+        assert "trap 'exit 143' HUP TERM" in block
+        assert 'sudo env RELAY_HOST="$RELAY_HOST" RELAY_CERT_NAME="$RELAY_CERT_NAME"' in block
+        assert 'RELAY_KIT="$PWD/deploy/relay-tcp"' in block
+    assert 'RELAY_BINARY="$RELAY_BINARY" MONTHLY_BYTES="$MONTHLY_BYTES"' in blocks[0]
+    assert 'backup="$backup"' in blocks[1]
+    assert 'rerun' in upgrade and 'same backup' in upgrade
+    assert 'avoid `set -e`' in upgrade
     assert 'no expiry e-mail' in upgrade
     assert '-checkend 2592000' in upgrade
     assert '-in /etc/latch-relay/fullchain.pem -noout -checkend 2592000' in upgrade
@@ -158,6 +186,35 @@ rollback() {
         assert "[[webroot_map]]" in rewritten
         assert "relay.test = /var/www/latch-relay" in rewritten
     print("PASS upgrade/rollback syntax, timer traps, command order and renewal configuration migration")
+
+
+def check_live_gate():
+    # Exercise argument dispatch without running installs, daemons or live probes.
+    import contextlib
+    import io
+    from unittest.mock import patch
+
+    for arguments, expected in (
+        ([], [("kit",)]),
+        (["--live", "relay.example"], [("live", "relay.example", 443)]),
+        (["--binary", "fixture"], [("kit",), ("binary", "fixture")]),
+        (["--binary", "fixture", "--live", "relay.example", "--port", "8443"],
+         [("kit",), ("binary", "fixture"), ("live", "relay.example", 8443)]),
+    ):
+        calls = []
+        replacements = {
+            "check_kit": lambda: calls.append(("kit",)),
+            "check_binary": lambda binary: calls.append(("binary", binary)),
+            "probe_carriers": lambda host, port: calls.append(("live", host, port)),
+        }
+        with (
+            patch.dict(main.__globals__, replacements),
+            patch.object(sys, "argv", [__file__, *arguments]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            main()
+        assert calls == expected, (arguments, calls)
+    print("PASS live-only dispatch skips kit checks and disposable daemons")
 
 
 def check_network(network):

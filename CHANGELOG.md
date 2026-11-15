@@ -98,6 +98,14 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Relay connectivity
 
+- Bound retained proxy settings to 60 seconds of incomplete discovery before
+  retrying direct access, and accept later successful discovery immediately.
+- Allow 1.5 seconds for anonymous probe headers on high-latency, lossy paths
+  while retaining absolute connection deadlines and admission/byte limits.
+- Deduplicate host network notices per viewer and confirm portal recovery across
+  two discovery rounds, preserving retry backoff and banners during flapping.
+- State relay maintenance interruption estimates and explain standalone renewal
+  and loss of the port-80 probe after rollback.
 - Keep relay connections usable when local wake notifications are unavailable,
   and preserve short-timer precision on Windows.
 - Keep anonymous connectivity checks and certificate challenges responsive

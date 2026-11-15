@@ -582,10 +582,16 @@ Latch discovers this network's OS, PAC/WPAD and environment proxy settings in
 background. A cached result is used immediately. Slow discovery continues while
 the connection tries direct access. Changing networks or signing in to a portal
 invalidates the cached result. Relay connection failures refresh discovery within
-two seconds. A failed PAC/WPAD lookup retains a previously working proxy until
-successful discovery replaces it.
+two seconds. Incomplete PAC/WPAD discovery retains the prior proxy for at most
+60 seconds from the first missing or empty incomplete result. After that, new
+connections try direct access again. A completed result with proxy or Direct
+candidates replaces the prior settings immediately, including platform WPAD
+fallback candidates.
 A confirmed portal retries after 1 second with exponential backoff up to 4
-seconds. Opening sign-in or returning to Latch rechecks promptly. Healthy
+seconds. Clearing a detected portal requires open results from two discovery
+rounds at least one second apart. Alternating redirects and open results keep
+the banner and retry back-off steady. Delivered media clears the banner
+immediately. Opening sign-in or returning to Latch rechecks promptly. Healthy
 sessions send no periodic HTTP probes. An in-flight check can
 take up to six seconds.
 

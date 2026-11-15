@@ -95,6 +95,11 @@ type byte and the payload and is at most 65 536. Payloads are JSON objects.
 | 7 | `DrawCursor` | viewer → host | `{"draw": bool}`; tells host whether to composite pointer into video |
 | 8 | `Relay` | either | `{"session": u32, "attempt": u64, "action": RelayAction}`; negotiated only when request and accept both set `relay` |
 
+Host network notices retain the version-1 type-4 `{"kind", "message"}` shape.
+Each control session emits the active notice once, then emits only changed
+kind/text. A new viewer receives the active notice independently. Clearing a
+condition rearms it locally and preserves 6.0.0 frame compatibility.
+
 `End` always uses the original control connection, including while relay is
 active. Codes 0 (intentional end), 1 (takeover), and 5 (host stopping) stop
 automatic reconnect. Code 6 is a recoverable transport failure, including
@@ -1044,10 +1049,14 @@ timeout or unavailable probe from an older relay produces no warning by itself.
 This endpoint is independent of the TLS relay framing and version-1 peer protocol.
 Healthy sessions reuse discovery until the network key changes or a relay
 connection fails. Confirmed portals retry with 1-to-4-second exponential
-backoff. Relay failures refresh within two seconds and incomplete PAC/WPAD
-results retain the prior proxy. Opening sign-in or returning to the app rechecks
-promptly. Delivered media clears the portal banner. Waiting before media ends
-three minutes after portal detection, and the normal media-stall deadline remains active once
+backoff. Clearing a portal requires two open observations from distinct discovery
+rounds at least one second apart, with a confirmation recheck after one second.
+Alternating redirects and open results preserve the banner and backoff.
+Relay failures refresh within two seconds. Incomplete PAC/WPAD results retain
+the prior proxy for at most 60 seconds from the first incomplete result, then
+new connections try direct access. A successful proxy discovery takes effect
+immediately. Opening sign-in or returning to the app rechecks promptly.
+Delivered media clears the portal banner. Waiting before media ends three minutes after portal detection, and the normal media-stall deadline remains active once
 pictures flow. Browser sign-in actions reject loopback and unspecified IPs,
 localhost and its subdomains while
 allowing private portal addresses.
@@ -1060,8 +1069,10 @@ bytes and two seconds per connection. Normal admissions have global 120/minute
 and per-source 30/minute caps, using the port-443 IPv4 /32 and IPv6 /64 keys.
 Two request slots and 16 challenge admissions per minute form an ACME-only
 reserve for existing challenge files under ordinary traffic. Missing files use
-ordinary credit. Headers expire after 250 ms. A source holds at most one idle
-request and two total pending requests. Idle requests cannot occupy the reserved
+ordinary credit. Headers expire after 1.5 seconds from acceptance, allowing
+300 ms one-way request delivery on a 600 ms RTT path plus a one-second initial
+retransmission delay. Arriving bytes never extend the deadline. A source holds
+at most one idle request and two total pending requests. Idle requests cannot occupy the reserved
 slots. These bounds reduce ordinary-traffic starvation and cannot guarantee
 availability under deliberate resource exhaustion. Monitor renewal failures and
 certificate expiry. Accept errors log once and back off for one second while
