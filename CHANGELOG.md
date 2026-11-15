@@ -218,8 +218,9 @@ GitHub release notes, so each version gets a heading of the form
   plus gateway deadline lateness and local wake/timeout timing for native TLS
   and WebSocket carriers.
 - Time the relay daemon's low-credit wake test from the peer's write, so a
-  late-starting helper thread on a loaded runner no longer fails it, and fail
-  when the wait returns before the write.
+  late-starting helper thread on a loaded runner no longer fails it. Judge the
+  first return after the write, and fail when the housekeeping timeout ended
+  that wait.
 
 ### Networking
 
