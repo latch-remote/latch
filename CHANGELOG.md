@@ -70,9 +70,6 @@ GitHub release notes, so each version gets a heading of the form
   real headless streams through blocked, lossy, proxy, TLS-inspecting,
   captive-portal and MTU-limited networks. Record decoded video, sound,
   input and path recovery in CI, with strict expected-failure tracking.
-
-### Interoperability
-
 - Add artifact-exchanged host/viewer interoperability CI across Windows,
   macOS and Linux x64/arm64, with decoded media, native input construction,
   clipboard contracts and explicit known-gap assertions.

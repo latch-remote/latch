@@ -16,6 +16,7 @@ fn config(width: u32, height: u32) -> VideoConfig {
         fps: 25,
         bitrate_kbps: 4000,
         codec: Codec::H264Baseline,
+        display: None,
     }
 }
 
@@ -96,6 +97,7 @@ fn encoded(mode: &str) -> anyhow::Result<Vec<(video::EncodedVideo, VideoInfo)>> 
                         height,
                         ..Default::default()
                     },
+                    captured_display: None,
                 },
             ));
         }
@@ -196,6 +198,7 @@ fn request(port: u16) -> StreamRequest {
         audio_channels: 6,
         mic: false,
         probe_trains: false,
+        display: None,
     }
 }
 
@@ -228,7 +231,7 @@ fn record(mode: &str, frames: Vec<(video::EncodedVideo, VideoInfo)>, root: &Path
             .prepare_using(
                 req.json().unwrap(),
                 peer,
-                vec![Codec::H264Baseline],
+                || vec![Codec::H264Baseline],
                 video::Limits::level,
                 |_| {
                     let frames = frames.take().unwrap();

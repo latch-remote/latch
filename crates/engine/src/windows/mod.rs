@@ -48,6 +48,7 @@ pub(crate) fn pair_probe_encoder() -> Result<()> {
         fps: 25,
         bitrate_kbps: 4000,
         codec: Codec::H264Baseline,
+        display: None,
     })?;
     Ok(())
 }
@@ -64,6 +65,7 @@ pub(crate) fn pair_encode() -> Result<Vec<(EncodedVideo, VideoInfo)>> {
             fps: 25,
             bitrate_kbps: 4000,
             codec: Codec::H264Baseline,
+            display: None,
         };
         // The Microsoft software MFT is available without a GPU or desktop.
         let mut encoder = MfEncoder::software(&config)?;
@@ -113,6 +115,7 @@ pub(crate) fn pair_encode() -> Result<Vec<(EncodedVideo, VideoInfo)>> {
                         height,
                         ..Default::default()
                     },
+                    captured_display: None,
                 },
             ));
         }

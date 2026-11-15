@@ -249,10 +249,11 @@ def summary(artifacts, results, expected):
     counts = {"passed": 0, "known-gap": 0, "failed": 0, "not-run": 0, "unavailable": 0}
 
     def status(matches, required):
-        if not required:
-            label = "unavailable"
-        elif any(r["status"] == "failed" for r in matches):
+        if any(r["status"] == "failed" for r in matches):
+            # A cell that ran and failed is a failure even where it was optional.
             label = "failed"
+        elif not required:
+            label = "unavailable"
         elif any(r["status"] == "passed" for r in matches):
             label = "passed"
         elif any(r["status"] == "known-gap" for r in matches):
