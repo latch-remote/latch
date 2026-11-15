@@ -68,12 +68,17 @@ date, and none of it is a tested capability until it leaves this list.
   70 pictures a second on an RX 6600. The decoder's own time and Latch's
   copy to the renderer have not been separated; that comes first.
 - **Windows ten-bit and HDR viewing without a CPU readback.**
-- **A separate cursor plane on Mac and Windows hosts.** Both composite the
-  pointer into video. Linux hosts can send shape and visibility separately.
+- **A separate cursor plane on Windows hosts.** Windows composites the pointer
+  into video. Mac and Linux hosts negotiate local shape/visibility planes.
+  Mac mixed-display/game cursor qualification and replacement of deprecated
+  system visibility querying remain open.
 - Apple hardware AV1 encode when the hardware and platform APIs offer it;
   AV1 viewing already works on supported Macs.
-- Gamepad emulation on Mac hosts, and motion and touchpad data from pads
-  on Mac viewers. Forwarding to Windows and Linux hosts already works.
+- Apple authorization and release signing for Mac host gamepads. The
+  IOHIDUserDevice backend/report tests exist, while current ad-hoc binaries
+  cannot create pads. GameController/SDL/Steam enumeration and native rumble
+  require verification after authorization. Motion and touchpad forwarding
+  from Mac viewers also remains open.
 - Wayland capture and input, with compositor permission handling.
 - Phone, TV and browser viewers. Current viewers are desktop apps.
 
