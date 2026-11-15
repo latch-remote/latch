@@ -94,7 +94,7 @@ jobs:
           cd "$work/tree"
           from="$(python3 -c 'import json; print(json.load(open("packaging/scoop/latch.json"))["version"])')"
           curl -fsSL "https://github.com/latch-remote/latch-releases/releases/download/v$from/SHA256SUMS" \
-            | sed "s/$from/9.9.9/g" > sums
+            | awk -v from="$from" '{ name = $2; i = index(name, from); if (i) name = substr(name, 1, i - 1) "9.9.9" substr(name, i + length(from)); print $1 "  " name }' > sums
           python3 scripts/bump-packaging.py 9.9.9 --sums sums --icon crates/core/assets/logo-1024.png
           chown -R builder: "$work"
           cd "packaging/aur/${{ matrix.package }}"
@@ -111,7 +111,12 @@ jobs:
       - name: namcap package
         working-directory: /home/builder/pkg
         run: |
-          namcap -i ./*.pkg.tar.zst | tee namcap.log
+          # The -debug split package holds only build-id links into the main
+          # package, which namcap reports as dangling when checked alone.
+          for pkg in ./*.pkg.tar.zst; do
+            case "$pkg" in *-debug-*) continue ;; esac
+            namcap -i "$pkg"
+          done | tee namcap.log
           ! grep ' E: ' namcap.log
       - name: install and run
         working-directory: /home/builder/pkg
@@ -169,10 +174,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # The runner's fresh profile has no Run key, which a desktop
-          # profile has; the 6.0.0 installer expects it.
-          $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-          if (-not (Test-Path $runKey)) { New-Item -Path $runKey | Out-Null }
+          # The runner's fresh profile has no Run key; the manifest must
+          # create it, since the 6.0.0 installer does not.
+          if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run') { throw 'expected a profile without a Run key' }
           scoop install .\packaging\scoop\latch.json
           if ($LASTEXITCODE -ne 0) { throw 'scoop install failed' }
           $version = (Get-Content packaging\scoop\latch.json -Raw | ConvertFrom-Json).version

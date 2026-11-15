@@ -39,14 +39,17 @@ stdenv.mkDerivation {
 
   nativeBuildInputs = [
     autoPatchelfHook
-    addDriverRunpath
     copyDesktopItems
   ];
   buildInputs = [
     alsa-lib
     (lib.getLib stdenv.cc.cc)
   ];
-  runtimeDependencies = latch.runtimeLibraries;
+  # The library outputs: libva's default output is `dev`, which has no .so.
+  runtimeDependencies = map lib.getLib latch.runtimeLibraries;
+  # autoPatchelf rewrites RUNPATH in postFixup, so the driver directory
+  # (NVENC, CUDA) goes in through it rather than after it.
+  appendRunpaths = [ "${addDriverRunpath.driverLink}/lib" ];
   inherit (latch) desktopItems;
 
   dontConfigure = true;
@@ -59,10 +62,6 @@ stdenv.mkDerivation {
     install -Dm644 NOTICE $out/share/licenses/latch-bin/NOTICE
     install -Dm644 ${../../crates/core/assets/logo-1024.png} $out/share/pixmaps/latch-host.png
     runHook postInstall
-  '';
-
-  postFixup = ''
-    addDriverRunpath $out/bin/latch-host
   '';
 
   meta = latch.meta // {

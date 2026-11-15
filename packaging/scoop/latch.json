@@ -27,6 +27,9 @@
         "if ($newer) {",
         "    Write-Host \"Latch $have in $installed is newer than $version; it was left in place.\"",
         "} else {",
+        "    # install-host.ps1 up to 6.0.0 stops if the profile has no Run key.",
+        "    $run = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'",
+        "    if (-not (Test-Path -LiteralPath $run)) { New-Item -Path $run | Out-Null }",
         "    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$dir\\install-host.ps1\" -Exe \"$dir\\latch-host.exe\" -NoStart",
         "    if ($LASTEXITCODE -ne 0) { throw \"install-host.ps1 failed with exit code $LASTEXITCODE\" }",
         "}"
