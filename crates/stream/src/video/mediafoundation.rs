@@ -1148,7 +1148,7 @@ impl State {
                 zero_reorder: [false; 2],
                 progress,
             };
-            match state.output_type() {
+            match state.output_type(Instant::now() + worker_deadline::STARTUP) {
                 Err(e)
                     if e.downcast_ref::<windows::core::Error>().is_some_and(|e| {
                         matches!(
@@ -1201,7 +1201,7 @@ impl State {
             (mf, api)
         }
     }
-    fn output_type(&mut self) -> Result<()> {
+    fn output_type(&mut self, deadline: Instant) -> Result<()> {
         // SAFETY: Type negotiation is serialized with ProcessInput/Output.
         unsafe {
             // Eight bits take the first NV12 or P010 type. A ten-bit stream
@@ -1211,6 +1211,10 @@ impl State {
             let mut stand_in = None;
             let mut chosen = None;
             for index in 0..256 {
+                ensure!(
+                    Instant::now() < deadline,
+                    "decoder output type negotiation deadline exceeded at type {index}"
+                );
                 self.progress.phase("GetOutputAvailableType");
                 let ty = match self.transform.GetOutputAvailableType(0, index) {
                     Ok(ty) => ty,
@@ -1330,14 +1334,17 @@ impl State {
     }
     fn drain(&mut self, budget: &mut OutputBudget, expected: Option<i64>) -> Result<()> {
         let mut pictures = std::mem::take(&mut self.pictures);
-        let result = drain_output(&mut pictures, budget, expected, || self.read_output())
-            .with_context(|| format!("drain decoder output, expected sample time {expected:?}"));
+        let deadline = budget.deadline;
+        let result = drain_output(&mut pictures, budget, expected, || {
+            self.read_output(deadline)
+        })
+        .with_context(|| format!("drain decoder output, expected sample time {expected:?}"));
         self.pictures = pictures;
         result
     }
-    fn read_output(&mut self) -> Result<Output<DecodedNv12>> {
+    fn read_output(&mut self, deadline: Instant) -> Result<Output<DecodedNv12>> {
         if self.output_type.is_none() {
-            match self.output_type() {
+            match self.output_type(deadline) {
                 Err(error)
                     if error
                         .downcast_ref::<windows::core::Error>()
@@ -1377,6 +1384,10 @@ impl State {
                 ..Default::default()
             };
             let mut status = 0;
+            ensure!(
+                Instant::now() < deadline,
+                "decoder output deadline exceeded before ProcessOutput"
+            );
             self.progress.phase("ProcessOutput");
             let result =
                 self.transform
