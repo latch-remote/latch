@@ -35,6 +35,25 @@ limits for every host/viewer direction.
    (or if the router forwards UDP 9). Settings can offer sleep after a
    session; that is off by default.
 
+## Linux hardware decoding
+
+The viewer tries VA-API H.264 and HEVC decoders using the installed system
+libva and GPU driver. Give your user access to `/dev/dri/renderD*`, usually
+through the distribution's `render` group. Stream stats show `VA-API H.264`
+or `VA-API HEVC` when hardware decoding is active. A machine without a usable
+driver uses software H.264 automatically.
+
+Set `LATCH_LINUX_DECODER=software` to force software decoding, or
+`LATCH_VAAPI_DEVICE=/dev/dri/renderD129` to try a particular GPU first.
+Driver-reported resolution limits filter codec offers. Hardware failures
+request a keyframe or restart the stream with another codec until software
+H.264 is available. A stalled driver disables VA-API until the app restarts.
+
+EGL/GLES renderers can import decoded DMA-BUF planes directly. Other
+renderers use hardware decode with CPU readback and texture upload. Ten-bit
+SDR requires a Main10 decoder and compatible renderer. Native HDR display
+output and AV1 decoding on Linux require further work.
+
 ## When the connection drops
 
 If a stream loses its connection, leave the window open. Latch tries again
