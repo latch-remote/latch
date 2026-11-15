@@ -5,10 +5,11 @@ pub(crate) struct Pacer {
     tokens: f64,
     updated: Instant,
     kbps: u32,
+    waiting: bool,
 }
-// Repay late scheduler wakes during a frame, with at most one 30-fps slot
-// of credit. Idle capture time still receives the original one-ms allowance.
-const MAX_CREDIT: Duration = Duration::from_millis(32);
+// Preserve the tested 16/30-ms wakes while a train waits. Longer stalls
+// restart with the ordinary one-ms allowance, including within a frame.
+const MAX_CREDIT: Duration = Duration::from_millis(30);
 const BURST: f64 = (2 * (latch_proto::MAX_DATAGRAM + 80)) as f64;
 impl Pacer {
     pub(crate) fn new(now: Instant) -> Self {
@@ -16,6 +17,7 @@ impl Pacer {
             tokens: BURST,
             updated: now,
             kbps: 0,
+            waiting: false,
         }
     }
     pub(crate) fn begin_frame(&mut self, now: Instant, kbps: u32) {
@@ -26,10 +28,12 @@ impl Pacer {
             .min(burst);
         self.updated = now;
         self.kbps = kbps;
+        self.waiting = false;
     }
 
-    /// Spend elapsed-time credit, including late wakes within an active frame.
-    /// Rate changes clamp credit immediately to the ordinary one-ms burst.
+    /// Repay ordinary late wakes while packets remain in a train. Completed
+    /// trains stop accruing extra credit without requiring a frame boundary.
+    /// Rate changes and long stalls clamp credit to the ordinary one-ms burst.
     /// The caller reloads the rate on every attempt.
     pub(crate) fn batch(
         &mut self,
@@ -41,19 +45,21 @@ impl Pacer {
             self.tokens = BURST;
             self.updated = now;
             self.kbps = 0;
+            self.waiting = false;
             return (packets.len(), Duration::ZERO);
         }
         let rate = f64::from(kbps) * 1000.0 / 8.0;
-        let credit = if self.kbps == kbps {
-            MAX_CREDIT.as_secs_f64()
+        let elapsed = now.saturating_duration_since(self.updated);
+        let small = BURST.max(rate * 0.001 + (latch_proto::MAX_DATAGRAM + 80) as f64);
+        let burst = if self.kbps != kbps || elapsed > MAX_CREDIT {
+            small
+        } else if self.waiting {
+            BURST.max(rate * MAX_CREDIT.as_secs_f64() + (latch_proto::MAX_DATAGRAM + 80) as f64)
         } else {
-            0.001
+            small.max(self.tokens)
         };
         self.kbps = kbps;
-        let burst = BURST.max(rate * credit + (latch_proto::MAX_DATAGRAM + 80) as f64);
-        self.tokens = (self.tokens
-            + now.saturating_duration_since(self.updated).as_secs_f64() * rate)
-            .min(burst);
+        self.tokens = (self.tokens + elapsed.as_secs_f64() * rate).min(burst);
         self.updated = now;
         let mut bytes = 0.0;
         let mut count = 0;
@@ -65,6 +71,7 @@ impl Pacer {
             bytes = next;
             count += 1;
         }
+        self.waiting = count < packets.len();
         if count > 0 {
             self.tokens -= bytes;
             return (count, Duration::ZERO);
@@ -206,5 +213,65 @@ mod batch_tests {
             p.batch(at + Duration::from_millis(1), &packets, 100_000).0,
             9
         );
+    }
+
+    #[test]
+    fn mid_train_stalls_restart_with_the_ordinary_burst() {
+        let packets = vec![vec![0; 1200]; 1024];
+        for kbps in [2000, 20_000, 60_000] {
+            for gap in [
+                MAX_CREDIT + Duration::from_nanos(1),
+                Duration::from_millis(100),
+                Duration::from_secs(1),
+                Duration::from_secs(10),
+            ] {
+                let start = Instant::now();
+                let mut pacer = Pacer::new(start);
+                pacer.batch(start, &packets, kbps);
+                let now = start + gap;
+                let count = pacer.batch(now, &packets, kbps).0;
+                let cap = (2 * 1280).max(kbps as usize / 8 + 1280);
+                assert!(
+                    count * 1280 <= cap,
+                    "{gap:?} stall at {kbps} kbps sent {} bytes, cap {cap}",
+                    count * 1280
+                );
+                assert_eq!(pacer.batch(now, &packets, kbps).0, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn mid_train_stalls_fit_a_shallow_bottleneck() {
+        use latch_proto::sim::{Impairment, Link};
+
+        let packets = vec![vec![0; 1200]; 256];
+        for kbps in [2000, 20_000, 60_000] {
+            let start = Instant::now();
+            let mut now = start;
+            let mut pacer = Pacer::new(start);
+            let mut link = Link::new(Impairment::NONE, 11);
+            // At 2 Mbps the two-datagram startup allowance needs a faster
+            // link. Every queue still holds only four ms of its link rate.
+            link.set_bandwidth(kbps.max(8000), Duration::from_millis(4));
+            let mut sent = 0;
+            let mut stalled = false;
+            while sent < packets.len() {
+                let (count, wait) = pacer.batch(now, &packets[sent..], kbps);
+                for packet in &packets[sent..sent + count] {
+                    link.send(now, packet);
+                }
+                sent += count;
+                now += wait;
+                if sent >= 16 && !stalled {
+                    now += Duration::from_millis(250);
+                    stalled = true;
+                }
+                link.receive(now);
+            }
+            assert!(stalled);
+            assert_eq!(link.counts().0, packets.len() as u64);
+            assert_eq!(link.counts().1, 0, "post-stall burst at {kbps} kbps");
+        }
     }
 }

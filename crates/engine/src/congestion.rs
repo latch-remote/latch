@@ -519,6 +519,7 @@ impl Controller {
             // Weight the covered receive time, including partial edge windows.
             // A coarse receiver can provide a full period in fewer reports.
             let qualified = Duration::from_millis(duration) >= period * 3 / 4
+                && recent.len() >= 2
                 && sent > 0
                 && sent * 5 < u64::from(earlier_delivery) * duration * 4
                 && loss >= duration as f32 * 10.0
@@ -2560,6 +2561,53 @@ mod media_path_tests {
         // Three 120-ms windows contain more evidence than four nominal
         // 50-ms reports. A slower receiver must retain that evidence.
         assert!(controller.udp_damage());
+    }
+
+    #[test]
+    fn damage_evidence_requires_two_reports_with_covered_time() {
+        let start = Instant::now();
+        let mut controller = Controller::new(5000, start);
+        controller.enable_media_policy(true);
+        for tick in 0..=10 {
+            controller.observe_sent(5000);
+            controller.update(
+                start + Duration::from_millis(tick * 100),
+                &Report {
+                    window_ms: 100,
+                    rtt_ms: 2.0,
+                    received_kbps: 5000,
+                    ..Default::default()
+                },
+                2.0,
+                0.0,
+            );
+        }
+        controller.observe_sent(2000);
+        let mut report = Report {
+            window_ms: 1000,
+            rtt_ms: 2.0,
+            received_kbps: 1400,
+            loss_pct: 30.0,
+            unrecovered_loss_pct: Some(30.0),
+            frames_lost: 1,
+            ..Default::default()
+        };
+        let now = start + Duration::from_secs(2);
+        controller.update(now, &report, 2.0, 0.0);
+        assert!(!controller.udp_damage());
+        // A retransmitted snapshot can shorten the evidence horizon while
+        // adding zero covered time. The long report is still the only sample.
+        report.window_ms = 50;
+        controller.update(now, &report, 2.0, 0.0);
+        assert!(
+            !controller.udp_damage(),
+            "one long report established damage"
+        );
+        controller.update(now + Duration::from_millis(50), &report, 2.0, 0.0);
+        assert!(
+            controller.udp_damage(),
+            "two covered reports lost their evidence"
+        );
     }
 
     #[test]

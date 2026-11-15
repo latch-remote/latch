@@ -705,13 +705,28 @@ media. Audio, input acknowledgements and pings bypass the video queue.
 
 Video uses a wire-byte token bucket at its current pacing rate. A new frame
 starts with at most two datagrams or 1 ms of credit plus one datagram,
-whichever is larger. Within that frame, elapsed send credit survives late
-scheduler wakes, capped at 32 ms plus one datagram. Idle capture time retains
-the ordinary one-ms cap. The sender spends credit in batches through the
-normal GSO/USO/batch fallback and reloads the current rate between batches.
-Waits request at most 1 ms using an absolute deadline. A rate change clamps
-saved credit immediately to the ordinary burst cap. The encoder allowance reserves audio separately,
-then compounds header overhead with rounded FEC rather than adding the two.
+whichever is larger. While a batch has packets left to send, elapsed send
+credit survives ordinary late scheduler wakes, capped at 30 ms plus one
+datagram. The 30 ms bound is the smallest that preserves the existing
+16 ms and 30 ms injected-clock rate checks at 2, 20 and 60 Mbps. Once a
+batch completes, new accrual has the ordinary one-ms cap and unspent tokens
+remain available. A gap longer than 30 ms restarts with the ordinary burst,
+even mid-frame. A rate change also clamps saved credit immediately.
+
+With 1,200-byte datagrams and the 80-byte tunnel allowance, the ordinary
+burst ceilings at pacing rates of 2, 20 and 60 Mbps are 2,560, 3,780 and
+8,780 bytes. The corresponding ordinary-late-wake ceilings are 8,780,
+76,280 and 226,280 bytes. These are wire-byte credit ceilings before
+rounding down to whole datagrams. Every gap longer than the credit bound
+uses the ordinary ceilings. The Windows sender uses `std::thread::sleep`.
+Rust attempts a high-resolution waitable timer on Windows 10 version 1803
+and later, with a fallback to `Sleep`.
+[Rust's Windows sleep implementation](https://github.com/rust-lang/rust/blob/1.99.0/library/std/src/sys/thread/windows.rs#L117)
+
+The sender spends credit in batches through the normal GSO/USO/batch fallback
+and reloads the current rate between batches. Waits request at most 1 ms
+using an absolute deadline. The encoder allowance reserves audio separately,
+then compounds header overhead with rounded FEC.
 For a loaded sender, cuts use the lower of budget and successful send rate,
 bounded by received throughput +7%. A sender is application-limited after
 four reports below 80% of what the encoder may spend (including zero-byte
@@ -1095,8 +1110,9 @@ The host congestion controller first
 reduces the actual offered load below demonstrated delivery so a shared FIFO
 can drain. Within a trailing period of at least 300 ms, or the feedback
 horizon on a distant path, covered receive time of at least three quarters
-of that period with 10% time-weighted mean raw loss at less than 80% of
-previously delivered throughput establishes residual UDP damage. Report
+of that period across at least two reports with 10% time-weighted mean raw
+loss at less than 80% of previously delivered throughput establishes residual
+UDP damage. Report
 intervals bound each sample's credit and partial edge windows are clipped.
 Windows with more than
 100 ms of local send backlog cannot establish this evidence. Standing delay
@@ -1125,9 +1141,10 @@ preserves picture quality keeps UDP.
 
 The host has one grant worker and a six-second negotiation deadline. If the
 trigger clears before the offer, the viewer withdraws preparation. A clean
-loss window clears a busy-quality trigger only after bitrate and FEC limits
-also recover, preserving preparation while a policer backoff still limits the
-picture. Loss-based preparation requires clean completed video for `max(100 ms, RTT)` before
+loss window clears a busy-quality trigger after bitrate and FEC limits
+recover or the controller's UDP damage memory expires. Active damage evidence
+preserves preparation while a policer backoff still limits the picture.
+Loss-based preparation requires clean completed video for `max(100 ms, RTT)` before
 clearing, allowing isolated receive/report gaps during continued damage. Its retry
 backoff grows through 2, 4, 8, 16 and 30 seconds. The host parks a completed
 grant and its host lanes for reuse for at most twenty seconds, bounded by

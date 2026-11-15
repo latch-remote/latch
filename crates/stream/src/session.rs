@@ -3030,8 +3030,7 @@ fn udp_quality_recovered(stats: &Stats, report: &Report) -> bool {
     report.fps > 0.0
         && report.loss_pct < 3.0
         && report.frames_lost == 0
-        && !relay_bandwidth_limited(stats)
-        && !relay_fec_limited(stats)
+        && (!stats.udp_damage || !relay_bandwidth_limited(stats) && !relay_fec_limited(stats))
 }
 
 #[derive(Default)]
@@ -5079,6 +5078,7 @@ mod tests {
             received_fps: 19.8,
             mbps: 1.16,
             application_limited: false,
+            udp_damage: true,
             ..Default::default()
         };
         let report = Report {
@@ -5105,6 +5105,38 @@ mod tests {
             udp_quality_recovered(&stats, &report),
             "an idle desktop can withdraw a preparation"
         );
+    }
+
+    #[test]
+    fn clean_capacity_limited_udp_recovers_after_damage_memory_expires() {
+        let mut stats = Stats {
+            requested_bitrate_kbps: 20_000,
+            wire_budget_kbps: 2009,
+            applied_bitrate_kbps: 844,
+            received_fps: 19.8,
+            mbps: 1.16,
+            application_limited: false,
+            udp_damage: true,
+            ..Default::default()
+        };
+        let mut report = Report {
+            fps: 19.8,
+            ..Default::default()
+        };
+        assert!(!udp_quality_recovered(&stats, &report));
+        stats.udp_damage = false;
+        assert!(
+            udp_quality_recovered(&stats, &report),
+            "expired damage evidence kept relay preparation alive on clean slow UDP"
+        );
+        report.loss_pct = 5.0;
+        assert!(!udp_quality_recovered(&stats, &report));
+        report.loss_pct = 0.0;
+        report.frames_lost = 1;
+        assert!(!udp_quality_recovered(&stats, &report));
+        report.frames_lost = 0;
+        report.fps = 0.0;
+        assert!(!udp_quality_recovered(&stats, &report));
     }
 
     #[test]

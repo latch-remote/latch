@@ -265,10 +265,13 @@ GitHub release notes, so each version gets a heading of the form
 ### Streaming and recovery
 
 - Preserve elapsed UDP pacing credit across late scheduler wakes, bounded to
-  32 ms within an active frame. Bound idle credit and apply rate cuts immediately.
+  30 ms while a packet train is waiting. Bound idle credit, reset long-stall
+  credit even mid-frame, and apply rate cuts immediately.
 - Weight reduced-offer UDP loss evidence by covered receive time so coarse
-  feedback windows can qualify a damaged path for relay recovery. Retain relay
-  preparation while bitrate or FEC still limits a busy picture after loss clears.
+  feedback windows across at least two reports can qualify a damaged path for
+  relay recovery. Retain relay preparation while damage evidence is active
+  and bitrate or FEC still limits a busy picture after loss clears. Release
+  preparation on clean slow UDP after that evidence expires.
 - Preserve the 100 ms idle-picture repeat phase across late wakes and restart
   the phase after a long stall.
 - Prepare relay recovery after 350 ms without UDP. Distinguish persistent
