@@ -205,6 +205,9 @@ impl RelayRoute {
     pub fn pending(&self) -> bool {
         self.state.lock().phase != RelayPhase::Idle
     }
+    pub fn failure(&self) -> Option<latch_relay::Failure> {
+        self.state.lock().failure.clone()
+    }
     pub fn connection_info(&self) -> Option<latch_relay::ConnectionInfo> {
         self.state.lock().connection_info.clone()
     }
@@ -2421,6 +2424,19 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
             && !inner.connected.load(Ordering::Acquire)
             && accepted.elapsed() >= MEDIA_TIMEOUT
         {
+            if matches!(
+                inner.relay.lock().failure(),
+                Some(
+                    latch_relay::Failure::TlsInterception { .. }
+                        | latch_relay::Failure::TlsRejected
+                        | latch_relay::Failure::ProxyAuthenticationRequired
+                        | latch_relay::Failure::ProxyRefused { .. }
+                )
+            ) {
+                if let Some(message) = status.messages.first() {
+                    return Outcome::Failed("network".into(), message.clone());
+                }
+            }
             if inner.video_health.lock().last_encoded.is_some() {
                 return Outcome::Failed(
                     "decoding".into(),
