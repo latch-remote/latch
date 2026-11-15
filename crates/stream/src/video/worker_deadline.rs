@@ -1,7 +1,10 @@
 //! Bounded caller waits for drivers that cannot safely be interrupted.
 use anyhow::{bail, Result};
-use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    sync::{mpsc, Mutex},
+};
 
 /// One access unit. A healthy decoder answers in milliseconds, and the
 /// VideoToolbox path gives up after the same second.
@@ -19,6 +22,80 @@ pub(super) const PROBE: Duration = Duration::from_secs(20);
 const WINDOW: Duration = Duration::from_secs(600);
 const MAX_STALLS: usize = 3;
 static STALLS: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
+
+/// Shared with the caller so a blocked COM call can describe itself without
+/// asking the worker to run any more code or release driver-owned objects.
+pub(super) struct Progress(Mutex<Operation>);
+struct Operation {
+    phase: &'static str,
+    phase_started: Instant,
+    started: Instant,
+    configuration: String,
+    outputs: u32,
+    recent_output: VecDeque<(i32, u32)>,
+    late_access_units: u64,
+}
+impl Progress {
+    pub(super) fn new(phase: &'static str) -> Self {
+        let now = Instant::now();
+        Self(Mutex::new(Operation {
+            phase,
+            phase_started: now,
+            started: now,
+            configuration: String::new(),
+            outputs: 0,
+            recent_output: VecDeque::new(),
+            late_access_units: 0,
+        }))
+    }
+    pub(super) fn begin(&self, phase: &'static str) {
+        let mut operation = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        operation.phase = phase;
+        operation.started = now;
+        operation.phase_started = now;
+        operation.outputs = 0;
+        operation.recent_output.clear();
+    }
+    pub(super) fn phase(&self, phase: &'static str) {
+        let mut operation = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        operation.phase = phase;
+        operation.phase_started = Instant::now();
+    }
+    pub(super) fn configure(&self, configuration: String) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .configuration = configuration;
+    }
+    pub(super) fn output(&self, code: i32, flags: u32) {
+        let mut operation = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        operation.outputs += 1;
+        if operation.recent_output.len() == 16 {
+            operation.recent_output.pop_front();
+        }
+        operation.recent_output.push_back((code, flags));
+    }
+    pub(super) fn late_output(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .late_access_units += 1;
+    }
+    pub(super) fn describe(&self) -> String {
+        let operation = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        format!(
+            "phase={} phase_elapsed={:?} operation_elapsed={:?} output_calls={} recent_output={:?} late_access_units={} {}",
+            operation.phase,
+            operation.phase_started.elapsed(),
+            operation.started.elapsed(),
+            operation.outputs,
+            operation.recent_output.iter().map(|&(code, flags)| (format!("0x{:08x}", code as u32), flags)).collect::<Vec<_>>(),
+            operation.late_access_units,
+            operation.configuration,
+        )
+    }
+}
 
 fn available(stalls: &mut Vec<Instant>, now: Instant) -> bool {
     stalls.retain(|at| now.saturating_duration_since(*at) < WINDOW);
@@ -48,6 +125,7 @@ pub(super) fn check() -> Result<()> {
 }
 
 pub(super) fn receive<T>(rx: &mpsc::Receiver<T>, timeout: Duration) -> Result<T> {
+    let started = Instant::now();
     match rx.recv_timeout(timeout) {
         Ok(value) => Ok(value),
         Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -55,7 +133,7 @@ pub(super) fn receive<T>(rx: &mpsc::Receiver<T>, timeout: Duration) -> Result<T>
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(Instant::now());
-            bail!("Media Foundation worker timed out; abandoning driver-owned resources");
+            bail!("Media Foundation worker timed out after {:?} (limit {timeout:?}); abandoning driver-owned resources", started.elapsed());
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => bail!("Media Foundation worker stopped"),
     }
@@ -80,10 +158,13 @@ mod tests {
     #[test]
     fn a_blocked_or_disconnected_worker_cannot_hold_its_caller() {
         let (tx, rx) = mpsc::channel::<()>();
-        assert!(receive(&rx, Duration::ZERO)
+        let progress = Progress::new("ProcessOutput");
+        let error = receive(&rx, Duration::ZERO)
             .unwrap_err()
-            .to_string()
-            .contains("timed out"));
+            .context(progress.describe());
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("timed out after"), "{diagnostic}");
+        assert!(diagnostic.contains("phase=ProcessOutput"), "{diagnostic}");
         drop(tx);
         assert!(receive(&rx, Duration::ZERO)
             .unwrap_err()
@@ -92,5 +173,27 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         tx.send(42).unwrap();
         assert_eq!(receive(&rx, Duration::ZERO).unwrap(), 42);
+    }
+
+    #[test]
+    fn worker_diagnostics_preserve_phase_and_elapsed_time() {
+        let progress = Progress::new("queued startup");
+        progress.configure("software H.264".into());
+        progress.begin("queued decode");
+        progress.output(-1, 256);
+        progress.late_output();
+        progress.phase("ProcessOutput");
+        let error = progress.describe();
+        assert!(error.contains("phase=ProcessOutput"), "{error}");
+        assert!(error.contains("phase_elapsed="), "{error}");
+        assert!(error.contains("operation_elapsed="), "{error}");
+        assert!(error.contains("output_calls=1"), "{error}");
+        assert!(error.contains("0xffffffff"), "{error}");
+        assert!(error.contains("late_access_units=1"), "{error}");
+        assert!(error.contains("software H.264"), "{error}");
+        for code in 0..20 {
+            progress.output(code, 0);
+        }
+        assert_eq!(progress.0.lock().unwrap().recent_output.len(), 16);
     }
 }

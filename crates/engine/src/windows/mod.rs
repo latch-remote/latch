@@ -959,7 +959,9 @@ mod tests {
                         );
                     }
                 }
-                let decoded = decoder.decode(&annexb)?;
+                let decoded = decoder.decode(&annexb).with_context(|| {
+                    format!("MF round trip input {i}: {}", decoder.diagnostics())
+                })?;
                 if i == 0 {
                     assert!(
                         decoded.is_some(),
@@ -991,6 +993,7 @@ mod tests {
                     assert!(psnr > 35.0, "PSNR {psnr}");
                     pictures += 1;
                     if pictures >= 8 {
+                        eprintln!("decoder diagnostics: {}", decoder.diagnostics());
                         return Ok(());
                     }
                 }

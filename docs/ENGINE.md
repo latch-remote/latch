@@ -280,7 +280,13 @@ VA-API output passes through this normalization. The Rust encoder already writes
 H.264 restriction. POC, colour, timing, crop and scaling lists are preserved.
 
 Media Foundation also normalizes incoming parameter sets for 6.0.0 hosts.
-It drains every output and reads the output sample time. The session keeps
+It drains every output and reads the output sample time. For a successfully
+parsed, explicitly zero-reorder H.264/HEVC sequence, a complete picture must
+return before the next access unit is submitted. If `ProcessOutput` first
+reports `MF_E_TRANSFORM_NEED_MORE_INPUT`, the worker polls the same input
+within its one-second deadline, reserving 20 ms for the worker reply. A missing
+picture is a decode error. Ready pictures incur no polling wait. Sequences
+with unknown or nonzero ordering may require further inputs. The session keeps
 bounded submitted-frame metadata and matches each picture to its original
 identity, route and latency measurements. Held, pending and discarded
 pictures appear in viewer statistics. VideoToolbox disables asynchronous
@@ -292,9 +298,10 @@ the current I/P access unit synchronously. Pair replay requires zero decoder del
 on each submitted access unit for every available host/viewer combination.
 
 Returning every ready MF output fixes the intermittent picture loss with
-Linux-encoded streams. Decoder withholding with those streams was not
-reproduced. Any recurrence now appears as latency and fails CI's strict
-per-call output assertion.
+Linux-encoded streams. Windows CI subsequently observed intermittent first-picture
+withholding with the Linux capture fixture. Local short Windows repetitions
+have not reproduced it. The strict per-call assertion verifies delivery
+before the following input, including bounded polling of the current input.
 
 A local 60-picture H.264 High recording with `LATCH_MAC_LTR=1` declares
 `max_num_ref_frames=15` and `max_dec_frame_buffering=15` both before and
@@ -1043,7 +1050,13 @@ failing events are then dropped so later input can proceed.
 
 Windows Media Foundation workers answer their caller within a deadline: one
 second for an access unit, five to open a decoder, twenty for the
-once-per-process probe of every codec. The GPU-copy fence keeps its
+once-per-process probe of every codec. Timeout diagnostics include the input
+identity, active COM phase and its elapsed time, operation elapsed time,
+the last 16 output HRESULT/status pairs and the cumulative count of access
+units delivered after polling. Every access unit shares a 2,048-call output
+budget across stream changes, event-only output and all drain passes, with
+at most 64 format/event transitions, 64 retained pictures and the same time
+deadline. The GPU-copy fence keeps its
 two-second bound. A decode that times out abandons that worker, reports an
 error (which requests a keyframe), and opens a fresh decoder on the next
 keyframe. At most three worker timeouts per ten minutes are allowed

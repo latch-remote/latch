@@ -1,6 +1,6 @@
 //! Standalone H.264, HEVC and AV1 decoding. COM and MF stay on a dedicated MTA so callers
 //! can create and move the decoder from a UI thread with any apartment.
-use super::worker_deadline;
+use super::worker_deadline::{self, Progress};
 use anyhow::{bail, ensure, Context, Result};
 use latch_proto::control::Codec;
 use parking_lot::Mutex;
@@ -12,6 +12,7 @@ use std::{
         mpsc, Arc,
     },
     thread,
+    time::{Duration, Instant},
 };
 use windows::{
     core::{Interface, VARIANT},
@@ -106,24 +107,87 @@ impl Drop for SharedSurface {
     }
 }
 type Pictures = Vec<(i64, DecodedNv12)>;
+enum Output<T> {
+    Picture(i64, T),
+    NeedInput,
+    StreamChange,
+    Events,
+}
+
+struct OutputBudget {
+    deadline: Instant,
+    calls: usize,
+    waits: usize,
+    stream_changes: usize,
+    events: usize,
+}
+impl OutputBudget {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            calls: 0,
+            waits: 0,
+            stream_changes: 0,
+            events: 0,
+        }
+    }
+    fn check(&mut self) -> Result<()> {
+        ensure!(
+            Instant::now() < self.deadline,
+            "decoder output deadline exceeded after {} calls ({} stream changes, {} event-only outputs, {} waits)",
+            self.calls, self.stream_changes, self.events, self.waits
+        );
+        ensure!(
+            self.calls < 2048,
+            "decoder output exceeded 2048 calls ({} stream changes, {} event-only outputs, {} waits)",
+            self.stream_changes, self.events, self.waits
+        );
+        ensure!(
+            self.stream_changes + self.events < 64,
+            "decoder output exceeded 64 format/event transitions ({} stream changes, {} event-only outputs)",
+            self.stream_changes, self.events
+        );
+        self.calls += 1;
+        Ok(())
+    }
+}
 /// Consume every ready output before asking the MFT for another input.
 /// Keep partial output on error so a retry can still return its identities.
 fn drain_output<T>(
-    pictures: &mut Vec<T>,
-    mut next: impl FnMut() -> Result<Option<T>>,
+    pictures: &mut Vec<(i64, T)>,
+    budget: &mut OutputBudget,
+    expected: Option<i64>,
+    mut next: impl FnMut() -> Result<Output<T>>,
 ) -> Result<()> {
-    for _ in 0..64 {
+    // A known zero-reorder picture is awaited within this access unit's
+    // existing deadline. Ready output takes this path without sleeping.
+    loop {
+        budget.check()?;
         match next()? {
-            Some(picture) => pictures.push(picture),
-            None => return Ok(()),
+            Output::Picture(time, picture) => {
+                ensure!(
+                    pictures.len() < 64,
+                    "decoder produced too many outputs without needing input"
+                );
+                pictures.push((time, picture));
+            }
+            Output::StreamChange => budget.stream_changes += 1,
+            Output::Events => budget.events += 1,
+            Output::NeedInput => {
+                if expected.is_none_or(|time| pictures.iter().any(|p| p.0 == time)) {
+                    return Ok(());
+                }
+                budget.waits += 1;
+                thread::sleep(Duration::from_millis(1));
+            }
         }
     }
-    bail!("decoder produced too many outputs without needing input")
 }
 
 struct Request {
     bytes: Vec<u8>,
     time: i64,
+    deadline: Instant,
     reply: mpsc::SyncSender<Result<(Pictures, &'static str)>>,
 }
 pub struct MfDecoder {
@@ -132,6 +196,7 @@ pub struct MfDecoder {
     name: &'static str,
     next_time: i64,
     generation: u64,
+    progress: Arc<Progress>,
 }
 impl MfDecoder {
     pub fn new() -> Result<Self> {
@@ -149,20 +214,37 @@ impl MfDecoder {
     /// `depth` 10 keeps a Main10 stream's P010 samples (see
     /// [`DecodedNv12::bit_depth`]); 8 reduces any P010 output to NV12.
     pub fn with_stream(codec: Codec, width: u32, height: u32, depth: u8) -> Result<Self> {
+        Self::start(codec, width, height, depth, true)
+    }
+    fn start(codec: Codec, width: u32, height: u32, depth: u8, dxva: bool) -> Result<Self> {
         worker_deadline::check()?;
+        let progress = Arc::new(Progress::new("queued decoder startup"));
+        let worker_progress = progress.clone();
         let (requests, receive) = mpsc::channel::<Request>();
         let (ready, startup) = mpsc::sync_channel(1);
         thread::Builder::new()
             .name("latch-mf-decode".into())
             .spawn(move || {
+                let progress = worker_progress;
                 let adapter = *RENDER_ADAPTER.lock();
                 let initialized = (|| {
-                    let runtime = Runtime::new()?;
-                    let decoder =
-                        State::new(codec, true, adapter, width, height, depth).or_else(|e| {
-                            tracing::warn!("Media Foundation DXVA: {e:#}; trying without it");
-                            State::new(codec, false, None, width, height, depth)
-                        })?;
+                    let runtime = Runtime::tracked(progress.clone())?;
+                    let decoder = State::tracked(
+                        codec,
+                        dxva,
+                        adapter,
+                        width,
+                        height,
+                        depth,
+                        progress.clone(),
+                    )
+                    .or_else(|e| {
+                        if !dxva {
+                            return Err(e);
+                        }
+                        tracing::warn!("Media Foundation DXVA: {e:#}; trying without it");
+                        State::tracked(codec, false, None, width, height, depth, progress.clone())
+                    })?;
                     Ok::<_, anyhow::Error>((runtime, decoder))
                 })();
                 let (_runtime, mut decoder) = match initialized {
@@ -182,9 +264,13 @@ impl MfDecoder {
                 }
                 for request in receive {
                     let result = decoder
-                        .decode(&request.bytes, request.time)
+                        .decode_until(&request.bytes, request.time, request.deadline)
                         .map(|frame| (frame, decoder.name()))
-                        .context("decode Media Foundation access unit");
+                        .with_context(|| {
+                            format!("decode Media Foundation access unit time {}", request.time)
+                        });
+                    let result = result.with_context(|| progress.describe());
+                    progress.phase("send decoded pictures");
                     let _ = request.reply.send(result);
                 }
             })
@@ -192,9 +278,11 @@ impl MfDecoder {
         Ok(Self {
             requests: Some(requests),
             stream: (codec, width, height, depth),
-            name: worker_deadline::receive(&startup, worker_deadline::STARTUP)??,
+            name: worker_deadline::receive(&startup, worker_deadline::STARTUP)
+                .with_context(|| progress.describe())??,
             next_time: 0,
             generation: 0,
+            progress,
         })
     }
     /// Convenience for synchronous tools. A buffered or multi-output decoder
@@ -229,16 +317,24 @@ impl MfDecoder {
             self.next_time = next_time;
             self.generation = generation;
         }
+        let deadline = Instant::now() + worker_deadline::DECODE;
+        self.progress.begin("queued access unit");
         self.requests
             .as_ref()
             .expect("reopened worker")
             .send(Request {
                 bytes: annexb.to_vec(),
                 time,
+                deadline,
                 reply,
             })
             .context("decoder worker stopped")?;
-        let response = match worker_deadline::receive(&receive, worker_deadline::DECODE) {
+        let response = match worker_deadline::receive(
+            &receive,
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .with_context(|| format!("MF input time {time}: {}", self.progress.describe()))
+        {
             Ok(response) => response,
             Err(error) => {
                 // Dropping the channel prevents further submissions. The stuck
@@ -259,6 +355,9 @@ impl MfDecoder {
     pub fn name(&self) -> &'static str {
         self.name
     }
+    pub fn diagnostics(&self) -> String {
+        self.progress.describe()
+    }
 }
 /// Probe actual pictures, not just an installed MFT or a D3D profile GUID.
 /// This also catches missing Store codec extensions and unusable driver paths.
@@ -267,9 +366,11 @@ pub fn supported() -> Vec<Codec> {
         return Vec::new();
     }
     let (tx, rx) = mpsc::sync_channel(1);
+    let progress = Arc::new(Progress::new("queued codec probe"));
+    let worker_progress = progress.clone();
     std::thread::spawn(move || {
         let result = (|| {
-            let Ok(_runtime) = Runtime::new() else {
+            let Ok(_runtime) = Runtime::tracked(worker_progress.clone()) else {
                 return Vec::new();
             };
             [
@@ -289,7 +390,9 @@ pub fn supported() -> Vec<Codec> {
             .into_iter()
             .filter_map(|(codec, bytes)| {
                 let result: Result<()> = (|| {
-                    let mut state = State::new(codec, true, None, 256, 256, 8)?;
+                    worker_progress.begin("probe codec");
+                    let mut state =
+                        State::tracked(codec, true, None, 256, 256, 8, worker_progress.clone())?;
                     for index in 0..10 {
                         if !state.decode(bytes, index * 166667)?.is_empty() {
                             ensure!(state.dxva_used, "decoder returned CPU samples");
@@ -310,15 +413,24 @@ pub fn supported() -> Vec<Codec> {
         })();
         let _ = tx.send(result);
     });
-    worker_deadline::receive(&rx, worker_deadline::PROBE).unwrap_or_default()
+    worker_deadline::receive(&rx, worker_deadline::PROBE)
+        .with_context(|| progress.describe())
+        .unwrap_or_else(|error| {
+            tracing::warn!("{error:#}; codec probe abandoned");
+            Vec::new()
+        })
 }
 
-unsafe fn create_transform(subtype: windows::core::GUID) -> Result<IMFTransform> {
+unsafe fn create_transform(
+    subtype: windows::core::GUID,
+    progress: &Progress,
+) -> Result<IMFTransform> {
     let input = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: subtype,
     };
     let (mut activates, mut count) = (std::ptr::null_mut(), 0);
+    progress.phase("MFTEnumEx");
     mf::MFTEnumEx(
         MFT_CATEGORY_VIDEO_DECODER,
         MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
@@ -331,6 +443,7 @@ unsafe fn create_transform(subtype: windows::core::GUID) -> Result<IMFTransform>
         for activate in std::slice::from_raw_parts_mut(activates, count as usize) {
             if let Some(activate) = activate.take() {
                 if result.is_none() {
+                    progress.phase("IMFActivate::ActivateObject");
                     result = activate.ActivateObject::<IMFTransform>().ok();
                 }
             }
@@ -342,13 +455,23 @@ unsafe fn create_transform(subtype: windows::core::GUID) -> Result<IMFTransform>
 
 struct Runtime {
     mf: bool,
+    progress: Arc<Progress>,
 }
 impl Runtime {
+    #[cfg(test)]
     fn new() -> Result<Self> {
+        Self::tracked(Arc::new(Progress::new("runtime startup")))
+    }
+    fn tracked(progress: Arc<Progress>) -> Result<Self> {
         // SAFETY: This guard never leaves its worker and balances both APIs.
+        progress.phase("CoInitializeEx");
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }.context("decoder COM MTA")?;
-        let mut runtime = Self { mf: false };
+        let mut runtime = Self {
+            mf: false,
+            progress,
+        };
         // SAFETY: COM is initialized; failure drops the guard and uninitializes it.
+        runtime.progress.phase("MFStartup");
         unsafe { mf::MFStartup(MF_VERSION, MFSTARTUP_FULL) }
             .context("start decoder Media Foundation")?;
         runtime.mf = true;
@@ -360,8 +483,10 @@ impl Drop for Runtime {
         // SAFETY: Decoder interfaces are destroyed before the runtime, on this thread.
         unsafe {
             if self.mf {
+                self.progress.phase("MFShutdown");
                 let _ = mf::MFShutdown();
             }
+            self.progress.phase("CoUninitialize");
             CoUninitialize();
         }
     }
@@ -859,6 +984,52 @@ impl Layout {
         })
     }
 }
+/// Only a successfully parsed, explicit zero-reorder sequence authorizes
+/// waiting for this picture. Unknown/reordered streams keep their behavior.
+fn expects_picture(codec: Codec, zero_reorder: &mut [bool; 2], annexb: &[u8]) -> bool {
+    use latch_codec::bitstream::{h264_sps, hevc_ordering, Format};
+    let format = match codec {
+        Codec::H264Baseline | Codec::H264High => Format::H264,
+        Codec::Hevc => Format::Hevc,
+        Codec::Av1 => return false,
+    };
+    let mut ordering = [None, None];
+    let mut picture = false;
+    for nal in latch_codec::h264::nal::iter_nal_units(annexb) {
+        let (slot, zero) = match format {
+            Format::H264 => match nal[0] & 31 {
+                7 => (
+                    1,
+                    h264_sps(nal).is_ok_and(|sps| sps.reorder_frames == Some(0)),
+                ),
+                1 | 5 => {
+                    picture = true;
+                    continue;
+                }
+                _ => continue,
+            },
+            Format::Hevc => match (nal[0] >> 1) & 63 {
+                32 | 33 => (
+                    ((nal[0] >> 1) & 63) as usize - 32,
+                    hevc_ordering(nal)
+                        .is_ok_and(|ordering| ordering.iter().all(|o| o.reorder_pics == 0)),
+                ),
+                0..=31 => {
+                    picture = true;
+                    continue;
+                }
+                _ => continue,
+            },
+        };
+        ordering[slot] = Some(ordering[slot].unwrap_or(true) && zero);
+    }
+    for (saved, provided) in zero_reorder.iter_mut().zip(ordering) {
+        if let Some(zero) = provided {
+            *saved = zero;
+        }
+    }
+    picture && zero_reorder[1] && (codec != Codec::Hevc || zero_reorder[0])
+}
 struct State {
     depth: u8,
     transform: IMFTransform,
@@ -867,6 +1038,8 @@ struct State {
     pictures: Pictures,
     codec: Codec,
     dxva_used: bool,
+    zero_reorder: [bool; 2],
+    progress: Arc<Progress>,
 }
 impl State {
     fn name(&self) -> &'static str {
@@ -878,6 +1051,7 @@ impl State {
     }
     /// `share`: the renderer's adapter, to decode on it and hand pictures
     /// over as [`SharedSurface`]s.
+    #[cfg(test)]
     fn new(
         codec: Codec,
         dxva: bool,
@@ -886,6 +1060,25 @@ impl State {
         height: u32,
         depth: u8,
     ) -> Result<Self> {
+        Self::tracked(
+            codec,
+            dxva,
+            share,
+            width,
+            height,
+            depth,
+            Arc::new(Progress::new("decoder setup")),
+        )
+    }
+    fn tracked(
+        codec: Codec,
+        dxva: bool,
+        share: Option<LUID>,
+        width: u32,
+        height: u32,
+        depth: u8,
+        progress: Arc<Progress>,
+    ) -> Result<Self> {
         // SAFETY: This runs only in the initialized decoder MTA.
         unsafe {
             let subtype = match codec {
@@ -893,7 +1086,8 @@ impl State {
                 Codec::Av1 => MFVideoFormat_AV1,
                 _ => MFVideoFormat_H264,
             };
-            let transform = create_transform(subtype)?;
+            progress.phase("MFTEnumEx / ActivateObject");
+            let transform = create_transform(subtype, &progress)?;
             // MF_LOW_LATENCY and CODECAPI_AVLowLatencyMode share one GUID.
             // Set the UINT32 transform attribute before types. The optional
             // H.264 ICodecAPI takes VT_UI4, while HEVC/AV1 take VT_BOOL.
@@ -901,6 +1095,7 @@ impl State {
             // the decoder actually in use.
             // A transform without attributes answers E_NOTIMPL and runs with
             // the bitstream's explicit reordering limits.
+            progress.phase("GetAttributes / low-latency configuration");
             match transform.GetAttributes() {
                 Ok(attributes) => {
                     attributes
@@ -922,10 +1117,12 @@ impl State {
                 }
             }
             let gpu = if dxva {
+                progress.phase("D3D11 decoder device setup");
                 Some(Gpu::new(&transform, share)?)
             } else {
                 None
             };
+            progress.phase("MFCreateMediaType / compressed type attributes");
             let input = mf::MFCreateMediaType()?;
             input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
             input.SetGUID(&MF_MT_SUBTYPE, &subtype)?;
@@ -936,6 +1133,7 @@ impl State {
                 )?;
                 input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             }
+            progress.phase("SetInputType");
             transform
                 .SetInputType(0, &input, 0)
                 .context("decoder compressed input type")?;
@@ -947,6 +1145,8 @@ impl State {
                 pictures: Vec::new(),
                 codec,
                 dxva_used: dxva,
+                zero_reorder: [false; 2],
+                progress,
             };
             match state.output_type() {
                 Err(e)
@@ -960,21 +1160,31 @@ impl State {
                     }) => {}
                 other => other?,
             }
+            state.progress.phase("BEGIN_STREAMING");
             state
                 .transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
                 .context("start decoder streaming")?;
+            state.progress.phase("START_OF_STREAM");
             state
                 .transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
                 .context("start decoder input stream")?;
-            tracing::info!(settings = ?state.low_latency(), "decoder low-latency readback");
+            let settings = state.low_latency();
+            state.progress.configure(format!(
+                "codec={codec:?} dxva={} low_latency={settings:?} output_type_set={}",
+                state.gpu.is_some(),
+                state.output_type.is_some()
+            ));
+            tracing::info!(?settings, "decoder low-latency readback");
             Ok(state)
         }
     }
     fn low_latency(&self) -> (Option<u32>, Option<bool>) {
         // SAFETY: Read on the same MTA as transform creation and decode.
         unsafe {
+            self.progress
+                .phase("GetAttributes / ICodecAPI::GetValue readback");
             let attributes = self.transform.GetAttributes().ok();
             let mf = attributes
                 .as_ref()
@@ -1001,6 +1211,7 @@ impl State {
             let mut stand_in = None;
             let mut chosen = None;
             for index in 0..256 {
+                self.progress.phase("GetOutputAvailableType");
                 let ty = match self.transform.GetOutputAvailableType(0, index) {
                     Ok(ty) => ty,
                     Err(e) if e.code() == MF_E_NO_MORE_TYPES => break,
@@ -1020,13 +1231,16 @@ impl State {
             let ty = chosen
                 .or(stand_in)
                 .context("decoder offers no NV12 output")?;
+            self.progress.phase("SetOutputType");
             match self.transform.SetOutputType(0, &ty, 0) {
                 Err(e) if e.code() == MF_E_UNSUPPORTED_D3D_TYPE && self.gpu.is_some() => {
+                    self.progress.phase("disable DXVA manager");
                     self.transform
                         .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0)
                         .context("disable unsupported decoder DXVA mode")?;
                     self.gpu = None;
                     self.dxva_used = false;
+                    self.progress.phase("SetOutputType software fallback");
                     self.transform
                         .SetOutputType(0, &ty, 0)
                         .context("set software decoder NV12 type")?;
@@ -1038,36 +1252,61 @@ impl State {
         }
     }
     fn decode(&mut self, annexb: &[u8], time: i64) -> Result<Pictures> {
+        self.decode_until(annexb, time, Instant::now() + worker_deadline::DECODE)
+    }
+    fn decode_until(&mut self, annexb: &[u8], time: i64, deadline: Instant) -> Result<Pictures> {
         use latch_codec::bitstream::{low_delay, Format};
+        self.progress.phase("normalize parameter sets");
         let bytes = match self.codec {
             Codec::H264Baseline | Codec::H264High => low_delay(annexb, Format::H264)?,
             Codec::Hevc => low_delay(annexb, Format::Hevc)?,
             Codec::Av1 => std::borrow::Cow::Borrowed(annexb),
         };
-        self.decode_input(&bytes, time)
+        self.decode_input_until(&bytes, time, deadline)
     }
+    #[cfg(test)]
     fn decode_input(&mut self, annexb: &[u8], time: i64) -> Result<Pictures> {
+        self.progress.begin("decode input");
+        self.decode_input_until(annexb, time, Instant::now() + worker_deadline::DECODE)
+    }
+    fn decode_input_until(
+        &mut self,
+        annexb: &[u8],
+        time: i64,
+        deadline: Instant,
+    ) -> Result<Pictures> {
+        let expected = expects_picture(self.codec, &mut self.zero_reorder, annexb).then_some(time);
+        // Let an exhausted output budget report a decode error before the
+        // caller's deadline abandons a genuinely blocked worker.
+        let mut budget = OutputBudget::new(deadline - Duration::from_millis(20));
         if self.output_type.is_some() {
-            self.drain()?;
+            self.drain(&mut budget, None)?;
         }
         if !annexb.is_empty() {
             let length = u32::try_from(annexb.len())?;
             // SAFETY: The input is copied into a locked buffer before being given
             // to the transform, which retains its own reference if necessary.
             unsafe {
+                self.progress
+                    .phase("MFCreateSample / compressed memory buffer");
                 let sample = mf::MFCreateSample()?;
                 let buffer = mf::MFCreateMemoryBuffer(length)?;
                 let mut data = std::ptr::null_mut();
+                self.progress.phase("compressed buffer Lock");
                 buffer.Lock(&mut data, None, None)?;
                 std::ptr::copy_nonoverlapping(annexb.as_ptr(), data, annexb.len());
+                self.progress
+                    .phase("compressed buffer Unlock / sample attributes");
                 buffer.Unlock()?;
                 buffer.SetCurrentLength(length)?;
                 sample.AddBuffer(&buffer)?;
                 sample.SetSampleTime(time)?;
                 sample.SetSampleDuration(166667)?;
+                self.progress.phase("ProcessInput");
                 match self.transform.ProcessInput(0, &sample, 0) {
                     Err(e) if e.code() == MF_E_NOTACCEPTING => {
-                        self.drain()?;
+                        self.drain(&mut budget, None)?;
+                        self.progress.phase("ProcessInput after NOTACCEPTING");
                         self.transform
                             .ProcessInput(0, &sample, 0)
                             .context("decoder retry ProcessInput")?;
@@ -1076,139 +1315,200 @@ impl State {
                 }
             }
         }
-        self.drain()?;
+        self.drain(&mut budget, expected)?;
+        if expected.is_some() && budget.waits > 0 {
+            self.progress.late_output();
+            tracing::debug!(
+                sample_time = time,
+                waits = budget.waits,
+                output_calls = budget.calls,
+                stream_changes = budget.stream_changes,
+                "MF picture arrived after NEED_MORE_INPUT without another input"
+            );
+        }
         Ok(std::mem::take(&mut self.pictures))
     }
-    fn drain(&mut self) -> Result<()> {
-        if self.output_type.is_none() {
-            match self.output_type() {
-                Err(e)
-                    if e.downcast_ref::<windows::core::Error>()
-                        .is_some_and(|e| e.code() == MF_E_TRANSFORM_TYPE_NOT_SET) =>
-                {
-                    return Ok(())
-                }
-                other => other?,
-            }
-        }
+    fn drain(&mut self, budget: &mut OutputBudget, expected: Option<i64>) -> Result<()> {
         let mut pictures = std::mem::take(&mut self.pictures);
-        let result = drain_output(&mut pictures, || self.read_output());
+        let result = drain_output(&mut pictures, budget, expected, || self.read_output())
+            .with_context(|| format!("drain decoder output, expected sample time {expected:?}"));
         self.pictures = pictures;
         result
     }
-    fn read_output(&mut self) -> Result<Option<(i64, DecodedNv12)>> {
+    fn read_output(&mut self) -> Result<Output<DecodedNv12>> {
+        if self.output_type.is_none() {
+            match self.output_type() {
+                Err(error)
+                    if error
+                        .downcast_ref::<windows::core::Error>()
+                        .is_some_and(|error| error.code() == MF_E_TRANSFORM_TYPE_NOT_SET) =>
+                {
+                    self.progress.phase("waiting for decoder output type");
+                    return Ok(Output::NeedInput);
+                }
+                result => result?,
+            }
+            let settings = self.low_latency();
+            self.progress.configure(format!(
+                "codec={:?} dxva={} low_latency={settings:?} output_type_set=true",
+                self.codec,
+                self.gpu.is_some()
+            ));
+        }
         // SAFETY: ManuallyDrop output fields are released on every HRESULT. All
         // output buffers are copied before the transform can recycle its sample.
         unsafe {
-            for _ in 0..64 {
-                let info = self.transform.GetOutputStreamInfo(0)?;
-                let sample = if info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 == 0 {
-                    let sample = mf::MFCreateSample()?;
-                    sample.AddBuffer(&mf::MFCreateAlignedMemoryBuffer(
-                        info.cbSize.max(1),
-                        info.cbAlignment.saturating_sub(1),
-                    )?)?;
-                    Some(sample)
-                } else {
-                    None
-                };
-                let mut output = MFT_OUTPUT_DATA_BUFFER {
-                    dwStreamID: 0,
-                    pSample: ManuallyDrop::new(sample),
-                    ..Default::default()
-                };
-                let mut status = 0;
-                let result =
-                    self.transform
-                        .ProcessOutput(0, std::slice::from_mut(&mut output), &mut status);
-                let sample = ManuallyDrop::take(&mut output.pSample);
-                ManuallyDrop::drop(&mut output.pEvents);
-                match result {
-                    Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
-                    Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                        self.output_type()?;
-                        continue;
-                    }
-                    result => result.context("decoder ProcessOutput")?,
+            self.progress.phase("GetOutputStreamInfo");
+            let info = self.transform.GetOutputStreamInfo(0)?;
+            self.progress.phase("allocate decoder output sample");
+            let sample = if info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 == 0 {
+                let sample = mf::MFCreateSample()?;
+                sample.AddBuffer(&mf::MFCreateAlignedMemoryBuffer(
+                    info.cbSize.max(1),
+                    info.cbAlignment.saturating_sub(1),
+                )?)?;
+                Some(sample)
+            } else {
+                None
+            };
+            let mut output = MFT_OUTPUT_DATA_BUFFER {
+                dwStreamID: 0,
+                pSample: ManuallyDrop::new(sample),
+                ..Default::default()
+            };
+            let mut status = 0;
+            self.progress.phase("ProcessOutput");
+            let result =
+                self.transform
+                    .ProcessOutput(0, std::slice::from_mut(&mut output), &mut status);
+            self.progress.output(
+                result.as_ref().err().map_or(0, |e| e.code().0),
+                output.dwStatus,
+            );
+            let sample = ManuallyDrop::take(&mut output.pSample);
+            let events = output.pEvents.is_some();
+            self.progress.phase("release output events");
+            ManuallyDrop::drop(&mut output.pEvents);
+            match result {
+                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
+                    self.progress.phase("release unused output sample");
+                    drop(sample);
+                    self.progress.phase("waiting for zero-reorder output");
+                    return Ok(Output::NeedInput);
                 }
-                let sample = sample.context("decoder returned no output sample")?;
-                let layout = Layout::from_type(
-                    self.output_type
-                        .as_ref()
-                        .context("decoder has no output type")?,
-                    self.depth,
-                )?;
-                let buffer = sample.GetBufferByIndex(0)?;
-                let picture = if let Ok(dxgi) = buffer.cast::<IMFDXGIBuffer>() {
-                    self.dxva_used = true;
-                    self.gpu
-                        .as_mut()
-                        .context("DXVA sample without a D3D11 device")?
-                        .read(&dxgi, layout)?
-                } else if let Ok(buffer2d) = buffer.cast::<IMF2DBuffer2>() {
-                    self.dxva_used = false;
-                    let (mut scan, mut start, mut pitch, mut length) =
-                        (std::ptr::null_mut(), std::ptr::null_mut(), 0, 0);
-                    buffer2d.Lock2DSize(
-                        MF2DBuffer_LockFlags_Read,
-                        &mut scan,
-                        &mut pitch,
-                        &mut start,
-                        &mut length,
-                    )?;
-                    let result = (|| {
-                        ensure!(
-                            pitch > 0 && scan as usize >= start as usize,
-                            "invalid NV12 2D buffer"
-                        );
-                        let offset = scan as usize - start as usize;
-                        let all = std::slice::from_raw_parts(start, length as usize);
-                        layout.copy(
-                            all.get(offset..).context("invalid NV12 scanline")?,
-                            pitch as usize,
-                            layout.coded_height as usize,
-                        )
-                    })();
-                    buffer2d.Unlock2D()?;
-                    result?
-                } else {
-                    self.dxva_used = false;
-                    let buffer = sample.ConvertToContiguousBuffer()?;
-                    let (mut data, mut length) = (std::ptr::null_mut(), 0);
-                    buffer.Lock(&mut data, None, Some(&mut length))?;
-                    let result = layout.copy(
-                        std::slice::from_raw_parts(data, length as usize),
-                        layout.stride,
-                        layout.coded_height as usize,
-                    );
-                    buffer.Unlock()?;
-                    result?
-                };
-                let time = sample
-                    .GetSampleTime()
-                    .context("decoder output has no sample time")?;
-                return Ok(Some((time, picture)));
+                Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                    self.progress.phase("release stream-change output sample");
+                    drop(sample);
+                    self.progress.phase("release stream-change output type");
+                    self.output_type = None;
+                    return Ok(Output::StreamChange);
+                }
+                result => result.context("decoder ProcessOutput")?,
             }
+            if output.dwStatus & MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0 as u32
+                == MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0 as u32
+                || (sample.is_none() && events)
+            {
+                return Ok(Output::Events);
+            }
+            let sample = sample.context("decoder returned no output sample")?;
+            self.progress.phase("output sample GetBufferCount");
+            ensure!(
+                sample.GetBufferCount()? > 0,
+                "decoder returned an empty output sample"
+            );
+            self.progress.phase("read decoder output layout");
+            let layout = Layout::from_type(
+                self.output_type
+                    .as_ref()
+                    .context("decoder has no output type")?,
+                self.depth,
+            )?;
+            self.progress.phase("output sample GetBufferByIndex");
+            let buffer = sample.GetBufferByIndex(0)?;
+            let picture = if let Ok(dxgi) = buffer.cast::<IMFDXGIBuffer>() {
+                self.dxva_used = true;
+                self.progress.phase("copy DXVA output / GPU fence");
+                self.gpu
+                    .as_mut()
+                    .context("DXVA sample without a D3D11 device")?
+                    .read(&dxgi, layout)?
+            } else if let Ok(buffer2d) = buffer.cast::<IMF2DBuffer2>() {
+                self.dxva_used = false;
+                let (mut scan, mut start, mut pitch, mut length) =
+                    (std::ptr::null_mut(), std::ptr::null_mut(), 0, 0);
+                self.progress.phase("output Lock2DSize");
+                buffer2d.Lock2DSize(
+                    MF2DBuffer_LockFlags_Read,
+                    &mut scan,
+                    &mut pitch,
+                    &mut start,
+                    &mut length,
+                )?;
+                let result = (|| {
+                    ensure!(
+                        pitch > 0 && scan as usize >= start as usize,
+                        "invalid NV12 2D buffer"
+                    );
+                    let offset = scan as usize - start as usize;
+                    let all = std::slice::from_raw_parts(start, length as usize);
+                    layout.copy(
+                        all.get(offset..).context("invalid NV12 scanline")?,
+                        pitch as usize,
+                        layout.coded_height as usize,
+                    )
+                })();
+                self.progress.phase("output Unlock2D");
+                buffer2d.Unlock2D()?;
+                result?
+            } else {
+                self.dxva_used = false;
+                self.progress.phase("ConvertToContiguousBuffer");
+                let buffer = sample.ConvertToContiguousBuffer()?;
+                let (mut data, mut length) = (std::ptr::null_mut(), 0);
+                self.progress.phase("output buffer Lock");
+                buffer.Lock(&mut data, None, Some(&mut length))?;
+                self.progress.phase("copy output pixels");
+                let result = layout.copy(
+                    std::slice::from_raw_parts(data, length as usize),
+                    layout.stride,
+                    layout.coded_height as usize,
+                );
+                self.progress.phase("output buffer Unlock");
+                buffer.Unlock()?;
+                result?
+            };
+            self.progress.phase("output GetSampleTime");
+            let time = sample
+                .GetSampleTime()
+                .context("decoder output has no sample time")?;
+            self.progress
+                .phase("release decoded output sample and buffers");
+            Ok(Output::Picture(time, picture))
         }
-        bail!("decoder changed output format too many times")
     }
 }
 impl Drop for State {
     fn drop(&mut self) {
         // SAFETY: The MFT is stopped before its manager/device and MF runtime drop.
         unsafe {
+            self.progress.phase("END_OF_STREAM");
             let _ = self
                 .transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            self.progress.phase("COMMAND_FLUSH");
             let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            self.progress.phase("END_STREAMING");
             let _ = self
                 .transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
             if self.gpu.is_some() {
+                self.progress.phase("detach decoder D3D manager");
                 let _ = self
                     .transform
                     .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
             }
+            self.progress.phase("release decoder COM resources");
         }
     }
 }
@@ -1224,7 +1524,13 @@ mod tests {
             .map(|identity| (identity * 166667, vec![identity as u8; 6]))
             .collect();
         let mut pictures = Vec::new();
-        drain_output(&mut pictures, || Ok(ready.pop_front()))?;
+        let mut budget = OutputBudget::new(Instant::now() + worker_deadline::DECODE);
+        drain_output(&mut pictures, &mut budget, None, || {
+            Ok(match ready.pop_front() {
+                Some((time, picture)) => Output::Picture(time, picture),
+                None => Output::NeedInput,
+            })
+        })?;
         assert!(ready.is_empty());
         assert_eq!(
             pictures,
@@ -1233,7 +1539,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         // A later drain leaves the returned batch intact.
-        drain_output(&mut pictures, || Ok(None))?;
+        drain_output(&mut pictures, &mut budget, None, || Ok(Output::NeedInput))?;
         assert_eq!(pictures.len(), 5);
         Ok(())
     }
@@ -1241,16 +1547,191 @@ mod tests {
     fn a_partial_drain_keeps_output_across_an_error_and_retry() -> Result<()> {
         let mut pictures = Vec::new();
         let mut outputs = [
-            Ok(Some(2)),
-            Ok(Some(3)),
+            Ok(Output::Picture(2, 2)),
+            Ok(Output::Picture(3, 3)),
             Err(anyhow::anyhow!("MFT failure")),
         ]
         .into_iter();
-        assert!(drain_output(&mut pictures, || outputs.next().unwrap()).is_err());
-        assert_eq!(pictures, [2, 3]);
+        let mut budget = OutputBudget::new(Instant::now() + worker_deadline::DECODE);
+        assert!(
+            drain_output(&mut pictures, &mut budget, None, || outputs.next().unwrap()).is_err()
+        );
+        assert_eq!(pictures, [(2, 2), (3, 3)]);
         let mut ready = [4, 5, 6].into_iter();
-        drain_output(&mut pictures, || Ok(ready.next()))?;
-        assert_eq!(pictures, [2, 3, 4, 5, 6]);
+        drain_output(&mut pictures, &mut budget, None, || {
+            Ok(match ready.next() {
+                Some(picture) => Output::Picture(picture, picture),
+                None => Output::NeedInput,
+            })
+        })?;
+        assert_eq!(pictures, [(2, 2), (3, 3), (4, 4), (5, 5), (6, 6)]);
+        Ok(())
+    }
+    #[test]
+    fn late_picture_after_stream_change_arrives_before_another_input() -> Result<()> {
+        let mut outputs = [
+            Output::NeedInput,
+            Output::StreamChange,
+            Output::NeedInput,
+            Output::Events,
+            Output::NeedInput,
+            Output::Picture(0, vec![32; 6]),
+            Output::NeedInput,
+        ]
+        .into_iter();
+        let mut budget = OutputBudget::new(Instant::now() + worker_deadline::DECODE);
+        let mut pictures = Vec::new();
+        let submitted_inputs = std::cell::Cell::new(1);
+        drain_output(&mut pictures, &mut budget, Some(0), || {
+            assert_eq!(
+                submitted_inputs.get(),
+                1,
+                "output must precede the next input"
+            );
+            Ok(outputs.next().unwrap())
+        })?;
+        assert_eq!(pictures, [(0, vec![32; 6])]);
+        assert_eq!(
+            (
+                budget.calls,
+                budget.stream_changes,
+                budget.events,
+                budget.waits
+            ),
+            (7, 1, 1, 3)
+        );
+        submitted_inputs.set(2);
+        Ok(())
+    }
+    #[test]
+    fn repeated_stream_changes_and_event_only_outputs_share_one_call_limit() {
+        let mut budget = OutputBudget::new(Instant::now() + worker_deadline::DECODE);
+        let mut pictures: Vec<(i64, ())> = Vec::new();
+        let mut calls = 0;
+        let error = drain_output(&mut pictures, &mut budget, None, || {
+            calls += 1;
+            Ok(if calls % 2 == 0 {
+                Output::StreamChange
+            } else {
+                Output::Events
+            })
+        })
+        .unwrap_err();
+        assert_eq!(calls, 64);
+        assert_eq!((budget.stream_changes, budget.events), (32, 32));
+        assert!(
+            error
+                .to_string()
+                .contains("exceeded 64 format/event transitions"),
+            "{error:#}"
+        );
+    }
+    #[test]
+    fn output_call_and_picture_counts_are_bounded() {
+        let mut pictures: Vec<(i64, ())> = Vec::new();
+        let mut budget = OutputBudget::new(Instant::now() + worker_deadline::DECODE);
+        budget.calls = 2048;
+        let error = drain_output(&mut pictures, &mut budget, None, || {
+            panic!("exhausted call budget must stop before another call")
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeded 2048 calls"),
+            "{error:#}"
+        );
+        let mut budget = OutputBudget::new(Instant::now() + worker_deadline::DECODE);
+        let error = drain_output(&mut pictures, &mut budget, None, || {
+            Ok(Output::Picture(0, ()))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("too many outputs"), "{error:#}");
+        assert_eq!(pictures.len(), 64);
+    }
+    #[test]
+    fn output_deadline_stops_calls_and_missing_zero_reorder_pictures_fail() {
+        let mut pictures: Vec<(i64, ())> = Vec::new();
+        let mut budget = OutputBudget::new(Instant::now());
+        let error = drain_output(&mut pictures, &mut budget, None, || {
+            panic!("expired budget must not call the transform")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded"), "{error:#}");
+        let started = Instant::now();
+        let mut budget = OutputBudget::new(started + Duration::from_millis(100));
+        let error = drain_output(&mut pictures, &mut budget, Some(0), || {
+            Ok(Output::NeedInput)
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded"), "{error:#}");
+        assert!(started.elapsed() < worker_deadline::DECODE);
+        assert!(budget.waits > 0);
+    }
+    #[test]
+    fn an_unqualified_or_reordered_stream_can_still_need_more_input() -> Result<()> {
+        let mut pictures: Vec<(i64, ())> = Vec::new();
+        let mut budget = OutputBudget::new(Instant::now() + worker_deadline::DECODE);
+        drain_output(&mut pictures, &mut budget, None, || Ok(Output::NeedInput))?;
+        assert_eq!((budget.calls, budget.waits), (1, 0));
+        Ok(())
+    }
+    #[test]
+    fn only_valid_explicit_zero_ordering_requires_the_current_picture() -> Result<()> {
+        use latch_codec::bitstream::{low_delay, Format};
+        for (codec, format, bytes) in [
+            (
+                Codec::H264Baseline,
+                Format::H264,
+                include_bytes!("../../../../tests/pairs/mac-vt-6.0.0.h264").as_slice(),
+            ),
+            (
+                Codec::Hevc,
+                Format::Hevc,
+                include_bytes!("../../tests/fixtures/decode-probe.hevc").as_slice(),
+            ),
+        ] {
+            let mut limits = [false; 2];
+            let fixed = low_delay(bytes, format)?;
+            assert!(expects_picture(codec, &mut limits, &fixed));
+            let mut slices = Vec::new();
+            for nal in latch_codec::h264::nal::nal_units(&fixed) {
+                let vcl = match format {
+                    Format::H264 => matches!(nal[0] & 31, 1 | 5),
+                    Format::Hevc => (nal[0] >> 1) & 63 <= 31,
+                };
+                if vcl {
+                    slices.extend_from_slice(&[0, 0, 1]);
+                    slices.extend_from_slice(nal);
+                }
+            }
+            assert!(
+                expects_picture(codec, &mut limits, &slices),
+                "ordering persists across access units"
+            );
+            let mut invalid = vec![0, 0, 1, if format == Format::H264 { 0x67 } else { 0x42 }];
+            invalid.extend_from_slice(&slices);
+            assert!(!expects_picture(codec, &mut limits, &invalid));
+            assert!(
+                !expects_picture(codec, &mut limits, &slices),
+                "rejected headers clear the ordering promise"
+            );
+        }
+        let mut limits = [false; 2];
+        assert!(
+            !expects_picture(
+                Codec::H264Baseline,
+                &mut limits,
+                include_bytes!("../../../../tests/pairs/mac-vt-6.0.0.h264")
+            ),
+            "implicit ordering remains unqualified"
+        );
+        assert!(
+            !expects_picture(
+                Codec::Hevc,
+                &mut limits,
+                include_bytes!("../../tests/fixtures/vaapi-b-frames.hevc")
+            ),
+            "a reordered stream keeps its decoder delay"
+        );
         Ok(())
     }
     #[test]
@@ -1273,11 +1754,10 @@ mod tests {
     }
     #[test]
     fn linux_capture_outputs_keep_their_sample_times_and_pixels() -> Result<()> {
-        let _runtime = Runtime::new()?;
         let bytes = include_bytes!("../../tests/fixtures/linux-aarch64-capture.h264");
         let units = latch_codec::h264::nal::access_units(bytes);
         assert_eq!(units.len(), 24);
-        let mut state = State::new(Codec::H264Baseline, false, None, 160, 98, 8)?;
+        let mut decoder = MfDecoder::start(Codec::H264Baseline, 160, 98, 8, false)?;
         let mut reference = latch_codec::h264::Decoder::new();
         for (index, unit) in units.into_iter().enumerate() {
             assert!(
@@ -1288,19 +1768,27 @@ mod tests {
                 "Linux software SPS already declares zero reordering"
             );
             let time = index as i64 * 166667;
-            let pictures = state.decode(unit, time)?;
+            let started = Instant::now();
+            let pictures = decoder.decode_frames(unit, time)?;
+            assert!(
+                started.elapsed() < worker_deadline::DECODE,
+                "Linux capture input {index} exceeded the per-access-unit bound"
+            );
             assert_eq!(
                 pictures.iter().map(|p| p.0).collect::<Vec<_>>(),
                 [time],
-                "Linux capture input {index}, low latency {:?}, output type set {}",
-                state.low_latency(),
-                state.output_type.is_some()
+                "Linux capture input {index}: {}",
+                decoder.diagnostics()
             );
             check_picture(
                 &pictures[0].1,
                 reference.decode(unit)?.context("Linux reference picture")?,
             );
         }
+        eprintln!(
+            "Linux capture decoder diagnostics: {}",
+            decoder.diagnostics()
+        );
         Ok(())
     }
     fn tape() -> Vec<&'static [u8]> {

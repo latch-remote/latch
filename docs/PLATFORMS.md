@@ -138,9 +138,21 @@ declares zero reordering. The shared output collector preserves every
 ready sample, independently of SPS rewriting. Its deterministic multi-output
 and partial-error/retry tests cover that loss mechanism, and the recorded
 Linux tape checks all 24 timestamps and picture contents. Returning every
-ready output fixes intermittent picture loss. Decoder withholding with
-Linux-encoded streams was not reproduced. A recurrence now appears as
-latency flagged by CI's strict per-call assertion.
+ready output fixes intermittent picture loss. Windows CI subsequently observed
+intermittent first-picture withholding with this Linux fixture. Short Windows
+repetitions have not reproduced that condition. For explicit zero-reorder
+sequences, the wrapper now polls a temporarily empty decoder within the
+one-second access-unit deadline, reserving 20 ms for the worker reply. The per-call assertion requires
+the picture before the next input is submitted. A missing picture reports a
+decode error. Iteration and time bounds cover repeated stream changes and
+event-only results, and timeout
+diagnostics identify the active phase and recent output HRESULT/status pairs.
+
+Decode-only Windows software H.264 repetitions completed 200 iterations of
+each reported test serially and another 200 with four concurrent processes,
+both before and after the changes, with zero failures and zero observed late
+outputs. Scripted tests cover late output and type negotiation. Recovery
+from these particular faults remains unverified against a real decoder failure.
 
 Mac VideoToolbox and the Rust decoder pass local zero-delay replay. Linux
 software, Windows software/MF and Mac VideoToolbox combinations run in the

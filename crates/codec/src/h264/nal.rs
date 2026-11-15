@@ -30,7 +30,8 @@ pub(crate) fn spans(stream: &[u8]) -> impl Iterator<Item = (usize, usize, usize)
     })
 }
 
-pub(crate) fn iter_nal_units(stream: &[u8]) -> impl Iterator<Item = &[u8]> {
+/// Iterate non-empty Annex B NAL units without allocating a start-code table.
+pub fn iter_nal_units(stream: &[u8]) -> impl Iterator<Item = &[u8]> {
     spans(stream)
         .filter(|(_, begin, end)| begin < end)
         .map(|(_, begin, end)| &stream[begin..end])
