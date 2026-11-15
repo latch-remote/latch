@@ -608,3 +608,246 @@ ACME webroot directory. Switch Certbot to the webroot authenticator and retain
 the validated certificate deployment hook. One listener can then answer both
 paths continuously through renewal. This follow-up requires implementation and
 its own renewal verification.
+
+## Carrier comparison on 2026-11-15
+
+The controlled clean-path comparisons reproduce similar native TLS and
+WebSocket capacity in the 5–20 Mbps product range. At 150 ms RTT, after
+warm-up, native/WebSocket delivered 4.966/4.918 Mbps at 5 Mbps and
+19.392/19.791 Mbps at 20 Mbps. At 300 ms RTT and 20 Mbps they delivered
+19.713/19.712 Mbps. At 20 ms RTT and 50 Mbps they delivered 48.484/48.414 Mbps.
+The initial 150 ms/50 Mbps sample favored native by 7.5%. Rechecks below
+qualify that observation. Across that sample and two order-reversed
+rechecks, median native/WebSocket rates were 45.734/46.165 Mbps. The two
+rechecks alone differed by 0.07% in their medians. A sustained
+WebSocket-specific throughput deficit was not established.
+
+The live 5 Mbps medians were 4.979 Mbps native and 4.980 Mbps WebSocket.
+At 20 Mbps they were 19.305 and 19.636 Mbps, including failed runs. Native
+completed two of three 20 Mbps runs and WebSocket completed one of three.
+Both carriers timed out in the second pair. The earlier deployment's
+multi-fold WebSocket throughput collapse was not reproduced. Variable WAN
+conditions and shared transport deadlines remain the likely explanation.
+The exact cause of the earlier deployment failures remains unknown.
+
+### Method and interpretation
+
+The client machine used Apple M3 Pro hardware. The local relay and paired
+probe ran release builds inside Ubuntu 24.04 on aarch64 Linux
+7.0.14-linuxkit with a four-CPU, 6-GiB container limit and Cargo `-j 4`.
+The lab reused the namespace topology, disposable certificates, route
+isolation and tinyproxy from `scripts/netlab`. Both host and viewer roles
+were in one probe process, with independent outbound sockets. Each frame
+crossed two one-way endpoint-to-relay legs, so 150 ms socket RTT gives
+roughly 150 ms minimum frame age and 300 ms ACK age. Each carrier used
+the same impairment parameters. Veth MTU was 1280, with TSO/GSO/GRO off.
+The loss condition applied independent random 0.5% loss in each direction.
+It used stochastic draws. CPU is approximate percentage of one core,
+including setup. Client CPU combines both roles. The proxy's CPU is additional.
+
+The primary matrix used 20-second runs, 60 fps, and five seconds at
+one-quarter bitrate. The all-run rate includes warm-up and drain. Its ideal
+average before drain is 81.25% of the requested bitrate. The second rate
+counts delivered bytes after the full-rate transition and includes drain
+and any warm-up frames still in flight at that transition. A dash means the
+run failed before that transition, or delivered no complete frames for ages.
+Latency distributions cover the whole run. Failed runs have shorter windows
+and their rates do not represent sustained capacity. `150-loss` denotes
+150 ms RTT with the 0.5% loss impairment. Other path labels are RTT in ms.
+
+```sh
+scripts/netlab/run-in-docker.sh --carrier-comparison
+scripts/netlab/run-in-docker.sh --carrier-comparison --seconds 15 --warmup 0
+cargo test -p latch-relay -j 4 websocket_matches_native_video_through_a_delayed_path -- --nocapture
+```
+
+The shared Mac disk filled during additional validation, causing Docker's
+filesystem journal to abort. All 36 cold-start samples were saved, but that
+lab's cleanup and the first Linux test build failed. Build-artifact cleanup
+and an explicitly authorized Docker Desktop restart restored the lab. The
+primary warm-up matrix and rechecks below ran after that restart. An earlier
+partial warm-up matrix is excluded. No production host was accessed or changed.
+
+### Controlled matrix
+
+| RTT / loss | Mbps | Carrier | Payload all / after warm-up Mbps | Frame p50 / p95 / max ms | Client / relay CPU % | Result / seconds |
+| --- | --- | --- | --- | --- | --- | --- |
+| 150 | 5 | native | 4.033 / 4.966 | 157.7 / 162.0 / 313.2 | 5.3 / 3.1 | complete 20.14 |
+| 150 | 5 | websocket | 3.997 / 4.918 | 160.8 / 174.8 / 309.8 | 5.7 / 3.4 | complete 20.15 |
+| 150 | 5 | connect | 3.974 / 4.888 | 181.7 / 201.1 / 349.8 | 4.9 / 3.3 | complete 20.20 |
+| 150 | 20 | native | 15.717 / 19.392 | 170.2 / 230.6 / 449.5 | 7.6 / 5.2 | complete 20.15 |
+| 150 | 20 | websocket | 16.045 / 19.791 | 163.1 / 184.6 / 445.2 | 6.7 / 4.5 | complete 20.15 |
+| 150 | 20 | connect | 16.017 / 19.738 | 174.6 / 179.0 / 426.0 | 6.6 / 4.4 | complete 20.21 |
+| 150 | 50 | native | 36.720 / 45.118 | 180.0 / 221.2 / 597.6 | 11.2 / 6.9 | complete 20.17 |
+| 150 | 50 | websocket | 34.181 / 41.752 | 184.4 / 441.3 / 705.6 | 10.2 / 7.0 | complete 20.17 |
+| 150 | 50 | connect | 27.899 / 33.317 | 221.4 / 463.4 / 720.8 | 9.4 / 7.8 | complete 20.30 |
+| 150-loss | 5 | native | 0.737 / 1.137 | 2029.1 / 2566.9 / 2615.1 | 4.4 / 2.6 | timeout 6.42 |
+| 150-loss | 5 | websocket | 0.803 / — | 415.1 / 497.0 / 552.4 | 3.0 / 2.4 | timeout 1.66 |
+| 150-loss | 5 | connect | 0.977 / — | 212.4 / 308.9 / 355.6 | 3.5 / 3.5 | timeout 1.47 |
+| 150-loss | 20 | native | 2.089 / 1.815 | 1820.2 / 4570.1 / 4901.5 | 4.3 / 3.0 | timeout 9.09 |
+| 150-loss | 20 | websocket | 0.820 / — | 1023.2 / 1967.2 / 2093.8 | 3.9 / 2.8 | timeout 3.05 |
+| 150-loss | 20 | connect | 3.480 / — | 429.2 / 944.3 / 990.8 | 4.4 / 3.1 | timeout 4.29 |
+| 150-loss | 50 | native | 1.200 / 1.153 | 2167.6 / 4462.5 / 4746.0 | 4.2 / 2.7 | timeout 5.90 |
+| 150-loss | 50 | websocket | 0.276 / — | 615.8 / 615.8 / 615.8 | 3.1 / 2.5 | timeout 0.76 |
+| 150-loss | 50 | connect | 1.392 / 1.898 | 2732.4 / 4808.7 / 4944.8 | 4.8 / 2.8 | timeout 5.99 |
+| 300 | 5 | native | 3.995 / 4.929 | 307.3 / 313.8 / 775.1 | 5.5 / 3.3 | complete 20.29 |
+| 300 | 5 | websocket | 0.734 / — | 576.8 / 742.9 / 793.7 | 2.5 / 1.8 | timeout 1.48 |
+| 300 | 5 | connect | 0.883 / — | 557.9 / 729.9 / 780.1 | 1.6 / 1.0 | timeout 1.56 |
+| 300 | 20 | native | 15.829 / 19.713 | 311.5 / 408.8 / 876.1 | 4.8 / 2.9 | complete 20.29 |
+| 300 | 20 | websocket | 15.845 / 19.712 | 311.4 / 430.8 / 875.1 | 5.2 / 3.2 | complete 20.30 |
+| 300 | 20 | connect | 15.606 / 19.332 | 325.6 / 787.6 / 977.5 | 4.4 / 2.8 | complete 20.60 |
+| 300 | 50 | native | 0.000 / — | — | 2.7 / 2.0 | timeout 0.75 |
+| 300 | 50 | websocket | 0.000 / — | — | 2.5 / 1.9 | timeout 0.75 |
+| 300 | 50 | connect | 0.000 / — | — | 2.3 / 1.8 | timeout 0.75 |
+| 20 | 5 | native | 4.060 / 4.997 | 28.7 / 31.2 / 37.0 | 4.4 / 2.5 | complete 20.01 |
+| 20 | 5 | websocket | 4.060 / 4.997 | 28.4 / 30.5 / 33.7 | 2.3 / 1.0 | complete 20.01 |
+| 20 | 5 | connect | 4.059 / 4.998 | 37.8 / 44.4 / 57.8 | 2.0 / 0.9 | complete 20.01 |
+| 20 | 20 | native | 16.236 / 19.984 | 30.6 / 33.0 / 40.7 | 2.9 / 1.5 | complete 20.02 |
+| 20 | 20 | websocket | 16.237 / 19.987 | 30.6 / 33.4 / 38.8 | 2.6 / 1.4 | complete 20.02 |
+| 20 | 20 | connect | 16.229 / 19.978 | 42.3 / 46.0 / 49.2 | 2.7 / 1.8 | complete 20.03 |
+| 20 | 50 | native | 39.487 / 48.484 | 46.8 / 58.9 / 69.3 | 6.6 / 3.6 | complete 20.03 |
+| 20 | 50 | websocket | 39.438 / 48.414 | 43.2 / 57.0 / 74.5 | 9.4 / 5.7 | complete 20.03 |
+| 20 | 50 | connect | 39.472 / 48.397 | 49.5 / 144.3 / 177.7 | 9.9 / 7.0 | complete 20.16 |
+
+Random loss caused unusable frame delay or timeouts across all three
+transports. Cold high-rate runs also failed on both direct carriers. These
+shared constraints prevent a sustained-capacity claim for those cases.
+The 300 ms/5 Mbps warm-up failures and the 150 ms/50 Mbps throughput gap
+received the additional comparisons below, reversing carrier order.
+
+### Additional controlled comparisons
+
+| RTT / loss | Mbps | Carrier | Payload all / after warm-up Mbps | Frame p50 / p95 / max ms | Client / relay CPU % | Result / seconds |
+| --- | --- | --- | --- | --- | --- | --- |
+| 150 / repeat 1 | 50 | websocket | 38.391 / 47.258 | 183.9 / 355.2 / 710.8 | 11.4 / 7.1 | complete 20.31 |
+| 150 / repeat 1 | 50 | native | 38.804 / 47.751 | 186.4 / 387.9 / 598.4 | 9.3 / 6.0 | complete 20.38 |
+| 150 / repeat 2 | 50 | native | 37.183 / 45.734 | 178.3 / 318.5 / 732.6 | 8.9 / 6.2 | complete 20.16 |
+| 150 / repeat 2 | 50 | websocket | 37.508 / 46.165 | 180.7 / 487.2 / 713.7 | 11.9 / 8.0 | complete 20.17 |
+| 300 / repeat 1 | 5 | websocket | 3.994 / 4.928 | 307.7 / 312.0 / 773.4 | 5.3 / 3.1 | complete 20.29 |
+| 300 / repeat 1 | 5 | native | 0.764 / — | 578.2 / 757.7 / 794.6 | 3.2 / 2.7 | timeout 1.50 |
+| 300 / repeat 2 | 5 | native | 0.766 / — | 564.5 / 742.9 / 782.1 | 3.5 / 2.4 | timeout 1.50 |
+| 300 / repeat 2 | 5 | websocket | 0.727 / — | 592.0 / 775.9 / 810.5 | 3.5 / 3.0 | timeout 1.52 |
+
+The 150 ms/50 Mbps rechecks delivered 47.751/47.258 Mbps and
+45.734/46.165 Mbps for native/WebSocket. At 300 ms/5 Mbps, one recheck
+completed on WebSocket while native timed out. The next timed out on both.
+Across the primary sample and rechecks each carrier completed one of three
+attempts. The new probe reason string identified `video acknowledgment
+deadline expired` on both carriers in failed rechecks. These reproduce a
+shared startup ACK/deadline constraint at that long RTT.
+
+### Cold-start matrix
+
+These runs used 15 seconds with zero warm-up. The all-run payload column
+covers each run through completion or failure. Post-warm-up rate was added
+to the probe after this matrix.
+
+| RTT / loss | Mbps | Carrier | Payload all / after warm-up Mbps | Frame p50 / p95 / max ms | Client / relay CPU % | Result / seconds |
+| --- | --- | --- | --- | --- | --- | --- |
+| 150 | 5 | native | 4.881 / — | 156.9 / 182.3 / 425.0 | 5.5 / 2.9 | complete 15.16 |
+| 150 | 5 | websocket | 4.742 / — | 162.7 / 204.6 / 432.5 | 6.7 / 3.8 | complete 15.15 |
+| 150 | 5 | connect | 3.824 / — | 387.8 / 485.3 / 522.3 | 4.0 / 2.4 | timeout 1.44 |
+| 150 | 20 | native | 0.441 / — | 643.5 / 643.5 / 643.5 | 3.8 / 1.9 | timeout 0.76 |
+| 150 | 20 | websocket | 0.443 / — | 622.5 / 622.5 / 622.5 | 2.9 / 1.7 | timeout 0.75 |
+| 150 | 20 | connect | 0.440 / — | 656.7 / 656.7 / 656.7 | 3.7 / 2.8 | timeout 0.76 |
+| 150 | 50 | native | 0.000 / — | — | 4.8 / 2.4 | timeout 0.77 |
+| 150 | 50 | websocket | 0.000 / — | — | 3.5 / 2.6 | timeout 0.75 |
+| 150 | 50 | connect | 0.000 / — | — | 2.4 / 2.7 | timeout 0.76 |
+| 150-loss | 5 | native | 1.456 / — | 2164.2 / 4516.4 / 4920.7 | 4.9 / 2.2 | timeout 7.27 |
+| 150-loss | 5 | websocket | 1.570 / — | 2517.7 / 4589.6 / 4911.2 | 5.5 / 2.9 | timeout 7.54 |
+| 150-loss | 5 | connect | 1.558 / — | 849.7 / 1124.6 / 1286.4 | 5.2 / 2.8 | complete 16.10 |
+| 150-loss | 20 | native | 0.443 / — | 610.7 / 610.7 / 610.7 | 3.1 / 2.1 | timeout 0.75 |
+| 150-loss | 20 | websocket | 0.441 / — | 612.2 / 612.2 / 612.2 | 3.4 / 2.1 | timeout 0.76 |
+| 150-loss | 20 | connect | 0.443 / — | 608.0 / 608.0 / 608.0 | 2.9 / 2.2 | timeout 0.75 |
+| 150-loss | 50 | native | 0.000 / — | — | 2.6 / 1.5 | timeout 0.75 |
+| 150-loss | 50 | websocket | 0.000 / — | — | 2.3 / 1.9 | timeout 0.75 |
+| 150-loss | 50 | connect | 0.000 / — | — | 2.1 / 1.8 | timeout 0.75 |
+| 300 | 5 | native | 4.621 / — | 307.6 / 517.4 / 874.2 | 5.1 / 2.3 | complete 15.29 |
+| 300 | 5 | websocket | 4.713 / — | 309.0 / 602.2 / 882.0 | 4.3 / 1.7 | complete 15.29 |
+| 300 | 5 | connect | 4.619 / — | 323.5 / 428.9 / 875.4 | 3.8 / 2.2 | complete 15.46 |
+| 300 | 20 | native | 0.000 / — | — | 1.0 / 0.7 | timeout 0.75 |
+| 300 | 20 | websocket | 0.000 / — | — | 1.4 / 1.1 | timeout 0.75 |
+| 300 | 20 | connect | 0.000 / — | — | 1.8 / 1.3 | timeout 0.75 |
+| 300 | 50 | native | 0.000 / — | — | 1.0 / 0.7 | timeout 0.75 |
+| 300 | 50 | websocket | 0.000 / — | — | 2.3 / 1.4 | timeout 0.75 |
+| 300 | 50 | connect | 0.000 / — | — | 2.3 / 2.0 | timeout 0.75 |
+| 20 | 5 | native | 4.996 / — | 26.9 / 29.2 / 37.6 | 4.3 / 2.4 | complete 15.01 |
+| 20 | 5 | websocket | 4.996 / — | 27.1 / 29.6 / 31.6 | 5.6 / 3.3 | complete 15.01 |
+| 20 | 5 | connect | 4.991 / — | 39.0 / 45.7 / 49.0 | 5.4 / 3.5 | complete 15.03 |
+| 20 | 20 | native | 19.911 / — | 35.9 / 53.3 / 109.6 | 7.4 / 5.0 | complete 15.02 |
+| 20 | 20 | websocket | 19.925 / — | 32.5 / 39.3 / 100.3 | 7.3 / 5.1 | complete 15.04 |
+| 20 | 20 | connect | 19.866 / — | 43.9 / 62.3 / 155.3 | 7.0 / 5.6 | complete 15.02 |
+| 20 | 50 | native | 43.091 / — | 48.7 / 106.8 / 165.1 | 8.3 / 5.5 | complete 15.05 |
+| 20 | 50 | websocket | 42.199 / — | 55.6 / 76.5 / 166.8 | 10.4 / 7.8 | complete 15.03 |
+| 20 | 50 | connect | 49.132 / — | 47.7 / 60.4 / 120.3 | 10.5 / 7.6 | complete 15.04 |
+
+### Interleaved live comparison
+
+Both roles ran on the campus Mac against the public Seoul relay. Four
+native/WebSocket pairs at 5 Mbps preceded three pairs at 20 Mbps. Each
+run used 30 seconds including five seconds at quarter rate, with two
+seconds between attempts. One additional 5 Mbps WebSocket run traversed
+a disposable loopback CONNECT proxy with TCP_NODELAY on both tunnel
+sockets. Every attempt is listed below. The production relay binary was
+unchanged, and relay CPU was unmeasured because this task made no host login.
+
+| Mbps / pair | Carrier | Payload all / after warm-up Mbps | Frame p50 / p95 / max ms | Client CPU % | Result / seconds |
+| --- | --- | --- | --- | --- | --- |
+| 5 / 1 | native | 4.355 / 4.979 | 150.2 / 155.7 / 540.2 | 4.0 | complete 30.14 |
+| 5 / 1 | websocket | 4.356 / 4.981 | 146.4 / 168.9 / 527.4 | 5.3 | complete 30.13 |
+| 5 / 2 | native | 4.354 / 4.979 | 151.1 / 158.3 / 530.1 | 5.9 | complete 30.14 |
+| 5 / 2 | websocket | 4.355 / 4.980 | 147.6 / 159.5 / 514.1 | 5.3 | complete 30.13 |
+| 5 / 3 | native | 4.356 / 4.981 | 150.5 / 176.9 / 530.8 | 5.0 | complete 30.13 |
+| 5 / 3 | websocket | 4.355 / 4.980 | 149.6 / 165.3 / 545.4 | 5.4 | complete 30.14 |
+| 5 / 4 | native | 4.344 / 4.968 | 154.8 / 167.4 / 536.3 | 5.2 | complete 30.17 |
+| 5 / 4 | websocket | 4.349 / 4.974 | 150.5 / 165.5 / 536.4 | 5.6 | complete 30.13 |
+| 20 / 1 | native | 17.387 / 19.911 | 154.6 / 168.2 / 560.7 | 5.1 | complete 30.15 |
+| 20 / 1 | websocket | 17.357 / 19.905 | 157.7 / 187.9 / 559.0 | 9.1 | complete 30.14 |
+| 20 / 2 | native | 10.487 / 15.116 | 191.9 / 296.2 / 482.4 | 5.7 | timeout 11.22 |
+| 20 / 2 | websocket | 11.126 / 16.555 | 176.2 / 486.4 / 732.6 | 5.9 | timeout 11.12 |
+| 20 / 3 | native | 16.861 / 19.305 | 159.4 / 223.8 / 590.0 | 7.7 | complete 30.16 |
+| 20 / 3 | websocket | 17.091 / 19.636 | 160.2 / 280.2 / 714.8 | 8.4 | timeout 29.48 |
+| 5 / 1 | websocket-connect | 4.356 / 4.981 | 147.2 / 163.1 / 535.7 | 3.2 | complete 30.13 |
+
+| Offered Mbps | Carrier | Median all / after warm-up Mbps | Median frame p50 / p95 / max ms | Completed |
+| --- | --- | --- | --- | --- |
+| 5 | native | 4.355 / 4.979 | 150.8 / 162.9 / 533.5 | 4/4 |
+| 5 | websocket | 4.355 / 4.980 | 148.6 / 165.4 / 531.9 | 4/4 |
+| 20 | native | 16.861 / 19.305 | 159.4 / 223.8 / 560.7 | 2/3 |
+| 20 | websocket | 17.091 / 19.636 | 160.2 / 280.2 / 714.8 | 1/3 |
+
+The scheduled production load had a 1.547 GB combined-transfer allowance
+using the probe's 25% headroom model, below the 3 GB ceiling. All 15 attempts
+are included, with no production retries beyond the requested pairs.
+
+### Code inspection and regression coverage
+
+Both carriers share `TlsSocket::new`, which enables TCP_NODELAY, the same
+TLS buffers, bounded socket I/O, two independent lanes, transport deadlines,
+and daemon forwarding/backpressure. Neither carrier receives a separate
+socket-buffer or TCP_NOTSENT_LOWAT policy. A WebSocket message carries the
+same bounded relay record, adding masking and a small header. Both carriers'
+maximum-sized framed relay records already exceed a 16-KiB TLS fragment, so
+WebSocket does not introduce a distinct maximum-record TLS split. WebSocket
+header reads consume decrypted memory, while masking and extra copies add CPU
+work. The measured CPU levels leave substantial one-core headroom.
+
+No carrier implementation change resulted from this investigation. The PR
+adds the reproducible scenario, delayed-path regression, and probe reporting
+improvements. The wire format is compatible with the deployed relay and this
+work requires no relay redeployment. The portable regression offers 20 Mbps
+at 60 fps after a 5 Mbps warm-up through a 150 ms RTT loopback delay shim. It
+requires at least 85% of native throughput, at least 10 Mbps on each carrier,
+p95 below 500 ms, maximum below 750 ms, and full frame drain. Initial macOS
+results delivered 20.000 Mbps on both carriers, with p95 187.9/192.0 ms and
+maximum 199.2/205.3 ms for native/WebSocket. The Linux repeat also delivered
+20.000 Mbps on both, with p95 189.3/192.0 ms and maximum 195.7/198.9 ms.
+
+The short samples leave long-duration stability, severe-loss capacity,
+shared-relay load, other CONNECT proxy implementations, and Windows runtime
+performance unverified locally. The original live failures and this run's
+production timeouts lack a precise deadline reason in their captured probe
+output. Future probe failures now preserve the transport's reason string.
+The delay shim models delivery delay and bounded queues. Linux netem supplies
+the separate TCP congestion/loss measurement.
+[Machine-readable measurements](results/carrier-comparison-20261115.json)
