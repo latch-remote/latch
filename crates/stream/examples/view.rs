@@ -27,7 +27,7 @@
 //! after the host made each click it reached this machine's speaker (both
 //! wall clocks; on two machines, their offset is in it).
 
-#[path = "../../relay/examples/support/mod.rs"]
+#[path = "support/relay.rs"]
 mod measurement_relay;
 mod netlab;
 
@@ -163,7 +163,7 @@ fn main() -> anyhow::Result<()> {
 
     let frames = Arc::new(FrameSlot::default());
     let (tx, rx) = mpsc::channel();
-    let asked = Instant::now();
+    let netlab_started = Instant::now();
     let session = Session::start_with_relay(
         latch_stream::Server {
             address: host,
@@ -197,8 +197,9 @@ fn main() -> anyhow::Result<()> {
         if flag("--mute") {
             session.set_volume(0.0);
         }
-        return netlab::run(&session, &frames, &rx, asked, seconds, &path[1]);
+        return netlab::run(&session, &frames, &rx, netlab_started, seconds, &path[1]);
     }
+    let asked = Instant::now();
     loop {
         match rx.recv_timeout(Duration::from_secs(20)) {
             Ok(Event::Connected) => {

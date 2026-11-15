@@ -10,7 +10,7 @@ import time
 
 
 def main():
-    scenario, directory = sys.argv[1:]
+    scenario, directory, role = sys.argv[1:]
     directory = Path(directory)
     observations = []
     context = ssl.create_default_context(cafile=str(directory / "relay-ca.pem"))
@@ -66,11 +66,11 @@ def main():
         assert response.getheader("Location") == "http://login.netlab.test/sign-in"
         observations.append({"portal_status": response.status, "location": response.getheader("Location")})
         connection.close()
-    if scenario == "m":
+    if scenario in ("m", "m2"):
         addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
         assert addresses and all(address[0] == socket.AF_INET6 for address in addresses), addresses
         observations.append({"dns64_addresses": [address[4][0] for address in addresses]})
-    (directory / "preflight.json").write_text(json.dumps(observations, indent=2) + "\n")
+    (directory / f"preflight-{role}.json").write_text(json.dumps(observations, indent=2) + "\n")
 
 
 if __name__ == "__main__":

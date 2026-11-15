@@ -142,6 +142,12 @@ impl ClientConfig {
         config.public_only = true;
         Ok(config)
     }
+    /// Replace trust anchors while preserving endpoint, address policy and transport settings.
+    /// Private-PKI measurement callers can use the production configuration path.
+    pub fn with_tls_roots(mut self, roots: rustls::RootCertStore) -> io::Result<Self> {
+        self.tls = Self::with_roots(self.endpoint.clone(), roots)?.tls;
+        Ok(self)
+    }
     /// Explicit trust anchors for private PKI and tests. Hostname verification remains enabled.
     pub fn with_roots(endpoint: Endpoint, roots: rustls::RootCertStore) -> io::Result<Self> {
         ensure_supported_cpu()?;
@@ -1170,6 +1176,14 @@ mod tests {
     }
     #[test]
     fn production_resolution_rejects_tailnet_and_private_addresses() {
+        let mut config =
+            ClientConfig::production(Endpoint::new("relay.example", 443).unwrap()).unwrap();
+        config.limits.max_frame_bytes = 12345;
+        let config = config
+            .with_tls_roots(rustls::RootCertStore::empty())
+            .unwrap();
+        assert!(config.public_only);
+        assert_eq!(config.limits.max_frame_bytes, 12345);
         for address in [
             "100.64.0.1",
             "100.127.255.255",

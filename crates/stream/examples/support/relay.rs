@@ -16,17 +16,22 @@ pub fn relay(args: &[String]) -> anyhow::Result<Option<latch_relay::ClientConfig
             &latch_proto::control::RelaySettings::default(),
         ));
     };
-    let endpoint =
-        latch_relay::Endpoint::new(host, value("--relay-port").unwrap_or("443").parse()?)?;
-    let config = if let Some(path) = value("--relay-ca") {
+    // Keep environment/proxy selection in the product's configuration entry point.
+    // The wiring PR must discover proxies for this endpoint and populate ClientConfig::proxy.
+    let settings = latch_proto::control::RelaySettings {
+        enabled: true,
+        host: host.to_owned(),
+        port: value("--relay-port").unwrap_or("443").parse()?,
+    };
+    let mut config = latch_stream::session::relay_config(&settings)
+        .ok_or_else(|| anyhow::anyhow!("relay configuration unavailable"))?;
+    if let Some(path) = value("--relay-ca") {
         let mut roots = rustls::RootCertStore::empty();
         for certificate in CertificateDer::pem_slice_iter(&std::fs::read(path)?) {
             roots.add(certificate?)?;
         }
         anyhow::ensure!(!roots.is_empty(), "relay-ca contains no certificates");
-        latch_relay::ClientConfig::with_roots(endpoint, roots)?
-    } else {
-        latch_relay::ClientConfig::production(endpoint)?
-    };
+        config = config.with_tls_roots(roots)?;
+    }
     Ok(Some(config))
 }

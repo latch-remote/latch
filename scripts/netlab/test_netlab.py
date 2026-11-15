@@ -2,12 +2,13 @@
 import json
 from pathlib import Path
 import struct
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from middlebox import alpns
-from netlab import classify, evaluate, main, run_scenario
+from netlab import Lab, classify, evaluate, main, run_scenario
 from stage_artifacts import stage
 
 
@@ -22,6 +23,39 @@ def healthy_events():
 
 
 class VerdictTests(unittest.TestCase):
+    def test_cleanup_continues_after_diagnostic_timeouts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lab = Lab("a", Path(directory))
+            lab.created = [lab.names["v"]]
+            lab.processes = [object()]
+            with patch.object(lab, "ns", side_effect=subprocess.TimeoutExpired("ss", 3)), \
+                    patch.object(lab, "stop_process") as stop, patch.object(lab, "run") as run:
+                with self.assertRaisesRegex(RuntimeError, "cleanup errors"):
+                    lab.close()
+                stop.assert_called_once_with(lab.processes[0])
+                run.assert_called_once_with("ip", "netns", "del", lab.names["v"], check=False)
+
+    def test_middlebox_evidence_is_required_even_for_an_expected_failure(self):
+        expected = {"failures": ["no_picture"], "required_assertions": ["viewer_reached_middlebox"]}
+        result = {"failures": ["no_picture"], "assertions": {"viewer_reached_middlebox": False}}
+        self.assertEqual(classify(result, expected), "FAIL")
+        result["assertions"]["viewer_reached_middlebox"] = True
+        self.assertEqual(classify(result, expected), "EXPECTED-FAILURE")
+
+    def test_loss_scenarios_require_requested_video_quality_on_either_path(self):
+        events = [{"kind": "connected", "elapsed_ms": 20}, {"kind": "first_frame", "elapsed_ms": 50}]
+        for tick in range(161):
+            events.append({"kind": "sample", "elapsed_ms": tick * 250, "decoded_seq": tick * 7.5,
+                           "path": "udp", "mbps": 5.5, "audio_click_ms": [20.]})
+            events.append({"kind": "input", "elapsed_ms": tick * 250, "round_trip_ms": 40})
+        self.assertEqual(evaluate("d1", events, 40, 0)["failures"], [])
+        for event in events:
+            if event["kind"] == "sample":
+                event["path"] = "relay"
+                event["mbps"] = 1
+        result = evaluate("d2", events, 40, 1)
+        self.assertIn("tail_video_at_least_75pct_requested", result["failures"])
+
     def test_artifact_copies_are_readable_and_exclude_private_files(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source"
@@ -71,6 +105,12 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(classify(result, expected), "FAIL")
         result["errors"] = [{"message": "no picture arrived"}]
         self.assertEqual(classify(result, expected), "EXPECTED-FAILURE")
+
+    def test_observed_quality_signatures_keep_other_failures_red(self):
+        expected = {"failures": ["video_bitrate"], "related_failures": ["fps"]}
+        self.assertEqual(classify({"failures": ["fps", "video_bitrate"]}, expected), "EXPECTED-FAILURE")
+        self.assertEqual(classify({"failures": ["fps"]}, expected), "FAIL")
+        self.assertEqual(classify({"failures": ["connected", "video_bitrate"]}, expected), "FAIL")
 
     def test_setup_error_and_unexpected_pass_fail_the_job(self):
         expected = {"i": {"failures": ["first_frame_deadline"]}}

@@ -12,7 +12,7 @@
 //! A viewer's microphone plays into `LATCH_MIC_DEVICE` (or the first
 //! virtual cable) on Windows and macOS, as the host does.
 
-#[path = "../../relay/examples/support/mod.rs"]
+#[path = "../../stream/examples/support/relay.rs"]
 mod measurement_relay;
 
 use latch_core::http::{self, Response};

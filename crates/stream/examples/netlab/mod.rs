@@ -58,6 +58,9 @@ pub fn run(
         }
         if frames.seq() != sequence {
             sequence = frames.seq();
+            emit(
+                serde_json::json!({"kind":"decoded_frame","elapsed_ms":elapsed_ms,"decoded_seq":sequence}),
+            )?;
             if !first {
                 first = true;
                 emit(serde_json::json!({"kind":"first_frame","elapsed_ms":elapsed_ms}))?;
@@ -92,6 +95,8 @@ pub fn run(
             emit(serde_json::json!({
                 "kind":"sample", "elapsed_ms":elapsed_ms, "decoded_seq":sequence,
                 "fps":stats.fps, "path":path, "mbps":stats.mbps,
+                "requested_bitrate_kbps":stats.requested_bitrate_kbps,
+                "applied_bitrate_kbps":stats.applied_bitrate_kbps,
                 "loss_pct":stats.loss_pct, "audio":stats.audio,
                 "audio_click_ms":latch_stream::audio::take_probe(),
                 "finished":session.finished(),

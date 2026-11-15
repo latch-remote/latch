@@ -2,7 +2,7 @@
 
 This Linux/root harness runs the real `serve`, `view`, and `latch-relay`
 binaries. It uses the software H.264 encoder/decoder, a 320 × 192 moving
-test pattern at 30 fps (random noise in scenario d), synthetic quarter-second audio clicks played into
+test pattern at 30 fps (640 × 360 random noise in d1 and d2), synthetic quarter-second audio clicks played into
 a private PulseAudio null sink, and one synthetic key press per second.
 Input timing measures the decoded square changing on the viewer's clock.
 
@@ -19,7 +19,7 @@ Input timing measures the decoded square changing on the viewer's clock.
      │                         └─ DNS64 + tayga NAT64 (scenario m)
      │                         │
      └──────── internet (i) ───┘
-               real latch-relay, relay.netlab.test, 198.18.0.1:443
+               real latch-relay, relay.netlab.test, 93.184.216.34:443
 ```
 
 Each scenario owns four network namespaces and four veth pairs. The
@@ -32,10 +32,14 @@ GPU codecs and physical audio devices require separate testing.
 No namespace has a route to an external network. The relay hostname maps
 to the disposable namespace daemon. Private test roots preserve hostname
 verification. The interception scenario presents a different private CA,
-which the viewer never receives as a trust anchor. Scenario m retains the
-IPv4 control/tailnet exception and removes the viewer's IPv4 default
-route. Its internet connectivity uses IPv6, a DNS64-only AAAA response,
-and tayga translating to the IPv4 relay.
+which the viewer never receives as a trust anchor. Scenarios m and m2 retain the
+IPv4 control/tailnet exception and remove both endpoints' IPv4 default
+routes. Each endpoint resolves a DNS64-only AAAA response and reaches
+the relay through IPv6 and tayga. Scenario m uses `64:ff9b::/96`, and m2
+uses the global-looking network-specific `2001:4860:64::/96`. The IPv4
+relay address exists inside the lab and passes the production public-address
+filter. Private TLS roots are applied after the product builds its relay
+configuration, preserving that filter and future proxy settings.
 
 ## Run
 
@@ -57,7 +61,7 @@ volumes remain as caches. Results are bind-mounted into the checkout.
 ```sh
 scripts/netlab/run-in-docker.sh
 NETLAB_VALIDATE=1 scripts/netlab/run-in-docker.sh
-scripts/netlab/run-in-docker.sh --scenarios cgn --jobs 2
+scripts/netlab/run-in-docker.sh --scenarios c,g,n --jobs 2
 ```
 
 `NETLAB_VALIDATE=1` also runs workspace Clippy, rustfmt, ShellCheck, and the
@@ -71,11 +75,13 @@ inside the runner, with unique namespace names, interfaces, ports,
 certificates, quota ledgers and audio sockets. Each PulseAudio daemon runs
 in foreground user mode with its own root-owned runtime/state directory, so
 it requires no login session or D-Bus service. A `pactl` preflight checks the
-private null sink before starting the real viewer. Scenario c runs for 85
-seconds to cover main's 60-second UDP reassessment dwell. The remaining
-scenarios run for 16–32 seconds each. A warm two-worker run takes about
-four minutes. Scenario m already passes on native TLS through DNS64/NAT64
-on main and is enabled.
+private null sink before starting the real viewer. The virtual audio output
+uses the existing `LATCH_AUDIO_BUFFER=960` setting for a 20 ms device buffer.
+Scenario c runs for 95 seconds to cover main's 60-second UDP reassessment dwell. The remaining
+scenarios run for 16–40 seconds each. A warm two-worker run takes about
+five minutes. Startup rejects leftover netlab namespaces. SIGINT and
+SIGTERM trigger process and namespace cleanup. Each diagnostic has a
+three-second timeout, and teardown continues after individual failures.
 
 ## Pass criteria
 
@@ -83,9 +89,11 @@ All streaming scenarios require control connection within **3 s**, a
 complete sampler trace through the requested duration, **zero session
 terminations**, at least **15 decoded fps over the final 6 s**, **no decoded
 stall longer than 5 s**, at least **3 input-to-picture round trips in the
-final 7 s**, each within **1.5 s**, and at least **4 decoded/played audio
+final 7 s**, each within **500 ms**, and at least **8 decoded/played audio
 clicks in the final 7 s**. FPS is computed from decoded frame sequence
-deltas and elapsed time. Input and audio must continue during recovery.
+deltas and elapsed time. Freeze durations use individual decoded-frame
+timestamps observed every 5 ms. A stall is a gap longer than 500 ms.
+Input and audio must continue during recovery.
 The headless example's exit status is checked in addition to these
 assertions.
 
@@ -94,17 +102,51 @@ assertions.
 | a | Clean links | First frame ≤3 s, UDP throughout, zero relay SYNs from either endpoint |
 | b | Drop tailnet UDP from startup | First frame ≤7 s, final 6 s on relay |
 | c | Drop UDP at 6 s, restore at 18 s | First frame ≤7 s, relay by 13 s, UDP within 70 s of restoration, final 6 s on UDP |
-| d | UDP netem 17% loss, 35% correlation, 25±10 ms delay with 25% correlation, 3 Mbps TBF | First frame ≤7 s, common health criteria on either path |
+| d1 | 17% bursty host-to-viewer UDP loss | Final 6 s ≥25 fps, ≤1 stall, longest freeze ≤1 s, delivered video ≥75% of requested 6 Mbps, stable UDP or relay path |
+| d2 | Host-to-viewer UDP policed to 3 Mbps | Same quality criteria as d1, real policer drops >0 |
 | e | Only outbound TCP 443, with tailnet control exception | First frame ≤7 s, final 6 s on relay |
-| f | Drop viewer relay TCP 443 while UDP is healthy | First frame ≤3 s, UDP throughout, zero relay SYNs reaching daemon |
-| g | Start with UDP denied, restore at 12 s, kill active relay at 14 s | Relay observed during 12–14 s, UDP observed during 14–20 s, continued session |
+| f | Drop relay TCP 443 from both endpoints while UDP is healthy | First frame ≤3 s, UDP throughout, zero relay SYNs reaching daemon |
+| g | Start with UDP denied, restore at 12 s, black-hole relay TCP at 14 s | Relay observed during 12–14 s, UDP observed during 14–20 s, continued session |
 | h | Silently drop UDP datagrams with UDP length >600 bytes | First frame ≤4 s, MTU-safe UDP recovered for final 6 s, common health criteria |
 | i | Explicit tinyproxy CONNECT proxy, direct viewer internet blocked | First frame ≤7 s, final 6 s on relay |
 | j | Reset TLS ClientHello unless every ALPN is h2 or http/1.1 | First frame ≤7 s, final 6 s on relay |
 | k | Campus TLS interceptor with an untrusted private CA | Zero decoded frames, explicit certificate/trust error to viewer within 8 s |
 | l | DNAT all viewer TCP 80/443 to a 302 sign-in redirect, local catch-all DNS | Zero decoded frames, explicit captive-portal/sign-in error to viewer within 8 s |
-| m | IPv6-only internet, DNS64 and tayga NAT64 to IPv4 relay | First frame ≤7 s, final 6 s on relay |
+| m | Both endpoints IPv6-only for internet, DNS64 and well-known NAT64 /96 | First frame ≤7 s, final 6 s on relay, media counters at both endpoints |
+| m2 | Both endpoints through global-looking network-specific NAT64 /96 | Same criteria as m |
 | n | Relay TCP silently drops IPv4 packets >600 bytes in either direction, TCP MTU probing disabled | First frame ≤4 s, final 6 s on relay, common health criteria |
+
+d1 uses Gilbert-Elliott loss with good-to-bad probability 10.24%,
+bad-to-good probability 50%, loss 100% in the bad state and 0% in the
+good state. Its stationary mean is 17%, with a two-packet mean burst.
+The qdisc is on campus `viewer` egress, where host-to-viewer media flows.
+An explicit priomap keeps every other protocol in the clean band. All
+veth TSO/GSO/GRO features are disabled and checked. The measured netem
+drop fraction, `drops / (packets + drops)`, must be 15–18% over at least
+1,000 real media packets. An invalid impairment is ERROR.
+
+d2 uses a tc police action at 3 Mbps with an 8 KiB burst. The noise stream
+requests 6 Mbps and must produce policer drops and a measured one-second
+offered rate above 3 Mbps. Its filter/action statistics
+are saved alongside qdisc statistics. UDP feedback remains clean in both
+cases. Either path must meet every quality criterion, so relay fallback
+is expected when UDP cannot sustain the requested picture.
+
+Endpoint nftables counters measure received direct-media UDP and relay TCP
+bytes once per second. The final media path must carry over 10 KiB in its
+measurement window. c and g also require independently observed relay media
+in the outage window. Scenarios with denied UDP require real dropped UDP
+attempts. Cases a and f require zero viewer relay attempts, with f separately
+preflighted from both endpoints.
+
+For i, j, k, l and n, post-preflight evidence must prove that the viewer
+attempted the relay and reached the middlebox. Evidence comes from proxy
+access logs, DPI ClientHello logs, interceptor handshake logs, portal
+connection logs and counted MSS-black-hole drops respectively. These guards
+are required for both PASS and EXPECTED-FAILURE. Preflight bytes and log
+entries are excluded. Scenario i additionally requires a successful product
+CONNECT request. Native direct TLS attempts are redirected to the same
+HTTP-only proxy for a logged rejection while CONNECT wiring is pending.
 
 The security scenarios require connection within 3 s and a complete
 sampler trace. Their rejection may terminate the session. They must expose
@@ -137,12 +179,20 @@ connectivity as applicable. Setup failures are always `ERROR`, including
 for expected-failure cases. Test probes are excluded from relay SYN counts.
 
 `expected-failures.json` records observed assertion IDs, the reason, and a
-fix reference. The comparison requires the exact failed assertion set and the recorded
+fix reference. The comparison requires the recorded failure signature and the recorded
 error pattern where supplied.
+
+d1 and d2 require the recorded requested-video-bitrate failure. Their
+`related_failures` list names accompanying quality failures observed across
+stochastic runs. FPS and audio counts vary, and d2 can also remain on UDP
+with stalls and delayed input. Every numeric assertion still runs and is
+reported. A repaired bitrate with a different remaining failure is FAIL.
+Control, sampler, termination, path-counter and middlebox failures always
+remain outside this quality signature.
 
 - A passing scenario with a failed assertion makes CI fail.
 - A listed scenario must fail exactly its recorded assertions. Additional
-  failures make CI fail.
+  failures outside its recorded related quality failures make CI fail.
 - A listed scenario satisfying every assertion is `UNEXPECTED-PASS` and
   makes CI fail. The feature PR enables it by deleting its entry from
   `expected-failures.json` after running the lab.
@@ -152,49 +202,47 @@ their PRs are opened. Update those references to their PR URLs as they
 become available. Product fixes belong to those PRs. The harness keeps
 its assertions unchanged.
 
-## Measured main result
+## Measured results
 
-The linux/arm64 Docker run on 2026-11-15 UTC used main `bf5da0d` plus the
-example-only hooks in this PR. All 14 scenarios completed in **206.27 s**
-with two workers. Software encode/decode and the null audio sink were real.
-The full Linux workspace Clippy check, rustfmt, ShellCheck, seven Python
-checks and the native-code audit also passed. macOS workspace Clippy and
-rustfmt passed.
+The current per-scenario table is generated into `summary.md` and the GitHub
+job summary. It includes final decoded fps, stalls, longest freeze, delivered
+and requested video bitrate, input RTT, played clicks, active path, measured
+loss and policer drops. `results.json` retains every individual assertion,
+kernel traffic sample and failure. The expected-failure entries record the
+observed product gaps and their source revision.
 
-| Scenario | Result | Connect ms | First frame ms | Tail decoded fps | Switches |
-|---|---|---:|---:|---:|---:|
-| a clean UDP | PASS | 6 | 21 | 30.0 | 0 |
-| b UDP denied at startup | PASS | 5 | 1141 | 29.9 | 1 |
-| c UDP outage and restoration | PASS | 5 | 21 | 30.1 | 2 |
-| d 17% burst loss, jitter, 3 Mbps UDP | PASS | 5 | 52 | 30.1 | 0 |
-| e campus TCP 443 only | PASS | 6 | 1142 | 30.1 | 1 |
-| f unreachable relay, healthy UDP | PASS | 6 | 21 | 30.0 | 0 |
-| g relay dies during stream | PASS | 6 | 1106 | 29.9 | 2 |
-| h UDP MTU black hole | EXPECTED-FAILURE | 5 | 1104 | 29.9 | 1 |
-| i explicit CONNECT proxy only | EXPECTED-FAILURE | 7 | — | 0.0 | 0 |
-| j HTTPS-only ALPN inspector | EXPECTED-FAILURE | 5 | — | 0.0 | 0 |
-| k TLS interception | EXPECTED-FAILURE | 6 | — | 0.0 | 0 |
-| l captive portal | EXPECTED-FAILURE | 6 | — | 0.0 | 0 |
-| m IPv6-only internet with DNS64/NAT64 | PASS | 6 | 1148 | 30.1 | 1 |
-| n relay TCP MSS black hole | EXPECTED-FAILURE | 6 | — | 0.0 | 0 |
-
-Case d exercised both impairments with 693 netem drops and 35,095 TBF
-overlimits. Case h sustained relay video, audio and input, while failing
-its MTU-safe UDP recovery assertion. Cases i, j and n decoded zero frames
-and reached the eight-second first-picture watchdog. Cases k and l also
-decoded zero frames and reached that watchdog, while failing the required
-specific certificate/portal diagnosis. Independent preflights verified
-certificate rejection and the HTTP 302 sign-in redirect. Case m passed
-through DNS64 and tayga NAT64, so it is enabled in CI.
+The earlier combined d case measured about 4.4% effective loss and zero TBF
+drops. d1 and d2 replace that case with separately verified impairments.
 
 ## Test hooks
 
 The runtime measurement hooks are confined to examples. `serve` and `view`
 share an example-only helper accepting `--relay-host`, `--relay-port`,
-and `--relay-ca`. It calls the existing `ClientConfig::with_roots` API.
-Production root selection and public-address enforcement stay in
-`ClientConfig::production`. No new environment-variable bypass, feature
-flag, dependency, or trust-all verifier enters shipped application code.
+and `--relay-ca`. The helper lives in
+`crates/stream/examples/support/relay.rs`. It first calls
+`latch_stream::session::relay_config` with the requested endpoint, then
+replaces only its TLS roots using `ClientConfig::with_tls_roots`. The
+production public-address policy and transport settings survive this step.
+Hostname verification remains enabled.
+
+### Proxy wiring contract for i
+
+The wiring PR must make `latch_stream::session::relay_config(&RelaySettings)`
+discover the environment for `settings.host` using PR #96's
+`latch_core::netenv::Options::new` and bounded discovery. It must map the
+selected HTTP proxy candidate, including credentials when present, to
+PR #95's `ProxyConfig` and set `ClientConfig::proxy` before returning.
+Both the product session and these measurement examples must use this same
+entry point. If discovery moves to an asynchronous worker, the wiring PR
+must provide an equivalent shared configuration entry point and update both
+callers together. The lab supplies `HTTPS_PROXY=http://10.77.2.1:3128` and
+`NO_PROXY=100.64.0.1` to the viewer. The relay must use CONNECT while the
+control connection retains its direct tailnet route.
+
+The example preserves the configured proxy when applying private roots.
+Scenario i keeps its CONNECT and media assertions until #95, #96 and the
+wiring PR land. Its post-preflight proxy-access guard also proves native
+attempts reach the HTTP proxy on the current product.
 
 `view --events PATH` uses the existing session, frame slot, media path
 query, audio probe and synthetic input APIs. It samples every 250 ms,
