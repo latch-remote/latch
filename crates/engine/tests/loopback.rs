@@ -405,18 +405,28 @@ fn local_cursor_negotiated_and_host_omits_pointer_when_asked() {
 
     let start = Instant::now();
     let mut cursor_omitted_again = false;
+    let mut least_diff = u64::MAX;
+    let mut closest_rows = Vec::new();
     while start.elapsed() < Duration::from_secs(3) {
         if let Some((s, f)) = next_frame(&frames, seq, Duration::from_millis(100)) {
             seq = s;
             let mut diff = 0u64;
+            let mut rows = Vec::new();
             for y in cursor_y - 5..cursor_y + 25 {
+                let mut row_diff = 0u64;
                 for x in cursor_x - 5..cursor_x + 25 {
                     let idx = y * f.y_stride + x;
                     if idx < f.y.len() && idx < luma_omitted.len() {
                         let d = f.y[idx].abs_diff(luma_omitted[idx]);
                         diff += d as u64;
+                        row_diff += d as u64;
                     }
                 }
+                rows.push(row_diff);
+            }
+            if diff < least_diff {
+                least_diff = diff;
+                closest_rows = rows;
             }
             frames.recycle(f);
             if diff < 50 {
@@ -427,7 +437,7 @@ fn local_cursor_negotiated_and_host_omits_pointer_when_asked() {
     }
     assert!(
         cursor_omitted_again,
-        "host did not omit cursor when draw_cursor(false)"
+        "host did not omit cursor when draw_cursor(false): least luma difference {least_diff}, rows {closest_rows:?}"
     );
 
     session.stop();
