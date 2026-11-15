@@ -150,8 +150,9 @@ impl Server {
     /// Binds the media socket on every IPv4 address at `port` and starts
     /// receiving.
     pub fn bind(port: u16, options: Options) -> anyhow::Result<Arc<Self>> {
-        let udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port))
-            .map_err(|e| anyhow::anyhow!("cannot listen on UDP port {port}: {e}"))?;
+        let udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).map_err(|e| {
+            anyhow::Error::new(e).context(format!("cannot listen on UDP port {port}"))
+        })?;
         latch_proto::transport::configure_socket(&udp, 8 * 1024 * 1024, 8 * 1024 * 1024)?;
         udp.set_read_timeout(Some(Duration::from_millis(200)))?;
         let server = Arc::new(Self {

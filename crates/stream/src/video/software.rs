@@ -1,6 +1,5 @@
 //! H.264 Constrained Baseline in Rust (`latch-codec`), for viewers without
-//! a platform decoder Latch uses: Linux, and Windows when Media Foundation
-//! cannot start.
+//! a working platform decoder, including recovery after a hardware failure.
 
 use super::{Decoder, Frame};
 use anyhow::Result;
@@ -30,6 +29,12 @@ impl Decoder for Software {
         frame.y_stride = y_stride;
         frame.uv_stride = uv_stride;
         frame.full_range = false;
+        frame.format = super::PixelFormat::Nv12;
+        frame.color = Default::default();
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        {
+            frame.native = None;
+        }
         Ok(Some(frame))
     }
 

@@ -315,7 +315,7 @@ measurements demonstrated no throughput or latency improvement.
 | `net.ipv4.tcp_rmem` | `4096 131072 14868224` | `4096 131072 16777216`, autotuned ceiling |
 | `net.ipv4.tcp_wmem` | `4096 16384 4194304` | `4096 65536 16777216`, moderate initial allocation and larger ceiling |
 | `udp_rmem_min`, `udp_wmem_min` | Kernel defaults | 16,384 each |
-| `tcp_mtu_probing` | 0 | 1, recover from PMTU black holes |
+| `tcp_mtu_probing` | 0 | 2, always probe so a PMTU black hole cannot stall a lane (1 during the measurements below) |
 | `tcp_notsent_lowat` | 4,294,967,295 | 131,072, bound queued unsent data while preserving the congestion window |
 | `tcp_slow_start_after_idle` | 1 | 0, preserve the window across brief video pauses under fq pacing |
 | `nf_conntrack_max` | 1,048,576 | 131,072, reduce worst-case table memory on this 2-GB host |
