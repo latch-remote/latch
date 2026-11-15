@@ -16,6 +16,16 @@ pub fn request_update() -> Result<()> {
         println!("Latch {} is up to date", update::current());
         return Ok(());
     }
+    let status: latch_core::api::Status = latch_core::http::get_json(
+        ("127.0.0.1", latch_core::CONTROL_PORT),
+        "/v1/status",
+        Duration::from_secs(2),
+    )
+    .context("read local service version before downloading")?;
+    if Version::parse(&status.version)? >= release.version {
+        println!("Latch {} is installed; reopen Latch", status.version);
+        return Ok(());
+    }
     let body = linux::download_release(&release)?;
     let version = release.version.to_string();
     let sha = update::sha256_hex(&body);
@@ -35,8 +45,21 @@ pub fn request_update() -> Result<()> {
         Duration::from_secs(120),
     )?;
     ensure!(response.status == 200, "update refused: {}", response.body);
-    println!("Installing Latch {version}; reopen the window after the service restarts. See update.log for rollback results.");
-    Ok(())
+    let deadline = std::time::Instant::now() + Duration::from_secs(250);
+    loop {
+        if let Some(state) = reconcile()? {
+            if state.terminal() {
+                ensure!(state.phase == linux::Phase::Succeeded, "{}", state.reason);
+                println!("{}", state.reason);
+                return Ok(());
+            }
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "Linux update outcome timed out; see linux-update.json"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// Same request headers and receiver-resolved manifest as Windows. The Linux
@@ -66,20 +89,14 @@ pub fn authenticate(req: &latch_core::http::Request, exe: &Path) -> Result<Versi
     Ok(version)
 }
 
-pub fn start(exe: &Path, version: &Version) -> Result<Child> {
-    let supervised = crate::unix_setup::supervised();
-    let mut command = if supervised {
-        let mut c = Command::new("systemd-run");
-        let mut environment = std::ffi::OsString::from("--setenv=LATCH_DATA_DIR=");
-        environment.push(latch_core::config::data_dir()?.canonicalize()?);
-        c.args(["--user", "--wait", "--collect", "--quiet"])
-            .arg(format!("--unit=latch-update-{}", std::process::id()))
-            .arg(environment)
-            .arg(exe);
-        c
-    } else {
-        Command::new(exe)
-    };
+/// Launch returns only after the independent supervisor has fsynced its startup.
+pub fn start(exe: &Path, version: &Version, body: &[u8]) -> Result<()> {
+    linux::owned(exe)?;
+    let path = linux::state_path()?;
+    let mut state = linux::UpdateState::request(exe, version, body, &path)?;
+    state.systemd = crate::unix_setup::supervised();
+    state.save(&path)?;
+    let mut command = Command::new(exe);
     command
         .arg("--linux-update")
         .arg(version.to_string())
@@ -87,69 +104,306 @@ pub fn start(exe: &Path, version: &Version) -> Result<Child> {
         .arg(exe)
         .arg("--linux-update-pid")
         .arg(std::process::id().to_string());
-    if supervised {
+    if state.systemd {
         command.arg("--linux-update-systemd");
     }
-    command
+    let result = launch(&mut command, &state, &path);
+    if let Err(e) = &result {
+        state.finish(&path, &Err(anyhow::anyhow!("{e:#}")))?;
+    }
+    result
+}
+
+fn launch(command: &mut Command, state: &linux::UpdateState, path: &Path) -> Result<()> {
+    // systemd-run exits once the unit has started. No --wait client remains in
+    // latch.service's control group when that service is restarted.
+    let mut environment = std::ffi::OsString::from("--setenv=LATCH_DATA_DIR=");
+    environment.push(
+        path.parent()
+            .context("update data directory")?
+            .canonicalize()?,
+    );
+    let mut launcher = Command::new("systemd-run");
+    launcher
+        .args([
+            "--user",
+            "--collect",
+            "--quiet",
+            "--service-type=exec",
+            "--property=RuntimeMaxSec=240",
+            "--property=TimeoutStopSec=10",
+        ])
+        .arg(format!("--unit={}", state.unit))
+        .arg(environment);
+    for (key, value) in command.get_envs() {
+        if let Some(value) = value {
+            let mut setting = std::ffi::OsString::from("--setenv=");
+            setting.push(key);
+            setting.push("=");
+            setting.push(value);
+            launcher.arg(setting);
+        }
+    }
+    let output = launcher
+        .arg(command.get_program())
+        .args(command.get_args())
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("start the Linux update supervisor")
+        .output()
+        .context("start the Linux update unit")?;
+    ensure!(
+        output.status.success(),
+        "Linux update unit failed to start: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let current = linux::UpdateState::load(path)?.context("missing supervisor state")?;
+        if current.phase == linux::Phase::Failed {
+            anyhow::bail!("{}", current.reason);
+        }
+        if current.supervisor != 0 && (current.alive() || current.terminal()) {
+            return Ok(());
+        }
+        ensure!(
+            unit_active(&state.unit)?,
+            "Linux update unit stopped before supervisor startup"
+        );
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "Linux update supervisor startup timed out"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn unit_active(unit: &str) -> Result<bool> {
+    let output = Command::new("systemctl")
+        .args(["--user", "show", "--property=ActiveState", "--value", unit])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "could not read Linux update unit state: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(matches!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "active" | "activating" | "reloading"
+    ))
+}
+
+/// Called on startup and while a service remains alive after a helper failure.
+/// A live PID and its birth time protect against PID reuse. Unit state exposes
+/// launch failures even before a PID is recorded.
+pub fn reconcile() -> Result<Option<linux::UpdateState>> {
+    let path = linux::state_path()?;
+    let Some(mut state) = linux::UpdateState::load(&path)? else {
+        return Ok(None);
+    };
+    if !state.alive() {
+        state.cleanup_completed()?;
+    }
+    if !state.terminal() && !state.alive() {
+        // A newly submitted unit may still be executing its startup handshake.
+        let starting = std::fs::metadata(&path)?
+            .modified()?
+            .elapsed()
+            .is_ok_and(|age| age < Duration::from_secs(15));
+        if state.supervisor == 0 && (starting || unit_active(&state.unit).unwrap_or(false)) {
+            return Ok(Some(state));
+        }
+        let needs_restart = matches!(
+            state.phase,
+            linux::Phase::Swapping | linux::Phase::Restoring
+        );
+        let restored = match state.recover(&path) {
+            Ok(restored) => restored,
+            Err(e) if e.to_string().contains("another updater is already running") => {
+                // Another startup monitor is recovering this same journal.
+                return Ok(Some(state));
+            }
+            Err(e) => {
+                state.reason = format!("Linux update recovery failed: {e:#}");
+                state.save(&path)?;
+                return Err(e);
+            }
+        };
+        if (restored || needs_restart) && state.systemd {
+            // Queue, so restarting our own cgroup cannot interrupt systemctl.
+            ensure!(
+                Command::new("systemctl")
+                    .args(["--user", "--no-block", "restart", "latch.service"])
+                    .status()?
+                    .success(),
+                "restart restored Linux service failed"
+            );
+        } else if restored || needs_restart {
+            use std::os::unix::fs::MetadataExt;
+            let this = std::fs::metadata("/proc/self/exe")?;
+            if Some((this.dev(), this.ino())) == state.replacement {
+                super::start_service(&state.exe, &["--replaces", &std::process::id().to_string()])?;
+                std::process::exit(0);
+            }
+        }
+    }
+    Ok(Some(state))
+}
+
+pub fn monitor(running: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    std::thread::spawn(move || loop {
+        match reconcile() {
+            Ok(Some(state)) if !state.terminal() => (),
+            Ok(_) => {
+                running.store(false, std::sync::atomic::Ordering::Release);
+                break;
+            }
+            Err(e) => {
+                tracing::error!("Linux update recovery failed: {e:#}");
+                running.store(false, std::sync::atomic::Ordering::Release);
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    });
 }
 
 pub fn supervise(exe: &Path, old_pid: u32, version: &Version, systemd: bool) -> Result<()> {
-    let exe = linux::owned(exe)?;
-    let transaction = linux::Transaction::begin(&exe)?;
-    // A delayed supervisor must still run the installed inode. This also
-    // rejects an old helper after another updater has already completed.
-    drop(linux::Process::open(std::process::id(), &exe)?);
-    // Pin the old process before network work so a reused PID is never killed.
-    let process = linux::Process::open(old_pid, &exe)?;
-    let release = update::for_version(version, None)?;
-    transaction.prepare(&release)?;
-    let mut child: Option<Child> = None;
-    transaction.install(
-        || {
-            if systemd {
-                // A crashing replacement may have exhausted StartLimitBurst.
-                // Clear that counter so the restored release can start too.
-                ensure!(
-                    Command::new("systemctl")
-                        .args(["--user", "reset-failed", "latch.service"])
-                        .status()?
-                        .success(),
-                    "could not reset the systemd user service failure counter"
-                );
-                ensure!(
-                    Command::new("systemctl")
-                        .args(["--user", "restart", "latch.service"])
-                        .status()?
-                        .success(),
-                    "systemd user service restart failed"
-                );
-            } else {
-                if let Some(child) = child.as_mut() {
-                    let _ = child.kill();
-                    child.wait()?;
-                }
-                process.terminate()?;
-                child = Some(super::start_service(
-                    &exe,
-                    &["--replaces", &old_pid.to_string()],
-                )?);
+    let result = (|| {
+        let exe = linux::owned(exe)?;
+        // Reject delayed helpers running a different installed inode.
+        drop(linux::Process::open(std::process::id(), &exe)?);
+        supervise_with(&exe, old_pid, version, systemd, || {
+            update::for_version(version, None)
+        })
+    })();
+    if result.is_err() {
+        let path = linux::state_path()?;
+        if let Some(mut state) = linux::UpdateState::load(&path)? {
+            if state.phase == linux::Phase::Pending && state.version == *version {
+                state.finish(&path, &result)?;
             }
-            Ok(())
-        },
-        || {
-            super::watch(
-                super::answering_version,
-                &version.to_string(),
-                super::PROBATION,
-                super::HEALTHY_FOR,
-                Duration::from_millis(500),
-            )
-            .map_err(anyhow::Error::msg)
-        },
-    )
+        }
+    }
+    result
 }
+
+fn supervise_with(
+    exe: &Path,
+    old_pid: u32,
+    version: &Version,
+    systemd: bool,
+    manifest: impl FnOnce() -> Result<update::Release>,
+) -> Result<()> {
+    let path = linux::state_path()?;
+    let mut state = linux::UpdateState::load(&path)?.context("missing update request")?;
+    ensure!(
+        state.exe == exe && state.version == *version && state.phase == linux::Phase::Pending,
+        "supervisor request does not match its journal"
+    );
+    state.supervisor = std::process::id();
+    state.supervisor_start = linux::process_start(state.supervisor);
+    state.phase = linux::Phase::Started;
+    state.reason = "Verifying Linux update".into();
+    state.save(&path)?;
+    let result = (|| -> Result<()> {
+        let mut transaction = linux::Transaction::begin(exe)?;
+        transaction.record(&path, &mut state)?;
+        let process = linux::Process::open(old_pid, exe)?;
+        // The supervisor obtains its own pinned manifest and re-hashes the
+        // private upload. The service's digest decision is never trusted.
+        transaction.prepare_uploaded(&manifest()?, &state.upload)?;
+        let mut child: Option<Child> = None;
+        transaction.install(
+            || {
+                if systemd {
+                    restart()?;
+                } else {
+                    if let Some(child) = child.as_mut() {
+                        let _ = child.kill();
+                        child.wait()?;
+                    }
+                    process.terminate()?;
+                    child = Some(super::start_service(
+                        exe,
+                        &["--replaces", &old_pid.to_string()],
+                    )?);
+                }
+                Ok(())
+            },
+            || {
+                super::watch(
+                    || {
+                        let pid = if systemd {
+                            main_pid().ok()?
+                        } else {
+                            // The replacement must be the process serving the port.
+                            // /proc selection also covers direct --background starts.
+                            linux::listener_pid(exe, latch_core::CONTROL_PORT).ok()?
+                        };
+                        linux::owns_listener(pid, exe, latch_core::CONTROL_PORT).ok()?;
+                        let version = super::answering_version()?;
+                        linux::owns_listener(pid, exe, latch_core::CONTROL_PORT).ok()?;
+                        Some(version)
+                    },
+                    &version.to_string(),
+                    super::PROBATION,
+                    super::HEALTHY_FOR,
+                    Duration::from_millis(500),
+                )
+                .map_err(anyhow::Error::msg)
+            },
+        )
+    })();
+    // commit() has already persisted success before deleting recovery files.
+    let mut current = linux::UpdateState::load(&path)?.context("missing supervisor state")?;
+    if current.phase != linux::Phase::Succeeded {
+        if matches!(
+            current.phase,
+            linux::Phase::Swapping | linux::Phase::Restoring
+        ) {
+            current.reason = format!(
+                "Linux update needs recovery: {}",
+                result.as_ref().unwrap_err()
+            );
+            current.save(&path)?;
+        } else {
+            current.finish(&path, &result)?;
+        }
+    }
+    result
+}
+
+fn restart() -> Result<()> {
+    for args in [
+        ["--user", "reset-failed", "latch.service"],
+        ["--user", "restart", "latch.service"],
+    ] {
+        let output = Command::new("systemctl").args(args).output()?;
+        ensure!(
+            output.status.success(),
+            "{} failed: {}",
+            args[1],
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn main_pid() -> Result<u32> {
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "--property=MainPID",
+            "--value",
+            "latch.service",
+        ])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "could not read latch.service MainPID"
+    );
+    Ok(String::from_utf8(output.stdout)?.trim().parse()?)
+}
+
+#[cfg(test)]
+mod tests;

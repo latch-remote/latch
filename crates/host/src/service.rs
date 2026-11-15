@@ -200,6 +200,16 @@ impl Service {
     /// update just started: the old one is still answering its last request,
     /// so wait for the port rather than give up.
     pub fn run(self: Arc<Self>, replacing: bool) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            update::linux::reconcile()?;
+            if let Ok(exe) = std::env::current_exe().and_then(|p| p.canonicalize()) {
+                latch_core::update::linux::cleanup(&exe, std::time::SystemTime::now())?;
+            }
+            // New services accept streams during probation, as on Windows.
+            // Continue recovery monitoring if their supervisor subsequently dies.
+            update::linux::monitor(self.update_running.clone());
+        }
         if !starts_with_window(&self.cfg.lock()) {
             // A Mac that is only a viewer: an older window (or anything else)
             // that starts the service must not share it. Exit 0, so launchd
@@ -530,6 +540,12 @@ impl Service {
             owner.tagged && !owner.tailnet.contains('@') && cfg.allowed_logins.is_empty()
         }) {
             setup.push("Tagged organisation host: set allowed_logins in host.toml. An email domain does not prove membership; remote control is refused until configured.".into());
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(Some(state)) = latch_core::update::linux::state_path()
+            .and_then(|path| latch_core::update::linux::UpdateState::load(&path))
+        {
+            setup.push(state.reason);
         }
         #[cfg(target_os = "macos")]
         setup.extend(crate::unix_setup::permission_items());
@@ -968,6 +984,21 @@ impl Service {
 
     #[cfg(target_os = "linux")]
     fn update_linux(&self, from: IpAddr, req: &Request) -> Response {
+        self.update_linux_with(from, req, |req| {
+            let exe = std::env::current_exe()?;
+            let version = update::linux::authenticate(req, &exe)?;
+            update::linux::start(&exe, &version, &req.body)?;
+            Ok(version)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn update_linux_with(
+        &self,
+        from: IpAddr,
+        req: &Request,
+        install: impl FnOnce(&Request) -> Result<semver::Version>,
+    ) -> Response {
         if !self.cfg.lock().accept_updates {
             return Response::json(403, &Ack::err("the owner has turned pushed updates off"));
         }
@@ -981,24 +1012,11 @@ impl Service {
                 !update::refuse_self_update(engine_running, self.someone_watching()),
                 "a stream is running; the update is retried after it ends"
             );
-            let exe = std::env::current_exe()?;
-            let version = update::linux::authenticate(req, &exe)?;
-            let mut helper = update::linux::start(&exe, &version)?;
-            let running = self.update_running.clone();
-            let log = self.log.clone();
+            let version = install(req)?;
+            update::linux::monitor(self.update_running.clone());
             self.log(format!(
                 "installing Linux Latch {version}, requested by {from}"
             ));
-            std::thread::spawn(move || {
-                // Success normally restarts this process. An early failure
-                // releases admission so a failed download cannot block streams.
-                let result = helper.wait();
-                push_log(
-                    &log,
-                    format!("Linux update supervisor finished: {result:?}"),
-                );
-                running.store(false, Ordering::Release);
-            });
             Ok(())
         })();
         match result {
@@ -2045,6 +2063,56 @@ mod tests {
         svc.update_running.store(false, Ordering::Release);
         assert_eq!(svc.update(LOOPBACK, &req).status, 400);
         assert!(!svc.update_running.load(Ordering::Acquire));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_supervisor_start_failure_clears_busy_and_reaches_the_caller() {
+        let svc = Service::new();
+        let response = svc.update_linux_with(LOOPBACK, &Request::default(), |_| {
+            anyhow::bail!("systemd update supervisor executable could not start")
+        });
+        assert_eq!(response.status, 400);
+        assert!(response
+            .body
+            .contains("supervisor executable could not start"));
+        assert!(!svc.update_running.load(Ordering::Acquire));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hosted_stream_refuses_linux_updates_with_409() {
+        if std::env::var_os("LATCH_HOSTED_UPDATE_FIXTURE").is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "service::tests::a_hosted_stream_refuses_linux_updates_with_409",
+                    "--nocapture"
+                ])
+                .env("LATCH_HOSTED_UPDATE_FIXTURE", "1")
+                .env("LATCH_TEST_PATTERN", "still")
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        let svc = Service::new();
+        let server = Server::bind(0, Options::default()).unwrap();
+        let req: StreamRequest = serde_json::from_value(serde_json::json!({
+            "protocol": latch_proto::PROTOCOL, "width": 64, "height": 64, "fps": 1,
+            "bitrate_kbps": 500, "codecs": ["h264-baseline"], "udp_port": 12345, "audio": false,
+        }))
+        .unwrap();
+        let prepared = server
+            .prepare(req, "127.0.0.1:12345".parse().unwrap())
+            .unwrap();
+        assert!(server.busy());
+        *svc.server.lock() = Some(server);
+        let response = svc.update(LOOPBACK, &Request::default());
+        assert_eq!(response.status, 409);
+        assert!(response.body.contains("a stream is running"));
+        assert!(!svc.update_running.load(Ordering::Acquire));
+        drop(prepared);
     }
 
     #[test]

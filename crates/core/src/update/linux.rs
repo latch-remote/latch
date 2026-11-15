@@ -25,6 +25,11 @@ pub enum Managed {
     Container,
     ReadOnly,
     Permissions,
+    Snap,
+    AppImage,
+    NativeKit,
+    Kernel,
+    UserManager,
 }
 
 impl std::fmt::Display for Managed {
@@ -34,6 +39,13 @@ impl std::fmt::Display for Managed {
             Self::Nix => "update your Nix package or flake and rebuild",
             Self::Container => "rebuild and recreate the container image",
             Self::ReadOnly => "replace the read-only installation through its deployment tool",
+            Self::Snap => "update through Snap (snap refresh)",
+            Self::AppImage => "replace the AppImage and reopen Latch",
+            Self::NativeKit => "rerun the installer for the native installation",
+            Self::Kernel => "update manually; Linux 5.3+ with pidfd_open is required",
+            Self::UserManager => {
+                "update manually; systemd-run and a reachable systemd user manager are required"
+            }
             Self::Permissions => "have the installation owner replace the release binary",
         })
     }
@@ -48,7 +60,11 @@ struct Ownership {
 }
 
 fn managed(path: &Path, f: Ownership) -> Option<Managed> {
-    if path.starts_with("/nix/store") {
+    if path.starts_with("/snap") || path.starts_with("/var/lib/snapd/snap") {
+        Some(Managed::Snap)
+    } else if path.starts_with("/usr/local/bin") && !f.writable {
+        Some(Managed::NativeKit)
+    } else if path.starts_with("/nix/store") {
         Some(Managed::Nix)
     } else if f.package || system_package_path(path) {
         Some(Managed::PackageManager)
@@ -66,6 +82,12 @@ fn managed(path: &Path, f: Ownership) -> Option<Managed> {
 /// Resolve symlinks before checking ownership, package registration and the
 /// backing filesystem. Replacement always targets that resolved file.
 pub fn installation(path: &Path) -> Result<std::result::Result<PathBuf, Managed>> {
+    if std::env::var_os("SNAP").is_some() {
+        return Ok(Err(Managed::Snap));
+    }
+    if std::env::var_os("APPIMAGE").is_some() {
+        return Ok(Err(Managed::AppImage));
+    }
     let exe = path
         .canonicalize()
         .context("resolve the installed executable")?;
@@ -103,8 +125,32 @@ pub fn installation(path: &Path) -> Result<std::result::Result<PathBuf, Managed>
     };
     Ok(match managed(&exe, facts) {
         Some(reason) => Err(reason),
-        None => Ok(exe),
+        None => prerequisites().map(|()| exe),
     })
+}
+
+/// Probe the actual syscall and user manager before offering or downloading.
+pub fn prerequisites() -> std::result::Result<(), Managed> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
+    if fd < 0 {
+        return Err(Managed::Kernel);
+    }
+    drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) });
+    if !Command::new("systemd-run")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+        || !Command::new("systemctl")
+            .args(["--user", "show-environment"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    {
+        return Err(Managed::UserManager);
+    }
+    Ok(())
 }
 
 fn container_install(root: &Path, image: bool, environment: bool) -> bool {
@@ -168,6 +214,318 @@ pub fn download_release(release: &Release) -> Result<Vec<u8>> {
     fs::read(path).context("read the verified Linux archive")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Phase {
+    Pending,
+    Started,
+    Swapping,
+    Restoring,
+    Succeeded,
+    Failed,
+}
+
+/// The fsynced journal is also the persistent automatic-retry suppression record.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UpdateState {
+    pub version: semver::Version,
+    pub exe: PathBuf,
+    pub phase: Phase,
+    pub reason: String,
+    pub supervisor: u32,
+    pub supervisor_start: Option<String>,
+    pub unit: String,
+    pub systemd: bool,
+    pub upload: PathBuf,
+    pub stage: Option<PathBuf>,
+    pub original: Option<(u64, u64)>,
+    pub replacement: Option<(u64, u64)>,
+}
+
+pub fn state_path() -> Result<PathBuf> {
+    Ok(crate::config::data_dir()?.join("linux-update.json"))
+}
+
+pub fn process_start(pid: u32) -> Option<String> {
+    // comm may contain spaces or ')'. Fields following the final ')' start at 3.
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<_> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    if fields.first() == Some(&"Z") {
+        return None;
+    }
+    fields.get(19).map(|s| (*s).to_owned())
+}
+
+impl UpdateState {
+    pub fn request(
+        exe: &Path,
+        version: &semver::Version,
+        body: &[u8],
+        path: &Path,
+    ) -> Result<Self> {
+        if let Some(previous) = Self::load(path)? {
+            ensure!(previous.terminal(), "another Linux update is unfinished");
+        }
+        let parent = path.parent().context("update data directory")?;
+        fs::create_dir_all(parent)?;
+        let mut upload = tempfile::Builder::new()
+            .prefix("linux-update-upload-")
+            .tempfile_in(parent)?;
+        upload.write_all(body)?;
+        upload.as_file().sync_all()?;
+        let (_, upload) = upload.keep()?;
+        let state = Self {
+            version: version.clone(),
+            exe: exe.into(),
+            phase: Phase::Pending,
+            reason: "Starting Linux update supervisor".into(),
+            supervisor: 0,
+            supervisor_start: None,
+            unit: format!(
+                "latch-update-{}-{}",
+                std::process::id(),
+                upload.file_name().context("upload name")?.to_string_lossy()
+            ),
+            upload,
+            systemd: false,
+            stage: None,
+            original: None,
+            replacement: None,
+        };
+        state.save(path)?;
+        Ok(state)
+    }
+
+    pub fn terminal(&self) -> bool {
+        matches!(self.phase, Phase::Succeeded | Phase::Failed)
+    }
+
+    pub fn alive(&self) -> bool {
+        self.supervisor_start.is_some() && process_start(self.supervisor) == self.supervisor_start
+    }
+
+    pub fn load(path: &Path) -> Result<Option<Self>> {
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let meta = file.metadata()?;
+        ensure!(
+            meta.is_file() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0,
+            "unsafe Linux update journal"
+        );
+        Ok(Some(serde_json::from_reader(file.take(64 * 1024))?))
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let parent = path.parent().context("journal directory")?;
+        fs::create_dir_all(parent)?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        file.write_all(&serde_json::to_vec(self)?)?;
+        file.as_file().sync_all()?;
+        file.persist(path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    pub fn finish(&mut self, path: &Path, result: &Result<()>) -> Result<()> {
+        self.phase = if result.is_ok() {
+            Phase::Succeeded
+        } else {
+            Phase::Failed
+        };
+        self.reason = match result {
+            Ok(()) => format!("Latch {} installed. Reopen Latch.", self.version),
+            Err(e) => format!("{e:#}"),
+        };
+        self.save(path)?;
+        match fs::remove_file(&self.upload) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => tracing::warn!("could not remove private Linux update upload: {e}"),
+        }
+        Ok(())
+    }
+
+    pub fn cleanup_completed(&self) -> Result<()> {
+        if !self.terminal() {
+            return Ok(());
+        }
+        if let Some(stage) = self.stage.as_ref().filter(|stage| stage.exists()) {
+            validate_stage(stage, &self.exe)?;
+            let installed = fs::symlink_metadata(&self.exe)?;
+            let expected = if self.phase == Phase::Succeeded {
+                self.replacement
+            } else {
+                self.original
+            };
+            ensure!(
+                installed.is_file() && Some((installed.dev(), installed.ino())) == expected,
+                "installation changed; recovery directory preserved"
+            );
+            fs::remove_dir_all(stage)?;
+            File::open(self.exe.parent().context("installation directory")?)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Roll back any uncommitted rename, including death between rename and fsync.
+    /// Returns true when this running service must restart onto the restored inode.
+    pub fn recover(&mut self, path: &Path) -> Result<bool> {
+        let _lock = Transaction::begin_resolved(&self.exe)?;
+        let latest = Self::load(path)?.context("missing recovery journal")?;
+        if latest.terminal() {
+            *self = latest;
+            return Ok(false);
+        }
+        ensure!(
+            latest.unit == self.unit && !latest.alive(),
+            "update supervisor is still running or changed"
+        );
+        let installed = fs::symlink_metadata(&self.exe)?;
+        ensure!(
+            installed.is_file(),
+            "installation changed to a symlink during recovery"
+        );
+        let inode = (installed.dev(), installed.ino());
+        let mut restored = false;
+        if self.phase == Phase::Swapping && Some(inode) == self.replacement {
+            let stage = self.stage.as_ref().context("missing recovery directory")?;
+            validate_stage(stage, &self.exe)?;
+            let previous = stage.join("previous");
+            let meta = fs::symlink_metadata(&previous)?;
+            ensure!(
+                meta.is_file() && Some((meta.dev(), meta.ino())) == self.original,
+                "recovery inode changed"
+            );
+            fs::rename(previous, &self.exe)?;
+            File::open(self.exe.parent().context("installation directory")?)?.sync_all()?;
+            restored = true;
+        } else if matches!(self.phase, Phase::Swapping | Phase::Restoring) {
+            ensure!(
+                Some(inode) == self.original,
+                "installation changed; recovery copy preserved"
+            );
+        }
+        self.finish(path, &Err(anyhow::anyhow!(
+            "Linux update supervisor stopped before completion; previous release restored or retained"
+        )))?;
+        if let Some(stage) = &self.stage {
+            if stage.exists() {
+                validate_stage(stage, &self.exe)?;
+                fs::remove_dir_all(stage)?;
+            }
+        }
+        Ok(restored)
+    }
+}
+
+fn validate_stage(stage: &Path, exe: &Path) -> Result<()> {
+    ensure!(
+        stage.parent() == exe.parent()
+            && stage
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(".latch-update-")),
+        "invalid recovery directory"
+    );
+    let meta = fs::symlink_metadata(stage)?;
+    ensure!(
+        meta.is_dir() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0,
+        "unsafe recovery directory"
+    );
+    ensure!(
+        fs::read(stage.join("owner"))? == exe.as_os_str().as_encoded_bytes(),
+        "unrecognized updater directory"
+    );
+    Ok(())
+}
+
+/// Only old private directories carrying our exact installation marker qualify.
+pub fn cleanup(exe: &Path, now: std::time::SystemTime) -> Result<()> {
+    let parent = exe.parent().context("installation directory")?;
+    let _lock = match Transaction::begin_resolved(exe) {
+        Ok(lock) => lock,
+        Err(_) => return Ok(()), // An active transaction owns its staging files.
+    };
+    let active = UpdateState::load(&state_path()?)?;
+    let legacy = parent.join(format!(
+        ".{}.update.lock",
+        exe.file_name()
+            .context("installation name")?
+            .to_string_lossy()
+    ));
+    if let Ok(file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&legacy)
+    {
+        let meta = file.metadata()?;
+        if meta.is_file()
+            && meta.uid() == unsafe { libc::geteuid() }
+            && meta.mode() & 0o777 == 0o600
+            && meta.len() == 0
+            && meta
+                .modified()
+                .ok()
+                .and_then(|at| now.duration_since(at).ok())
+                .is_some_and(|age| age >= Duration::from_secs(24 * 3600))
+            && unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0
+        {
+            fs::remove_file(legacy)?;
+        }
+    }
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let path = entry.path();
+        if active
+            .as_ref()
+            .is_some_and(|s| !s.terminal() && s.stage.as_ref() == Some(&path))
+        {
+            continue;
+        }
+        if validate_stage(&path, exe).is_ok()
+            && entry
+                .metadata()?
+                .modified()
+                .ok()
+                .and_then(|at| now.duration_since(at).ok())
+                .is_some_and(|age| age >= Duration::from_secs(24 * 3600))
+            && (!path.join("previous").exists()
+                || active.as_ref().is_some_and(|s| {
+                    s.phase == Phase::Succeeded && s.stage.as_ref() == Some(&path)
+                }))
+        {
+            fs::remove_dir_all(path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Shared by the desktop scheduler with its injected monotonic clock.
+pub fn automatic_update_due(
+    offered: &semver::Version,
+    running: &semver::Version,
+    failed: Option<&UpdateState>,
+    explicit: bool,
+    now: Instant,
+    next: Instant,
+) -> bool {
+    offered > running
+        && (explicit || now >= next)
+        && (explicit || !failed.is_some_and(|s| s.phase == Phase::Failed && offered <= &s.version))
+}
+
+fn lock_path(exe: &Path) -> Result<PathBuf> {
+    let dir = crate::config::data_dir()?.join("update-locks");
+    fs::create_dir_all(&dir)?;
+    Ok(dir.join(super::sha256_hex(exe.as_os_str().as_encoded_bytes())))
+}
+
 struct UpdateLock(File);
 
 impl Drop for UpdateLock {
@@ -190,6 +548,7 @@ pub struct Transaction {
     swapped: bool,
     replacement: Option<(u64, u64)>,
     _lock: UpdateLock,
+    journal: Option<PathBuf>,
 }
 
 impl Transaction {
@@ -199,17 +558,14 @@ impl Transaction {
 
     fn begin_resolved(exe: &Path) -> Result<Self> {
         let parent = exe.parent().context("installation has no parent")?;
-        let name = exe
-            .file_name()
-            .context("installation has no name")?
-            .to_string_lossy();
+
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(parent.join(format!(".{name}.update.lock")))?;
+            .open(lock_path(exe)?)?;
         let meta = lock.metadata()?;
         ensure!(
             meta.is_file() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0,
@@ -224,6 +580,13 @@ impl Transaction {
             .prefix(".latch-update-")
             .tempdir_in(parent)?;
         fs::set_permissions(stage.path(), fs::Permissions::from_mode(0o700))?;
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(stage.path().join("owner"))?;
+        marker.write_all(exe.as_os_str().as_encoded_bytes())?;
+        marker.sync_all()?;
         let meta = fs::symlink_metadata(exe)?;
         ensure!(meta.is_file(), "installation changed to a symlink");
         Ok(Self {
@@ -233,7 +596,27 @@ impl Transaction {
             stage,
             swapped: false,
             replacement: None,
+            journal: None,
         })
+    }
+
+    pub fn prepare_uploaded(&self, release: &Release, upload: &Path) -> Result<()> {
+        self.prepare_with(release, |_, path| {
+            fs::copy(upload, path)?;
+            Ok(())
+        })
+    }
+
+    pub fn record(&mut self, path: &Path, state: &mut UpdateState) -> Result<()> {
+        File::open(self.stage.path())?.sync_all()?;
+        File::open(self.exe.parent().context("installation directory")?)?.sync_all()?;
+        state.stage = Some(self.stage.path().into());
+        state.original = Some(self.original);
+        state.save(path)?;
+        self.journal = Some(path.into());
+        // A killed supervisor leaves the journal and recovery copy for startup.
+        self.stage.disable_cleanup(true);
+        Ok(())
     }
 
     pub fn prepare(&self, release: &Release) -> Result<()> {
@@ -325,6 +708,13 @@ impl Transaction {
         let replacement = fs::symlink_metadata(self.stage.path().join("new"))?;
         ensure!(replacement.is_file(), "staged binary changed to a symlink");
         self.replacement = Some((replacement.dev(), replacement.ino()));
+        if let Some(path) = &self.journal {
+            let mut state = UpdateState::load(path)?.context("missing update journal")?;
+            state.replacement = self.replacement;
+            state.phase = Phase::Swapping;
+            state.reason = "Restarting and checking the Linux update".into();
+            state.save(path)?;
+        }
         fs::rename(self.stage.path().join("new"), &self.exe)?;
         self.swapped = true;
         File::open(self.exe.parent().unwrap())?.sync_all()?;
@@ -340,8 +730,14 @@ impl Transaction {
             );
             fs::rename(self.stage.path().join("previous"), &self.exe)
                 .context("restore the previous binary")?;
-            self.swapped = false;
             File::open(self.exe.parent().unwrap())?.sync_all()?;
+            self.swapped = false;
+            if let Some(path) = &self.journal {
+                let mut state = UpdateState::load(path)?.context("missing rollback journal")?;
+                state.phase = Phase::Restoring;
+                state.reason = "Restarting the previous Linux release after rollback".into();
+                state.save(path)?;
+            }
         }
         Ok(())
     }
@@ -357,13 +753,22 @@ impl Transaction {
         if let Err(why) = restart().and_then(|()| health()) {
             self.rollback()?;
             restart().context("restart the previous binary after rollback")?;
-            return Err(why.context("the previous Linux release was restored and restarted"));
+            let result = Err(why.context("the previous Linux release was restored and restarted"));
+            if let Some(path) = &self.journal {
+                let mut state = UpdateState::load(path)?.context("missing rollback journal")?;
+                state.finish(path, &result)?;
+            }
+            return result;
         }
         self.commit()
     }
 
     fn commit(mut self) -> Result<()> {
         ensure!(self.swapped, "update has not been swapped");
+        if let Some(path) = &self.journal {
+            let mut state = UpdateState::load(path)?.context("missing update journal")?;
+            state.finish(path, &Ok(()))?;
+        }
         self.swapped = false;
         fs::remove_dir_all(self.stage.path())?;
         Ok(())
@@ -386,11 +791,13 @@ impl Drop for Transaction {
                 .and_then(|mut file| file.write_all(self.exe.as_os_str().as_encoded_bytes()));
             // TempDir::disable_cleanup preserves the only recovery binary.
             self.stage.disable_cleanup(true);
+        } else {
+            let _ = fs::remove_dir_all(self.stage.path());
         }
     }
 }
 
-fn verify_version(exe: &Path, want: &semver::Version) -> Result<()> {
+pub fn verify_version(exe: &Path, want: &semver::Version) -> Result<()> {
     let output = tempfile::tempfile()?;
     let mut child = Command::new(exe)
         .arg("--version")
@@ -420,6 +827,46 @@ fn verify_version(exe: &Path, want: &semver::Version) -> Result<()> {
         "release executable version does not exactly match {want}"
     );
     Ok(())
+}
+
+/// Require the expected executable to own the listening socket used by health.
+/// Checking both sides of the HTTP request rejects process exits during a probe.
+pub fn owns_listener(pid: u32, exe: &Path, port: u16) -> Result<()> {
+    drop(Process::open(pid, exe)?);
+    let sockets: Vec<_> = fs::read_dir(format!("/proc/{pid}/fd"))?
+        .filter_map(|entry| fs::read_link(entry.ok()?.path()).ok())
+        .filter_map(|link| {
+            link.to_str()?
+                .strip_prefix("socket:[")?
+                .strip_suffix(']')
+                .map(str::to_owned)
+        })
+        .collect();
+    let tcp = fs::read_to_string(format!("/proc/{pid}/net/tcp"))?;
+    ensure!(
+        tcp.lines().skip(1).any(|line| {
+            let columns: Vec<_> = line.split_whitespace().collect();
+            columns.len() > 9
+                && columns[3] == "0A"
+                && (columns[1] == format!("00000000:{port:04X}")
+                    || columns[1] == format!("0100007F:{port:04X}"))
+                && sockets.iter().any(|inode| inode == columns[9])
+        }),
+        "health port is not owned by the replacement service process"
+    );
+    Ok(())
+}
+
+pub fn listener_pid(exe: &Path, port: u16) -> Result<u32> {
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        if let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse().ok()) {
+            if owns_listener(pid, exe, port).is_ok() {
+                return Ok(pid);
+            }
+        }
+    }
+    bail!("replacement service does not own the health port")
 }
 
 /// A kernel process handle pins the service across the download and swap.
@@ -465,12 +912,240 @@ impl Process {
     }
 }
 
+/// Bounds slow headers and bodies across all redirects. A blocking read is
+/// additionally capped by the transport's 30-second socket timeout.
+pub(super) struct TimedIo<T> {
+    pub inner: T,
+    pub started: Instant,
+    pub read: u64,
+    pub minimum: u64,
+}
+
+fn transfer_budget(elapsed: Duration, read: u64, minimum: u64) -> std::io::Result<()> {
+    if elapsed >= Duration::from_secs(120) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Linux update download exceeded its 120-second deadline",
+        ));
+    }
+    if elapsed >= Duration::from_secs(30) && read < minimum * elapsed.as_secs() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Linux update download fell below its minimum transfer rate",
+        ));
+    }
+    Ok(())
+}
+
+impl<T: Read> Read for TimedIo<T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        transfer_budget(self.started.elapsed(), self.read, self.minimum)?;
+        let count = self.inner.read(buf)?;
+        self.read += count as u64;
+        transfer_budget(self.started.elapsed(), self.read, self.minimum)?;
+        Ok(count)
+    }
+}
+
+impl<T: Write> Write for TimedIo<T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        transfer_budget(self.started.elapsed(), self.read, self.minimum)?;
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use semver::Version;
     use std::io::Write;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn a_running_new_service_never_downloads_again_on_an_injected_clock() {
+        let now = Instant::now();
+        let offered = Version::new(999, 0, 0);
+        let mut downloads = 0;
+        for elapsed in [0, 6 * 3600, 6 * 3600 + 900, 12 * 3600] {
+            if automatic_update_due(
+                &offered,
+                &offered,
+                None,
+                false,
+                now + Duration::from_secs(elapsed),
+                now,
+            ) {
+                downloads += 1;
+            }
+        }
+        assert_eq!(downloads, 0);
+        assert!(!automatic_update_due(
+            &offered, &offered, None, true, now, now
+        ));
+    }
+
+    #[test]
+    fn a_failed_release_and_reason_survive_restart_and_clock_advances() {
+        let (dir, exe) = install();
+        let path = dir.path().join("journal.json");
+        let offered = Version::new(999, 0, 0);
+        let mut state = UpdateState::request(&exe, &offered, b"archive", &path).unwrap();
+        state
+            .finish(
+                &path,
+                &Err(anyhow::anyhow!("health check failed; rolled back")),
+            )
+            .unwrap();
+        let state = UpdateState::load(&path).unwrap().unwrap();
+        assert_eq!(state.reason, "health check failed; rolled back");
+        let now = Instant::now();
+        let old = Version::new(1, 0, 0);
+        for elapsed in [0, 900, 6 * 3600, 24 * 3600] {
+            assert!(!automatic_update_due(
+                &offered,
+                &old,
+                Some(&state),
+                false,
+                now + Duration::from_secs(elapsed),
+                now
+            ));
+        }
+        assert!(automatic_update_due(
+            &offered,
+            &old,
+            Some(&state),
+            true,
+            now,
+            now
+        ));
+        assert!(automatic_update_due(
+            &Version::new(999, 0, 1),
+            &old,
+            Some(&state),
+            false,
+            now,
+            now
+        ));
+        assert!(!automatic_update_due(
+            &Version::new(999, 0, 1),
+            &old,
+            Some(&state),
+            false,
+            now,
+            now + Duration::from_secs(900)
+        ));
+    }
+
+    #[test]
+    fn slow_downloads_have_an_overall_deadline_and_minimum_rate() {
+        assert!(transfer_budget(Duration::from_secs(29), 0, 32 * 1024).is_ok());
+        assert!(transfer_budget(Duration::from_secs(30), 1, 32 * 1024)
+            .unwrap_err()
+            .to_string()
+            .contains("minimum"));
+        assert!(transfer_budget(Duration::from_secs(119), 120 * 32 * 1024, 32 * 1024).is_ok());
+        assert!(
+            transfer_budget(Duration::from_secs(120), u64::MAX, 32 * 1024)
+                .unwrap_err()
+                .to_string()
+                .contains("deadline")
+        );
+    }
+
+    #[test]
+    fn crash_after_swap_is_recovered_from_the_fsynced_journal() {
+        let (dir, exe) = install();
+        let path = dir.path().join("journal.json");
+        assert!(Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "update::linux::tests::crash_fixture",
+                "--nocapture"
+            ])
+            .env("LATCH_CRASH_FIXTURE", &path)
+            .env("LATCH_CRASH_EXE", &exe)
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(fs::read(&exe).unwrap(), b"new");
+        let mut state = UpdateState::load(&path).unwrap().unwrap();
+        let stage = state.stage.clone().unwrap();
+        assert!(state.recover(&path).unwrap());
+        assert_eq!(fs::read(&exe).unwrap(), b"old");
+        assert!(!stage.exists());
+        assert_eq!(
+            UpdateState::load(&path).unwrap().unwrap().phase,
+            Phase::Failed
+        );
+    }
+
+    #[test]
+    fn death_after_restoring_the_inode_keeps_recovery_pending_for_a_restart() {
+        let (dir, exe) = install();
+        let path = dir.path().join("journal.json");
+        assert!(Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "update::linux::tests::crash_fixture",
+                "--nocapture"
+            ])
+            .env("LATCH_CRASH_FIXTURE", &path)
+            .env("LATCH_CRASH_EXE", &exe)
+            .env("LATCH_CRASH_RESTORING", "1")
+            .status()
+            .unwrap()
+            .success());
+        let mut state = UpdateState::load(&path).unwrap().unwrap();
+        assert_eq!(state.phase, Phase::Restoring);
+        assert_eq!(fs::read(&exe).unwrap(), b"old");
+        assert!(!state.recover(&path).unwrap());
+        assert_eq!(state.phase, Phase::Failed);
+        assert!(!state.stage.as_ref().unwrap().exists());
+    }
+
+    #[test]
+    fn crash_fixture() {
+        let Some(path) = std::env::var_os("LATCH_CRASH_FIXTURE") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let exe = PathBuf::from(std::env::var_os("LATCH_CRASH_EXE").unwrap());
+        let mut state =
+            UpdateState::request(&exe, &Version::new(999, 0, 0), b"archive", &path).unwrap();
+        let mut tx = Transaction::begin_resolved(&exe).unwrap();
+        tx.record(&path, &mut state).unwrap();
+        stage(&tx, b"new");
+        tx.swap().unwrap();
+        if std::env::var_os("LATCH_CRASH_RESTORING").is_some() {
+            tx.rollback().unwrap();
+        }
+        // Exit bypasses Drop just as SIGKILL does, releasing kernel-held locks.
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn cleanup_preserves_unmarked_recent_and_recovery_directories() {
+        let (dir, exe) = install();
+        let old = dir.path().join(".latch-update-abandoned");
+        fs::create_dir(&old).unwrap();
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(old.join("owner"), exe.as_os_str().as_encoded_bytes()).unwrap();
+        let unrelated = dir.path().join(".latch-update-unrelated");
+        fs::create_dir(&unrelated).unwrap();
+        fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o700)).unwrap();
+        cleanup(&exe, std::time::SystemTime::now()).unwrap();
+        assert!(old.exists() && unrelated.exists());
+        cleanup(
+            &exe,
+            std::time::SystemTime::now() + Duration::from_secs(48 * 3600),
+        )
+        .unwrap();
+        assert!(!old.exists());
+        assert!(unrelated.exists());
+    }
 
     #[test]
     fn every_external_install_rule_has_update_instructions() {
@@ -519,6 +1194,47 @@ mod tests {
                 Some(expected)
             );
             assert!(expected.to_string().contains(wording));
+        }
+    }
+
+    #[test]
+    fn snap_native_kit_and_missing_prerequisites_have_specific_notices() {
+        assert_eq!(
+            managed(
+                Path::new("/snap/latch/current/latch-host"),
+                Ownership::default()
+            ),
+            Some(Managed::Snap)
+        );
+        assert_eq!(
+            managed(Path::new("/usr/local/bin/latch-host"), Ownership::default()),
+            Some(Managed::NativeKit)
+        );
+        for (reason, text) in [
+            (Managed::Snap, "Snap"),
+            (Managed::NativeKit, "rerun the installer"),
+            (Managed::AppImage, "AppImage"),
+            (Managed::Kernel, "5.3+"),
+            (Managed::UserManager, "user manager"),
+        ] {
+            assert!(reason.to_string().contains(text));
+        }
+        assert!(Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "update::linux::tests::appimage_extract_and_run_is_refused"
+            ])
+            .env("APPIMAGE", "/tmp/latch.AppImage")
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[test]
+    fn appimage_extract_and_run_is_refused() {
+        if std::env::var_os("APPIMAGE").is_some() {
+            let (_dir, exe) = install();
+            assert_eq!(installation(&exe).unwrap(), Err(Managed::AppImage));
         }
     }
 
@@ -668,10 +1384,10 @@ mod tests {
         let next = Transaction::begin_resolved(&exe).unwrap();
         drop(next);
         drop(inherited);
-        fs::remove_file(dir.path().join(".latch-host.update.lock")).unwrap();
+        fs::remove_file(lock_path(&exe).unwrap()).unwrap();
         let unrelated = dir.path().join("unrelated");
         fs::write(&unrelated, b"keep").unwrap();
-        symlink(&unrelated, dir.path().join(".latch-host.update.lock")).unwrap();
+        symlink(&unrelated, lock_path(&exe).unwrap()).unwrap();
         assert!(Transaction::begin_resolved(&exe).is_err());
         assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
     }
@@ -731,6 +1447,31 @@ mod tests {
                 "digest": format!("sha256:{}", super::super::sha256_hex(bytes)),
                 "url": format!("https://github.com/{}/releases/download/v{version}/{name}", super::super::REPO)}]
         })).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn uploaded_archives_are_rehashed_against_the_supervisors_manifest() {
+        let (dir, exe) = install();
+        let upload = dir.path().join("upload");
+        fs::write(&upload, b"tampered").unwrap();
+        let tx = Transaction::begin_resolved(&exe).unwrap();
+        let error = tx
+            .prepare_uploaded(&release(b"original", "999.0.0"), &upload)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("SHA-256"));
+        assert_eq!(fs::read(exe).unwrap(), b"old");
+    }
+
+    #[test]
+    fn health_probes_require_the_expected_process_and_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let port = listener.local_addr().unwrap().port();
+        owns_listener(std::process::id(), &exe, port).unwrap();
+        let (_dir, other) = install();
+        assert!(owns_listener(std::process::id(), &other, port).is_err());
+        drop(listener);
+        assert!(owns_listener(std::process::id(), &exe, port).is_err());
     }
 
     #[test]
@@ -805,7 +1546,7 @@ mod tests {
             Ok(_) => Transaction::begin(exe).unwrap(),
             // Containers and Nix build sandboxes refuse production updates.
             // Check that policy before exercising their filesystem transaction.
-            Err(why @ (Managed::Container | Managed::Permissions)) => {
+            Err(why @ (Managed::Container | Managed::Permissions | Managed::UserManager)) => {
                 assert!(Transaction::begin(exe).is_err(), "{why}");
                 Transaction::begin_resolved(exe).unwrap()
             }

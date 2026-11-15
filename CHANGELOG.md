@@ -114,6 +114,15 @@ GitHub release notes, so each version gets a heading of the form
   service restart and post-update health rollback. Keep package-manager,
   Nix, protected and container installs on their deployment update paths.
   Add native x64/arm64 CI fixture updates and a headless `--self-update` request.
+  Persist supervisor progress and failures, recover interrupted swaps, avoid
+  downloading releases already installed by the local service, and suppress
+  failed-version retries until a newer release or an explicit request.
+  Require Linux 5.3+ and a working systemd user manager before downloading.
+  Restart and rollback under a real systemd session remain untested until
+  the `Linux updater systemd` CI job for the commit passes. No Linux desktop machine was available. Real GUI
+  reopening and stream continuity across updates remain untested. Streams
+  admitted during probation can be cut by rollback, as on Windows. Refusing
+  toolbox/distrobox through container detection remains a documented follow-up.
 
 - Add a Scoop manifest, AUR packages (`latch-remote-bin` from the release
   binaries, `latch-remote` from the source archive) and a Nix flake that
