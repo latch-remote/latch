@@ -55,7 +55,16 @@ fn reference(events: &[crate::input::Event]) -> Vec<Value> {
             Event::MouseButton { button, down } => out.push(json!([
                 "button",
                 if cfg!(target_os = "macos") {
-                    button - 1
+                    match button {
+                        1 => 0,
+                        2 => 2,
+                        3 => 1,
+                        4 => 3,
+                        5 => 4,
+                        _ => panic!("unknown button"),
+                    }
+                } else if cfg!(target_os = "linux") && *button >= 4 {
+                    button + 4
                 } else {
                     *button
                 },
@@ -67,7 +76,9 @@ fn reference(events: &[crate::input::Event]) -> Vec<Value> {
             } => {
                 if cfg!(target_os = "linux") {
                     for (axis, (value, positive, negative)) in
-                        [(*vertical, 4, 5), (*horizontal, 7, 6)].into_iter().enumerate()
+                        [(*vertical, 4, 5), (*horizontal, 7, 6)]
+                            .into_iter()
+                            .enumerate()
                     {
                         scroll[axis] += i32::from(value);
                         let notches = scroll[axis] / 120;
@@ -107,6 +118,7 @@ fn pair_native_input() {
     );
     let files = format::files(&root, ".input.json");
     let mut consumed = 0;
+    let mut failures = 0;
     for path in files {
         let recording: InputRecording = format::read(&path);
         assert_eq!(recording.version, format::VERSION);
@@ -115,72 +127,83 @@ fn pair_native_input() {
         }
         consumed += 1;
         for case in recording.cases {
-            let observed = native(&format::inputs(&case.bytes));
-            assert_eq!(
-                observed,
-                reference(&format::inputs(&case.bytes)),
-                "native adapter regressed, {} {}",
-                recording.producer,
-                case.name
-            );
-            let expected = reference(&format::inputs(&case.expected));
-            let gap = case.name == "right-shift-identity"
-                || (case.name == "held-super-z" && !recording.producer.starts_with("macos-"));
-            if gap {
-                assert_ne!(observed, expected, "known gap unexpectedly passes");
-            } else {
+            let row = json!({"producer": recording.producer, "consumer": format::platform(), "case": case.name});
+            if !format::cell("input.jsonl", row, || {
+                let observed = native(&format::inputs(&case.bytes));
                 assert_eq!(
                     observed,
-                    expected,
-                    "{} -> {} {}",
+                    reference(&format::inputs(&case.bytes)),
+                    "native adapter regressed, {} {}",
                     recording.producer,
-                    format::platform(),
                     case.name
+                );
+                let expected = reference(&format::inputs(&case.expected));
+                let gap = format::input_gap(&case.name, &recording.producer);
+                if gap {
+                    assert_ne!(observed, expected, "known gap unexpectedly passes");
+                } else {
+                    assert_eq!(
+                        observed,
+                        expected,
+                        "{} -> {} {}",
+                        recording.producer,
+                        format::platform(),
+                        case.name
+                    );
+                }
+                format::result(
+                    "input.jsonl",
+                    json!({ "producer": recording.producer, "consumer": format::platform(), "case": case.name, "status": if gap { "known-gap" } else { "passed" }, "observed": observed, "expected": expected }),
+                );
+            }) {
+                failures += 1;
+            }
+        }
+        let row = json!({"producer": recording.producer, "consumer": format::platform(), "case": "gamepad-report"});
+        if !format::cell("input.jsonl", row, || {
+            let pad: serde_json::Value =
+                format::read(&path.parent().unwrap().join("gamepad.pad.json"));
+            assert_eq!(pad["producer"], recording.producer);
+            let bytes: Vec<u8> = serde_json::from_value(pad["bytes"].clone()).unwrap();
+            let latch_proto::wire::Datagram::Pad { updates, .. } =
+                latch_proto::wire::parse(&bytes).unwrap()
+            else {
+                panic!("no pad packet")
+            };
+            let update = updates.iter().next().unwrap();
+            let s = update.state;
+            assert_eq!(
+                crate::gamepad::map::xusb(&s),
+                [4, 16, 64, 191, 1, 128, 255, 127, 0, 0, 0, 0]
+            );
+            assert_eq!(
+                crate::gamepad::map::ds4(&s),
+                [0, 0, 128, 128, 38, 12, 0, 64, 191, 0]
+            );
+            #[cfg(target_os = "linux")]
+            {
+                assert_eq!(
+                    crate::gamepad::map::ev_axes(&s),
+                    [
+                        (0, -32767),
+                        (1, -32768),
+                        (3, 0),
+                        (4, -1),
+                        (2, 256),
+                        (5, 767),
+                        (16, -1),
+                        (17, 0)
+                    ]
                 );
             }
             format::result(
                 "input.jsonl",
-                json!({ "producer": recording.producer, "consumer": format::platform(), "case": case.name, "status": if gap { "known-gap" } else { "passed" }, "observed": observed, "expected": expected }),
+                json!({ "producer": recording.producer, "consumer": format::platform(), "case": "gamepad-report", "status": "passed", "xusb": crate::gamepad::map::xusb(&s), "ds4": crate::gamepad::map::ds4(&s), "native_bus": if cfg!(target_os = "macos") { "unavailable, macOS cannot add virtual gamepads" } else { "conversion only, hosted runner has no configured virtual bus" } }),
             );
+        }) {
+            failures += 1;
         }
-        let pad: serde_json::Value = format::read(&path.parent().unwrap().join("gamepad.pad.json"));
-        assert_eq!(pad["producer"], recording.producer);
-        let bytes: Vec<u8> = serde_json::from_value(pad["bytes"].clone()).unwrap();
-        let latch_proto::wire::Datagram::Pad { updates, .. } =
-            latch_proto::wire::parse(&bytes).unwrap()
-        else {
-            panic!("no pad packet")
-        };
-        let update = updates.iter().next().unwrap();
-        let s = update.state;
-        assert_eq!(
-            crate::gamepad::map::xusb(&s),
-            [4, 16, 64, 191, 1, 128, 255, 127, 0, 0, 0, 0]
-        );
-        assert_eq!(
-            crate::gamepad::map::ds4(&s),
-            [0, 0, 128, 128, 38, 12, 0, 64, 191, 0]
-        );
-        #[cfg(target_os = "linux")]
-        {
-            assert_eq!(
-                crate::gamepad::map::ev_axes(&s),
-                [
-                    (0, -32767),
-                    (1, -32768),
-                    (3, 0),
-                    (4, -1),
-                    (2, 256),
-                    (5, 767),
-                    (16, -1),
-                    (17, 0)
-                ]
-            );
-        }
-        format::result(
-            "input.jsonl",
-            json!({ "producer": recording.producer, "consumer": format::platform(), "case": "gamepad-report", "status": "passed", "xusb": crate::gamepad::map::xusb(&s), "ds4": crate::gamepad::map::ds4(&s), "native_bus": if cfg!(target_os = "macos") { "unavailable, macOS cannot add virtual gamepads" } else { "conversion only, hosted runner has no configured virtual bus" } }),
-        );
     }
     assert!(consumed > 0, "no input artifacts for this host");
+    assert_eq!(failures, 0, "required input cells failed");
 }

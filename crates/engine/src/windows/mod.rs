@@ -962,3 +962,6 @@ mod tests {
         bail!("MF round trip produced only {pictures} decoded pictures")
     }
 }
+
+#[cfg(test)]
+pub(crate) use audio::pair_pcm;

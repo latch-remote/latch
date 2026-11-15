@@ -163,6 +163,14 @@ impl AudioCapture for SyntheticAudio {
                 out.push((channel as i16 + 1) * 1000 + (sample % 127) as i16);
             }
         }
+        #[cfg(target_os = "macos")]
+        let converted = crate::mac::pair_pcm(out);
+        #[cfg(windows)]
+        let converted = crate::windows::pair_pcm(out);
+        #[cfg(target_os = "linux")]
+        let converted = crate::linux::pair_pcm(out);
+        assert_eq!(converted, *out, "OS capture format/channel order");
+        *out = converted;
         self.sample += audio::FRAME;
         Ok(true)
     }
@@ -497,11 +505,21 @@ fn record(mode: &str, frames: Vec<(video::EncodedVideo, VideoInfo)>, root: &Path
                 control::read_message(&mut &event.bytes[..]).unwrap(),
                 Message::Cursor(_)
             )));
+    let (audio_group, repair_us) = format::recovery_group(&recording);
+    assert_eq!(
+        (recording.pictures[0].width, recording.pictures[0].height),
+        (160, 98)
+    );
+    assert_eq!(
+        (recording.pictures[12].width, recording.pictures[12].height),
+        (128, 74),
+        "capture/encoder resize"
+    );
     let path = root.join(format!("{mode}.session.json"));
     format::write(&path, &recording);
     format::result(
         "producer.jsonl",
-        serde_json::json!({ "producer": format::platform(), "mode": mode, "status": "recorded", "hardware": hardware, "frames": recording.pictures.len(), "audio": recording.audio.len() }),
+        serde_json::json!({ "producer": format::platform(), "mode": mode, "status": "recorded", "hardware": hardware, "frames": recording.pictures.len(), "audio": recording.audio.len(), "recovery_group": audio_group, "repair_us": repair_us }),
     );
 }
 
@@ -549,6 +567,11 @@ fn pair_record() {
                 assert_eq!(std::env::var("LATCH_PAIR_CAPTURE_WINDOW").unwrap(), "1");
                 let mut frames = Vec::new();
                 for index in 0..FRAMES {
+                    if index == FRAMES / 2 {
+                        drop(pipeline);
+                        pipeline =
+                            video::open(&config(128, 74)).expect("native capture resize/reopen");
+                    }
                     frames.push((
                         pipeline
                             .next(

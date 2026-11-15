@@ -128,7 +128,7 @@ fn pair_input_record() {
             ));
         }
         let meta = Modifiers {
-            command: true,
+            command: cfg!(target_os = "macos"),
             mac_cmd: cfg!(target_os = "macos"),
             ..Modifiers::NONE
         };
@@ -214,9 +214,31 @@ fn pair_input_record() {
                 Sent::Button(1, false),
             ]),
         });
+        for (name, button, number) in [
+            ("button-left", PointerButton::Primary, 1),
+            ("button-right", PointerButton::Secondary, 3),
+            ("button-middle", PointerButton::Middle, 2),
+            ("button-x1", PointerButton::Extra1, 4),
+            ("button-x2", PointerButton::Extra2, 5),
+        ] {
+            cases.push(case(
+                target,
+                name,
+                [true, false]
+                    .into_iter()
+                    .map(|pressed| Event::PointerButton {
+                        pos: ON_PICTURE,
+                        button,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    })
+                    .collect(),
+                Modifiers::NONE,
+                vec![Sent::Button(number, true), Sent::Button(number, false)],
+            ));
+        }
         for item in &cases {
-            let gap = item.name == "right-shift-identity"
-                || (item.name == "held-super-z" && !cfg!(target_os = "macos"));
+            let gap = format::input_gap(&item.name, &format::platform());
             if gap {
                 assert_ne!(
                     item.bytes, item.expected,
@@ -238,14 +260,37 @@ fn pair_input_record() {
                 );
             }
         }
-        let clipboard = latch_core::api::Clipboard::fit(
-            if cfg!(windows) {
-                "first\r\néλ你😀\r\n"
-            } else {
-                "first\néλ你😀\n"
+        let (mut paste_view, _) = recording_on(
+            View {
+                captured: true,
+                grabbed: true,
+                ..Default::default()
             },
-            0,
+            true,
+            target,
         );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        paste_view
+            .state_mut()
+            .live
+            .as_mut()
+            .unwrap()
+            .clipboard
+            .pair_sender = Some(sender);
+        let text = if cfg!(windows) {
+            "first\r\néλ你😀\r\n"
+        } else {
+            "first\néλ你😀\n"
+        };
+        frame(
+            &mut paste_view,
+            vec![Event::Paste(text.into())],
+            Modifiers::NONE,
+        );
+        let clipboard = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Event::Paste did not reach the clipboard sender");
+        assert_eq!(clipboard.text, text, "paste encoding/line endings");
         format::write(
             &root.join(format!("{target}.input.json")),
             &InputRecording {

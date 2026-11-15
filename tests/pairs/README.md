@@ -8,8 +8,18 @@ and six distinct synthetic audio channels. The software encoder is
 IOSurface adapter around VideoToolbox. Windows uses the production
 Microsoft H.264 MFT and NV12 memory-sample path. Linux additionally captures
 a deterministic X11 window through `X11Capture` and `SoftwarePipeline`.
-macOS and Windows attempt native capture while a disposable fullscreen
-test window is open. API/window failures appear in the producer results.
+macOS and Windows open native capture while a disposable fullscreen test
+window is open. Both native encoder and capture tapes reopen at frame 12
+with a requested size change from 160×98 to 128×74 and assert both sizes.
+The software tapes share the same deterministic source across OSes. The
+native encoder and capture tapes exercise the OS-specific video paths.
+The producer also runs its ramp through the production OS audio conversion
+boundary. macOS copies planar Float32 buffers and converts to i16, Windows
+converts Float32 and PCM24 with the 5.1 side-surround WAVE mask through the
+WASAPI converter/resampler, and Linux checks the actual PulseAudio channel
+map and S16LE representation. These in-memory sources supply the server's
+AudioCapture boundary. Physical loopback devices and OS callback timing
+require separate desktop qualification.
 
 ## Format version 1
 
@@ -54,16 +64,36 @@ without opening a physical playback device.
 
 The clean schedule preserves recorded event timing. The loss/reorder
 schedule removes shard zero of frame 2, removes every datagram of frame
-4, reverses the shards of frame 7 and removes audio packet 4 while
-retaining parity. Replay requires video FEC recovery, audio recovery,
-keyframe requests and the exact surviving frame sequence. Recorded IDR 6
-answers recovery through the ordinary receive path. This finite tape
+4, reverses the shards of frame 7 and loses the first audio packet of a
+complete group selected by its actual recorded timings. Producers require
+a group whose first packet to parity interval is below the receiver's
+documented 20 ms AUDIO_HOLD. Replay dispatches the surviving
+group and its parity together to keep OS sleep granularity out of the
+inside-hold recovery assertion. All audio references must survive exactly.
+The separate late-audio schedule withholds that group's parity for at least
+40 ms and until the real receiver reports exactly that missing packet,
+then requires every other audio reference with exact content and ordering.
+Replay requires video FEC recovery and the exact surviving frame sequence.
+The peer withholds recorded recovery IDR 6 until the viewer requests a
+keyframe, failing after a bounded two-second wait. Tape time pauses during
+that wait so subsequent media retains its spacing. IDR 6 then enters the
+ordinary receive/decode path. This finite tape
 cannot generate reference-invalidation responses to arbitrary new
 requests. Recordings negotiate keyframe recovery.
 
 The consumer uses strict software or strict OS decoder construction so
-an OS decoder cell cannot silently switch backends. Failure to open an
-optional OS backend produces an explicit unavailable result. Failure
+an OS decoder cell cannot silently switch backends. Failure to open a
+required OS backend fails CI. The hosted capability contract is explicit.
+
+| Runner | Required producer modes | Required decoders | Explicit unavailable capability |
+|---|---|---|---|
+| macos-15 ARM64 | software, VideoToolbox native, ScreenCaptureKit capture | software, VideoToolbox | none |
+| windows-latest x86_64 | software, Media Foundation native | software, Media Foundation | desktop capture, hosted runner has no D3D11 adapter |
+| ubuntu-24.04 x86_64 | software, isolated X11 capture | software | native encoder/decoder, no hardware device |
+| ubuntu-24.04-arm ARM64 | software, isolated X11 capture | software | native encoder/decoder, no hardware device |
+
+Local macOS capture requires `--capture-window` and Screen Recording access.
+Every required backend is checked on the producer and consumer. Failure
 after a successful open fails its cell. Each producer also runs the
 existing loopback integration tests and a separate `serve` process
 against a software-decoding viewer, with key-to-picture and stereo audio
@@ -71,11 +101,13 @@ assertions.
 
 ## Input and platform boundaries
 
-The viewer recorder drives the production OS-event callback and following
-egui frame in the existing stream-view fixture, recording actual `Sink`
+The viewer recorder drives the production event gate with translated egui
+events and the following egui frame in the existing stream-view fixture, recording actual `Sink`
 output. Cases include Shift and held Super,
 right-Shift intent, AZERTY/QWERTZ physical-key preference, Unicode IME
 commit, captured motion, absolute positions/buttons and wheel units.
+The clipboard source drives `Event::Paste` through `StreamView::paste` and
+the real clipboard push/fitting and JSON encoding, with an in-memory sender.
 Native consumers use independent small key-code fixtures and inspect
 constructed native flags, coordinates, Unicode and scroll conversion.
 Linux observes XTest from another connection to the isolated `:9` display,
@@ -98,4 +130,32 @@ values for every case. Every required producer, media schedule, input
 case, gamepad conversion and clipboard case must produce a result row.
 The workflow has read-only repository permissions, SHA-pinned actions
 and 19-minute producer plus 6-minute consumer timeouts. Consumer jobs
-reuse their OS's producer-built test binaries.
+reuse their OS's producer-built test binaries. The driver restores execute
+permissions for every executable, including the X11 helper, and fails with
+the helper path if restoration fails. Every media cell runs in its own child
+process. Input and clipboard assertions are isolated per case. All cells
+run after a failure, and the final summary distinguishes passed, known-gap,
+failed, not-run and unavailable, with a run count. Any required failed or
+not-run cell fails the job.
+
+## Observed Mac audio repair latency
+
+Run 43693057052's macOS capture tape sends data seq 4 at 61.120 ms and its
+parity at 101.657 ms, a 40.537 ms delay. Seq 5 exposes the gap 40.522 ms
+before parity. The receiver's 20 ms hold expires first. Sender PTS advances
+40.572 ms between the first data and parity, so this is visible at the
+production sender as well as at the recording socket. Of 72 complete groups,
+37 have more than 20 ms between seq group+1 and parity. The maximum
+first-data-to-parity interval is 46.062 ms.
+
+The same run's software and native-encoder tapes have 47/91 and 48/84 such
+groups, with maxima 45.910 and 46.634 ms. All three use the same synthetic
+5 ms AudioCapture implementation. These numbers establish a real Mac
+server pacing/FEC vulnerability under this fixture's scheduling conditions.
+Physical ScreenCaptureKit audio callback cadence requires separate
+measurement. ScreenCaptureKit independently queues converted 5 ms frames,
+and send_audio emits parity only after every fourth coded packet. A callback
+or scheduling stall exceeding the hold can therefore waste redundancy in
+a live session too. The pacing/capture-cadence investigation needs its own
+product follow-up. This PR preserves product timing and tests both timely
+repair and exact late-packet concealment through the real receiver.

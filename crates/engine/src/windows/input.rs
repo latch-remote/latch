@@ -519,7 +519,20 @@ mod pair_interop {
                         } else if mouse.dwFlags == MOUSEEVENTF_HWHEEL {
                             out.push(json!(["wheel-h", mouse.mouseData as i32]));
                         } else {
-                            out.push(json!(["button", 1, mouse.dwFlags == MOUSEEVENTF_LEFTDOWN]));
+                            let (button, down) = match mouse.dwFlags {
+                                MOUSEEVENTF_LEFTDOWN => (1, true),
+                                MOUSEEVENTF_LEFTUP => (1, false),
+                                MOUSEEVENTF_RIGHTDOWN => (3, true),
+                                MOUSEEVENTF_RIGHTUP => (3, false),
+                                MOUSEEVENTF_MIDDLEDOWN => (2, true),
+                                MOUSEEVENTF_MIDDLEUP => (2, false),
+                                MOUSEEVENTF_XDOWN | MOUSEEVENTF_XUP => {
+                                    assert!(matches!(mouse.mouseData, 1 | 2));
+                                    (mouse.mouseData + 3, mouse.dwFlags == MOUSEEVENTF_XDOWN)
+                                }
+                                flags => panic!("unexpected mouse flags {flags:?}"),
+                            };
+                            out.push(json!(["button", button, down]));
                         }
                     }
                 }

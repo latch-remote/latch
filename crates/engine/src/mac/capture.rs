@@ -452,24 +452,8 @@ unsafe fn audio_sample(sample: Ref, state: &mut State) -> Result<()> {
                 || (!planar && count == 1 && buffers[0].channels as usize == channels),
             "inconsistent audio channel layout"
         );
-        let mut interleaved = Vec::new();
-        if planar {
-            let frames = buffers
-                .iter()
-                .map(|b| b.size as usize / 4)
-                .min()
-                .unwrap_or(0);
-            for i in 0..frames {
-                for b in buffers {
-                    interleaved.push(*b.data.add(i));
-                }
-            }
-        } else {
-            interleaved.extend_from_slice(std::slice::from_raw_parts(
-                buffers[0].data,
-                buffers[0].size as usize / 4,
-            ));
-        }
+        // SAFETY: the retained sample owns all validated buffers through this call.
+        let interleaved = interleave_audio(buffers, planar);
         let rate = asbd.rate.round() as u32;
         if state
             .resampler
@@ -584,4 +568,56 @@ mod hdr_tests {
             );
         }
     }
+}
+
+/// Buffers must point to live Float32 samples for their declared byte sizes.
+unsafe fn interleave_audio(buffers: &[AudioBuffer], planar: bool) -> Vec<f32> {
+    // SAFETY: the caller owns the sample buffers for the duration of this copy.
+    unsafe {
+        let mut interleaved = Vec::new();
+        if planar {
+            let frames = buffers
+                .iter()
+                .map(|b| b.size as usize / 4)
+                .min()
+                .unwrap_or(0);
+            for i in 0..frames {
+                for b in buffers {
+                    interleaved.push(*b.data.add(i));
+                }
+            }
+        } else {
+            interleaved.extend_from_slice(std::slice::from_raw_parts(
+                buffers[0].data,
+                buffers[0].size as usize / 4,
+            ));
+        }
+        interleaved
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn pair_pcm(pcm: &[i16]) -> Vec<i16> {
+    let planes: Vec<Vec<f32>> = (0..6)
+        .map(|channel| {
+            pcm.as_chunks::<6>()
+                .0
+                .iter()
+                .map(|frame| f32::from(frame[channel]) / 32767.0)
+                .collect()
+        })
+        .collect();
+    let buffers: Vec<_> = planes
+        .iter()
+        .map(|plane| AudioBuffer {
+            channels: 1,
+            size: std::mem::size_of_val(plane.as_slice()) as u32,
+            data: plane.as_ptr(),
+        })
+        .collect();
+    // SAFETY: planes owns every buffer and remains live during the copy.
+    let interleaved = unsafe { interleave_audio(&buffers, true) };
+    let mut out = vec![0; interleaved.len()];
+    audio::f32_to_i16(&interleaved, &mut out);
+    out
 }

@@ -19,6 +19,32 @@ SYSTEM = {"Darwin": "macos", "Windows": "windows", "Linux": "linux"}[platform.sy
 ARCH = {"arm64": "aarch64", "aarch64": "aarch64", "amd64": "x86_64", "x86_64": "x86_64"}[platform.machine().lower()]
 IDENTITY = f"{SYSTEM}-{ARCH}"
 EXE = ".exe" if SYSTEM == "windows" else ""
+REQUIRED = {
+    "linux": {"software", "capture"},
+    "macos": {"software", "native", "capture"},
+    "windows": {"software", "native"},
+}
+# Only these absent hosted devices/backends may produce unavailable rows.
+UNAVAILABLE = {
+    "linux": {"native": "Linux hosted runners have no native encoder device"},
+    "macos": {},
+    "windows": {"capture": "0x887A0004"},
+}
+INPUT_CASES = ("ansi-a", "azerty-a-at-q", "qwertz-z-at-y", "shift-a", "control-a", "alt-a", "right-shift-identity", "held-super-z", "unicode-commit", "relative-pointer", "wheel-line", "wheel-two-half-notches", "absolute-pointer-button", "button-left", "button-right", "button-middle", "button-x1", "button-x2", "gamepad-report", "clipboard-line-endings")
+SCHEDULES = ("clean", "loss-reorder", "late-audio")
+
+
+def executable(binaries, name):
+    path = binaries / (name + EXE)
+    if not path.is_file():
+        raise RuntimeError(f"required pair executable is missing: {path}")
+    try:
+        path.chmod(path.stat().st_mode | 0o111)
+    except OSError as error:
+        raise RuntimeError(f"cannot restore execute permission for required pair executable {path}: {error}") from error
+    if not os.access(path, os.X_OK):
+        raise RuntimeError(f"required pair executable is not executable: {path}")
+    return path
 
 
 def run(args, *, env=None, timeout=180):
@@ -57,8 +83,7 @@ def build(binaries):
 
 
 def execute(binaries, name, test, env):
-    path = binaries / (name + EXE)
-    path.chmod(path.stat().st_mode | 0o111)
+    path = executable(binaries, name)
     listing = subprocess.check_output([str(path), test, "--list"], text=True, env=env)
     assert "1 test," in listing, f"expected one named pair test, got {listing}"
     run([path, test, "--ignored", "--nocapture", "--test-threads=1"], env=env)
@@ -93,8 +118,7 @@ def capture_window(binaries, output, env, enabled):
         return
     ready = output / "window.ready"
     ready.unlink(missing_ok=True)
-    path = binaries / ("pair_window" + EXE)
-    path.chmod(path.stat().st_mode | 0o111)
+    path = executable(binaries, "pair_window")
     with (output / "window.log").open("w") as log:
         proc = subprocess.Popen([str(path), str(ready)], stdout=log, stderr=log, env=env)
         try:
@@ -123,18 +147,16 @@ def record(args):
         for path in output.glob(pattern):
             path.unlink()
     env = dict(os.environ, LATCH_PAIR_RECORD=str(output), LATCH_PAIR_RESULTS=str(output / "results"))
-    env["LATCH_PAIR_X11_HELPER"] = str(args.binaries / ("serve" + EXE))
+    env["LATCH_PAIR_X11_HELPER"] = str(executable(args.binaries, "serve"))
     with xvfb(env), capture_window(args.binaries, output, env, args.capture_window):
         execute(args.binaries, "engine", "pair_record", env)
         execute(args.binaries, "client", "pair_input_record", env)
         execute(args.binaries, "stream", "pair_gamepad_record", env)
         # Existing loopback suite verifies the synthetic key/picture and pad
         # round trips. It runs in addition to the two-process audio session.
-        path = args.binaries / ("loopback" + EXE)
-        path.chmod(path.stat().st_mode | 0o111)
+        path = executable(args.binaries, "loopback")
         run([path, "--nocapture", "--test-threads=1"], env=env)
-        serve = args.binaries / ("serve" + EXE)
-        serve.chmod(serve.stat().st_mode | 0o111)
+        serve = executable(args.binaries, "serve")
         env.update(LATCH_TEST_PATTERN="still", LATCH_TEST_AUDIO="clicks", LATCH_PAIR_LIVE_PORT="47863")
         with (output / "live.log").open("w") as log:
             host = subprocess.Popen([str(serve), "--port", "47863"], stdout=log, stderr=log, env=env)
@@ -154,7 +176,22 @@ def record(args):
                 host.wait(timeout=10)
     files = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in output.glob("*.json") if path.name != "manifest.json"}
     manifest = {"version": 1, "producer": IDENTITY, "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(), "files": files, "capabilities": rows(output / "results")}
+    require_capabilities(manifest, args)
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def require_capabilities(manifest, args):
+    system = manifest["producer"].split("-")[0]
+    required = REQUIRED[system].copy()
+    if system == "macos" and not (args.grid or args.capture_window or os.environ.get("GITHUB_ACTIONS") == "true"):
+        required.remove("capture")
+    for mode in required:
+        assert any(row.get("mode") == mode and row["status"] == "recorded" for row in manifest["capabilities"]), f"{manifest['producer']} requires {mode} on this runner"
+    if args.grid or os.environ.get("GITHUB_ACTIONS") == "true":
+        for row in manifest["capabilities"]:
+            if row["status"] == "unavailable":
+                reason = UNAVAILABLE[system].get(row["mode"])
+                assert reason and reason in row["reason"], f"unexpected unavailable capability on {manifest['producer']}: {row}"
 
 
 def verify(args):
@@ -166,6 +203,7 @@ def verify(args):
         assert manifest["version"] == 1
         assert manifest["revision"] == revision, "recording was produced by another revision"
         identities.append(manifest["producer"])
+        require_capabilities(manifest, args)
         assert "software.session.json" in manifest["files"]
         assert "gamepad.pad.json" in manifest["files"]
         for mode in ("software", "native", "capture"):
@@ -191,7 +229,7 @@ def verify(args):
     for name in ("media.jsonl", "input.jsonl", "clipboard.jsonl"):
         (results / name).unlink(missing_ok=True)
     env = dict(os.environ, LATCH_PAIR_ARTIFACTS=str(args.artifacts.resolve()), LATCH_PAIR_RESULTS=str(results))
-    env["LATCH_PAIR_X11_HELPER"] = str(args.binaries / ("serve" + EXE))
+    env["LATCH_PAIR_X11_HELPER"] = str(executable(args.binaries, "serve"))
     failures = []
     with xvfb(env):
         for binary, test in [("stream", "pair_replay"), ("engine", "pair_native_input"), ("host", "pair_clipboard")]:
@@ -206,28 +244,50 @@ def verify(args):
 
 def summary(artifacts, results, expected):
     observations = rows(results)
-    lines = [f"## Pair interoperability on {IDENTITY}", "", "| Host recording | Mode | Viewer decoder | Clean | Loss/reorder |", "|---|---|---|---|---|"]
+    lines = [f"## Pair interoperability on {IDENTITY}", "", "| Host recording | Mode | Viewer decoder | Clean | Loss/reorder | Late audio |", "|---|---|---|---|---|---|"]
     missing = []
+    counts = {"passed": 0, "known-gap": 0, "failed": 0, "not-run": 0, "unavailable": 0}
+
+    def status(matches, required):
+        if not required:
+            label = "unavailable"
+        elif any(r["status"] == "failed" for r in matches):
+            label = "failed"
+        elif any(r["status"] == "passed" for r in matches):
+            label = "passed"
+        elif any(r["status"] == "known-gap" for r in matches):
+            label = "known-gap"
+        else:
+            label = "not-run"
+        counts[label] += 1
+        return label
+
+    native_unavailable = next((r for r in observations if r.get("consumer") == IDENTITY and r.get("decoder") == "native" and r["status"] == "unavailable"), None)
+    if native_unavailable and SYSTEM != "linux":
+        missing.append((IDENTITY, "required native decoder unavailable", native_unavailable["reason"]))
+    inputs = []
     for producer in expected:
         manifest = next(json.loads(p.read_text(encoding="utf-8")) for p in artifacts.rglob("manifest.json") if json.loads(p.read_text(encoding="utf-8"))["producer"] == producer)
         for mode in ("software", "native", "capture"):
             available = f"{mode}.session.json" in manifest["files"]
             for decoder in ("software", "native"):
-                unavailable = next((r for r in observations if r.get("decoder") == decoder and r["status"] == "unavailable"), None)
-                status = []
-                for schedule in ("clean", "loss-reorder"):
-                    found = any(r.get("producer") == producer and r.get("mode") == mode and r.get("decoder") == decoder and r.get("schedule") == schedule and r["status"] == "passed" for r in observations)
-                    label = "passed" if found else "unavailable" if not available or unavailable else "FAILED"
-                    status.append(label)
-                    if label == "FAILED": missing.append((producer, mode, decoder, schedule))
-                lines.append(f"| {producer} | {mode} | {decoder} | {' | '.join(status)} |")
-        for case in ("ansi-a", "azerty-a-at-q", "qwertz-z-at-y", "shift-a", "control-a", "alt-a", "right-shift-identity", "held-super-z", "unicode-commit", "relative-pointer", "wheel-line", "wheel-two-half-notches", "absolute-pointer-button", "gamepad-report", "clipboard-line-endings"):
-            if not any(r.get("producer") == producer and r.get("case") == case and r["status"] in ("passed", "known-gap") for r in observations):
-                missing.append((producer, case))
-    lines.extend(["", "### Input, clipboard and gamepad results", "", "| Viewer | Host | Case | Result |", "|---|---|---|---|"])
-    for row in observations:
-        if "case" in row:
-            lines.append(f"| {row['producer']} | {IDENTITY} | {row['case']} | {row['status']} |")
+                required = available and (decoder == "software" or SYSTEM != "linux")
+                labels = []
+                for schedule in SCHEDULES:
+                    matches = [r for r in observations if r.get("consumer") == IDENTITY and r.get("producer") == producer and r.get("mode") == mode and r.get("decoder") == decoder and r.get("schedule") == schedule]
+                    label = status(matches, required)
+                    labels.append(label)
+                    if label in ("failed", "not-run"):
+                        missing.append((producer, mode, decoder, schedule, label))
+                lines.append(f"| {producer} | {mode} | {decoder} | {' | '.join(labels)} |")
+        for case in INPUT_CASES:
+            matches = [r for r in observations if r.get("consumer") == IDENTITY and r.get("producer") == producer and r.get("case") == case]
+            label = status(matches, True)
+            inputs.append(f"| {producer} | {IDENTITY} | {case} | {label} |")
+            if label in ("failed", "not-run"):
+                missing.append((producer, case, label))
+    run_count = counts["passed"] + counts["known-gap"] + counts["failed"]
+    lines.extend(["", f"Run {run_count}, passed {counts['passed']}, known-gap {counts['known-gap']}, failed {counts['failed']}, not-run {counts['not-run']}, unavailable {counts['unavailable']}.", "", "### Input, clipboard and gamepad results", "", "| Viewer | Host | Case | Result |", "|---|---|---|---|", *inputs])
     lines.extend(["", "### Capability limits and known gaps", ""])
     for path in artifacts.rglob("producer.jsonl"):
         for row in rows(path.parent):
@@ -235,7 +295,7 @@ def summary(artifacts, results, expected):
     for limit in sorted({row["native_bus"] for row in observations if "native_bus" in row}):
         lines.append(f"- Gamepad injection — {limit}")
     for row in observations:
-        if row["status"] in ("unavailable", "known-gap"):
+        if row["status"] in ("unavailable", "known-gap", "failed"):
             lines.extend(["```json", json.dumps(row, ensure_ascii=False), "```", ""])
     text = "\n".join(lines) + "\n"
     (results / "summary.md").write_text(text, encoding="utf-8")

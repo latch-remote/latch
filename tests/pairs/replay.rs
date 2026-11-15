@@ -45,7 +45,10 @@ impl Probe {
     }
 }
 
-fn check(recording: Recording, native: bool, impaired: bool) {
+fn check(recording: Recording, native: bool, schedule: &str) {
+    let impaired = schedule == "loss-reorder";
+    let late_audio = schedule == "late-audio";
+    let (audio_group, repair_us) = format::recovery_group(&recording);
     let probe = Arc::new(Probe {
         native,
         channels: 6,
@@ -56,10 +59,10 @@ fn check(recording: Recording, native: bool, impaired: bool) {
     });
     let recording = Arc::new(recording);
     let (udp, listener) = format::ports::udp_and_tcp_on_one_port();
-    udp.set_read_timeout(Some(Duration::from_millis(2)))
-        .unwrap();
+    udp.set_nonblocking(true).unwrap();
     let port = udp.local_addr().unwrap().port();
     let tape = recording.clone();
+    let host_probe = probe.clone();
     let host = std::thread::spawn(move || {
         let (mut tcp, peer) = listener.accept().unwrap();
         tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -88,6 +91,7 @@ fn check(recording: Recording, native: bool, impaired: bool) {
         let mut dropped_video = 0;
         let mut dropped_audio = 0;
         let mut fec_erased = 0;
+        let mut requests_at_loss = None;
         let mut receive = [0; 2048];
         let mut reply = Vec::new();
         let mut poll = || {
@@ -113,12 +117,15 @@ fn check(recording: Recording, native: bool, impaired: bool) {
         while !hello_seen.get() {
             assert!(Instant::now() < deadline, "viewer Hello deadline");
             poll();
+            std::thread::sleep(Duration::from_millis(1));
         }
         let start = Instant::now();
         let mut reordered = Vec::new();
+        let mut pause = Duration::ZERO;
+        let mut audio_sent = false;
         for event in &tape.events {
             // Leave time for receiver/decode startup on two-core hosted machines.
-            let due = start + Duration::from_micros(event.us) + Duration::from_millis(100);
+            let due = start + Duration::from_micros(event.us) + Duration::from_millis(100) + pause;
             while Instant::now() < due {
                 poll();
                 std::thread::sleep(Duration::from_millis(1));
@@ -132,18 +139,84 @@ fn check(recording: Recording, native: bool, impaired: bool) {
                 continue;
             }
             let datagram = wire::parse(&event.bytes).unwrap();
+            // Hold the recovery IDR until the real viewer asks. Freeze tape time
+            // while waiting so subsequent frames and audio retain their spacing.
+            if impaired
+                && matches!(datagram, Datagram::Video { shard, .. } if shard.frame == 6)
+                && requests.get() <= requests_at_loss.expect("frame 4 must precede recovery IDR")
+            {
+                let waiting = Instant::now();
+                let deadline = waiting + Duration::from_secs(2);
+                while requests.get() <= requests_at_loss.unwrap() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "viewer did not request a recovery keyframe within 2 s"
+                    );
+                    poll();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                pause += waiting.elapsed();
+            }
+            if impaired || late_audio {
+                if let Datagram::Audio { packet, .. } = datagram {
+                    if packet.seq >= audio_group
+                        && packet.seq < audio_group + latch_proto::audio::GROUP
+                    {
+                        if !audio_sent {
+                            audio_sent = true;
+                            // Dispatch this tape-derived group together. This removes
+                            // OS sleep granularity from the inside-hold recovery check.
+                            let mut parity = None;
+                            for data in &tape.events {
+                                if data.lane != Lane::Datagram {
+                                    continue;
+                                }
+                                if let Datagram::Audio { packet: p, .. } =
+                                    wire::parse(&data.bytes).unwrap()
+                                {
+                                    if p.parity && p.seq == audio_group {
+                                        parity = Some(&data.bytes);
+                                    }
+                                    if !p.parity
+                                        && p.seq > audio_group
+                                        && p.seq < audio_group + latch_proto::audio::GROUP
+                                    {
+                                        udp.send_to(&data.bytes, viewer).unwrap();
+                                    }
+                                }
+                            }
+                            dropped_audio += 1;
+                            if late_audio {
+                                let waiting = Instant::now();
+                                let deadline = waiting + Duration::from_secs(2);
+                                while !host_probe.missing.lock().contains(&audio_group)
+                                    || waiting.elapsed() < latch_proto::audio::AUDIO_HOLD * 2
+                                {
+                                    assert!(
+                                        Instant::now() < deadline,
+                                        "viewer did not conceal late audio within 2 s"
+                                    );
+                                    poll();
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                pause += waiting.elapsed();
+                            }
+                            udp.send_to(parity.expect("selected group parity"), viewer)
+                                .unwrap();
+                        }
+                        continue;
+                    }
+                }
+            }
             if impaired {
                 match datagram {
                     Datagram::Video { shard, .. } if shard.frame == 4 => {
+                        requests_at_loss.get_or_insert(requests.get());
                         dropped_video += 1;
                         continue;
                     }
                     Datagram::Video { shard, .. } if shard.frame == 2 && shard.shard == 0 => {
                         fec_erased += 1;
-                        continue;
-                    }
-                    Datagram::Audio { packet, .. } if !packet.parity && packet.seq == 4 => {
-                        dropped_audio += 1;
                         continue;
                     }
                     Datagram::Video { shard, .. } if shard.frame == 7 => {
@@ -164,13 +237,20 @@ fn check(recording: Recording, native: bool, impaired: bool) {
         let deadline = Instant::now() + Duration::from_millis(350);
         while Instant::now() < deadline {
             poll();
+            std::thread::sleep(Duration::from_millis(1));
         }
         assert!(
             hello_seen.get(),
             "viewer never authenticated the UDP session"
         );
+        if impaired || late_audio {
+            assert!(
+                audio_sent && dropped_audio == 1,
+                "selected audio loss must run"
+            );
+        }
         if impaired {
-            assert!(dropped_video > 0 && fec_erased > 0 && dropped_audio == 1);
+            assert!(dropped_video > 0 && fec_erased > 0);
             assert!(
                 requests.get() > 0,
                 "loss did not exercise keyframe requests"
@@ -297,10 +377,24 @@ fn check(recording: Recording, native: bool, impaired: bool) {
             min_psnr = min_psnr.min(psnr);
         }
     }
-    assert!(probe.missing.lock().is_empty(), "unrecovered audio");
+    let expected_missing = if late_audio {
+        vec![audio_group]
+    } else {
+        vec![]
+    };
+    assert_eq!(
+        *probe.missing.lock(),
+        expected_missing,
+        "audio concealment identities"
+    );
     let sound = probe.sound.lock();
-    assert_eq!(sound.len(), recording.audio.len(), "audio frame count");
-    for ((seq, channels, hash), expected) in sound.iter().zip(&recording.audio) {
+    let expected_audio: Vec<_> = recording
+        .audio
+        .iter()
+        .filter(|a| !late_audio || a.seq != audio_group)
+        .collect();
+    assert_eq!(sound.len(), expected_audio.len(), "audio frame count");
+    for ((seq, channels, hash), expected) in sound.iter().zip(expected_audio) {
         assert_eq!(
             (*seq, *channels, hash),
             (expected.seq, expected.channels, &expected.hash),
@@ -315,7 +409,7 @@ fn check(recording: Recording, native: bool, impaired: bool) {
     }
     format::result(
         "media.jsonl",
-        serde_json::json!({ "producer": recording.producer, "consumer": format::platform(), "mode": recording.mode, "decoder": if native { "native" } else { "software" }, "backend": session.stats().decoder, "schedule": if impaired { "loss-reorder" } else { "clean" }, "status": "passed", "frames": pictures.len(), "audio": sound.len(), "min_psnr": min_psnr, "keyframe_requests": requests }),
+        serde_json::json!({ "producer": recording.producer, "consumer": format::platform(), "mode": recording.mode, "decoder": if native { "native" } else { "software" }, "backend": session.stats().decoder, "schedule": schedule, "audio_group": audio_group, "recorded_repair_us": repair_us, "concealed": *probe.missing.lock(), "status": "passed", "frames": pictures.len(), "audio": sound.len(), "min_psnr": min_psnr, "keyframe_requests": requests }),
     );
 }
 
@@ -327,6 +421,19 @@ fn pair_replay() {
     );
     let files = format::files(&root, ".session.json");
     assert!(!files.is_empty(), "no producer recordings");
+    // Each cell runs in a child so a failed assertion also closes its sockets
+    // and worker threads before the next independent session starts.
+    if let Some(file) = std::env::var_os("LATCH_PAIR_CELL") {
+        let recording: Recording = format::read(std::path::Path::new(&file));
+        assert_eq!(recording.version, format::VERSION);
+        assert_eq!(recording.pictures.len(), format::FRAMES);
+        check(
+            recording,
+            std::env::var("LATCH_PAIR_DECODER").unwrap() == "native",
+            &std::env::var("LATCH_PAIR_SCHEDULE").unwrap(),
+        );
+        return;
+    }
     // VideoToolbox creates its OS session lazily on the first access unit.
     // Probe actual decoding before declaring the optional backend available.
     let native = match video::pair_decoder(true, 256, 256).and_then(|mut decoder| {
@@ -354,19 +461,43 @@ fn pair_replay() {
             false
         }
     };
+    let mut failures = 0;
     for file in files {
-        for decoder in [false, true]
+        for decoder in ["software", "native"]
             .into_iter()
-            .filter(|native_mode| !native_mode || native)
+            .filter(|d| *d != "native" || native)
         {
-            for impaired in [false, true] {
+            for schedule in ["clean", "loss-reorder", "late-audio"] {
                 let recording: Recording = format::read(&file);
-                assert_eq!(recording.version, format::VERSION);
-                assert_eq!(recording.pictures.len(), format::FRAMES);
-                check(recording, decoder, impaired);
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "pair_replay",
+                        "--ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env("LATCH_PAIR_CELL", &file)
+                    .env("LATCH_PAIR_DECODER", decoder)
+                    .env("LATCH_PAIR_SCHEDULE", schedule)
+                    .output()
+                    .expect("start replay cell");
+                println!("{}", String::from_utf8_lossy(&output.stdout));
+                if !output.status.success() {
+                    failures += 1;
+                    format::result(
+                        "media.jsonl",
+                        serde_json::json!({
+                            "producer": recording.producer, "consumer": format::platform(),
+                            "mode": recording.mode, "decoder": decoder, "schedule": schedule,
+                            "status": "failed", "error": String::from_utf8_lossy(&output.stderr),
+                            "output": String::from_utf8_lossy(&output.stdout)
+                        }),
+                    );
+                }
             }
         }
     }
+    assert_eq!(failures, 0, "required media cells failed");
 }
 
 #[test]

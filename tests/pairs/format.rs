@@ -10,6 +10,16 @@ pub mod ports;
 pub const VERSION: u32 = 1;
 pub const FRAMES: usize = 24;
 
+// Flip each gate in the fixing PR listed in KNOWN-GAPS.md. Intent stays exact.
+pub const HELD_SUPER_GAP: bool = true; // PR #109, native capture fixture required.
+pub const RIGHT_SHIFT_GAP: bool = true; // PR #109, native capture fixture required.
+pub const CLIPBOARD_CRLF_GAP: bool = true; // Follow-up PR remains unassigned.
+
+pub fn input_gap(case: &str, producer: &str) -> bool {
+    (RIGHT_SHIFT_GAP && case == "right-shift-identity")
+        || (HELD_SUPER_GAP && case == "held-super-z" && !producer.starts_with("macos-"))
+}
+
 pub fn platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
@@ -145,4 +155,58 @@ pub fn result(file: &str, row: serde_json::Value) {
             .unwrap();
         writeln!(output, "{row}").unwrap();
     }
+}
+
+/// Keep running independent cells, retaining each assertion's failure evidence.
+pub fn cell(file: &str, mut row: serde_json::Value, check: impl FnOnce()) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)) {
+        Ok(()) => true,
+        Err(error) => {
+            row["status"] = "failed".into();
+            row["error"] = error
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| error.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_else(|| "non-string panic".into())
+                .into();
+            result(file, row);
+            false
+        }
+    }
+}
+
+/// Choose a complete, non-initial audio group by its actual repair latency.
+/// Keeping the fastest group leaves headroom inside the receiver's hold.
+pub fn recovery_group(recording: &Recording) -> (u32, u64) {
+    use latch_proto::{
+        audio::{AUDIO_HOLD, GROUP},
+        wire::{parse, Datagram},
+    };
+    recording
+        .events
+        .iter()
+        .filter_map(|event| {
+            let Datagram::Audio { packet, .. } = parse(&event.bytes).ok()? else {
+                return None;
+            };
+            if event.lane != Lane::Datagram || !packet.parity || packet.seq < GROUP {
+                return None;
+            }
+            let mut first = None;
+            for seq in packet.seq..packet.seq + GROUP {
+                let data = recording.events.iter().find(|data| {
+                    data.lane == Lane::Datagram
+                        && matches!(parse(&data.bytes),
+                    Ok(Datagram::Audio { packet: p, .. }) if !p.parity && p.seq == seq)
+                })?;
+                first.get_or_insert(data.us);
+                if data.us > event.us {
+                    return None;
+                }
+            }
+            Some((packet.seq, event.us - first?))
+        })
+        .filter(|(_, delay)| *delay < AUDIO_HOLD.as_micros() as u64)
+        .min_by_key(|(_, delay)| *delay)
+        .expect("tape needs a complete audio repair group arriving within AUDIO_HOLD (20 ms)")
 }

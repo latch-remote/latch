@@ -366,3 +366,6 @@ impl AudioCapture for Audio {
         "ScreenCaptureKit system audio · 48 kHz stereo".to_string()
     }
 }
+
+#[cfg(test)]
+pub(crate) use capture::pair_pcm;

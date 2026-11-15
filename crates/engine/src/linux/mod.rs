@@ -167,3 +167,6 @@ mod tests {
         assert!(!xwayland_outputs(std::iter::empty()));
     }
 }
+
+#[cfg(test)]
+pub(crate) use audio::pair_pcm;

@@ -20,35 +20,44 @@ fn pair_clipboard() {
         std::env::var_os("LATCH_PAIR_ARTIFACTS").expect("set LATCH_PAIR_ARTIFACTS"),
     );
     let mut consumed = 0;
+    let mut failures = 0;
     for file in format::files(&root, ".input.json") {
         let recording: format::InputRecording = format::read(&file);
         if recording.target != std::env::consts::OS {
             continue;
         }
         consumed += 1;
-        CAPTURE.set(Some(Vec::new()));
-        write(&recording.clipboard).unwrap();
-        let observed = CAPTURE.take().unwrap();
-        let expected = if cfg!(windows) {
-            "first\r\néλ你😀\r\n"
-        } else {
-            "first\néλ你😀\n"
-        };
-        let gap = recording.producer.starts_with("windows-") && !cfg!(windows);
-        if gap {
-            assert_eq!(observed, ["first\r\néλ你😀\r\n"]);
-            assert_ne!(
-                observed,
-                [expected],
-                "known newline gap unexpectedly passes"
+        let row = serde_json::json!({"producer": recording.producer, "consumer": format::platform(), "case": "clipboard-line-endings"});
+        if !format::cell("clipboard.jsonl", row, || {
+            CAPTURE.set(Some(Vec::new()));
+            write(&recording.clipboard).unwrap();
+            let observed = CAPTURE.take().unwrap();
+            let expected = if cfg!(windows) {
+                "first\r\néλ你😀\r\n"
+            } else {
+                "first\néλ你😀\n"
+            };
+            let gap = format::CLIPBOARD_CRLF_GAP
+                && recording.producer.starts_with("windows-")
+                && !cfg!(windows);
+            if gap {
+                assert_eq!(observed, ["first\r\néλ你😀\r\n"]);
+                assert_ne!(
+                    observed,
+                    [expected],
+                    "known newline gap unexpectedly passes"
+                );
+            } else {
+                assert_eq!(observed, [expected]);
+            }
+            format::result(
+                "clipboard.jsonl",
+                serde_json::json!({ "producer": recording.producer, "consumer": format::platform(), "case": "clipboard-line-endings", "status": if gap { "known-gap" } else { "passed" }, "observed": observed, "expected": [expected] }),
             );
-        } else {
-            assert_eq!(observed, [expected]);
+        }) {
+            failures += 1;
         }
-        format::result(
-            "clipboard.jsonl",
-            serde_json::json!({ "producer": recording.producer, "consumer": format::platform(), "case": "clipboard-line-endings", "status": if gap { "known-gap" } else { "passed" }, "observed": observed, "expected": [expected] }),
-        );
     }
     assert!(consumed > 0);
+    assert_eq!(failures, 0, "required clipboard cells failed");
 }
