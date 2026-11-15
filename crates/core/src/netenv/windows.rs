@@ -292,6 +292,57 @@ mod tests {
     }
 
     #[test]
+    fn real_async_pac_download_and_stalled_server() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let location = format!("http://{}/proxy.pac", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            crate::http::read_request(&mut stream).unwrap().unwrap();
+            let script =
+                "function FindProxyForURL(url, host) { return 'PROXY first.test:8080; DIRECT'; }";
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{script}", script.len()).unwrap();
+        });
+        let result = unsafe {
+            auto_proxy(
+                "https://relay.test/",
+                &location,
+                false,
+                Instant::now() + Duration::from_secs(3),
+            )
+        }
+        .expect("WinHTTP evaluates local PAC");
+        server.join().unwrap();
+        assert_eq!(result.candidates.len(), 2);
+        assert_eq!(result.candidates[0].source, ProxySource::WindowsPac);
+        assert_eq!(
+            result.candidates[0].proxy.to_string(),
+            "http://first.test:8080"
+        );
+        assert_eq!(result.candidates[1].proxy, Proxy::Direct);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let location = format!("http://{}/stalled.pac", listener.local_addr().unwrap());
+        let start = Instant::now();
+        let result = unsafe {
+            auto_proxy(
+                "https://relay.test/",
+                &location,
+                false,
+                start + Duration::from_millis(100),
+            )
+        };
+        assert!(result.is_none());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn async_result_preserves_order_and_direct_choice() {
         let host: Vec<u16> = "proxy.test".encode_utf16().chain(Some(0)).collect();
         let mut entries = [
