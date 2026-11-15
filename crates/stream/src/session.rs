@@ -3125,6 +3125,7 @@ fn handle(
 
 struct SubmittedFrame {
     identity: u32,
+    keyframe: bool,
     started: Instant,
     ready: Instant,
     host_delay: u16,
@@ -3155,6 +3156,7 @@ fn decode(
     // when a decoder emits several pictures while accepting another one.
     let mut pending = BTreeMap::new();
     let mut sample_time = 0i64;
+    let mut last_published = i64::MIN;
     loop {
         let ((frame, ready), route_revision) = {
             let mut q = inner.queue.lock();
@@ -3197,6 +3199,7 @@ fn decode(
             sample_time,
             SubmittedFrame {
                 identity: frame.frame,
+                keyframe: frame.keyframe,
                 started: start,
                 ready,
                 host_delay: frame.host_delay,
@@ -3204,19 +3207,17 @@ fn decode(
                 route_revision,
             },
         );
-        let decoded = decoder
-            .decode_frames(&frame.data, frame.keyframe, sample_time, spare)
-            .and_then(|pictures| {
-                let mut times = std::collections::BTreeSet::new();
-                if !pictures
-                    .iter()
-                    .all(|(time, _)| pending.contains_key(time) && times.insert(*time))
-                {
-                    inner.stats.lock().decoder_discarded_frames += pictures.len() as u64;
-                    anyhow::bail!("decoder returned an unknown or duplicate sample time");
-                }
-                Ok(pictures)
-            });
+        let generation = decoder.generation();
+        let decoded = decoder.decode_frames(&frame.data, frame.keyframe, sample_time, spare);
+        if decoder.generation() != generation {
+            let before = pending.len();
+            pending.retain(|&time, _| time == sample_time);
+            inner.stats.lock().decoder_discarded_frames += (before - pending.len()) as u64;
+        }
+        if decoded.is_err() {
+            pending.remove(&sample_time);
+            inner.stats.lock().decoder_discarded_frames += 1;
+        }
         #[cfg(test)]
         if let Some(probe) = &inner.pair_probe {
             probe.decode_call(frame.frame, &decoded, sample_time);
@@ -3227,11 +3228,19 @@ fn decode(
         }
         if inner.relay.lock().revision() != route_revision {
             // A route committed during this call. Retire its returned
-            // identities while preserving metadata for older held outputs.
+            // identities and any older unresolved inputs.
             if let Ok(pictures) = decoded {
                 let discarded = pictures.len() as u64;
+                let mut newest = None;
                 for (time, _) in pictures {
-                    pending.remove(&time);
+                    if pending.remove(&time).is_some() {
+                        newest = Some(newest.map_or(time, |previous: i64| previous.max(time)));
+                    }
+                }
+                if let Some(time) = newest {
+                    let before = pending.len();
+                    pending = pending.split_off(&time);
+                    inner.stats.lock().decoder_discarded_frames += (before - pending.len()) as u64;
                 }
                 inner.stats.lock().decoder_discarded_frames += discarded;
             }
@@ -3277,8 +3286,20 @@ fn decode(
         }
         match decoded {
             Ok(pictures) => {
+                let mut newest = None;
                 for (time, mut picture) in pictures {
-                    let submitted = pending.remove(&time).expect("validated sample time");
+                    let Some(submitted) = pending.remove(&time) else {
+                        // Unknown and duplicate times affect only this output.
+                        inner.stats.lock().decoder_discarded_frames += 1;
+                        continue;
+                    };
+                    if newest.is_none_or(|(previous, _)| time > previous) {
+                        newest = Some((time, submitted.keyframe));
+                    }
+                    if time <= last_published {
+                        inner.stats.lock().decoder_discarded_frames += 1;
+                        continue;
+                    }
                     // Serialize publication with the TCP owner's route commit.
                     let route = inner.relay.lock();
                     if route.revision() != submitted.route_revision {
@@ -3324,6 +3345,7 @@ fn decode(
                     if let Some(probe) = &inner.pair_probe {
                         probe.picture(submitted.identity, &picture);
                     }
+                    last_published = time;
                     inner.frames.publish(picture);
                     inner
                         .published_us
@@ -3346,6 +3368,19 @@ fn decode(
                     w.queue_us += (submitted.started - submitted.ready).as_micros() as u64;
                     w.host_tenths += u64::from(submitted.host_delay);
                     w.assembly_us += submitted.assembly.as_micros() as u64;
+                }
+                // Retire only inputs absent from the entire batch. An older
+                // returned picture was already counted if publication dropped it.
+                if let Some((time, keyframe)) = newest {
+                    let before = pending.len();
+                    pending = pending.split_off(&time);
+                    let missing = before - pending.len();
+                    if missing > 0 {
+                        inner.stats.lock().decoder_discarded_frames += missing as u64;
+                        if !keyframe {
+                            inner.queue.lock().want_keyframe = true;
+                        }
+                    }
                 }
             }
             Err(e) => {

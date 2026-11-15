@@ -112,12 +112,32 @@ five reference-buffer slots, with latency-increase-plus-one zero. Host
 normalization makes the latency bound explicit as one and preserves those
 five slots.
 
+The opt-in Mac H.264 High LTR recording (`LATCH_MAC_LTR=1`, 60 synthetic
+pictures at 320×192) declares 15 reference frames and 15 decoder-buffer
+slots before and after rewriting. FFmpeg's live reference lists reach 15,
+including long-term references. The hardware pipeline assertion requires
+buffering to cover the measured total. A decode-only Windows run returned
+all 60 pictures at zero per-call delay through Media Foundation software
+and DXVA. Their visible pixels matched at 40 dB PSNR or better, and both low-latency settings read back as enabled.
+Intel and NVIDIA DXVA, Linux GPU encoding and VA-API decoding remain
+unverified on hardware.
+
+Optimizer compatibility tests also decode profile-id-144 H.264, reserved
+H.264 constraint bits, and 16400-pixel-wide or tall HEVC through FFmpeg
+after byte-identical pass-through. The invalid HEVC VPS reserved value
+`0xfffe` is preserved, but FFmpeg rejects it and MF software returns no
+picture. Successful decoding of that class and HEVC depths above 16 bits
+remains unverified with the available decoders.
+
 The separate Linux ARM64 capture → Windows MF failure at PR #107 head
 `d2e4d3c` lost identities 2–5 even though the Rust encoder's SPS already
 declares zero reordering. The shared output collector preserves every
 ready sample, independently of SPS rewriting. Its deterministic multi-output
 and partial-error/retry tests cover that loss mechanism, and the recorded
-Linux tape checks all 24 timestamps and picture contents.
+Linux tape checks all 24 timestamps and picture contents. Returning every
+ready output fixes intermittent picture loss. Decoder withholding with
+Linux-encoded streams was not reproduced. A recurrence now appears as
+latency flagged by CI's strict per-call assertion.
 
 Mac VideoToolbox and the Rust decoder pass local zero-delay replay. Linux
 software, Windows software/MF and Mac VideoToolbox combinations run in the

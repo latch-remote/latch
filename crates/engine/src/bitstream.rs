@@ -344,6 +344,19 @@ mod tests {
     }
 
     #[test]
+    fn rejected_sps_does_not_fail_encoder_output() -> Result<()> {
+        let bytes = include_bytes!("../../../tests/pairs/mac-vt-rejected-sps.h264");
+        let mut decoder = latch_codec::h264::Decoder::new();
+        for unit in latch_codec::h264::nal::access_units(bytes) {
+            let mut output = unit.to_vec();
+            low_delay(crate::video::Codec::H264High, &mut output)?;
+            assert_eq!(output, unit);
+            assert!(decoder.decode(&output)?.is_some());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn nal_units_split_on_three_and_four_byte_start_codes() {
         let data = [
             9, 9, // ignored

@@ -272,8 +272,10 @@ H.264/HEVC hosts declare zero output reordering. A shared Rust SPS rewriter
 adds H.264 VUI restrictions with zero reordered frames and the minimum
 buffer compatible with the SPS reference count. It sets HEVC VPS/SPS
 sublayer reorder counts to zero and latency-increase-plus-one to one while
-retaining reference storage. VideoToolbox, MF, AMF, NVENC and VA-API output
-passes through this normalization. The Rust encoder already writes the
+retaining reference storage. Explicit nonzero reordering and any parse or
+validation failure preserve the entire original access unit and emit a
+rate-limited warning with the reason. VideoToolbox, MF, AMF, NVENC and
+VA-API output passes through this normalization. The Rust encoder already writes the
 H.264 restriction. POC, colour, timing, crop and scaling lists are preserved.
 
 Media Foundation also normalizes incoming parameter sets for 6.0.0 hosts.
@@ -283,9 +285,26 @@ identity, route and latency measurements. Held, pending and discarded
 pictures appear in viewer statistics. VideoToolbox disables asynchronous
 and temporal processing, passes per-input callback storage and waits for
 completion. VA-API submits one identified surface and synchronizes that
-surface before returning it. The Rust decoder reconstructs the current
-I/P access unit synchronously. Pair replay requires zero decoder delay
+surface before returning it according to code inspection. This VA-API
+behavior remains unverified on hardware. The Rust decoder reconstructs
+the current I/P access unit synchronously. Pair replay requires zero decoder delay
 on each submitted access unit for every available host/viewer combination.
+
+Returning every ready MF output fixes the intermittent picture loss with
+Linux-encoded streams. Decoder withholding with those streams was not
+reproduced. Any recurrence now appears as latency and fails CI's strict
+per-call output assertion.
+
+A local 60-picture H.264 High recording with `LATCH_MAC_LTR=1` declares
+`max_num_ref_frames=15` and `max_dec_frame_buffering=15` both before and
+after rewriting. The original and rewritten SPS are both
+`27640015ac131410050669a80808083c20108420`.
+FFmpeg's live short-term plus long-term reference lists reach 15. The
+opt-in LTR pipeline test asserts that the rewritten buffering covers this
+measured reference use. A decode-only Windows run returned all 60 pictures
+on their own submission through both Media Foundation software and DXVA,
+with at least 40 dB PSNR between their visible pixels. H.264 low-latency settings read back
+as enabled through both APIs.
 
 The viewer lists what it decodes; the host picks the first it can encode,
 then fits the request to that encoder (`video::Limits`, reported to

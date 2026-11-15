@@ -606,3 +606,103 @@ fn a_session_that_gives_nothing_back_is_replaced_without_waiting() {
         .unwrap();
     assert!(next.keyframe && next.picture > first.picture + 1);
 }
+
+#[test]
+#[ignore = "requires LATCH_MAC_LTR=1 and an LTR-capable Mac"]
+fn h264_ltr_declares_capacity_for_its_references() {
+    let _serial = ENCODER_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let config = VideoConfig {
+        width: size().0 as u32,
+        height: size().1 as u32,
+        fps: 60,
+        bitrate_kbps: 3000,
+        codec: Codec::H264High,
+        color: Default::default(),
+        display: None,
+    };
+    let mut encoder = Encoder::new(&config, Depth::Eight).unwrap();
+    assert!(
+        encoder.recovers(),
+        "run with LATCH_MAC_LTR=1 on an LTR-capable Mac"
+    );
+    encoder.output.output.lock().raw_sps = Some(Vec::new());
+    let images = pool();
+    let mut stream = Vec::new();
+    let mut minimum = u32::MAX;
+    for index in 0..60 {
+        let frame = encoder
+            .encode(images[index % images.len()].0, Instant::now(), index == 0)
+            .unwrap()
+            .expect("LTR picture");
+        for nal in latch_codec::h264::nal::nal_units(&frame.data) {
+            if nal[0] & 31 == 7 {
+                let after = latch_codec::bitstream::h264_sps(nal).unwrap();
+                let raw = encoder
+                    .output
+                    .output
+                    .lock()
+                    .raw_sps
+                    .as_ref()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .clone();
+                let before = latch_codec::bitstream::h264_sps(&raw).unwrap();
+                eprintln!("LTR SPS before {raw:02x?} refs={} buffering={:?}; after {nal:02x?} refs={} buffering={:?}",
+                    before.reference_frames, before.buffering, after.reference_frames, after.buffering);
+                assert_eq!(before.reference_frames, after.reference_frames);
+                assert!(after.buffering.unwrap() >= before.reference_frames);
+                minimum = minimum.min(after.buffering.unwrap());
+            }
+        }
+        // Preserve encoder access-unit boundaries for replay even when the
+        // software Baseline parser cannot inspect this High/CABAC PPS.
+        stream.extend_from_slice(&[0, 0, 0, 1, 9, 0x30]);
+        stream.extend(frame.data);
+    }
+    assert!(
+        !encoder.output.output.lock().tokens.is_empty(),
+        "stream must use long-term references"
+    );
+    let ffmpeg = ffmpeg().expect("FFmpeg is required to inspect LTR reference use");
+    let path = std::env::temp_dir().join(format!("latch-ltr-{}.h264", std::process::id()));
+    fs::write(&path, &stream).unwrap();
+    let decoded = Command::new(ffmpeg)
+        .args(["-v", "debug", "-debug", "mmco", "-threads", "1", "-i"])
+        .arg(&path)
+        .args(["-f", "null", "-"])
+        .output()
+        .unwrap();
+    fs::remove_file(&path).unwrap();
+    assert!(decoded.status.success());
+    let log = String::from_utf8_lossy(&decoded.stderr);
+    let (mut count, mut peak, mut long_term, mut saw_long_term) = (0, 0, false, false);
+    let mut listing = false;
+    for line in log.lines() {
+        if line.contains("short term list:") {
+            count = 0;
+            listing = true;
+            long_term = false;
+        } else if line.contains("long term list:") {
+            long_term = true;
+        } else if listing && line.contains(" fn:") {
+            count += 1;
+            peak = peak.max(count);
+            saw_long_term |= long_term;
+        } else {
+            listing = false;
+        }
+    }
+    assert!(
+        saw_long_term && peak > 0,
+        "FFmpeg must report the live LTR DPB"
+    );
+    assert!(
+        minimum >= peak,
+        "declared buffering {minimum} < live references {peak}"
+    );
+    eprintln!("LTR peak live short+long references={peak}, minimum declared buffering={minimum}");
+    if let Some(path) = std::env::var_os("LATCH_LTR_RECORDING") {
+        fs::write(path, &stream).unwrap();
+    }
+}

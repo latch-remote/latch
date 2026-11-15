@@ -422,6 +422,10 @@ pub trait Decoder: Send {
             .map(|frame| (time, frame))
             .collect())
     }
+    /// Changes whenever outstanding inputs are lost to a reset or backend switch.
+    fn generation(&self) -> u64 {
+        0
+    }
     fn name(&self) -> &'static str;
 }
 
@@ -720,6 +724,7 @@ pub struct Fallback {
     proven: bool,
     tries: u32,
     next_time: i64,
+    generation: u64,
 }
 
 impl Fallback {
@@ -730,6 +735,7 @@ impl Fallback {
             proven: false,
             tries: 0,
             next_time: 0,
+            generation: 0,
         }
     }
 }
@@ -788,6 +794,7 @@ impl Decoder for Fallback {
                         platform.name(),
                         self.tries
                     );
+                    self.generation += platform.generation() + 1;
                     self.platform = None;
                     self.software = Some(software::Software::new());
                     if !idr {
@@ -806,6 +813,9 @@ impl Decoder for Fallback {
         }
     }
 
+    fn generation(&self) -> u64 {
+        self.generation + self.platform.as_ref().map_or(0, |p| p.generation())
+    }
     fn name(&self) -> &'static str {
         match &self.platform {
             Some(platform) => platform.name(),
@@ -850,6 +860,9 @@ impl Decoder for Broken {
         Ok(None)
     }
 
+    fn generation(&self) -> u64 {
+        self.decoder.generation()
+    }
     fn name(&self) -> &'static str {
         self.decoder.name()
     }
@@ -882,6 +895,9 @@ impl Decoder for MediaFoundation {
             .into_iter()
             .map(|(time, picture)| (time, Self::picture(picture)))
             .collect())
+    }
+    fn generation(&self) -> u64 {
+        self.0.generation()
     }
     fn name(&self) -> &'static str {
         self.0.name()
@@ -985,6 +1001,11 @@ mod tests {
         assert_eq!((frame.width, frame.height), (64, 64));
         assert!(frame.y[0].abs_diff(200) <= 2);
         assert_eq!(decoder.name(), "Latch H.264 (software)");
+        assert_eq!(
+            decoder.generation(),
+            1,
+            "fallback invalidates pending inputs"
+        );
         // From then on software fills the renderer's spare buffers.
         let spare = Frame {
             format: PixelFormat::P010,
@@ -1017,6 +1038,11 @@ mod tests {
         }
         assert!(decoder.decode(&[0, 0, 1, 0x41], false, None).is_err());
         assert_eq!(decoder.name(), "Latch H.264 (software)");
+        assert_eq!(
+            decoder.generation(),
+            1,
+            "fallback invalidates pending inputs"
+        );
     }
 
     #[test]
@@ -1042,6 +1068,11 @@ mod tests {
             .expect("keyframe request");
         assert!(error.to_string().contains("waiting for a keyframe"));
         assert_eq!(decoder.name(), "Latch H.264 (software)");
+        assert_eq!(
+            decoder.generation(),
+            1,
+            "fallback invalidates pending inputs"
+        );
         let (idr, width, height) = vaapi::probe_baseline();
         let frame = decoder.decode(&idr, true, None).unwrap().unwrap();
         assert_eq!((frame.width, frame.height), (width, height));

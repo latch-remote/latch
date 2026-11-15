@@ -187,3 +187,24 @@ The two SPS NALs are `2742c015ab4187f08c44d404040408` and
 original bytes independently of this tape. The Windows decoder tests
 compare raw playback, host-normalized playback and viewer-normalized
 playback, and isolate the reordering limit from DPB storage and POC type.
+
+## Rejected SPS regression recording
+
+`mac-vt-rejected-sps.h264` derives from the synthetic pre-fix Mac tape above.
+Every SPS gains a VUI restriction with zero reorder frames and zero decoder
+buffer slots, below its one declared reference frame. The optimizer rejects
+that restriction. The software decoder tolerates it and returns all 24
+pictures, including the resize. Codec, host-output and Windows viewer-input
+regressions assert byte-identical pass-through and successful decoding.
+
+The optimizer compatibility fixtures in `crates/stream/tests/fixtures` are
+one-picture gray images. `optimizer-profile-144.h264` is a 64×64 x264
+High 4:4:4 stream with the legacy profile id 144. The x265 HEVC fixtures
+are 16400×64 and 64×16400, beyond the optimizer's dimension cap. FFmpeg
+qualifies decoding after byte-identical pass-through, alongside reserved
+H.264 constraint bits derived from the existing synthetic recording.
+An HEVC VPS reserved value of `0xfffe` passes through byte-identically,
+but FFmpeg rejects it and the available MF software decoder returns no
+picture. Its test compares the decoder's own result before and after normalization. HEVC depths
+above 16 bits have byte-preservation coverage. Successful decode of those
+two rejection classes remains unverified with the available decoders.

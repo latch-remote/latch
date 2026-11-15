@@ -78,7 +78,12 @@ GitHub release notes, so each version gets a heading of the form
 - Fix stale or missing host pictures and decoder buffering on Windows. Declare
   zero H.264/HEVC reordering on hosts, normalize legacy hosts' parameter
   sets in the Windows viewer, preserve decoder output identities, and
-  expose held-picture counters in stream statistics.
+  expose held-picture counters in stream statistics. Returning every ready
+  output fixes intermittent picture loss with Linux-encoded streams. Decoder
+  withholding with those streams was not reproduced and would now appear as
+  latency flagged by CI's strict per-call assertion. Parameter sets rejected
+  by the optimizer, including streams declaring nonzero reordering, pass
+  through unchanged with rate-limited warnings.
 
 - Choose which of a host's displays to share. Hosts list their displays in
   `/v1/status` (`streamer.displays`), and the viewer offers them in the

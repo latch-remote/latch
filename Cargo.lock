@@ -2089,6 +2089,9 @@ dependencies = [
 [[package]]
 name = "latch-codec"
 version = "6.0.0"
+dependencies = [
+ "tracing",
+]
 
 [[package]]
 name = "latch-core"

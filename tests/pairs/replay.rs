@@ -803,3 +803,197 @@ fn buffered_decoder_retains_every_output_identity_and_reports_delay() {
     assert_eq!(inner.decode.lock().host_tenths, 30);
     assert_eq!(inner.frames.seq(), 3);
 }
+
+#[derive(Clone)]
+enum DecoderStep {
+    Hold,
+    Error,
+    Reset,
+    Output(Vec<i64>),
+}
+
+fn check_decoder_retirement(
+    steps: Vec<DecoderStep>,
+    expected: &[u32],
+    discarded: u64,
+    want_keyframe: bool,
+) {
+    struct Scripted {
+        steps: std::collections::VecDeque<DecoderStep>,
+        generation: u64,
+    }
+    impl video::Decoder for Scripted {
+        fn decode(
+            &mut self,
+            _: &[u8],
+            _: bool,
+            _: Option<crate::Frame>,
+        ) -> anyhow::Result<Option<crate::Frame>> {
+            unreachable!("timestamped session interface")
+        }
+        fn decode_frames(
+            &mut self,
+            _: &[u8],
+            _: bool,
+            time: i64,
+            _: Option<crate::Frame>,
+        ) -> anyhow::Result<Vec<(i64, crate::Frame)>> {
+            let offsets = match self.steps.pop_front().unwrap() {
+                DecoderStep::Hold => Vec::new(),
+                DecoderStep::Error => anyhow::bail!("rejected input"),
+                DecoderStep::Reset => {
+                    self.generation += 1;
+                    vec![0]
+                }
+                DecoderStep::Output(offsets) => offsets,
+            };
+            Ok(offsets
+                .into_iter()
+                .map(|offset| {
+                    let mut frame = crate::Frame::default();
+                    frame.fill((2, 2), (&[32; 4], 2), (&[128; 2], 2), false);
+                    (time + offset * 166667, frame)
+                })
+                .collect())
+        }
+        fn generation(&self) -> u64 {
+            self.generation
+        }
+        fn name(&self) -> &'static str {
+            "scripted retirement fixture"
+        }
+    }
+    let probe = Arc::new(Probe {
+        native: false,
+        channels: 0,
+        pictures: Mutex::new(Vec::new()),
+        sound: Mutex::new(Vec::new()),
+        missing: Mutex::new(Vec::new()),
+        decode_errors: Mutex::new(Vec::new()),
+        decode_calls: Mutex::new(Vec::new()),
+        fec: AtomicU64::new(0),
+    });
+    let (events, _) = mpsc::channel();
+    let (wake, wakes) = mpsc::channel();
+    let mut inner = Inner::new(
+        events,
+        Arc::new(FrameSlot::default()),
+        Box::new(move || {
+            let _ = wake.send(());
+        }),
+    );
+    inner.pair_probe = Some(probe.clone());
+    for identity in 0..steps.len() as u32 {
+        inner.queue.lock().frames.push_back((
+            InFrame {
+                frame: identity,
+                data: vec![32],
+                keyframe: identity == 0
+                    || matches!(steps[identity as usize], DecoderStep::Reset)
+                    || matches!(
+                        steps[identity.saturating_sub(1) as usize],
+                        DecoderStep::Error
+                    ),
+                recovery: false,
+                host_delay: 0,
+                assembly: Duration::ZERO,
+            },
+            Instant::now(),
+        ));
+    }
+    let inner = Arc::new(inner);
+    let worker_inner = inner.clone();
+    let worker = std::thread::spawn(move || {
+        decode(
+            &worker_inner,
+            Box::new(Scripted {
+                steps: steps.into(),
+                generation: 0,
+            }),
+            Codec::H264Baseline,
+            Default::default(),
+        )
+    });
+    for _ in expected {
+        wakes.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    inner.stop.store(true, Ordering::Release);
+    inner.queue_cv.notify_all();
+    worker.join().unwrap();
+    assert_eq!(
+        probe
+            .pictures
+            .lock()
+            .iter()
+            .map(|p| p.0)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let stats = inner.stats.lock();
+    assert_eq!(stats.decoder_pending_frames, 0);
+    assert_eq!(stats.decoder_discarded_frames, discarded);
+    assert_eq!(inner.queue.lock().want_keyframe, want_keyframe);
+}
+
+#[test]
+fn decoder_retires_inputs_older_than_returned_picture() {
+    check_decoder_retirement(
+        vec![DecoderStep::Hold, DecoderStep::Output(vec![0])],
+        &[1],
+        1,
+        true,
+    );
+}
+
+#[test]
+fn decoder_errors_retire_failed_inputs_and_keep_held_outputs() {
+    check_decoder_retirement(
+        vec![
+            DecoderStep::Hold,
+            DecoderStep::Error,
+            DecoderStep::Output(vec![0]),
+        ],
+        &[2],
+        2,
+        false,
+    );
+    check_decoder_retirement(
+        vec![
+            DecoderStep::Hold,
+            DecoderStep::Error,
+            DecoderStep::Output(vec![-2, 0]),
+        ],
+        &[0, 2],
+        1,
+        false,
+    );
+}
+
+#[test]
+fn decoder_reset_clears_unresolved_inputs() {
+    check_decoder_retirement(vec![DecoderStep::Hold, DecoderStep::Reset], &[1], 1, false);
+}
+
+#[test]
+fn decoder_drops_outputs_older_than_last_published_picture() {
+    check_decoder_retirement(
+        vec![
+            DecoderStep::Output(vec![0]),
+            DecoderStep::Output(vec![0, -1]),
+        ],
+        &[0, 1],
+        1,
+        false,
+    );
+    check_decoder_retirement(
+        vec![DecoderStep::Hold, DecoderStep::Output(vec![0, -1])],
+        &[1],
+        1,
+        false,
+    );
+}
+
+#[test]
+fn decoder_publishes_matches_in_batch_with_unknown_and_duplicate_times() {
+    check_decoder_retirement(vec![DecoderStep::Output(vec![100, 0, 0])], &[0], 2, false);
+}

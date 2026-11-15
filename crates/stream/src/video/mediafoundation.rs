@@ -131,6 +131,7 @@ pub struct MfDecoder {
     stream: (Codec, u32, u32, u8),
     name: &'static str,
     next_time: i64,
+    generation: u64,
 }
 impl MfDecoder {
     pub fn new() -> Result<Self> {
@@ -193,6 +194,7 @@ impl MfDecoder {
             stream: (codec, width, height, depth),
             name: worker_deadline::receive(&startup, worker_deadline::STARTUP)??,
             next_time: 0,
+            generation: 0,
         })
     }
     /// Convenience for synchronous tools. A buffered or multi-output decoder
@@ -221,9 +223,11 @@ impl MfDecoder {
         if self.requests.is_none() {
             let (codec, width, height, depth) = self.stream;
             let next_time = self.next_time;
+            let generation = self.generation;
             *self = Self::with_stream(codec, width, height, depth)
                 .context(worker_deadline::ReopenFailed)?;
             self.next_time = next_time;
+            self.generation = generation;
         }
         self.requests
             .as_ref()
@@ -240,6 +244,7 @@ impl MfDecoder {
                 // Dropping the channel prevents further submissions. The stuck
                 // worker owns all COM/GPU resources until the driver returns.
                 self.requests = None;
+                self.generation += 1;
                 tracing::warn!("{error:#}; reopening decoder on the next keyframe");
                 return Err(error);
             }
@@ -247,6 +252,9 @@ impl MfDecoder {
         let (frame, name) = response?;
         self.name = name;
         Ok(frame)
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
     pub fn name(&self) -> &'static str {
         self.name
@@ -976,7 +984,10 @@ impl State {
                 .cast::<ICodecAPI>()
                 .ok()
                 .and_then(|a| a.GetValue(&CODECAPI_AVLowLatencyMode).ok())
-                .and_then(|v| bool::try_from(&v).ok());
+                .and_then(|v| match self.codec {
+                    Codec::H264Baseline | Codec::H264High => u32::try_from(&v).ok().map(|n| n != 0),
+                    _ => bool::try_from(&v).ok(),
+                });
             (mf, api)
         }
     }
@@ -1451,6 +1462,24 @@ mod tests {
         let _runtime = Runtime::new()?;
         long_gop_delay(false)
     }
+    #[test]
+    fn rejected_sps_does_not_fail_viewer_input() -> Result<()> {
+        let bytes = include_bytes!("../../../../tests/pairs/mac-vt-rejected-sps.h264");
+        let mut decoder = MfDecoder::with_size(Codec::H264Baseline, 160, 98)?;
+        let mut reference = latch_codec::h264::Decoder::new();
+        for unit in latch_codec::h264::nal::access_units(bytes) {
+            assert_eq!(
+                latch_codec::bitstream::low_delay(unit, latch_codec::bitstream::Format::H264)?
+                    .as_ref(),
+                unit
+            );
+            let expected = reference.decode(unit)?.expect("reference picture");
+            let picture = decoder.decode(unit)?.expect("rejected SPS still decodes");
+            check_picture(&picture, expected);
+        }
+        Ok(())
+    }
+
     fn check_picture(frame: &DecodedNv12, reference: &latch_codec::Yuv420) {
         assert_eq!(
             (frame.width, frame.height),
@@ -1502,6 +1531,51 @@ mod tests {
             assert!(mse <= 6.5025, "decoded picture PSNR below 40 dB, MSE={mse}");
         }
     }
+    #[test]
+    #[ignore = "decode-only LTR qualification requires LATCH_LTR_RECORDING and DXVA"]
+    fn h264_ltr_outputs_immediately_in_software_and_dxva() -> Result<()> {
+        let _runtime = Runtime::new()?;
+        let bytes = std::fs::read(std::env::var("LATCH_LTR_RECORDING")?)?;
+        let units = latch_codec::h264::nal::access_units(&bytes);
+        ensure!(
+            units.len() == 60,
+            "expected the 60-picture synthetic LTR recording"
+        );
+        let mut software = State::new(Codec::H264High, false, None, 320, 192, 8)?;
+        let mut hardware = State::new(Codec::H264High, true, None, 320, 192, 8)?;
+        for (index, unit) in units.into_iter().enumerate() {
+            let time = index as i64 * 166667;
+            let a = software.decode(unit, time)?;
+            let b = hardware.decode(unit, time)?;
+            ensure!(
+                a.len() == 1 && a[0].0 == time,
+                "software withheld LTR picture {index}"
+            );
+            ensure!(
+                b.len() == 1 && b[0].0 == time,
+                "DXVA withheld LTR picture {index}"
+            );
+            ensure!(hardware.dxva_used, "DXVA returned CPU samples");
+            let a = &a[0].1;
+            let mut reference = latch_codec::Yuv420::new(a.width, a.height);
+            for row in 0..a.height as usize {
+                let width = a.width as usize;
+                reference.y[row * reference.y_stride..row * reference.y_stride + width]
+                    .copy_from_slice(&a.y[row * a.y_stride..row * a.y_stride + width]);
+            }
+            for row in 0..a.height as usize / 2 {
+                for x in 0..a.width as usize / 2 {
+                    reference.u[row * reference.c_stride + x] = a.uv[row * a.uv_stride + x * 2];
+                    reference.v[row * reference.c_stride + x] = a.uv[row * a.uv_stride + x * 2 + 1];
+                }
+            }
+            check_picture(&b[0].1, &reference);
+        }
+        assert_eq!(software.low_latency(), (Some(1), Some(true)));
+        assert_eq!(hardware.low_latency(), (Some(1), Some(true)));
+        Ok(())
+    }
+
     #[test]
     #[ignore = "decode-only qualification requires a real DXVA adapter"]
     fn hardware_legacy_mac_outputs_immediately() -> Result<()> {

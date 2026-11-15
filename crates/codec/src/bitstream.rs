@@ -251,6 +251,10 @@ fn content_bits(bytes: &[u8]) -> Result<usize> {
 }
 fn h264_low_delay(nal: &[u8]) -> Result<Cow<'_, [u8]>> {
     let sps = parse_h264(nal)?;
+    valid(
+        sps.info.reorder_frames.is_none_or(|count| count == 0),
+        "H.264 encoder declares reordered pictures",
+    )?;
     let buffering = sps.info.reference_frames.max(1);
     if sps.info.reorder_frames == Some(0) && sps.info.buffering == Some(buffering) {
         return Ok(Cow::Borrowed(nal));
@@ -388,6 +392,10 @@ pub fn hevc_ordering(nal: &[u8]) -> Result<Vec<HevcOrdering>> {
 }
 fn hevc_low_delay(nal: &[u8]) -> Result<Cow<'_, [u8]>> {
     let parsed = parse_hevc(nal)?;
+    valid(
+        parsed.ordering.iter().all(|o| o.reorder_pics == 0),
+        "HEVC encoder declares reordered pictures",
+    )?;
     if parsed
         .ordering
         .iter()
@@ -414,7 +422,28 @@ fn hevc_low_delay(nal: &[u8]) -> Result<Cow<'_, [u8]>> {
 /// applied before MF decoding to accept pre-fix 6.0.0 hosts. Other NALs,
 /// start-code lengths and trailing zero bytes are preserved byte for byte.
 /// Already-correct units borrow their input without copying slice data.
+/// Rejected syntax and explicitly reordered streams pass through unchanged,
+/// with a rate-limited warning. Rewriting is always an optimization.
 pub fn low_delay(annexb: &[u8], format: Format) -> Result<Cow<'_, [u8]>> {
+    match rewrite(annexb, format) {
+        Ok(bytes) => Ok(bytes),
+        Err(reason) => {
+            // A syntax optimization must never prevent an encoder output or
+            // decoder input. Report only the parser's static reason, at most
+            // once per five seconds across streams, without logging payloads.
+            static WARNED: std::sync::Mutex<Option<std::time::Instant>> =
+                std::sync::Mutex::new(None);
+            let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+            if warned.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(5)) {
+                tracing::warn!(?format, %reason, "keeping original video parameter sets");
+                *warned = Some(std::time::Instant::now());
+            }
+            Ok(Cow::Borrowed(annexb))
+        }
+    }
+}
+
+fn rewrite(annexb: &[u8], format: Format) -> Result<Cow<'_, [u8]>> {
     let mut result = Vec::new();
     let mut copied = 0;
     for (_, begin, end) in crate::h264::nal::spans(annexb) {
@@ -605,7 +634,7 @@ mod tests {
                 b.ue(1);
                 b.ue(12);
                 b.ue(13);
-                b.ue(2);
+                b.ue(0);
                 b.ue(4);
             }
         }
@@ -640,7 +669,8 @@ mod tests {
                         "truncation {cut}/{}",
                         nal.len()
                     );
-                    assert!(low_delay(&unit(&nal[..cut]), Format::H264).is_err() || cut == 0);
+                    let input = unit(&nal[..cut]);
+                    assert_eq!(low_delay(&input, Format::H264).unwrap().as_ref(), input);
                 }
             }
         }
@@ -679,7 +709,7 @@ mod tests {
         }
     }
     #[test]
-    fn malformed_and_fuzz_style_inputs_never_panic() {
+    fn malformed_parameter_sets_are_rejected_by_inspection() {
         for raw in [
             "",
             "67",
@@ -691,19 +721,315 @@ mod tests {
         ] {
             assert!(h264_sps(&hex(raw)).is_err());
         }
+    }
+
+    #[test]
+    fn recorded_parameter_set_mutations_are_bounded_and_reparse() {
+        let mut seeds = vec![
+            (Format::H264, hex("2742c015ab4187f08c44d404040408")),
+            (Format::H264, synthetic(true, true, true)),
+        ];
+        for stream in [
+            include_bytes!("../../stream/tests/fixtures/decode-probe.hevc").as_slice(),
+            include_bytes!("../../stream/tests/fixtures/decode-probe-main10.hevc").as_slice(),
+        ] {
+            for nal in crate::h264::nal::nal_units(stream) {
+                if matches!((nal[0] >> 1) & 63, 32 | 33) {
+                    assert!(hevc_ordering(nal).is_ok());
+                    seeds.push((Format::Hevc, nal.to_vec()));
+                }
+            }
+        }
         let mut state = 17u32;
-        for len in 0..512 {
-            let mut data = vec![0x67];
-            for _ in 0..len {
+        for (format, seed) in seeds {
+            for iteration in 0..1024 {
                 state ^= state << 13;
                 state ^= state >> 17;
                 state ^= state << 5;
-                data.push(state as u8);
+                let mut nal = seed.clone();
+                let at = state as usize % nal.len();
+                match iteration % 6 {
+                    0 => nal[at] ^= 1 << (state % 8),
+                    1 => nal.insert(at, state as u8),
+                    2 => {
+                        nal.remove(at);
+                    }
+                    3 => nal.truncate(at),
+                    // Field-targeted extremes at every byte, including PTL,
+                    // VUI and HRD. Long zero prefixes stress Exp-Golomb caps.
+                    4 => nal.splice(at..at + 1, [0, 0, 0, 0, 0x80]).for_each(drop),
+                    _ => nal[at] = 0xff,
+                }
+                let input = unit(&nal);
+                let output = low_delay(&input, format).unwrap();
+                assert!(output.len() <= input.len() * 2 + 128);
+                if output.as_ref() != input {
+                    for nal in crate::h264::nal::nal_units(&output) {
+                        match format {
+                            Format::H264 if nal[0] & 31 == 7 => {
+                                h264_sps(nal).unwrap();
+                            }
+                            Format::Hevc if matches!((nal[0] >> 1) & 63, 32 | 33) => {
+                                hevc_ordering(nal).unwrap();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
-            let _ = h264_low_delay(&data);
-            let _ = hevc_low_delay(&data);
         }
     }
+
+    fn restriction(nal: &[u8], reorder: u32, buffering: u32) -> Vec<u8> {
+        let parsed = parse_h264(nal).unwrap();
+        assert!(!parsed.insert_restriction);
+        let mut bits = Bits::default();
+        copy_bits(&mut bits, &parsed.bytes, 0..parsed.replace.start);
+        bits.ue(reorder);
+        bits.ue(buffering);
+        finish(&nal[..1], bits)
+    }
+
+    #[test]
+    fn rejected_parameter_sets_pass_through_byte_identical() {
+        let base = hex("6742c01e8d6828ff889a808080a0000003002000000651e1108d40");
+        let mut unknown = base.clone();
+        unknown[1] = 144;
+        let mut reserved = base.clone();
+        reserved[2] |= 1;
+        let mut oversized = base.clone();
+        oversized.resize(65537, 0xff);
+        for nal in [
+            restriction(&base, 0, 0),
+            restriction(&base, 2, 1),
+            unknown,
+            reserved,
+            oversized,
+        ] {
+            assert!(h264_sps(&nal).is_err());
+            let input = unit(&nal);
+            assert_eq!(low_delay(&input, Format::H264).unwrap().as_ref(), input);
+        }
+        for (kind, field) in [(32, 0), (33, 0), (33, 1), (33, 2), (33, 3)] {
+            let mut bits = Bits::default();
+            bits.put(0, 4);
+            if kind == 32 {
+                bits.put(0, 8);
+            }
+            bits.put(0, 3);
+            bits.bit(true);
+            if kind == 32 {
+                bits.put(0, 16);
+            } // reserved != 0xffff
+            for _ in 0..3 {
+                bits.put(0, 32);
+            } // PTL
+            if kind == 33 {
+                bits.ue(0); // id
+                bits.ue(1); // chroma
+                bits.ue(if field == 0 { 16385 } else { 160 });
+                bits.ue(if field == 1 { 16385 } else { 98 });
+                bits.bit(false);
+                bits.ue(if field == 2 { 9 } else { 0 });
+                bits.ue(if field == 3 { 9 } else { 0 });
+                bits.ue(4);
+            }
+            bits.bit(false);
+            bits.ue(4);
+            bits.ue(0);
+            bits.ue(0);
+            bits.bit(false);
+            let nal = finish(&[kind << 1, 1], bits);
+            assert!(hevc_ordering(&nal).is_err());
+            let input = unit(&nal);
+            assert_eq!(low_delay(&input, Format::Hevc).unwrap().as_ref(), input);
+        }
+    }
+
+    #[test]
+    fn explicitly_reordered_parameter_sets_pass_through() {
+        let base = hex("6742c01e8d6828ff889a808080a0000003002000000651e1108d40");
+        let nal = restriction(&base, 1, 2);
+        assert_eq!(h264_sps(&nal).unwrap().reorder_frames, Some(1));
+        assert!(h264_low_delay(&nal).is_err());
+        let input = unit(&nal);
+        assert_eq!(low_delay(&input, Format::H264).unwrap().as_ref(), input);
+    }
+
+    #[test]
+    fn explicitly_reordered_hevc_parameter_sets_pass_through() {
+        let stream = include_bytes!("../../stream/tests/fixtures/decode-probe.hevc");
+        let mut checked = 0;
+        for nal in crate::h264::nal::nal_units(stream) {
+            if !matches!((nal[0] >> 1) & 63, 32 | 33) {
+                continue;
+            }
+            let parsed = parse_hevc(nal).unwrap();
+            let mut bits = Bits::default();
+            copy_bits(&mut bits, &parsed.bytes, 0..parsed.replace.start);
+            for ordering in &parsed.ordering {
+                bits.ue(ordering.buffering.max(2) - 1);
+                bits.ue(1);
+                bits.ue(ordering.latency_increase_plus1);
+            }
+            copy_bits(
+                &mut bits,
+                &parsed.bytes,
+                parsed.replace.end..content_bits(&parsed.bytes).unwrap(),
+            );
+            let reordered = finish(&nal[..2], bits);
+            assert!(hevc_ordering(&reordered)
+                .unwrap()
+                .iter()
+                .all(|o| o.reorder_pics == 1));
+            assert!(hevc_low_delay(&reordered).is_err());
+            let input = unit(&reordered);
+            assert_eq!(low_delay(&input, Format::Hevc).unwrap().as_ref(), input);
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "exercise both VPS and SPS ordering");
+    }
+
+    #[test]
+    fn rejected_active_sps_still_decodes_recorded_pictures() {
+        let stream = include_bytes!("../../../tests/pairs/mac-vt-6.0.0.h264");
+        for variant in 0..3 {
+            let mut decoder = crate::h264::Decoder::new();
+            let mut count = 0;
+            let mut rejected_stream = Vec::new();
+            for input in crate::h264::nal::access_units(stream) {
+                let mut modified = Vec::new();
+                for nal in crate::h264::nal::nal_units(input) {
+                    let nal = if nal[0] & 31 == 7 {
+                        let fixed = h264_low_delay(nal).unwrap();
+                        match variant {
+                            0 => restriction(&fixed, 0, 0), // buffering below references
+                            1 => restriction(&fixed, 2, 1), // reordering above buffering
+                            _ => {
+                                let mut oversized = fixed.into_owned();
+                                oversized.resize(65537, 0xff);
+                                oversized
+                            }
+                        }
+                    } else {
+                        nal.to_vec()
+                    };
+                    modified.extend(unit(&nal));
+                }
+                let output = low_delay(&modified, Format::H264).unwrap();
+                assert_eq!(output.as_ref(), modified);
+                assert!(decoder.decode(&output).unwrap().is_some());
+                rejected_stream.extend_from_slice(&modified);
+                count += 1;
+            }
+            assert_eq!(count, 24);
+            if variant == 0 {
+                assert_eq!(
+                    rejected_stream,
+                    include_bytes!("../../../tests/pairs/mac-vt-rejected-sps.h264")
+                );
+            }
+        }
+    }
+    #[test]
+    fn ffmpeg_preserves_acceptance_of_rejected_parameter_sets() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        if !Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!(
+                "FFmpeg unavailable; recorded rejection decode qualification requires FFmpeg"
+            );
+            return;
+        }
+        let decode = |bytes: &[u8], format| {
+            let input_format = match format {
+                Format::H264 => "h264",
+                Format::Hevc => "hevc",
+            };
+            let mut decoder = Command::new("ffmpeg")
+                .args(["-f", input_format])
+                .args([
+                    "-v", "error", "-threads", "1", "-i", "pipe:0", "-pix_fmt", "gray", "-f",
+                    "rawvideo", "pipe:1",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            decoder.stdin.take().unwrap().write_all(bytes).unwrap();
+            decoder.wait_with_output().unwrap()
+        };
+        let mut reserved_h264 = Vec::new();
+        let baseline = crate::h264::nal::access_units(include_bytes!(
+            "../../../tests/pairs/mac-vt-6.0.0.h264"
+        ));
+        for nal in crate::h264::nal::nal_units(baseline[0]) {
+            let mut nal = nal.to_vec();
+            if nal[0] & 31 == 7 {
+                nal[2] |= 1;
+            }
+            reserved_h264.extend(unit(&nal));
+        }
+        let mut reserved_hevc = Vec::new();
+        for nal in crate::h264::nal::nal_units(include_bytes!(
+            "../../stream/tests/fixtures/decode-probe.hevc"
+        )) {
+            let mut nal = nal.to_vec();
+            if (nal[0] >> 1) & 63 == 32 {
+                assert_eq!(&nal[4..6], &[0xff, 0xff]);
+                nal[5] = 0xfe;
+            }
+            reserved_hevc.extend(unit(&nal));
+        }
+        for (format, input, pixels) in [
+            (Format::H264, reserved_h264.as_slice(), Some(160 * 98)),
+            (Format::Hevc, reserved_hevc.as_slice(), None),
+            (
+                Format::H264,
+                include_bytes!("../../stream/tests/fixtures/optimizer-profile-144.h264").as_slice(),
+                Some(64 * 64),
+            ),
+            (
+                Format::Hevc,
+                include_bytes!("../../stream/tests/fixtures/optimizer-wide.hevc").as_slice(),
+                Some(16400 * 64),
+            ),
+            (
+                Format::Hevc,
+                include_bytes!("../../stream/tests/fixtures/optimizer-tall.hevc").as_slice(),
+                Some(64 * 16400),
+            ),
+        ] {
+            assert!(rewrite(input, format).is_err());
+            let output = low_delay(input, format).unwrap();
+            assert_eq!(output.as_ref(), input);
+            let decoded = decode(&output, format);
+            match pixels {
+                Some(pixels) => {
+                    assert!(
+                        decoded.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&decoded.stderr)
+                    );
+                    assert_eq!(decoded.stdout.len(), pixels);
+                }
+                None => {
+                    // Preserve the decoder's own acceptance decision for this
+                    // non-conformant reserved value, including implementations
+                    // that tolerate it. Available FFmpeg rejects it.
+                    let original = decode(input, format);
+                    assert_eq!(decoded.status.code(), original.status.code());
+                    assert_eq!(decoded.stdout, original.stdout);
+                }
+            }
+        }
+    }
+
     #[test]
     fn hevc_real_fixtures_keep_reference_capacity_and_suffix() {
         for stream in [
@@ -716,6 +1042,12 @@ mod tests {
                 .filter(|n| matches!((n[0] >> 1) & 63, 32 | 33))
             {
                 let before = parse_hevc(nal).unwrap();
+                if before.ordering.iter().any(|o| o.reorder_pics > 0) {
+                    assert!(hevc_low_delay(nal).is_err());
+                    let input = unit(nal);
+                    assert_eq!(low_delay(&input, Format::Hevc).unwrap().as_ref(), input);
+                    continue;
+                }
                 let fixed = hevc_low_delay(nal).unwrap();
                 let after = parse_hevc(&fixed).unwrap();
                 assert_eq!(before.ordering.len(), after.ordering.len());

@@ -8,6 +8,40 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::path::Path;
 
+fn assert_declared_ordering(codec: latch_proto::control::Codec, data: &[u8]) {
+    use latch_codec::bitstream::{h264_sps, hevc_ordering};
+    for nal in latch_codec::h264::nal::nal_units(data) {
+        match codec {
+            latch_proto::control::Codec::H264Baseline | latch_proto::control::Codec::H264High
+                if nal[0] & 31 == 7 =>
+            {
+                let sps = h264_sps(nal).unwrap();
+                assert_eq!(
+                    sps.reorder_frames,
+                    Some(0),
+                    "host must declare no reordering"
+                );
+                assert_eq!(sps.buffering, Some(sps.reference_frames.max(1)));
+            }
+            latch_proto::control::Codec::Hevc if matches!((nal[0] >> 1) & 63, 32 | 33) => {
+                for ordering in hevc_ordering(nal).unwrap() {
+                    assert_eq!(ordering.reorder_pics, 0, "host must declare no reordering");
+                    assert_eq!(ordering.latency_increase_plus1, 1);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn hevc_recording_checks_declared_ordering() {
+    let raw = include_bytes!("../../crates/stream/tests/fixtures/decode-probe.hevc");
+    let fixed =
+        latch_codec::bitstream::low_delay(raw, latch_codec::bitstream::Format::Hevc).unwrap();
+    assert_declared_ordering(latch_proto::control::Codec::Hevc, &fixed);
+}
+
 fn config(width: u32, height: u32) -> VideoConfig {
     VideoConfig {
         color: Default::default(),
@@ -365,18 +399,7 @@ fn record(mode: &str, frames: Vec<(video::EncodedVideo, VideoInfo)>, root: &Path
                 };
                 if frame.keyframe {
                     if mode != "legacy-mac" {
-                        for nal in latch_codec::h264::nal::nal_units(&frame.data)
-                            .into_iter()
-                            .filter(|n| n[0] & 31 == 7)
-                        {
-                            let sps = latch_codec::bitstream::h264_sps(nal).unwrap();
-                            assert_eq!(
-                                sps.reorder_frames,
-                                Some(0),
-                                "host must declare no reordering"
-                            );
-                            assert_eq!(sps.buffering, Some(sps.reference_frames.max(1)));
-                        }
+                        assert_declared_ordering(recording.accept.codec, &frame.data);
                     }
                     assert!(
                         frame.data.windows(5).any(|nal| {
