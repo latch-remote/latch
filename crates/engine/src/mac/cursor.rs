@@ -12,6 +12,7 @@ use objc2::{class, msg_send, rc::Retained, runtime::AnyObject, MainThreadMarker}
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use std::{
     cell::RefCell,
+    collections::VecDeque,
     ptr,
     sync::mpsc,
     time::{Duration, Instant},
@@ -32,18 +33,47 @@ struct Snapshot {
     sampled: Instant,
 }
 
-/// One unsafe reading latches composition for this capture's lifetime. This
-/// deliberately conservative hysteresis permits at most one fallback, even if
-/// deprecated visibility readings flap or the main queue repeatedly stalls.
+const SAMPLE_MAX_AGE: Duration = Duration::from_millis(250);
+const SHAPE_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30 + 1);
+const VISIBLE_STABLE: Duration = Duration::from_secs(1);
+const COMPOSITION_DWELL: Duration = Duration::from_secs(3);
+
+/// Hidden/off-display readings recover after stable visibility. Unreadable or
+/// stale observations latch until capture restarts. Immediate fallback plus a
+/// three-second composition dwell permits at most two changes in any 3 s window.
 #[derive(Default)]
 struct Safety {
     separate: bool,
     fallback: bool,
+    visible_since: Option<Instant>,
+    composed_at: Option<Instant>,
+    failed_at: Option<Instant>,
 }
 impl Safety {
-    fn observe(&mut self, trustworthy_visible: bool) {
-        self.fallback |= !trustworthy_visible;
-        self.separate = trustworthy_visible && !self.fallback;
+    fn observe(&mut self, visible: Option<bool>, now: Instant) {
+        self.fallback |= visible.is_none();
+        if visible != Some(true) {
+            self.visible_since = None;
+            self.separate = false;
+            return;
+        }
+        let since = *self.visible_since.get_or_insert(now);
+        self.separate = !self.fallback
+            && now.duration_since(since) >= VISIBLE_STABLE
+            && self
+                .composed_at
+                .is_none_or(|at| now.duration_since(at) >= COMPOSITION_DWELL);
+    }
+    fn configured(&mut self, composited: bool, now: Instant) {
+        self.failed_at = None;
+        if composited {
+            self.composed_at = Some(now);
+            self.separate = false;
+        }
+    }
+    fn configuration_failed(&mut self, now: Instant) {
+        self.observe(None, now);
+        self.failed_at = Some(now);
     }
 }
 
@@ -52,63 +82,86 @@ pub(super) struct Plane {
     pending: Option<(Instant, mpsc::Receiver<Option<Snapshot>>)>,
     checked_shape: Option<Instant>,
     snapshot: Option<Snapshot>,
+    last_shape: Option<CursorShape>,
     safety: Safety,
     tracker: Tracker,
-    pub requested_drawn: bool,
+    composition: VecDeque<(Instant, bool)>,
+    frame_separate: bool,
+    preparing: bool,
+    entry_announced: bool,
+    overlap: bool,
+    requested_drawn: bool,
 }
 impl Plane {
     /// Drop replies in the old display/encoded geometry before restarting SCK.
     pub fn reset(&mut self) {
+        self.reset_at(Instant::now());
+    }
+    fn reset_at(&mut self, now: Instant) {
         self.pending = None;
         self.checked_shape = None;
         self.snapshot = None;
         self.safety = Safety::default();
+        self.preparing = false;
+        self.entry_announced = false;
+        self.configured(true, now);
     }
-    fn accept(&mut self, snapshot: Option<Snapshot>) {
-        self.safety.observe(
-            snapshot
-                .as_ref()
-                .is_some_and(|s| s.visible && s.sampled.elapsed() <= Duration::from_millis(250)),
-        );
+    fn accept(&mut self, snapshot: Option<Snapshot>, now: Instant) {
+        let observation = snapshot.as_ref().and_then(|s| {
+            (now.saturating_duration_since(s.sampled) <= SAMPLE_MAX_AGE).then_some(s.visible)
+        });
+        self.safety.observe(observation, now);
         // Keep the last readable shape until SCK confirms composition. If
         // updateConfiguration fails, the viewer must still draw that shape.
-        if snapshot.is_some() {
-            self.snapshot = snapshot;
+        if let Some(snapshot) = snapshot {
+            self.last_shape = Some(snapshot.shape.clone());
+            self.snapshot = Some(snapshot);
         }
     }
-    pub fn sample(&mut self, display: DisplayRect, width: u32, height: u32) {
-        // CoreGraphics position/visibility reads are thread-safe. AppKit shape
-        // checks run at most 30 Hz, including when its object identities churn.
-        if !visible(display) {
-            self.safety.observe(false);
+    pub fn request_drawn(&mut self, drawn: bool) {
+        if drawn != self.requested_drawn {
+            // Captured mode does not sample. Discard its pending reply so a
+            // later free-mode request starts a fresh visibility interval.
+            self.pending = None;
+            self.checked_shape = None;
+            self.safety.visible_since = None;
+            self.safety.separate = false;
         }
+        self.requested_drawn = drawn;
+    }
+    pub fn sample(&mut self, display: DisplayRect, width: u32, height: u32) {
+        self.sample_at(display, width, height, Instant::now());
+    }
+    fn sample_at(&mut self, display: DisplayRect, width: u32, height: u32, now: Instant) {
+        // CoreGraphics reads are thread-safe. Hidden/off-display is temporary,
+        // while failure to obtain a position is an unreliable observation.
+        self.safety.observe(visible(display), now);
         if let Some((started, receiver)) = &self.pending {
             match receiver.try_recv() {
                 Ok(snapshot) => {
                     self.pending = None;
-                    self.accept(snapshot);
+                    self.accept(snapshot, now);
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending = None;
-                    self.accept(None);
+                    self.accept(None, now);
                 }
                 Err(mpsc::TryRecvError::Empty) => {
-                    if started.elapsed() > Duration::from_millis(250) {
-                        self.safety.observe(false);
+                    if now.duration_since(*started) > SAMPLE_MAX_AGE {
+                        self.safety.observe(None, now);
                     }
                     return;
                 }
             }
         }
-        if self
-            .checked_shape
-            .is_some_and(|at| at.elapsed() < Duration::from_millis(33))
-        {
+        if !self.shape_due(now) {
             return;
         }
-        self.checked_shape = Some(Instant::now());
         if MainThreadMarker::new().is_some() {
-            self.accept(objc2::rc::autoreleasepool(|_| read(display, width, height)));
+            self.accept(
+                objc2::rc::autoreleasepool(|_| read(display, width, height)),
+                Instant::now(),
+            );
         } else {
             let (tx, rx) = mpsc::sync_channel(1);
             dispatch2::DispatchQueue::main().exec_async(move || {
@@ -118,12 +171,69 @@ impl Plane {
             // last completed sample and never block the encoder on AppKit.
             if self.snapshot.is_none() {
                 if let Ok(snapshot) = rx.recv_timeout(Duration::from_millis(40)) {
-                    self.accept(snapshot);
+                    self.accept(snapshot, Instant::now());
                     return;
                 }
             }
-            self.pending = Some((Instant::now(), rx));
+            self.pending = Some((now, rx));
         }
+    }
+    fn shape_due(&mut self, now: Instant) -> bool {
+        if self
+            .checked_shape
+            .is_some_and(|at| now.duration_since(at) < SHAPE_INTERVAL)
+        {
+            return false;
+        }
+        self.checked_shape = Some(now);
+        true
+    }
+    pub fn can_configure(&self, now: Instant) -> bool {
+        self.safety
+            .failed_at
+            .is_none_or(|at| now.duration_since(at) >= COMPOSITION_DWELL)
+    }
+    pub fn configuration_drawn(&mut self) -> bool {
+        let drawn = self.drawn();
+        if drawn {
+            self.entry_announced = false;
+        }
+        // Send a local-plane update with one final composited picture before
+        // omitting it from capture. This deliberately chooses a brief double.
+        self.preparing = !drawn && !self.entry_announced;
+        drawn || self.preparing
+    }
+    pub fn configured(&mut self, composited: bool, now: Instant) {
+        self.preparing = false;
+        self.safety.configured(composited, now);
+        self.composition.push_back((now, composited));
+    }
+    pub fn encoded(&mut self, captured: Instant) {
+        // VideoToolbox may still return up to two pre-transition pictures.
+        // Their cursor control must reflect their own composition mode.
+        let was_separate = self.frame_separate;
+        while self
+            .composition
+            .front()
+            .is_some_and(|(at, _)| *at <= captured)
+        {
+            self.frame_separate = !self.composition.pop_front().unwrap().1;
+        }
+        // Keep the plane through the first composited picture as well. Control
+        // and video travel separately, so favour overlap on both handoff edges.
+        self.overlap = was_separate && !self.frame_separate;
+    }
+    pub fn update_for_frame(&mut self) -> Option<CursorUpdate> {
+        if self.preparing {
+            self.entry_announced = true;
+        }
+        self.update(
+            !(self.frame_separate || self.preparing || self.entry_announced || self.overlap),
+        )
+    }
+    pub fn configuration_failed(&mut self, now: Instant) {
+        self.preparing = false;
+        self.safety.configuration_failed(now);
     }
     pub fn drawn(&self) -> bool {
         self.requested_drawn || !self.safety.separate
@@ -131,8 +241,7 @@ impl Plane {
     pub fn update(&mut self, composited: bool) -> Option<CursorUpdate> {
         // Use the applied SCK mode, including a failed configuration change.
         // A hidden/unreadable sample requests composition, never a blank plane.
-        self.tracker
-            .update(!composited, self.snapshot.as_ref().map(|s| s.shape.clone()))
+        self.tracker.update(!composited, self.last_shape.clone())
     }
 }
 
@@ -147,20 +256,24 @@ struct ShapeKey {
     display: DisplayRect,
     pixels: (u32, u32, u32, u32),
     format: [usize; 6],
-    source: Vec<u8>,
 }
 #[derive(Default)]
 struct ShapeCache {
     key: Option<ShapeKey>,
+    source: Vec<u8>,
+    image: Option<Owned>,
     shape: Option<CursorShape>,
 }
 impl ShapeCache {
     fn get(
         &mut self,
         key: ShapeKey,
+        source: &[u8],
         draw: impl FnOnce() -> Option<CursorShape>,
     ) -> Option<CursorShape> {
-        if self.key.as_ref() != Some(&key) {
+        if self.key.as_ref() != Some(&key) || self.source != source {
+            self.source.clear();
+            self.source.extend_from_slice(source);
             self.shape = draw();
             self.key = Some(key);
         }
@@ -219,19 +332,6 @@ fn read(display: DisplayRect, width: u32, height: u32) -> Option<Snapshot> {
         if cg.is_null() {
             return None;
         }
-        let provider = CGImageGetDataProvider(cg);
-        if provider.is_null() {
-            return None;
-        }
-        let data = Owned::new(CGDataProviderCopyData(provider)).ok()?;
-        let len = CFDataGetLength(data.0);
-        if !(1..=64 * 1024 * 1024).contains(&len) {
-            return None;
-        }
-        let bytes = CFDataGetBytePtr(data.0);
-        if bytes.is_null() {
-            return None;
-        }
         let key = ShapeKey {
             points: [size.width, size.height, hotspot.x, hotspot.y, backing],
             display,
@@ -244,30 +344,54 @@ fn read(display: DisplayRect, width: u32, height: u32) -> Option<Snapshot> {
                 CGImageGetBitsPerComponent(cg),
                 CGImageGetBitmapInfo(cg) as usize,
             ],
-            source: std::slice::from_raw_parts(bytes, len as usize).to_vec(),
         };
-        let shape =
-            SHAPE.with_borrow_mut(|cache| cache.get(key, || rasterize(cg, w, h, hx, hy)))?;
+        let shape = SHAPE.with_borrow_mut(|cache| {
+            if cache.key.as_ref() == Some(&key)
+                && cache.image.as_ref().is_some_and(|old| old.0 == cg.cast())
+            {
+                return cache.shape.clone();
+            }
+            let provider = CGImageGetDataProvider(cg);
+            if provider.is_null() {
+                return None;
+            }
+            let data = Owned::new(CGDataProviderCopyData(provider)).ok()?;
+            let len = CFDataGetLength(data.0);
+            if !(1..=64 * 1024 * 1024).contains(&len) {
+                return None;
+            }
+            let bytes = CFDataGetBytePtr(data.0);
+            if bytes.is_null() {
+                return None;
+            }
+            let shape = cache.get(key, std::slice::from_raw_parts(bytes, len as usize), || {
+                rasterize(cg, w, h, hx, hy)
+            });
+            cache.image = Some(Owned::retain(cg.cast()));
+            shape
+        })?;
         Some(Snapshot {
-            visible: visible(display),
+            visible: visible(display)?,
             shape,
             sampled: Instant::now(),
         })
     }
 }
 
-fn visible(display: DisplayRect) -> bool {
+fn visible(display: DisplayRect) -> Option<bool> {
     // SAFETY: CoreGraphics queries neither inject events nor change visibility.
     unsafe {
         let Ok(event) = Owned::new(CGEventCreate(ptr::null())) else {
-            return false;
+            return None;
         };
         let point = CGEventGetLocation(event.0);
-        point.x >= f64::from(display.x)
-            && point.y >= f64::from(display.y)
-            && point.x < f64::from(display.x) + f64::from(display.width)
-            && point.y < f64::from(display.y) + f64::from(display.height)
-            && CGCursorIsVisible() != 0
+        Some(
+            point.x >= f64::from(display.x)
+                && point.y >= f64::from(display.y)
+                && point.x < f64::from(display.x) + f64::from(display.width)
+                && point.y < f64::from(display.y) + f64::from(display.height)
+                && CGCursorIsVisible() != 0,
+        )
     }
 }
 /// Request at least the display's backing pixels so Retina artwork remains
@@ -380,34 +504,42 @@ mod tests {
             sampled: Instant::now(),
         }
     }
+    fn accept_at(plane: &mut Plane, visible: Option<bool>, now: Instant) {
+        let sample = visible.map(|visible| Snapshot {
+            sampled: now,
+            ..snapshot(visible)
+        });
+        plane.accept(sample, now);
+    }
     #[test]
-    fn every_mode_transition_selects_exactly_one_cursor_and_fallback_latches() {
-        // Exhaust every sequence of visible, hidden and unreadable observations,
-        // requested free/captured mode, and configuration success/failure.
-        for sequence in 0..81 {
+    fn every_mode_transition_selects_exactly_one_cursor_and_only_unreliable_readings_latch() {
+        // Exhaust visible, hidden, off-display and unreadable observations,
+        // requested free/captured mode and SCK success/failure. Hidden and
+        // off-display both arrive as Some(false).
+        for sequence in 0..256 {
             let mut n = sequence;
             let mut plane = Plane::default();
             let mut composited = true;
-            let mut unsafe_seen = false;
-            let mut flips = 0;
+            let mut unreliable_seen = false;
             let mut local = false;
+            let start = Instant::now();
             for step in 0..4 {
-                let reading = n % 3;
-                n /= 3;
-                unsafe_seen |= reading != 0;
-                plane.accept(match reading {
-                    0 => Some(snapshot(true)),
-                    1 => Some(snapshot(false)),
+                let now = start + Duration::from_secs(step * 5);
+                let reading = n % 4;
+                n /= 4;
+                unreliable_seen |= reading == 3;
+                let visible = match reading {
+                    0 => Some(true),
+                    1 | 2 => Some(false),
                     _ => None,
-                });
-                if unsafe_seen {
-                    assert!(plane.drawn());
-                }
+                };
+                accept_at(&mut plane, visible, now);
+                accept_at(&mut plane, visible, now + VISIBLE_STABLE);
+                assert_eq!(plane.safety.separate, reading == 0 && !unreliable_seen);
                 for captured in [true, false] {
                     plane.requested_drawn = captured;
                     let desired = plane.drawn();
                     for succeeds in [false, true] {
-                        // Failing an SCK update leaves the applied mode intact.
                         let applied = if succeeds { desired } else { composited };
                         if let Some(update) = plane.update(applied) {
                             local = update.visible;
@@ -418,34 +550,199 @@ mod tests {
                 }
                 plane.requested_drawn = false;
                 if plane.drawn() != composited {
-                    flips += 1;
                     composited = plane.drawn();
+                    plane.configured(composited, now + VISIBLE_STABLE);
                 }
             }
-            assert!(flips <= 2); // One separate-plane entry, at most one fallback.
         }
+    }
+    #[test]
+    fn off_display_and_hidden_for_typing_return_after_stable_visibility() {
+        for _reason in ["off display", "hidden for typing"] {
+            let mut plane = Plane::default();
+            let start = Instant::now();
+            accept_at(&mut plane, Some(true), start);
+            assert!(plane.drawn());
+            accept_at(&mut plane, Some(true), start + VISIBLE_STABLE);
+            assert!(!plane.drawn());
+            let hidden = start + Duration::from_secs(2);
+            accept_at(&mut plane, Some(false), hidden);
+            assert!(plane.drawn());
+            plane.configured(true, hidden);
+            accept_at(&mut plane, Some(true), hidden + Duration::from_secs(2));
+            accept_at(
+                &mut plane,
+                Some(true),
+                hidden + COMPOSITION_DWELL - Duration::from_nanos(1),
+            );
+            assert!(plane.drawn());
+            accept_at(&mut plane, Some(true), hidden + COMPOSITION_DWELL);
+            assert!(!plane.drawn());
+            assert!(!plane.safety.fallback);
+        }
+    }
+    #[test]
+    fn rapid_flapping_at_the_hysteresis_bound_limits_configuration_changes() {
+        let mut plane = Plane::default();
+        let start = Instant::now();
+        let mut composited = true;
+        let mut changes = Vec::new();
+        // One millisecond steps include both edges of the 1 s and 3 s gates.
+        for millis in 0..30_000 {
+            let now = start + Duration::from_millis(millis);
+            // Stay visible long enough to return, then hide immediately.
+            let visible = millis % 4001 != 1001;
+            accept_at(&mut plane, Some(visible), now);
+            if plane.drawn() != composited {
+                composited = plane.drawn();
+                plane.configured(composited, now);
+                changes.push(now);
+            }
+        }
+        assert!(
+            changes.len() >= 10,
+            "temporary fallback must keep recovering"
+        );
+        for triple in changes.windows(3) {
+            assert!(triple[2].duration_since(triple[0]) >= COMPOSITION_DWELL);
+        }
+        let now = start + Duration::from_secs(31);
+        plane.configuration_failed(now);
+        assert!(plane.drawn());
+        assert!(!plane.can_configure(now + COMPOSITION_DWELL - Duration::from_nanos(1)));
+        assert!(plane.can_configure(now + COMPOSITION_DWELL));
+        accept_at(&mut plane, Some(true), now + Duration::from_secs(10));
+        assert!(plane.drawn(), "configuration failure latches");
+    }
+    #[test]
+    fn handoffs_keep_a_cursor_on_queued_frames_and_choose_one_frame_of_overlap() {
+        let mut plane = Plane::default();
+        let start = Instant::now();
+        accept_at(&mut plane, Some(true), start);
+        accept_at(&mut plane, Some(true), start + VISIBLE_STABLE);
+        // First announce the local plane while SCK still draws.
+        assert!(plane.configuration_drawn());
+        plane.encoded(start + VISIBLE_STABLE);
+        assert!(plane.update_for_frame().unwrap().visible);
+        assert!(!plane.configuration_drawn());
+        plane.configured(false, start + Duration::from_millis(1100));
+        // An old composited frame may still leave VideoToolbox first. Keeping
+        // the announcement enabled here favours a double until separate video.
+        let mut local = true;
+        for (millis, composited, expected) in [(1050, true, 2), (1200, false, 1), (1900, false, 1)]
+        {
+            plane.encoded(start + Duration::from_millis(millis));
+            if let Some(update) = plane.update_for_frame() {
+                local = update.visible;
+            }
+            assert_eq!(u8::from(composited) + u8::from(local), expected);
+        }
+        accept_at(&mut plane, Some(false), start + Duration::from_secs(2));
+        assert!(plane.configuration_drawn());
+        plane.configured(true, start + Duration::from_secs(2));
+        for (millis, composited, expected) in [(1950, false, 1), (2100, true, 2), (2200, true, 1)] {
+            plane.encoded(start + Duration::from_millis(millis));
+            if let Some(update) = plane.update_for_frame() {
+                local = update.visible;
+            }
+            assert_eq!(u8::from(composited) + u8::from(local), expected);
+        }
+        assert!(plane.composition.is_empty());
+        // Restart keeps the last shape for old separate frames while discarding
+        // sampling geometry and restoring composition for the new capture.
+        plane.configured(false, start + Duration::from_secs(4));
+        plane.encoded(start + Duration::from_millis(4100));
+        assert!(plane.update_for_frame().unwrap().visible);
+        plane.reset_at(start + Duration::from_secs(5));
+        assert!(plane.snapshot.is_none());
+        plane.encoded(start + Duration::from_millis(4200));
+        assert!(plane.update_for_frame().is_none());
+        plane.encoded(start + Duration::from_millis(5100));
+        assert!(plane.update_for_frame().is_none());
+        plane.encoded(start + Duration::from_millis(5200));
+        assert!(!plane.update_for_frame().unwrap().visible);
+    }
+    #[test]
+    fn captured_mode_pause_discards_old_pending_samples_without_latching() {
+        let mut plane = Plane::default();
+        let start = Instant::now();
+        accept_at(&mut plane, Some(true), start);
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(Some(Snapshot {
+            sampled: start,
+            ..snapshot(true)
+        }))
+        .unwrap();
+        plane.pending = Some((start, rx));
+        plane.request_drawn(true);
+        assert!(plane.pending.is_none());
+        plane.configured(true, start);
+        plane.request_drawn(false);
+        accept_at(&mut plane, Some(true), start + Duration::from_secs(10));
+        assert!(plane.drawn());
+        accept_at(&mut plane, Some(true), start + Duration::from_secs(11));
+        assert!(!plane.drawn());
+        assert!(!plane.safety.fallback);
     }
     #[test]
     fn stalled_samples_and_restart_discard_stale_geometry() {
         let mut plane = Plane::default();
-        plane.accept(Some(snapshot(true)));
+        let now = Instant::now();
+        accept_at(&mut plane, Some(true), now - VISIBLE_STABLE);
+        accept_at(&mut plane, Some(true), now);
         assert!(!plane.drawn());
         let (_tx, rx) = mpsc::sync_channel(1);
-        plane.pending = Some((Instant::now() - Duration::from_secs(1), rx));
-        plane.sample(DisplayRect::default(), 1920, 1080);
+        plane.pending = Some((now - Duration::from_secs(1), rx));
+        plane.sample_at(DisplayRect::default(), 1920, 1080, now);
         assert!(plane.drawn());
-        plane.accept(Some(snapshot(true)));
+        accept_at(&mut plane, Some(true), now + Duration::from_secs(5));
         assert!(plane.drawn());
-        let mut stale = snapshot(true);
-        stale.sampled = Instant::now() - Duration::from_secs(1);
-        plane.accept(Some(stale));
-        assert!(plane.drawn());
-        plane.reset();
+        let restarted = now + Duration::from_secs(6);
+        plane.reset_at(restarted);
         assert!(plane.pending.is_none());
         assert!(plane.snapshot.is_none());
         assert!(plane.drawn());
-        plane.accept(Some(snapshot(true)));
+        accept_at(&mut plane, Some(true), restarted);
+        accept_at(&mut plane, Some(true), restarted + COMPOSITION_DWELL);
         assert!(!plane.drawn());
+        let mut stale = snapshot(true);
+        stale.sampled = restarted;
+        plane.accept(Some(stale), restarted + COMPOSITION_DWELL + SAMPLE_MAX_AGE);
+        assert!(plane.drawn());
+        accept_at(&mut plane, Some(true), now + Duration::from_secs(10));
+        assert!(plane.drawn());
+    }
+    #[test]
+    fn shape_checks_are_limited_to_thirty_hz_with_an_injected_clock() {
+        let mut plane = Plane::default();
+        let start = Instant::now();
+        assert!(plane.shape_due(start));
+        assert!(!plane.shape_due(start));
+        assert!(!plane.shape_due(start + SHAPE_INTERVAL - Duration::from_nanos(1)));
+        assert!(plane.shape_due(start + SHAPE_INTERVAL));
+        plane.checked_shape = None;
+        let checks = (0..1_000_000)
+            .filter(|micros| plane.shape_due(start + Duration::from_micros(*micros)))
+            .count();
+        assert_eq!(checks, 30);
+        // Draining a pending reply precedes the gate, even between checks.
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(Some(Snapshot {
+            sampled: start,
+            ..snapshot(true)
+        }))
+        .unwrap();
+        plane.pending = Some((start, rx));
+        plane.checked_shape = Some(start);
+        plane.sample_at(
+            DisplayRect::default(),
+            1920,
+            1080,
+            start + Duration::from_millis(1),
+        );
+        assert!(plane.pending.is_none());
+        assert!(plane.snapshot.is_some());
+        assert_eq!(plane.checked_shape, Some(start));
     }
     #[test]
     fn unchanged_cursor_is_rasterized_and_encoded_only_once() {
@@ -458,8 +755,8 @@ mod tests {
                     display: DisplayRect::default(),
                     pixels: (16 * scale, 16 * scale, 2 * scale, 2 * scale),
                     format: [16, 16, 64, 32, 8, 0x4001],
-                    source: vec![identity; 16 * 16 * 4],
                 },
+                &vec![identity; 16 * 16 * 4],
                 || {
                     draws.set(draws.get() + 1);
                     Some(snapshot(true).shape)
@@ -515,12 +812,9 @@ mod tests {
     fn old_peers_missing_shapes_and_captured_mode_keep_capture_drawing() {
         let mut plane = Plane::default();
         assert!(plane.drawn());
-        plane.snapshot = Some(Snapshot {
-            shape: CursorShape::new(0, 1, 1, 0, 0, &[255; 4]),
-            visible: true,
-            sampled: Instant::now(),
-        });
-        plane.safety.observe(true);
+        let now = Instant::now();
+        accept_at(&mut plane, Some(true), now);
+        accept_at(&mut plane, Some(true), now + VISIBLE_STABLE);
         assert!(!plane.drawn());
         plane.requested_drawn = true;
         assert!(plane.drawn());

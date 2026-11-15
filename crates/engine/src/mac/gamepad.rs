@@ -16,7 +16,7 @@ use std::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, OnceLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub const UNAVAILABLE: &str = "Mac host controllers unavailable. Apple requires entitlement com.apple.developer.hid.virtual.device and Apple-authorized signing. Ad-hoc Latch builds cannot create virtual controllers. See docs/MACOS.md.";
@@ -69,8 +69,27 @@ fn has_entitlement() -> bool {
     }
 }
 
-fn wait_for_cancel(receiver: &std::sync::mpsc::Receiver<()>, timeout: Duration) -> bool {
-    receiver.recv_timeout(timeout).is_ok()
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn wait_for_cancel(receiver: &std::sync::mpsc::Receiver<()>, deadline: Instant) -> bool {
+    receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .is_ok()
+}
+
+fn cancel_all<T>(
+    pads: &mut [T],
+    timeout: Duration,
+    mut start: impl FnMut(&mut T),
+    mut finish: impl FnMut(&mut T, Instant),
+) {
+    let deadline = Instant::now() + timeout;
+    for pad in pads.iter_mut() {
+        start(pad);
+    }
+    for pad in pads {
+        finish(pad, deadline);
+    }
 }
 
 struct Bus;
@@ -83,21 +102,29 @@ struct Target {
     cancelled: std::sync::mpsc::Receiver<()>,
 }
 
-impl Drop for Target {
-    fn drop(&mut self) {
+impl Target {
+    fn cancel(&mut self) {
         self.stopped.store(true, Ordering::Release);
         if let Some(device) = self.device.take() {
-            // SAFETY: cancellation prevents new callbacks. The cancel handler
-            // owns the Create reference until all in-flight callbacks finish.
+            // SAFETY: the cancel handler owns the Create reference until all
+            // in-flight callbacks finish, including after our deadline expires.
             unsafe { IOHIDUserDeviceCancel(device.0) };
             std::mem::forget(device);
-            // If IOKit wedges, retain the queue and the callback-owned Create
-            // reference. A late cancellation can still safely release it.
-            if !wait_for_cancel(&self.cancelled, Duration::from_secs(2)) {
+        }
+    }
+    fn finish_cancel(&mut self, deadline: Instant) {
+        if let Some(queue) = self.queue.take() {
+            if !wait_for_cancel(&self.cancelled, deadline) {
                 tracing::warn!("virtual controller cancellation timed out or disconnected; retaining device and queue to avoid blocking teardown");
-                std::mem::forget(self.queue.take());
+                std::mem::forget(queue);
             }
         }
+    }
+}
+impl Drop for Target {
+    fn drop(&mut self) {
+        self.cancel();
+        self.finish_cancel(Instant::now() + CANCEL_TIMEOUT);
     }
 }
 
@@ -227,6 +254,15 @@ impl VirtualBus for Bus {
         })
     }
 
+    fn unplug_all(&mut self, mut pads: Vec<Target>) {
+        cancel_all(
+            &mut pads,
+            CANCEL_TIMEOUT,
+            Target::cancel,
+            Target::finish_cancel,
+        );
+    }
+
     fn submit(&mut self, pad: &mut Target, state: &PadState) -> Result<()> {
         let report = reports::input(pad.kind, state);
         *pad.state.lock() = report.clone();
@@ -332,11 +368,57 @@ mod tests {
     #[test]
     fn cancellation_wait_is_bounded_and_accepts_late_completion() {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        assert!(!wait_for_cancel(&rx, Duration::from_millis(5)));
+        assert!(!wait_for_cancel(
+            &rx,
+            Instant::now() + Duration::from_millis(5)
+        ));
         tx.send(()).unwrap();
-        assert!(wait_for_cancel(&rx, Duration::from_millis(5)));
+        assert!(wait_for_cancel(
+            &rx,
+            Instant::now() + Duration::from_millis(5)
+        ));
         drop(tx);
-        assert!(!wait_for_cancel(&rx, Duration::from_millis(5)));
+        assert!(!wait_for_cancel(
+            &rx,
+            Instant::now() + Duration::from_millis(5)
+        ));
+    }
+    #[test]
+    fn all_sixteen_stuck_controllers_share_one_teardown_deadline() {
+        let channels: Vec<_> = (0..latch_proto::gamepad::MAX_PADS)
+            .map(|_| std::sync::mpsc::sync_channel::<()>(1))
+            .collect();
+        let mut pads: Vec<_> = channels.iter().map(|(_, rx)| rx).collect();
+        let starts = std::cell::Cell::new(0);
+        let mut deadlines = Vec::new();
+        let began = Instant::now();
+        let cancel_started = std::cell::Cell::new(None);
+        cancel_all(
+            &mut pads,
+            Duration::from_millis(5),
+            |_| {
+                cancel_started.set(Some(Instant::now()));
+                starts.set(starts.get() + 1);
+            },
+            |rx, deadline| {
+                assert_eq!(starts.get(), latch_proto::gamepad::MAX_PADS);
+                deadlines.push(deadline);
+                assert!(!wait_for_cancel(rx, deadline));
+            },
+        );
+        assert_eq!(deadlines.len(), 16);
+        assert!(deadlines.iter().all(|deadline| *deadline == deadlines[0]));
+        assert!(
+            deadlines[0].saturating_duration_since(cancel_started.get().unwrap())
+                <= Duration::from_millis(5)
+        );
+        // A late callback still owns and releases its device, and sending to a
+        // dropped receiver is harmless. Successful cancellations need no wait.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(()).unwrap();
+        assert!(wait_for_cancel(&rx, began));
+        drop(rx);
+        assert!(tx.send(()).is_err());
     }
     #[test]
     fn native_creation_is_capability_gated_and_releases_every_pad() {

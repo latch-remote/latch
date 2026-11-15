@@ -45,16 +45,22 @@ GitHub release notes, so each version gets a heading of the form
 
 - Send system cursor shapes and visibility through the existing local cursor
   plane when the viewer negotiates it. ScreenCaptureKit omits the pointer in
-  free mouse mode and restores composition for captured mode, hidden or
-  untrusted visibility, unreadable shapes and older viewers. Latch uncertain
-  visibility to composition for each capture lifetime to prevent mode flapping.
-  Cache rasterized shapes and sample Retina artwork at backing scale. Scale
-  images and hotspots to the captured display and encoded picture.
+  free mouse mode and restores composition for captured mode, hidden/off-display
+  readings and older viewers. Return after 1 s of stable visible/on-display
+  readings and at least 3 s in composition, bounding switches to two per 3 s.
+  Latch unreadable shapes, stale/stalled sampling and configuration failures
+  until capture restarts. Retry failed configuration at most once per 3 s.
+  Check shapes at most 30 Hz, skip bitmap copying for reused immutable CGImages,
+  and cache rasterized Retina artwork. Scale images and hotspots to the captured
+  display and encoded picture. Cross-application hide/unhide and cross-machine
+  cursor handoff remain unverified on real hardware.
 - Check virtual-HID signing and cache a single inactive capability probe
   before advertising lazy gamepad slots. Current ad-hoc builds explain Apple's
   virtual-HID entitlement restriction in the viewer. Add entitlement-gated
   IOHIDUserDevice lifecycle, Xbox-style/DS4 report conversion and output-feedback handling, with tests.
-  Native controller enumeration and rumble remain blocked by signing.
+  Cancel every pad before waiting against one shared 2 s teardown deadline.
+  The entitled gamepad path, native enumeration and rumble remain unverified
+  on real hardware and blocked by signing in current ad-hoc builds.
 
 ### Testing
 

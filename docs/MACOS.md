@@ -214,8 +214,10 @@ bindings. It stages Xbox-style HID and wired DS4 descriptors, normalized
 buttons/sticks/triggers, up to the protocol limit of 16 lazy slots,
 connect/replacement/disconnect, bounded cancellation on session teardown and
 output-report motor/light mapping. A device is activated only when a viewer
-pad connects. If cancellation fails to complete within two seconds, teardown
-logs the failure and retains its reference and queue for safe late completion.
+pad connects. Session teardown starts cancellation for all pads first, then
+waits against one shared two-second deadline for all 16 slots. An individual
+unplug also has a two-second limit. Expiry logs the failure and retains the
+reference and queue for safe late completion.
 Generic pads use the Xbox layout. Native motion/touch sensors and device-specific feature reports are unimplemented.
 Descriptor/report, feedback and lifecycle tests establish byte conversion and
 cleanup. GameController, SDL and Steam compatibility still requires a real
@@ -285,27 +287,43 @@ A viewer that offers `cursor` receives the system image and visibility through
 the existing cursor controls. In free mode the pointer follows local mouse
 movement while ScreenCaptureKit uses `showsCursor = false`. Captured relative
 mode requests composition, allowing games to control pointer hiding as before.
-Older viewers retain composition. A hidden visibility reading, an off-display
-pointer, an unreadable/empty shape or a main queue stalled for 250 ms restores
-composition and sends `visible = false` after SCK confirms the change. The
-legacy visibility API's hidden reading is treated as untrusted, even when the
-shape remains readable. SCK then decides whether an application intentionally
-hid the pointer, preserving the composited behaviour of earlier releases.
-Fallback is latched for the capture lifetime, preventing flapping observations
-from repeatedly reconfiguring SCK and requesting keyframes. A capture restart
-clears pending samples and old geometry before sampling the new display. If a
-configuration change fails, the last readable local shape remains enabled
-until composition is confirmed.
+Older viewers retain composition. A clean hidden or off-display reading
+immediately requests composition, so SCK decides whether the pointer belongs
+on screen. The separate plane returns after one continuous second of visible,
+on-captured-display readings, with a readable shape, and at least three seconds
+in composition since the last switch. Initial negotiation also requires the
+one-second stable period. This chosen bound permits at most two composition
+changes in any three-second window, including a return immediately followed by
+another fallback. It bounds SCK reconfiguration and keyframe requests without
+requiring a measured reconfiguration cost. Captured-mode requests also start
+the three-second composition dwell.
+
+Unreadable/empty shapes, failed position queries, samples older than 250 ms,
+a main-queue request stalled beyond 250 ms and configuration failures latch
+composition until capture restarts. Failed configuration attempts are retried
+at most once every three seconds. A capture restart discards pending samples
+and old geometry. Plane visibility follows the mode SCK actually applied. The
+last readable local shape stays enabled until a composited picture leaves the
+encoder, so a failed composition change keeps a pointer. Up to two queued
+VideoToolbox pictures retain the cursor mode from their capture timestamps,
+including across a capture restart. The host announces the local plane with a
+final composited picture before omitting the cursor from capture, and keeps it through the first composited
+picture on fallback. This deliberately favours brief double cursors during
+handoff while queued video/control delivery catches up. Cross-machine handoff
+timing remains unverified.
 The background host pumps its main run loop while the HTTP service runs on a
 worker, so AppKit sampling also works through the installed service entry point.
 
 `NSCursor.currentSystemCursor` supplies the current system image and hotspot,
 including other applications' cursors. This API returned fresh cursor/image
 identities even for an unchanged pointer on the tested Mac. Shape checks run
-at most 30 Hz and compare source bitmap bytes, format, point size, hotspot,
-backing scale and display/encoded geometry before rasterization or base64
-encoding. Per-frame work reads position and visibility. A proposed image
-rectangle at least as large as the backing-scale artwork selects the Retina
+at most 30 Hz, with a minimum interval of 33.333334 ms. The cache first
+compares retained immutable CGImage identity, format, point size, hotspot,
+backing scale and display/encoded geometry. Reusing that image skips source
+bitmap copying. When identities change, source bytes are compared before
+rasterization or base64 encoding, and the cached byte vector is updated only
+when content or geometry changes. Per-frame work reads position and visibility.
+A proposed image rectangle at least as large as the backing-scale artwork selects the Retina
 representation before the image is rendered into premultiplied
 sRGB RGBA, converted to straight alpha and scaled from desktop points into
 encoded-picture pixels using the selected display's geometry and aspect fit.
@@ -356,6 +374,18 @@ of cursor scheduling per video frame. Cross-application hide/unhide correctness
 and an end-to-end remote viewer session remain unverified. The virtual-HID
 entitlement check took the denied path. No permission grant or system setting
 changed, and the root case remains untested.
+
+A further 15 November implementation check used the same Rust probe with a
+temporary 120-frame limit and a 30-second process timeout. AppKit returned a
+visible 31×44 shape, hotspot (5, 5), and sampled 100 shapes at a mean 0.286 ms.
+Both standalone and worker Screen Recording preflights returned true, but
+`open_video` then reported a missing Screen Recording grant. This attempt
+produced no real capture frames and changed no permissions. The 1 s / 3 s
+recovery gates, 30 Hz limit, queued-frame handoff and shared controller
+cancellation deadline are covered by state-transition, injected-clock and
+bounded cancellation tests. Real
+cross-application hide/unhide and an entitled controller session remain
+unverified.
 
 Windows can reuse `VideoPipeline::set_cursor_drawn`, `take_cursor`,
 `CursorUpdate`, the control messages and viewer rendering. After enabling the shared cursor module for Windows and decoding DXGI

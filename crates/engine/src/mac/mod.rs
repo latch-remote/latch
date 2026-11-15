@@ -244,7 +244,10 @@ impl VideoPipeline for Video {
             if let Some((.., frame)) = self.encoder.collect(Duration::ZERO) {
                 drop(state);
                 match frame {
-                    Some(Ok(frame)) => return Ok(frame),
+                    Some(Ok(frame)) => {
+                        self.cursor.encoded(frame.captured);
+                        return Ok(frame);
+                    }
                     Some(Err(error)) => self.recover(error)?,
                     // A real-time encoder may drop under load; the next
                     // picture carries any keyframe that one was.
@@ -334,14 +337,21 @@ impl VideoPipeline for Video {
         }
     }
     fn set_cursor_drawn(&mut self, drawn: bool) -> bool {
-        self.cursor.requested_drawn = drawn;
+        self.cursor.request_drawn(drawn);
         if !drawn {
             self.cursor
                 .sample(self.capture.display, self.config.width, self.config.height);
         }
-        match self.capture.set_cursor_drawn(self.cursor.drawn()) {
+        let now = Instant::now();
+        if !self.cursor.can_configure(now) {
+            return true;
+        }
+        let drawn = self.cursor.configuration_drawn();
+        match self.capture.set_cursor_drawn(drawn) {
             Ok(changed) => {
                 if changed {
+                    self.cursor
+                        .configured(self.capture.cursor_drawn(), Instant::now());
                     self.pending = None;
                     self.encoder.request_keyframe();
                 }
@@ -349,13 +359,14 @@ impl VideoPipeline for Video {
                 true
             }
             Err(error) => {
+                self.cursor.configuration_failed(Instant::now());
                 tracing::warn!(%error, "could not change ScreenCaptureKit cursor composition");
-                false
+                true
             }
         }
     }
     fn take_cursor(&mut self) -> Option<crate::video::CursorUpdate> {
-        self.cursor.update(self.capture.cursor_drawn())
+        self.cursor.update_for_frame()
     }
     fn recovers(&self) -> bool {
         self.encoder.recovers()

@@ -53,6 +53,10 @@ pub(crate) trait VirtualBus: Send {
     fn kinds(&self) -> &'static [PadKind];
     fn plug(&mut self, slot: u8, kind: PadKind, feedback: FeedbackFn) -> anyhow::Result<Self::Pad>;
     fn submit(&mut self, pad: &mut Self::Pad, state: &PadState) -> anyhow::Result<()>;
+    /// Platforms with asynchronous cancellation can cancel every pad before waiting.
+    fn unplug_all(&mut self, pads: Vec<Self::Pad>) {
+        drop(pads);
+    }
 }
 
 /// A [`VirtualBus`] as a [`PadSink`]: plugs a pad in on its first state,
@@ -104,9 +108,19 @@ impl<B: VirtualBus> PadSink for Pads<B> {
     }
 
     fn unplug_all(&mut self) {
-        for pad in &mut self.pads {
-            *pad = None;
-        }
+        let pads = self
+            .pads
+            .iter_mut()
+            .filter_map(Option::take)
+            .map(|(_, pad)| pad)
+            .collect();
+        self.bus.unplug_all(pads);
+    }
+}
+
+impl<B: VirtualBus> Drop for Pads<B> {
+    fn drop(&mut self) {
+        self.unplug_all();
     }
 }
 
