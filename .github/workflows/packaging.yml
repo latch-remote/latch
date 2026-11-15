@@ -174,9 +174,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # The runner's fresh profile has no Run key; the manifest must
-          # create it, since the 6.0.0 installer does not.
-          if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run') { throw 'expected a profile without a Run key' }
+          # Exercise the manifest on a profile without a Run key; the
+          # manifest must create it, since the 6.0.0 installer does not.
+          $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          if (Test-Path $runKey) { Remove-Item -Path $runKey -Recurse -Force }
           scoop install .\packaging\scoop\latch.json
           if ($LASTEXITCODE -ne 0) { throw 'scoop install failed' }
           $version = (Get-Content packaging\scoop\latch.json -Raw | ConvertFrom-Json).version
