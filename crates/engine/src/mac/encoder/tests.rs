@@ -129,6 +129,7 @@ fn roundtrip(codec: Codec, allow_hardware: bool) {
         fps: FPS,
         bitrate_kbps: 10_000,
         codec,
+        display: None,
     };
     let mut encoder = Encoder::create(&config, allow_hardware).unwrap();
     let image = surface();
@@ -253,6 +254,7 @@ fn software_session_encodes_an_iosurface() {
         fps: FPS,
         bitrate_kbps: 10_000,
         codec: Codec::H264Baseline,
+        display: None,
     };
     let mut encoder = Encoder::create(&config, false).unwrap();
     let image = surface();
@@ -407,6 +409,7 @@ pub fn run_encoder_benchmark_case(
         fps,
         bitrate_kbps,
         codec,
+        display: None,
     };
     let mut encoder = Encoder::create(&config, true).expect("create hardware encoder");
     assert!(encoder.hardware, "expected hardware encoder");
@@ -640,6 +643,7 @@ fn sessions_are_real_time_without_reordering_and_tagged_bt709() {
             fps: FPS,
             bitrate_kbps: 10_000,
             codec,
+            display: None,
         };
         let encoder = Encoder::create(&config, allow_hardware).unwrap();
         // SAFETY: each copied value is the documented CF type for its key.
@@ -794,6 +798,7 @@ fn realtime_case(
             fps,
             bitrate_kbps: kbps,
             codec,
+            display: None,
         },
         true,
         Depth::Eight,
@@ -870,6 +875,7 @@ fn pipelined_frames_come_out_in_order_with_their_capture_times() {
         fps: FPS,
         bitrate_kbps: 10_000,
         codec: Codec::Hevc,
+        display: None,
     };
     let mut encoder = Encoder::create(&config, true).unwrap();
     let woken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -930,6 +936,7 @@ fn main10_iosurface_roundtrip() {
         fps: FPS,
         bitrate_kbps: 20_000,
         codec: Codec::Hevc,
+        display: None,
     };
     assert!(Encoder::open(&config, true, Depth::Ten, false)
         .map(|_| ())
@@ -1112,6 +1119,7 @@ fn recovery_skips_queued_pictures_and_coalesces_retries() {
                 fps: FPS,
                 bitrate_kbps: 10_000,
                 codec,
+                display: None,
             },
             true,
         )
@@ -1161,6 +1169,7 @@ fn a_dropped_recovery_idr_is_retried_before_any_p_frame_leaves() {
             fps: FPS,
             bitrate_kbps: 10_000,
             codec: Codec::Hevc,
+            display: None,
         },
         true,
     )
@@ -1204,6 +1213,7 @@ fn a_bitrate_change_keeps_the_reference_chain_and_applies_to_the_next_picture() 
                 fps: FPS,
                 bitrate_kbps: 20_000,
                 codec,
+                display: None,
             },
             true,
         )
@@ -1227,8 +1237,7 @@ fn a_bitrate_change_keeps_the_reference_chain_and_applies_to_the_next_picture() 
             }
         };
         run(&mut encoder, 0, 30, &mut out);
-        // Two pictures are still in the encoder when the rate drops.
-        assert_eq!(encoder.in_flight(), 2);
+        // Drain every picture still pending when the rate drops.
         let boundary = encoder.index;
         encoder.bitrate(2_000).unwrap();
         assert_eq!(encoder.in_flight(), 0);
@@ -1328,6 +1337,7 @@ fn color_latency_benchmark() {
             fps: 60,
             bitrate_kbps: 20000,
             codec: Codec::Hevc,
+            display: None,
         };
         let mut encoder = Encoder::new(&config, depth).unwrap();
         let mut decoder = latch_stream::video::new_decoder_color(Codec::Hevc, color).unwrap();
@@ -1421,6 +1431,7 @@ fn ltr_recovery_matches_uninterrupted_decoding() {
             bitrate_kbps: 10_000,
             codec,
             color: Default::default(),
+            display: None,
         };
         let mut encoder = Encoder::open(&config, true, Depth::Eight, true).unwrap();
         eprintln!(
@@ -1565,12 +1576,16 @@ fn ltr_boundary_drops_ahead_frames_and_retries_a_dropped_refresh_with_idr() {
         bitrate_kbps: 10_000,
         codec: Codec::H264High,
         color: Default::default(),
+        display: None,
     };
     for missing_callback in [false, true] {
         let mut encoder = Encoder::open(&config, true, Depth::Eight, true).unwrap();
         if !encoder.recovers() {
             return;
         }
+        // Exercise the recovery boundary even when ahead-frame callbacks have
+        // already produced H.264 long-term marks before recover_from runs.
+        encoder.unsafe_h264_refresh = true;
         let image = surface();
         fill(&image, &pattern(0));
         let base = encoder

@@ -43,6 +43,17 @@ GitHub release notes, so each version gets a heading of the form
   source changes, and require large-segment loss evidence for automatic MSS hints.
   Cover 280 ms RTT recovery and retry non-blocking test accepts with deadlines.
 
+### Streaming
+
+- Choose which of a host's displays to share. Hosts list their displays in
+  `/v1/status` (`streamer.displays`), and the viewer offers them in the
+  machine's menu in the list and in the stream toolbar, remembered per
+  machine. A choice made during a stream reconnects on that display. Hosts
+  that do not list displays, and viewers that do not choose, keep sharing
+  the display the host picks: the virtual display on Windows, the main
+  display (or `LATCH_MAC_DISPLAY`) on a Mac, the whole X screen on Linux.
+  `StreamRequest.display` is additive and omitted when nothing is chosen.
+
 - Send viewer mouse and keyboard input directly from OS events on macOS,
   Windows and Linux, preserving input ordering, capture, focus and local
   shortcuts while avoiding the next UI frame for ordinary input.

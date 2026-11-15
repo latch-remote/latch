@@ -56,6 +56,7 @@ fn quality_benchmark() {
             fps,
             bitrate_kbps: kbps,
             codec,
+            display: None,
         },
         true,
     )

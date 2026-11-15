@@ -74,7 +74,11 @@ fn machine_noun(os: &str) -> &'static str {
 /// Whether the machine's menu has anything in it: power actions its owner
 /// allows, or an update for an old host.
 fn has_power_items(env: &Env<'_>) -> bool {
-    env.power_allowed || env.old_host.is_some()
+    env.power_allowed || env.old_host.is_some() || !display_choices(env).is_empty()
+}
+
+fn display_choices(env: &Env<'_>) -> Vec<(Option<String>, String)> {
+    crate::session::display_choices(&env.displays)
 }
 
 /// What a power action costs, said before it is sent to `pc`.
@@ -105,6 +109,8 @@ pub enum Action {
     ApplySettings(StreamSettings),
     /// Whether a click on the picture captures the mouse.
     MouseCapture(bool),
+    /// Share this display of the machine's (`None`: the one it picks).
+    ChooseDisplay(Option<String>),
 }
 
 /// An unexpected connection drop reconnection state machine.
@@ -202,6 +208,9 @@ pub struct Env<'a> {
     pub power_allowed: bool,
     /// Sleep is offered: something can wake the machine again.
     pub can_sleep: bool,
+    /// The machine's displays, as its status lists them.
+    pub displays: Vec<latch_proto::control::HostDisplay>,
+    pub captured_display: Option<String>,
 }
 
 struct Toast {
@@ -1159,7 +1168,7 @@ impl View {
                                     self.keys_menu(ui, live, cfg, actions);
                                     self.stats_button(ui);
                                     self.fullscreen_button(ui, env, actions);
-                                    self.power_menu(ui, env);
+                                    self.power_menu(ui, env, actions);
                                     if rect.width() >= 1100.0 {
                                         self.volume_controls(ui, live);
                                     } else {
@@ -1301,7 +1310,7 @@ impl View {
             self.key_items(ui, live, cfg, actions);
             if has_power_items(env) {
                 ui::menu_label(ui, machine_noun(&env.os));
-                self.power_items(ui, env);
+                self.power_items(ui, env, actions);
             }
         });
     }
@@ -1357,18 +1366,43 @@ impl View {
         }
     }
 
-    fn power_menu(&mut self, ui: &mut egui::Ui, env: &Env<'_>) {
+    fn power_menu(&mut self, ui: &mut egui::Ui, env: &Env<'_>, actions: &mut Vec<Action>) {
         if !has_power_items(env) {
             return;
         }
-        ui::menu_button(ui, machine_noun(&env.os), |ui| self.power_items(ui, env));
+        ui::menu_button(ui, machine_noun(&env.os), |ui| {
+            self.power_items(ui, env, actions)
+        });
     }
 
     /// Sleep, Restart and Shut down where the machine's owner allows them,
     /// each asked about first: a slip in this menu must not end the stream
     /// or put to sleep a machine that nothing here can wake. The stream
     /// stays up until the machine has agreed.
-    fn power_items(&mut self, ui: &mut egui::Ui, env: &Env<'_>) {
+    fn power_items(&mut self, ui: &mut egui::Ui, env: &Env<'_>, actions: &mut Vec<Action>) {
+        let displays = display_choices(env);
+        if !displays.is_empty() {
+            ui::menu_label(ui, "Display to share");
+            let streamed = env
+                .live
+                .display
+                .as_deref()
+                .map(|requested| env.captured_display.as_deref().unwrap_or(requested));
+            let current = crate::session::chosen_display(&env.displays, streamed);
+            for (choice, label) in displays {
+                if ui::menu_choice(ui, &label, choice == current)
+                    .on_hover_text("The stream starts again on this display, in a second or two.")
+                    .clicked()
+                    && (choice != current
+                        || choice.as_deref() != env.cfg.display(&env.live.node_id))
+                {
+                    actions.push(Action::ChooseDisplay(choice));
+                }
+            }
+            if env.power_allowed || env.old_host.is_some() {
+                ui::menu_separator(ui);
+            }
+        }
         if env.power_allowed {
             if env.can_sleep && ui::menu_item(ui, "Sleep…").clicked() {
                 self.confirm = Some(PowerAction::Sleep);
@@ -2980,6 +3014,8 @@ pub(crate) mod tests {
         pub video_help: Option<crate::display::Help>,
         pub power_allowed: bool,
         pub can_sleep: bool,
+        pub displays: Vec<latch_proto::control::HostDisplay>,
+        pub captured_display: Option<String>,
     }
 
     pub(crate) struct Fixture {
@@ -3044,6 +3080,7 @@ pub(crate) mod tests {
                 cursor: true,
                 gamepads: false,
                 mic: false,
+                display: None,
             },
             frames.clone(),
             tx,
@@ -3070,6 +3107,7 @@ pub(crate) mod tests {
             clipboard: crate::clipboard::Sync::spawn(ip, ctx.clone()),
             shortcuts: Default::default(),
             pads,
+            display: None,
         }
     }
 
@@ -3101,6 +3139,8 @@ pub(crate) mod tests {
             video_help: extra.video_help.clone(),
             power_allowed: extra.power_allowed,
             can_sleep: extra.can_sleep,
+            displays: extra.displays.clone(),
+            captured_display: extra.captured_display.clone(),
         };
         let actions = view.show(ctx, &env);
         if !actions.is_empty() {
@@ -3161,6 +3201,85 @@ pub(crate) mod tests {
                 },
             ),
         )
+    }
+
+    #[test]
+    fn the_stream_menu_can_switch_displays_without_power_permission() {
+        use latch_proto::control::HostDisplay;
+        let displays = vec![
+            HostDisplay {
+                id: "1".into(),
+                name: "Built-in display".into(),
+                width: 3024,
+                height: 1964,
+                default: true,
+                ..Default::default()
+            },
+            HostDisplay {
+                id: "2".into(),
+                name: "External display".into(),
+                width: 2560,
+                height: 1440,
+                ..Default::default()
+            },
+        ];
+        let mut h = harness_with(
+            Vec2::new(1280.0, 800.0),
+            1.0,
+            false,
+            fixture(
+                view_with_bar(),
+                Extra {
+                    os: "macOS".into(),
+                    displays,
+                    ..Default::default()
+                },
+            ),
+        );
+        let external = "External display · 2560 × 1440";
+        h.get_by_label("Mac").simulate_click();
+        h.run_steps(2);
+        h.get_by_label(external).simulate_click();
+        h.run_steps(2);
+        assert_eq!(h.state().actions, [Action::ChooseDisplay(Some("2".into()))]);
+
+        // Once reconnected, choosing the same display leaves the stream up.
+        h.state_mut().live.as_mut().unwrap().display = Some("2".into());
+        h.state_mut().cfg.choose_display("n1", Some("2".into()));
+        h.state_mut().actions.clear();
+        h.get_by_label("Mac").simulate_click();
+        h.run_steps(2);
+        h.get_by_label(external).simulate_click();
+        h.run_steps(2);
+        assert!(h.state().actions.is_empty());
+
+        // B disappeared and capture fell back to A. Replugging B keeps
+        // A selected until B is chosen again, even though B was requested.
+        h.state_mut().extra.captured_display = Some("1".into());
+        h.get_by_label("Mac").simulate_click();
+        h.run_steps(2);
+        h.get_by_label(external).simulate_click();
+        h.run_steps(2);
+        assert_eq!(h.state().actions, [Action::ChooseDisplay(Some("2".into()))]);
+        h.state_mut().actions.clear();
+
+        h.get_by_label("Mac").simulate_click();
+        h.run_steps(2);
+        h.get_by_label("Automatic (Built-in display)")
+            .simulate_click();
+        h.run_steps(2);
+        assert_eq!(h.state().actions, [Action::ChooseDisplay(None)]);
+
+        // A stream that fell back after a display disappeared can still
+        // forget the saved choice by choosing Automatic.
+        h.state_mut().live.as_mut().unwrap().display = None;
+        h.state_mut().actions.clear();
+        h.get_by_label("Mac").simulate_click();
+        h.run_steps(2);
+        h.get_by_label("Automatic (Built-in display)")
+            .simulate_click();
+        h.run_steps(2);
+        assert_eq!(h.state().actions, [Action::ChooseDisplay(None)]);
     }
 
     fn bar_control_rects(h: &egui_kittest::Harness<'_, Fixture>) -> Vec<(String, Rect)> {

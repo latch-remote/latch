@@ -47,7 +47,12 @@ fn main() -> anyhow::Result<()> {
             relay: measurement_relay::relay(&args)?,
             prepare: args.iter().any(|a| a == "--prepare-display").then(|| {
                 Box::new(|req: &StreamRequest| {
-                    let previous = latch_engine::display::prepare(req.width, req.height, req.fps)?;
+                    let previous = latch_engine::display::prepare(
+                        req.width,
+                        req.height,
+                        req.fps,
+                        req.display.as_deref(),
+                    )?;
                     Ok(previous.map(|previous| {
                         Box::new(move || {
                             if let Err(e) = latch_engine::display::restore(&previous) {
