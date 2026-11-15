@@ -85,6 +85,14 @@ fn record_grab(status: i32) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn guide_retains_x11_grab_hang_and_kill_recovery_warning() {
+        let guide = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/USING.md"));
+        assert!(guide.contains("An active grab blocks other X11 clients until released"));
+        assert!(guide
+            .contains("a hung Latch can hold the session keyboard until the process is killed"));
+    }
+
+    #[test]
     fn a_failed_grab_remains_retryable_and_logs_once() {
         REQUESTED.set(false);
         WARNED.set(false);
