@@ -18,7 +18,7 @@
     ]
   },
   "d2": {
-    "reason": "After the 3 Mbps UDP policer drops real media, main switches to relay but retains the reduced UDP bitrate instead of restoring requested video quality.",
+    "reason": "Under the 3 Mbps UDP policer, main either remains on degraded UDP or switches to relay while retaining the reduced UDP bitrate. The media path policy must recover requested video quality on a sustainable path.",
     "fix": "https://github.com/latch-remote/latch/compare/main...t3/media-path-policy",
     "failures": [
       "tail_video_at_least_75pct_requested"
@@ -136,7 +136,7 @@
     ]
   },
   "n": {
-    "reason": "PR #95 provides reduced-MSS fresh-connection retries. The wiring PR must retain and use the retry hint in session relay recovery.",
+    "reason": "PR #95 owns reduced-MSS fresh-connection retries, and the wiring PR must retain and use that hint in session relay recovery. At #95 head e22bddf its retry clamps MSS to 1200, which still exceeds this lab path's 600-byte IP-packet budget. Recovery needs a smaller retry MSS (512 fits) before this case can pass.",
     "fix": "https://github.com/latch-remote/latch/pull/95",
     "failures": [
       "first_frame_deadline",

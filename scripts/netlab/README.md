@@ -157,7 +157,10 @@ Scenario h deliberately checks recovery to usable UDP with smaller
 datagrams. Existing native relay recovery alone cannot satisfy that MTU
 probing requirement. Scenario n covers a TCP PMTU black hole after SYN/MSS
 negotiation. Kernel TCP MTU probing is disabled in each namespace to make
-the product's behavior reproducible.
+the product's behavior reproducible. PR #95 currently retries with a
+1,200-byte MSS. Scenario n requires a smaller retry, such as 512 bytes,
+to fit its 600-byte IP-packet budget. The expected-failure reference covers
+that carrier change and the session wiring that applies the retry hint.
 
 ## Results and expected failures
 
@@ -240,6 +243,10 @@ callers together. The lab supplies `HTTPS_PROXY=http://10.77.2.1:3128` and
 control connection retains its direct tailnet route.
 
 The example preserves the configured proxy when applying private roots.
+PR #95 adds a separate `ClientConfig::verifier` for certificate diagnostics.
+Its integration must update `with_tls_roots` to replace that verifier from
+the same private roots alongside `tls`. Both TLS verification paths must
+use the supplied lab CA while retaining production address filtering.
 Scenario i keeps its CONNECT and media assertions until #95, #96 and the
 wiring PR land. Its post-preflight proxy-access guard also proves native
 attempts reach the HTTP proxy on the current product.
