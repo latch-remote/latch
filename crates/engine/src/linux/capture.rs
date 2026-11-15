@@ -95,11 +95,7 @@ const MAX_REGIONS: usize = 8;
 impl X11Capture {
     pub fn new() -> anyhow::Result<Self> {
         let (conn, screen) = super::connect(super::X11_SILENCE).map_err(|e| {
-            let wayland = super::wayland_session(
-                std::env::var_os("WAYLAND_DISPLAY").as_deref(),
-                std::env::var_os("XDG_SESSION_TYPE").as_deref(),
-            );
-            e.context(if wayland {
+            e.context(if super::in_wayland_session() {
                 super::WAYLAND
             } else {
                 "connect to X11 DISPLAY"
@@ -529,6 +525,25 @@ impl Drop for X11Capture {
             let _ = shm::detach(&self.conn, segment.id);
         }
         let _ = self.conn.flush();
+    }
+}
+
+/// What `$DISPLAY` reaches, for choosing a backend: an X desktop, rootless
+/// Xwayland, or nothing.
+pub(super) fn probe() -> super::wayland::backend::XServer {
+    use super::wayland::backend::XServer;
+    let Ok((conn, screen)) = super::connect(super::X11_SILENCE) else {
+        return XServer::Unavailable;
+    };
+    let root = conn.setup().roots[screen].root;
+    let randr = randr::query_version(&conn, 1, 3)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .is_some();
+    match xwayland(&conn, root, randr) {
+        Ok(false) => XServer::Desktop,
+        Ok(true) => XServer::Xwayland,
+        Err(_) => XServer::Unavailable,
     }
 }
 

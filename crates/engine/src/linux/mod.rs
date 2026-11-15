@@ -1,5 +1,7 @@
-//! Linux (X11): MIT-SHM capture with the XFixes cursor, RandR sizing,
-//! XTest input, PulseAudio/PipeWire monitor capture, uinput gamepads.
+//! Linux: on X11, MIT-SHM capture with the XFixes cursor, RandR sizing and
+//! XTest input; on Wayland, the desktop portal's screencast through
+//! PipeWire and its remote-desktop input (see `wayland/`). Both have
+//! PulseAudio/PipeWire monitor capture and uinput gamepads.
 
 mod audio;
 mod capture;
@@ -11,17 +13,76 @@ mod nv12;
 mod nvenc;
 mod uinput;
 mod vaapi;
+pub mod wayland;
 
 use crate::audio::AudioCapture;
 use crate::input::InputSink;
 use crate::video::{VideoConfig, VideoPipeline};
 pub use capture::X11Capture;
-use std::ffi::OsStr;
 use std::time::Duration;
+pub use wayland::backend::Backend;
+pub use wayland::WaylandCapture;
+
+/// Whether `$WAYLAND_DISPLAY` or `$XDG_SESSION_TYPE` say Wayland.
+fn in_wayland_session() -> bool {
+    wayland::backend::wayland_session(
+        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+        std::env::var_os("XDG_SESSION_TYPE").as_deref(),
+    )
+}
+
+/// The display server this host shares now (see [`wayland::backend`]):
+/// `$LATCH_LINUX_BACKEND`, else X11 outside a Wayland session, else
+/// Wayland unless `$DISPLAY` is an Xorg desktop.
+pub fn backend() -> Backend {
+    let preference =
+        wayland::backend::preference(std::env::var("LATCH_LINUX_BACKEND").ok().as_deref());
+    wayland::backend::choose(preference, in_wayland_session(), capture::probe)
+}
+
+/// [`backend`], looked at again at most every 30 seconds: for a status
+/// that is asked for every second.
+pub fn backend_cached() -> Backend {
+    use parking_lot::Mutex;
+    use std::time::Instant;
+    static CACHE: Mutex<Option<(Instant, Backend)>> = Mutex::new(None);
+    let mut cache = CACHE.lock();
+    match *cache {
+        Some((at, backend)) if at.elapsed() < Duration::from_secs(30) => backend,
+        _ => {
+            let backend = backend();
+            *cache = Some((Instant::now(), backend));
+            backend
+        }
+    }
+}
+
+/// What the owner still has to do for a viewer to see this Wayland desktop
+/// without someone at it: approve the portal's prompt once.
+pub fn wayland_setup_item() -> Option<String> {
+    (backend_cached() == Backend::Wayland && !wayland::approved()).then(|| {
+        "Wayland: approve screen sharing once with Run setup, or a viewer waits for someone to approve it on this screen.".into()
+    })
+}
+
+/// Asks the owner to approve sharing this Wayland desktop (the portal's
+/// prompt) and keeps the approval, so a viewer's session needs nobody at
+/// this machine. Nothing to do on X11.
+pub fn approve_wayland() -> anyhow::Result<()> {
+    if backend() != Backend::Wayland {
+        return Ok(());
+    }
+    wayland::approve()
+}
 
 /// Query the root size through the same bounded initialization as capture.
+/// On Wayland, the last screencast's size: asking the portal could prompt.
 pub fn capture_size() -> anyhow::Result<[u32; 2]> {
+    use anyhow::Context as _;
     use x11rb::connection::Connection;
+    if backend_cached() == Backend::Wayland {
+        return wayland::last_size().context("no Wayland screencast has run yet");
+    }
     let (conn, screen) = connect(X11_SILENCE)?;
     let root = &conn.setup().roots[screen];
     Ok([root.width_in_pixels.into(), root.height_in_pixels.into()])
@@ -62,6 +123,17 @@ pub fn takes(codec: crate::video::Codec, width: u32, height: u32) -> bool {
 /// [`Unencodable`](crate::video::Unencodable), and the next session
 /// negotiates another codec.
 pub fn open_video(config: &VideoConfig) -> anyhow::Result<Box<dyn VideoPipeline>> {
+    match backend() {
+        Backend::X11 => open_pipeline(X11Capture::new, config),
+        Backend::Wayland => open_pipeline(|| WaylandCapture::new(config.fps), config),
+    }
+}
+
+/// `capture` into the encoder [`open_video`] describes.
+fn open_pipeline<C: crate::software::CpuCapture + 'static>(
+    capture: impl FnOnce() -> anyhow::Result<C>,
+    config: &VideoConfig,
+) -> anyhow::Result<Box<dyn VideoPipeline>> {
     use crate::software::{LatchEncoder, PictureEncoder, SoftwarePipeline};
     use crate::video::{Codec, Unencodable};
     let codec = config.codec;
@@ -71,7 +143,7 @@ pub fn open_video(config: &VideoConfig) -> anyhow::Result<Box<dyn VideoPipeline>
             h264,
             Unencodable(format!("this host has no {} encoder", codec.name()))
         );
-        return Ok(Box::new(SoftwarePipeline::new(X11Capture::new()?, config)?));
+        return Ok(Box::new(SoftwarePipeline::new(capture()?, config)?));
     };
     // Opens the hardware encoder for the negotiated output size; for
     // H.264, the software one where that fails.
@@ -98,7 +170,7 @@ pub fn open_video(config: &VideoConfig) -> anyhow::Result<Box<dyn VideoPipeline>
             Ok(Box::new(LatchEncoder::open(width, height, config)?))
         };
     Ok(Box::new(SoftwarePipeline::with_encoder(
-        X11Capture::new()?,
+        capture()?,
         config,
         Box::new(open),
     )?))
@@ -110,7 +182,10 @@ pub fn open_mic(format: &latch_proto::control::AudioFormat) -> anyhow::Result<cr
     mic::open(format)
 }
 pub fn open_input() -> anyhow::Result<Box<dyn InputSink>> {
-    Ok(Box::new(input::X11Input::new()?))
+    match backend() {
+        Backend::X11 => Ok(Box::new(input::X11Input::new()?)),
+        Backend::Wayland => wayland::open_input(),
+    }
 }
 pub fn open_pads(feedback: crate::gamepad::FeedbackFn) -> anyhow::Result<crate::gamepad::Opened> {
     Ok(crate::gamepad::Pads::opened(uinput::open()?, feedback))
@@ -120,22 +195,20 @@ pub fn prepare_display(
     height: u32,
     fps: u32,
 ) -> anyhow::Result<Option<crate::display::Previous>> {
+    // A Wayland compositor's outputs are its own: Latch does not resize them.
+    if backend() == Backend::Wayland {
+        return Ok(None);
+    }
     display::prepare(width, height, fps)
 }
 pub fn restore_display(previous: &crate::display::Previous) -> anyhow::Result<()> {
     display::restore(previous)
 }
 
-/// Why a Wayland desktop cannot be shared, and what the owner can do.
-const WAYLAND: &str = "this is a Wayland session, which Latch cannot share yet: \
-    log out, choose an Xorg (X11) session at the login screen, and log in again";
-
-/// Whether `$WAYLAND_DISPLAY` and `$XDG_SESSION_TYPE` describe a Wayland
-/// session. Only a hint: a separate Xorg server on `$DISPLAY` still works.
-fn wayland_session(display: Option<&OsStr>, session_type: Option<&OsStr>) -> bool {
-    display.is_some_and(|d| !d.is_empty())
-        || session_type.is_some_and(|t| t.eq_ignore_ascii_case("wayland"))
-}
+/// Why X11 capture refuses a Wayland desktop, and what the owner can do.
+const WAYLAND: &str = "this is a Wayland session, whose desktop X11 cannot capture: \
+    unset LATCH_LINUX_BACKEND (or set it to wayland) to share it through the desktop portal, \
+    or log in to an Xorg (X11) session";
 
 /// Whether these RandR output names are rootless Xwayland's, whose root
 /// window holds no desktop: XWAYLAND0, XWAYLAND1, …
@@ -154,13 +227,7 @@ use x11::{connect, wait_fd, X11};
 mod tests {
     use super::*;
     #[test]
-    fn recognises_wayland_sessions_and_xwayland_outputs() {
-        let os = |s| Some(OsStr::new(s));
-        assert!(wayland_session(os("wayland-0"), None));
-        assert!(wayland_session(None, os("wayland")));
-        assert!(wayland_session(os(""), os("Wayland")));
-        assert!(!wayland_session(None, None));
-        assert!(!wayland_session(os(""), os("x11")));
+    fn recognises_xwayland_outputs() {
         let names: [&[u8]; 2] = [b"DUMMY0", b"XWAYLAND0"];
         assert!(xwayland_outputs(names.into_iter()));
         assert!(!xwayland_outputs(names[..1].iter().copied()));

@@ -28,6 +28,11 @@ futures = "0.3"
 # The GPU vendors' encoders (libva, libnvidia-encode) are opened at run
 # time, when present: nothing is linked.
 libloading = "0.8"
+# Wayland: the desktop portal over D-Bus (pure Rust; already in the build
+# through eframe's accessibility), and its timers. libpipewire is opened
+# at run time with libloading, like the encoders.
+zbus = { version = "4", default-features = false, features = ["async-io"] }
+async-io = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.58"
