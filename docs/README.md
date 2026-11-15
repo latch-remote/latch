@@ -7,6 +7,7 @@
 | [USING.md](USING.md) | A session from Connect to Disconnect, updates, waking a PC, staying reachable |
 | [WINDOWS.md](WINDOWS.md) | Windows: install, what setup changes, gamepads, sound, troubleshooting |
 | [MACOS.md](MACOS.md) | macOS: install, permissions, the toolbar and keyboard, troubleshooting |
+| [../packaging/README.md](../packaging/README.md) | Scoop, AUR and Nix packages, and how to publish them |
 | [../deploy/native/README.md](../deploy/native/README.md) | A Linux server sharing a virtual desktop, under systemd |
 | [../deploy/node/NODE.md](../deploy/node/NODE.md) | The same in a Docker container |
 | [../deploy/relay/RELAY.md](../deploy/relay/RELAY.md) | Your own Tailscale peer relay, for networks that cannot connect directly |
