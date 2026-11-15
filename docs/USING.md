@@ -582,12 +582,24 @@ Latch discovers this network's OS, PAC/WPAD and environment proxy settings in
 background. A cached result is used immediately. Slow discovery continues while
 the connection tries direct access. Changing networks or signing in to a portal
 invalidates the cached result. Relay connection failures refresh discovery within
-two seconds. A failed PAC/WPAD lookup retains a previously working proxy until
-successful discovery replaces it.
+two seconds. A missing or empty incomplete PAC/WPAD result retains the prior
+proxy. After 60 seconds without a successful connection through that retained
+proxy, new connections try direct access first and keep the proxy as fallback.
+Successful proxy connections restart this timer, including grant renewals and
+reconnects. Healthy sessions reuse discovery, so one failed lookup can stay
+cached. A completed result with proxy or Direct candidates replaces the prior
+settings immediately, including platform WPAD fallback candidates. System
+sleep can change the attempt order while retaining the proxy fallback.
+
 A confirmed portal retries after 1 second with exponential backoff up to 4
-seconds. Opening sign-in or returning to Latch rechecks promptly. Healthy
-sessions send no periodic HTTP probes. An in-flight check can
-take up to six seconds.
+seconds. The first portal observation and the first fresh open result take
+effect immediately. After an open result on the same network, the banner
+returns only after two consecutive redirect observations in separate discovery
+rounds. A returning portal therefore needs one additional discovery round.
+Alternating redirect/open results clear the banner once and preserve the retry
+back-off. Delivered media clears the banner immediately. Opening sign-in or
+returning to Latch rechecks promptly. Healthy sessions send no periodic HTTP
+probes. An in-flight check can take up to six seconds.
 
 - **This network needs a sign-in** appears when a portal redirects the anonymous
   connectivity check. Choose **Open network sign-in**, complete the browser's

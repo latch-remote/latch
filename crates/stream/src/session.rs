@@ -38,9 +38,11 @@ pub fn relay_config(settings: &control::RelaySettings) -> Option<latch_relay::Cl
         .and_then(latch_relay::ClientConfig::production)
         .map(|mut config| {
             let host = settings.host.clone();
-            config.set_proxy_discovery(move || {
-                crate::network::proxy_selection(&crate::network::diagnosis(&host))
-            });
+            let connected_host = host.clone();
+            config.set_proxy_discovery_policy(
+                move || crate::network::relay_proxy_selection(&host),
+                move |proxy| crate::network::proxy_connected(&connected_host, proxy),
+            );
             config
         })
         .map_err(|error| tracing::warn!(%error, "relay unavailable"))
