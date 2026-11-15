@@ -1,0 +1,6 @@
+{
+  "utc": "2026-11-15T04:18:16.393144+00:00",
+  "command": "paired_probe relay.latch.rune.foo 25 5 60 5",
+  "exit_code": 0,
+  "stderr": ""
+}
