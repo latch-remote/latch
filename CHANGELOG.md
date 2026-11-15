@@ -6,6 +6,34 @@ GitHub release notes, so each version gets a heading of the form
 
 ## Unreleased
 
+### Relay connectivity
+
+- Add HTTPS WebSocket relay fallback on TCP 443 alongside native
+  `latch-relay/1` TLS, with shared admission, durable quotas and bounded queues.
+- Add explicit HTTP CONNECT proxies with redacted Basic credentials and a
+  bounded native-to-WebSocket connection ladder. Expose typed carrier and
+  failure diagnostics, including TLS interception, captive portals and proxy
+  authentication or refusal.
+- Listen on IPv4 and IPv6, accept DNS64/NAT64 destinations with public-address
+  filtering, and retain address racing and Windows connect readiness checks.
+  Retry stalled Unix paths with a reduced TCP MSS and enable Linux server
+  TCP MTU probing in the deployment kit.
+- Harden DNS64 discovery and embedded-IPv4 validation while always denying
+  private and tailnet destinations. Aggregate IPv6 admission by /64 and evict
+  old rate windows so new sources can compete for capacity. Deny RFC 8215
+  local-use destinations across every layout, keep optional DNS64 discovery on
+  its own bounded worker for IPv6-only routes, and accept public well-known
+  NAT64 answers without relay A records.
+- Report early TLS closes as blocked or relay busy, keep verified HTTPS upgrade
+  rejection retryable, wipe proxy credential buffers, sanitize certificate issuer
+  text, and aggregate decoy traffic without consuming failure diagnostics.
+- Reuse successful carrier/address selections across lanes and grants. Expire
+  reduced-MSS hints after 30 seconds and report their stall cause. Cover malformed
+  WebSocket frames and control floods over real daemon sockets. Restart the full
+  ladder with fresh DNS after stale cached paths, invalidate shortcuts on local
+  source changes, and require large-segment loss evidence for automatic MSS hints.
+  Cover 280 ms RTT recovery and retry non-blocking test accepts with deadlines.
+
 - Send viewer mouse and keyboard input directly from OS events on macOS,
   Windows and Linux, preserving input ordering, capture, focus and local
   shortcuts while avoiding the next UI frame for ordinary input.

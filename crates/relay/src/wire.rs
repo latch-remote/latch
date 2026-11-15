@@ -177,9 +177,34 @@ impl Framer {
     }
 }
 
+/// Private timeout payload, so MSS decisions never depend on display strings.
+#[derive(Debug)]
+pub(crate) struct Stall {
+    pub mss_reason: Option<crate::MssReason>,
+    pub write: bool,
+}
+impl fmt::Display for Stall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.write {
+            "TLS write deadline expired"
+        } else {
+            "TLS record deadline expired"
+        })
+    }
+}
+impl std::error::Error for Stall {}
+impl Stall {
+    pub fn error(self) -> io::Error {
+        io::Error::new(io::ErrorKind::TimedOut, self)
+    }
+}
+
 /// Owns the entire TLS state and a single pending framed write.
 pub(crate) struct TlsSocket {
     pub conn: rustls::Connection,
+    pub carrier: crate::carrier::State,
+    control: Option<Vec<u8>>,
+    closing: bool,
     pub tcp: TcpStream,
     pub framer: Framer,
     pending: Vec<u8>,
@@ -190,6 +215,8 @@ pub(crate) struct TlsSocket {
     pub credit_epoch: u64,
     pub transferred: u64,
     handshake_bytes: usize,
+    small_record_received: bool,
+    large_write_after_small: bool,
 }
 impl TlsSocket {
     pub fn new(conn: rustls::Connection, tcp: TcpStream) -> io::Result<Self> {
@@ -197,6 +224,9 @@ impl TlsSocket {
         tcp.set_nodelay(true)?;
         let mut result = Self {
             conn,
+            carrier: crate::carrier::State::Native,
+            control: None,
+            closing: false,
             tcp,
             framer: Framer::default(),
             pending: Vec::new(),
@@ -207,12 +237,14 @@ impl TlsSocket {
             credit_epoch: 0,
             transferred: 0,
             handshake_bytes: 0,
+            small_record_received: false,
+            large_write_after_small: false,
         };
         result.conn.set_buffer_limit(Some(TLS_BUFFER));
         Ok(result)
     }
     pub fn idle_write(&self) -> bool {
-        self.pending.is_empty() && !self.conn.wants_write()
+        self.pending.is_empty() && self.control.is_none() && !self.conn.wants_write()
     }
     pub fn queue(&mut self, record: &[u8]) -> io::Result<()> {
         if !self.idle_write() {
@@ -221,9 +253,8 @@ impl TlsSocket {
         if record.is_empty() || record.len() > RECORD_MAX {
             return Err(invalid("invalid outbound relay record"));
         }
-        self.pending
-            .extend_from_slice(&(record.len() as u32).to_be_bytes());
-        self.pending.extend_from_slice(record);
+        self.carrier.encode(record, &mut self.pending)?;
+        self.large_write_after_small = self.small_record_received && record.len() > 1200;
         self.written = 0;
         self.sending = Some(Instant::now());
         Ok(())
@@ -233,6 +264,15 @@ impl TlsSocket {
             quota.credit(&mut self.credit, &mut self.credit_epoch)?;
         }
         let was_handshaking = self.conn.is_handshaking();
+        let early_close = |kind| {
+            io::Error::new(
+                kind,
+                crate::ConnectError {
+                    failure: crate::Failure::ClosedBeforeHandshake,
+                    attempts: Vec::new(),
+                },
+            )
+        };
         let metered = self.credit != 0;
         let mut meter = Meter {
             tcp: &mut self.tcp,
@@ -246,23 +286,54 @@ impl TlsSocket {
             match self.conn.write_tls(&mut meter) {
                 Ok(_) => (),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+                Err(e)
+                    if was_handshaking
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::BrokenPipe
+                                | io::ErrorKind::ConnectionAborted
+                        ) =>
+                {
+                    return Err(early_close(e.kind()));
+                }
                 Err(e) => return Err(e),
             }
         }
         if self.conn.wants_read() {
             match self.conn.read_tls(&mut meter) {
                 Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "relay socket closed",
-                    ))
+                    return Err(if was_handshaking {
+                        early_close(io::ErrorKind::UnexpectedEof)
+                    } else {
+                        io::Error::new(io::ErrorKind::UnexpectedEof, "relay socket closed")
+                    })
                 }
                 Ok(_) => {
                     self.conn
                         .process_new_packets()
-                        .map_err(|_| invalid("TLS verification or protocol failed"))?;
+                        .map_err(|error| match error {
+                            rustls::Error::AlertReceived(
+                                rustls::AlertDescription::NoApplicationProtocol,
+                            ) => crate::Failure::AlpnRejected.error(),
+                            rustls::Error::InvalidMessage(
+                                rustls::InvalidMessage::InvalidContentType,
+                            ) if was_handshaking => crate::Failure::CaptivePortal.error(),
+                            _ => crate::Failure::TlsRejected.error(),
+                        })?;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+                Err(e)
+                    if was_handshaking
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::BrokenPipe
+                                | io::ErrorKind::ConnectionAborted
+                        ) =>
+                {
+                    return Err(early_close(e.kind()));
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -277,8 +348,19 @@ impl TlsSocket {
             }
         }
         if !self.conn.is_handshaking() {
-            if self.conn.alpn_protocol() != Some(ALPN) {
-                return Err(invalid("relay ALPN required"));
+            self.carrier.alpn(self.conn.alpn_protocol())?;
+            if matches!(self.carrier, crate::carrier::State::Closing) && self.idle_write() {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            if self.closing && self.idle_write() {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            if self.pending.is_empty() {
+                if let Some(control) = self.control.take() {
+                    self.set_pending(control);
+                } else if let Some(response) = self.carrier.negotiate(&mut self.conn.reader())? {
+                    self.set_pending(response);
+                }
             }
             if self.written < self.pending.len() {
                 match self.conn.writer().write(&self.pending[self.written..]) {
@@ -298,24 +380,54 @@ impl TlsSocket {
         }
         Ok(())
     }
+    pub fn set_pending(&mut self, bytes: Vec<u8>) {
+        self.pending = bytes;
+        self.written = 0;
+        self.sending = Some(Instant::now());
+    }
+    pub fn ready(&self) -> bool {
+        !self.conn.is_handshaking() && self.carrier.ready() && self.idle_write()
+    }
     pub fn read_record(&mut self) -> io::Result<Option<Vec<u8>>> {
-        if self.conn.is_handshaking() {
+        if self.conn.is_handshaking() || self.control.is_some() || self.closing {
             return Ok(None);
         }
-        self.framer.read(&mut self.conn.reader())
+        let record = match &mut self.carrier {
+            crate::carrier::State::Native => self.framer.read(&mut self.conn.reader())?,
+            crate::carrier::State::WebSocket(ws) => {
+                let result = ws.read(&mut self.conn.reader())?;
+                self.control = result.response;
+                self.closing = result.close;
+                result.record
+            }
+            _ => None,
+        };
+        if let Some(bytes) = &record {
+            self.small_record_received |= bytes.len() <= 1200;
+        }
+        Ok(record)
     }
+
     pub fn check_deadlines(&self, stall: Duration, idle: Duration) -> io::Result<()> {
         if self.sending.is_some_and(|t| t.elapsed() >= stall) {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "TLS write deadline expired",
-            ));
+            return Err(Stall {
+                mss_reason: self
+                    .large_write_after_small
+                    .then_some(crate::MssReason::WriteStall),
+                write: true,
+            }
+            .error());
         }
-        if self.framer.expired(stall) {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "TLS record deadline expired",
-            ));
+        if self.framer.expired(stall) || self.carrier.expired(stall) {
+            let large_partial_record = self.small_record_received
+                && self.framer.body.len() > 1200
+                && self.framer.body_read > 0;
+            return Err(Stall {
+                mss_reason: (self.large_write_after_small || large_partial_record)
+                    .then_some(crate::MssReason::RecordStall),
+                write: false,
+            }
+            .error());
         }
         if self.last_io.elapsed() >= idle {
             return Err(io::Error::new(
@@ -390,6 +502,54 @@ mod tests {
         let mut f = Framer::default();
         assert!(f.read(&mut &[0, 0][..]).unwrap().is_none());
         assert!(f.read(&mut &[][..]).is_err());
+    }
+    #[test]
+    fn mss_requires_small_record_progress_before_large_segment_stall() {
+        let (mut client, mut server) = tls_pair("localhost").unwrap();
+        server.queue(b"small reply").unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            server.pump(None).unwrap();
+            client.pump(None).unwrap();
+            if client.read_record().unwrap().is_some() {
+                break;
+            }
+            assert!(Instant::now() < until);
+            std::thread::sleep(TICK);
+        }
+        for (size, expected) in [(10, None), (2400, Some(crate::MssReason::WriteStall))] {
+            client.queue(&vec![1; size]).unwrap();
+            client.sending = Some(Instant::now() - Duration::from_secs(1));
+            let error = client
+                .check_deadlines(Duration::from_millis(10), Duration::from_secs(5))
+                .unwrap_err();
+            assert_eq!(
+                error
+                    .get_ref()
+                    .unwrap()
+                    .downcast_ref::<Stall>()
+                    .unwrap()
+                    .mss_reason,
+                expected
+            );
+            client.pending.clear();
+        }
+        // A large first write alone gives no evidence that small records flowed.
+        client.small_record_received = false;
+        client.queue(&vec![1; 2400]).unwrap();
+        client.sending = Some(Instant::now() - Duration::from_secs(1));
+        let error = client
+            .check_deadlines(Duration::from_millis(10), Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<Stall>()
+                .unwrap()
+                .mss_reason,
+            None
+        );
     }
     fn tls_pair(name: &'static str) -> io::Result<(TlsSocket, TlsSocket)> {
         use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName};

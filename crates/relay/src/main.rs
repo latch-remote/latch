@@ -16,7 +16,7 @@ use std::{
 const HELP: &str = "latch-relay --cert certificate-chain.pem --key private-key.pem --quota-file persistent-ledger\n\
   [--listen 127.0.0.1:8443] [--monthly-bytes 10737418240]\n\
   [--limits-json pilot-limits.json] [--initialize-quota]\n\n\
-Explicitly select --listen 0.0.0.0:443 only after TLS, persistent budget storage\n\
+Explicitly select --listen [::]:443 only after TLS, persistent budget storage\n\
 and operator limits are configured. Initialize the ledger once. Later starts\n\
 require the same retained file. Counters are emitted to stdout every 30 seconds.";
 fn invalid(message: &str) -> io::Error {
