@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Latch
+GenericName=Remote Desktop
+Comment=Stream and control your own machines over Tailscale
+Exec=latch-host
+Icon=latch-host
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;streaming;game;tailscale;
