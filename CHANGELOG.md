@@ -8,36 +8,26 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Windows streaming
 
-- Add partial support for a separate Windows cursor plane with scaled
-  hotspots and visibility. Place the pointer locally in the viewer, including
-  on a static desktop. Convert DXGI colour, monochrome and masked-colour shapes,
-  outline inverted regions, and retain GPU composition for unsupported XOR or
-  unreadable data. Viewers without cursor support keep host-composited cursors.
-  Add cross-platform buffer tests and a synthetic cursor-control session
-  independent of video production.
+- Windows hosts send the pointer's shape and visibility apart from the video,
+  and a focused viewer in free-mouse mode draws the pointer itself at its own
+  mouse position, so the pointer no longer waits for a video frame, including
+  on a static desktop. Colour, monochrome and masked-colour pointers are
+  converted, with an outline where a pointer inverts what is under it.
   Live Windows capture of the separate plane is unverified.
-- Keep focused free-mouse placement local and deduplicate each viewer's cursor
-  controls. Cache fallback bitmaps with a 250 ms failure retry, preserve shapes
-  across resolution changes and use the shared viewer texture reset on reconnect.
-  Test capture ownership through mode switches, idle timeouts, fallback and
-  capture/output restarts.
-- Continue Windows video immediately when all cursor bitmap reads fail and
-  retry recovery on its backoff. Suppress extra cursor planes over an unfocused
-  viewer's local arrow and test actual viewer painting across ownership states.
-  Document focused local-pointer authority when host warps or other mice move it.
-  If both system bitmap reads fail permanently and no retained bitmap exists,
-  the pointer remains absent until a shape becomes readable.
-- Keep cursor ownership on the viewer-selected output through capture reopen
-  and missing-display fallback. Retain and rescale shapes on same-output reopen,
-  re-send them with fresh serials, and reset per-output pointer state when
-  changing displays. Report the captured Windows display to the chooser on
-  hardware and software encode paths. Add combined regression tests for
-  selection, fallback, output exit/re-entry and shape retention.
-- Consolidate Windows and Mac cursor tracking, serial allocation and alpha
-  conversion in the shared tracker. Use main's existing shape/visibility wire
-  format across hosts. Adapt the position-extension tests to local placement
-  and shape/visibility publication. Remove the host position sampler, eliminating
-  its 120 Hz idle wakeups and its capture-dependent re-entry handoff.
+- The pointer stays in the video, as in 6.0.0, when the viewer does not
+  support the separate pointer, in captured mouse mode for games, and whenever
+  Windows cannot supply a readable pointer shape. Video continues if every
+  shape read fails. If Windows never supplies a readable shape, the pointer
+  stays absent until one becomes readable.
+- While the focused viewer drives the pointer, its own position wins: when an
+  application or another mouse moves the host pointer, the drawn pointer stays
+  put until the viewer's mouse next moves. A viewer that loses focus while its
+  pointer is over the stream shows no host pointer until it is focused again.
+- Pointer shapes survive resolution changes and capture restarts, and reset
+  when the viewer reconnects or chooses another display. Windows reports the
+  display it actually captures to the display chooser, including after a
+  missing display falls back to the default.
+- Windows and Mac hosts share one pointer tracker and the same wire messages.
 
 ### Deployment
 
@@ -53,6 +43,10 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Relay connectivity
 
+- Add a repeatable native TLS/WebSocket/CONNECT carrier comparison at four
+  emulated path conditions, plus a cross-platform 20-Mbps delayed-path
+  regression test. Preserve whole-run probe latency distributions and report
+  cumulative and post-warm-up payload rates.
 - Add HTTPS WebSocket relay fallback on TCP 443 alongside native
   `latch-relay/1` TLS, with shared admission, durable quotas and bounded queues.
 - Add explicit HTTP CONNECT proxies with redacted Basic credentials and a

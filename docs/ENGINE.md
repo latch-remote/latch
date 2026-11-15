@@ -230,7 +230,11 @@ authoritative. If an application warps the host pointer or another mouse moves
 it, the drawn cursor stays at the local position until the user next moves the
 mouse. Hover effects on the host can diverge while the local pointer is still.
 An unfocused viewer keeps its local OS arrow, paints no plane and sends no
-`DrawCursor` updates.
+`DrawCursor` updates. If focus is lost while the local pointer is over the
+stream, the last `DrawCursor(false)` stays in force: the host does not draw
+the pointer into the video and the viewer paints none, so pointer motion made
+at the host is invisible until the viewer is focused again. Mac hosts behave
+the same.
 
 Separate cursor bytes remain sRGB on SDR and HDR desktops/sessions. The viewer
 renders them with its SDR UI white, including over native HDR presentation. The

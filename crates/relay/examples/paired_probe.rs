@@ -6,6 +6,7 @@ use latch_relay::{
     create_grant_with_info, Cancel, Carrier, ClientConfig, Endpoint, Event, Lane, ProxyConfig,
     SessionKeys, Transport,
 };
+use rustls::pki_types::{pem::PemObject, CertificateDer};
 use serde_json::json;
 use std::{
     env, io, thread,
@@ -75,6 +76,7 @@ fn percentile(samples: &mut [u64], percent: usize) -> u64 {
 
 #[derive(Default)]
 struct Stats {
+    full_rate_start: Option<(Instant, u64)>,
     sent: u64,
     received: u64,
     bytes: u64,
@@ -105,6 +107,9 @@ fn report(
             "received_bytes":stats.bytes, "source_dropped_frames":stats.dropped,
         "accepted_not_received":stats.sent.saturating_sub(stats.received),
             "received_mbps":rate, "session_rotations":rotations,
+            "payload_mbps":stats.bytes as f64 * 8.0 / start.elapsed().as_secs_f64() / 1e6,
+            "post_warmup_payload_mbps":stats.full_rate_start.map(|(time, bytes)|
+                (stats.bytes - bytes) as f64 * 8.0 / time.elapsed().as_secs_f64() / 1e6),
             "frame_age_p50_ms":percentile(&mut stats.ages_us,50) as f64 / 1000.0,
             "frame_age_p95_ms":percentile(&mut stats.ages_us,95) as f64 / 1000.0,
             "frame_age_p99_ms":percentile(&mut stats.ages_us,99) as f64 / 1000.0,
@@ -117,10 +122,8 @@ fn report(
             "priority_rtt_p95_ms":percentile(&mut stats.priority_us,95) as f64 / 1000.0,
         })
     );
-    stats.ages_us.clear();
-    stats.acks_us.clear();
-    stats.priority_us.clear();
-    stats.max_queue_us = 0;
+    // Keep cumulative distributions so the final drain cannot replace a run's
+    // latency measurements with just its last few frames.
     *previous = (now, stats.bytes);
 }
 
@@ -165,6 +168,17 @@ fn run() -> io::Result<()> {
     let size = (bytes_per_second / u64::from(fps)) as usize;
     let warm_size = (size / 4).max(12);
     let mut config = ClientConfig::production(Endpoint::new(&args[0], 443)?)?;
+    // Disposable netlab CA, with hostname and public-address checks retained.
+    if let Some(path) = env::var_os("PAIRED_PROBE_CA") {
+        let pem = std::fs::read(path)?;
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(&pem) {
+            roots
+                .add(cert.map_err(|_| invalid("invalid probe CA PEM"))?)
+                .map_err(|_| invalid("invalid probe CA certificate"))?;
+        }
+        config = config.with_tls_roots(roots)?;
+    }
     config.carrier = parse_carrier(args.get(5).map_or("auto", String::as_str))?;
     if let Some(proxy) = args.get(6) {
         let (host, port) = proxy
@@ -223,9 +237,12 @@ fn run() -> io::Result<()> {
                 }
                 Event::Datagram(bytes) => viewer.try_send_datagram(&bytes)?,
                 Event::Control(bytes) => viewer.try_send_control(&bytes)?,
-                Event::Closed { kind, .. } => {
+                Event::Closed { kind, message } => {
                     report(&mut stats, start, &mut previous, rotations, true);
-                    return Err(io::Error::new(kind, "viewer transport closed"));
+                    return Err(io::Error::new(
+                        kind,
+                        format!("viewer transport closed: {message}"),
+                    ));
                 }
                 Event::Ready => return Err(io::Error::other("duplicate viewer ready")),
             }
@@ -242,9 +259,12 @@ fn run() -> io::Result<()> {
                 Event::Control(bytes) if bytes == b"paired-probe-control" => {
                     stats.control_echoes += 1
                 }
-                Event::Closed { kind, .. } => {
+                Event::Closed { kind, message } => {
                     report(&mut stats, start, &mut previous, rotations, true);
-                    return Err(io::Error::new(kind, "host transport closed"));
+                    return Err(io::Error::new(
+                        kind,
+                        format!("host transport closed: {message}"),
+                    ));
                 }
                 _ => return Err(io::Error::other("unexpected host event")),
             }
@@ -265,6 +285,7 @@ fn run() -> io::Result<()> {
         }
         let warming = session_started.elapsed() < Duration::from_secs(warmup);
         if !warming && !full_rate_announced {
+            stats.full_rate_start = Some((now, stats.bytes));
             println!(
                 "{}",
                 json!({"phase":"full_rate","elapsed_s":start.elapsed().as_secs_f64(),"rotation":rotations})
