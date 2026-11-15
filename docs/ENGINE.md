@@ -406,22 +406,41 @@ lets tests check audio bit for bit. Opus is gone.
   period holds it. WASAPI loopback runs at the endpoint's engine period
   (10 ms on most drivers, and low-latency `IAudioClient3` streams refuse
   the loopback flag), so a Windows host sends two packets every 10 ms.
-* **Repair waits for the group's parity.** Each four-packet group repairs
-  one loss. The receiver estimates when parity is due from the group's
-  observed data position and the largest forward-arrival interval, starting
-  at the negotiated packet duration and capped at 60 ms. It allows another
-  20 ms for reordering after that estimate, with a hard limit of 60 ms from
-  gap detection. Intact audio incurs zero repair delay. The 60 ms ceiling
-  is half the documented 120 ms playback-buffer cap,
-  allowing two remaining 20 ms capture intervals plus the 20 ms allowance.
-  Typical documented playback targets of 11–15 ms on a quiet path and
-  about 27 ms on the jittery simulation put repair plus buffering at
-  71–75 ms and 87 ms at this ceiling. Playback buffering retains its own
-  120 ms cap, so simultaneous maximum repair and playback buffering can
-  total 180 ms before capture, network and device-output time. Recovery
-  releases earlier as soon as parity rebuilds the frame. The host keeps
-  sending captures immediately, avoiding a pacing queue on intact audio.
-  [Deadline details](PROTOCOL.md#audio-3)
+* **Repair uses the playback reserve.** Four packets share one parity
+  packet. The desktop receiver estimates when parity is due using the
+  group's position and the maximum forward-arrival interval from the last
+  eight groups. Intervals of at least 60 ms reset the estimate as a pause.
+  Before an interval is observed, the seed is 20 ms.
+  The player supplies a deadline from its queued audio, with up to 3 ms
+  of grace for a late repair and a 25 ms maximum wait from gap detection.
+  A 100 ms pause grants the first returning group the same startup window.
+  Larger device pulls reduce that grace. The next group's second packet
+  retains the previous progress cutoff. A group whose parity has arrived
+  with an unrepaired gap is concealed immediately. Intact frames deliver
+  immediately. [Deadline details](PROTOCOL.md#audio-3)
+* **Repair timing stays out of network jitter.** Arrival measurement uses
+  original datagrams and sequence distances. Buffered release and
+  concealment do not become arrival samples. After a repair-induced
+  underrun, playback resumes the intact backlog directly and preserves the
+  margin. After a confirmed loss, a genuine network underrun increases the
+  margin by its observed gap, bounded to 2–25 ms per event, with the existing
+  40 ms margin cap and
+  0.1 ms/s decay. Preserving intact sound can leave extra queued audio.
+  The queue retains its 120 ms safety limit and normal clock steering.
+  Controller cushion and actual queued latency are measured separately.
+* **Deterministic loss evaluation.** The test-only comparison runs the real
+  receiver, codec, queue and mixer against the receiver from main at
+  `45ad4b7`. Each trace has a one-second warmup and 23 measured seconds,
+  2.5 ms device pulls, up to 1 ms seeded arrival jitter, and either 5 ms
+  packets or modeled 21.333 ms capture callbacks. Independent loss of
+  1%, 5% and 15% includes parity. A fourth trace loses 16 ms every 400 ms.
+  Every trace has lower `silence + intact discard + 5 ms * concealments`
+  and mean controller cushion. Intact discard in every new trace is at most
+  the reference's. Burst-cadence mean cushion is 33.07, 35.05 and 35.56 ms,
+  against 41.63, 55.68 and 59.76 ms in the reference. Actual queued latency
+  can increase, including 34.30 to 47.44 ms mean in the steady burst-loss
+  trace. This simulated result does not measure physical audibility,
+  real network parity arrival or device scheduling.
 * **Surround when both ends have it.** A viewer whose output device has
   more than two channels asks for them (`StreamRequest.audio_channels`);
   the host captures the device's own layout up to that (WASAPI channel
@@ -458,8 +477,9 @@ lets tests check audio bit for bit. Opus is gone.
   device pull to a 2 ms margin plus whatever part of a burst the jitter
   does not already spread, trimming playback speed by at most 0.2 % to
   hold it. A real underrun (not the host going quiet: it sends nothing
-  for silence) widens the margin by 2 ms, which narrows again by 0.1 ms
-  a second. Devices that state their range get a 2.5 ms buffer
+  for silence) widens the margin by at least 2 ms. After confirmed packet
+  loss it uses the observed shortage, capped at 25 ms per event. The margin
+  narrows again by 0.1 ms a second. Devices that state their range get a 2.5 ms buffer
   (`LATCH_AUDIO_BUFFER` overrides it, in frames or `default`).
 * **The viewer's microphone, opt-in.** With **Send my microphone** on and
   a host that answers with `Accept.mic`, the default input is mixed to

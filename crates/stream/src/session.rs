@@ -11,7 +11,7 @@
 
 use crate::audio::Player;
 use crate::video::{self, Decoder, FrameSlot};
-use latch_proto::audio::{AudioOut, AudioReceiver};
+use latch_proto::audio::AudioReceiver;
 use latch_proto::control::{self, Accept, Codec, Message, Report, StreamRequest};
 use latch_proto::gamepad::{Feedback, LatestReceiver, PadKind, PadSender, PadState};
 use latch_proto::input::{Event as InputEvent, InputSender};
@@ -2661,6 +2661,7 @@ fn receive(
                                 &mut out,
                                 &mut reassembler,
                                 &mut audio_rx,
+                                &mut player,
                                 &mut feedback,
                                 &mut rtt,
                                 &mut media_seen,
@@ -2742,6 +2743,7 @@ fn receive(
                             &mut out,
                             &mut reassembler,
                             &mut audio_rx,
+                            &mut player,
                             &mut feedback,
                             &mut rtt,
                             &mut media_seen,
@@ -2793,6 +2795,7 @@ fn receive(
                                 &mut out,
                                 &mut reassembler,
                                 &mut audio_rx,
+                                &mut player,
                                 &mut feedback,
                                 &mut rtt,
                                 &mut media_seen,
@@ -2815,13 +2818,10 @@ fn receive(
         let now = Instant::now();
         // Also when no audio arrived: a lost packet at the end of a sound
         // must not hold the rest of it until the next sound.
-        while let Some(out) = audio_rx.pop(now) {
-            if let Some(player) = player.as_mut() {
-                match out {
-                    AudioOut::Frame { payload, .. } => player.push(&payload),
-                    AudioOut::Missing { .. } => player.push(&[]),
-                }
-            }
+        if let Some(player) = player.as_mut() {
+            player.receive(&mut audio_rx, now);
+        } else {
+            while audio_rx.pop(now).is_some() {}
         }
         if route_revision != relay.revision() {
             continue;
@@ -3158,6 +3158,7 @@ fn handle(
     out: &mut Vec<u8>,
     reassembler: &mut Reassembler,
     audio_rx: &mut AudioReceiver,
+    player: &mut Option<Player>,
     feedback: &mut LatestReceiver,
     rtt: &mut RttEstimator,
     media_seen: &mut bool,
@@ -3173,7 +3174,12 @@ fn handle(
             *media_seen = true;
             reassembler.push(shard, now);
         }
-        Datagram::Audio { packet, .. } => audio_rx.push(packet, now),
+        Datagram::Audio { packet, .. } => {
+            if let Some(player) = player.as_mut() {
+                player.observe_packet(packet, now);
+            }
+            audio_rx.push(packet, now);
+        }
         Datagram::InputAck { next, .. } => {
             if let Some(link) = inner.link.lock().as_mut() {
                 let before = link.sender.unacked();

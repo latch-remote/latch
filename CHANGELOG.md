@@ -145,8 +145,10 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Streaming
 
-- Reduce sound dropouts on lossy connections by waiting for repair packets
-  across capture bursts and network jitter, with a bounded recovery delay.
+- Bound desktop audio repair waits by available playback reserve and keep
+  receiver buffering out of the jitter estimate. Deterministic loss replays
+  cover steady and bursty capture, including lost repair packets. Real-network
+  audible results remain unmeasured.
 - Choose which of a host's displays to share. Hosts list their displays in
   `/v1/status` (`streamer.displays`), and the viewer offers them in the
   machine's menu in the list and in the stream toolbar, remembered per

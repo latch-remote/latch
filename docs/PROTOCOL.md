@@ -294,35 +294,43 @@ sends a parity packet with `seq = 4k`: the XOR of the four packets'
 `u16 length | payload`, each zero-padded to the longest. It rebuilds any
 one lost packet of the four.
 
-The receiver delivers intact frames immediately. When `pop` first finds a
-missing frame with later data or group parity already received, it starts a
-bounded repair wait. For each group it remembers the most recent data
-packet's arrival and zero-based position `p`. Expected parity arrival is
-`arrival + (3 - p) * spacing`. Spacing starts at `frame_samples / rate` and
-keeps the largest observed interval between forward-sequence data arrivals,
-capped at the 60 ms hard bound. Zero intervals within a capture burst
-preserve this estimate.
-Losses and silence can enlarge it conservatively. Each new data arrival
-updates its group's estimate, and spacing changes also apply to pending groups.
+The receiver delivers intact frames immediately. A gap becomes known when
+`pop` finds later data or its group's parity. Expected parity arrival is
+`last_group_arrival + (3 - position) * spacing`. Spacing is the maximum
+nonzero forward-arrival interval in the most recent eight groups, with the
+negotiated frame duration as its floor. Its initial seed is 20 ms. An
+interval of at least 60 ms clears that history and is excluded as a pause.
+A 64-packet discontinuity also resets timing history.
 
-The repair deadline is the earlier of expected parity arrival plus 20 ms
-and gap detection plus 60 ms. Once parity is present, only reordered data
-can help, so allow 20 ms from its actual arrival, within the same hard cap.
-One hard-bound timer covers a consecutive run of missing frames and resets
-when a frame is delivered. A 64-packet discontinuity still resynchronizes
-immediately. Later groups within that window allow pending parity to arrive
-until the deadline. A caller must drain `pop` on arrivals and wake at
-`next_deadline` even during silence.
+Desktop playback calls `set_playout_deadline` before each `pop`. The deadline
+is the minimum of estimated parity arrival plus 20 ms, the supplied output
+reserve, and detection plus 25 ms. A pending gap's supplied deadline can
+only tighten. The player derives its reserve from currently queued source
+frames. With 2.5 ms device pulls it allows up to 3 ms of additional grace
+so a near-due repair can avoid a full 5 ms concealment. For larger pulls,
+grace is `max(0, 3 ms - max(0, pull_duration - 2.5 ms))`. An already-empty
+queue starts no new wait during continuous playback. After a 100 ms pause,
+the first returning group has a fixed 25 ms startup window. The next group's
+second data packet retains the
+reference receiver's progress cutoff. Parity with an unrepaired gap
+releases concealment immediately in this playback policy.
 
-For steady 5 ms data at 0, 5, 10 and 15 ms, parity is due at 15 ms.
-With one data loss and lost parity, continued steady data gives deadlines
-of 35, 35, 35 and 40 ms for loss positions one through four. The fourth
-position's estimate includes the observed 10 ms interval over the loss.
-The receiver adds zero latency without loss and at most 60 ms of repair
-waiting from detection under loss. The playback queue has its separate
-120 ms cap described in [ENGINE.md](ENGINE.md#audio). Wire bytes and
-negotiation are unchanged, preserving protocol-1 and 6.0.0 interoperability
-in both directions.
+Callers must drain on arrivals and timer wakeups using `next_deadline`.
+A consecutive missing run shares its timer until an actual frame delivers.
+Callers without a playback deadline retain the bounded 60 ms transport
+fallback and 20 ms reordered-data allowance after parity. The host microphone
+currently uses this fallback and services deadlines on arrivals or its
+200 ms socket timeout. Its wall-clock release therefore remains coarse.
+
+A hold stalls every later intact packet. If it drains the device queue,
+release can cause silence, catch-up discard and extra buffering. The viewer
+measures jitter before receiver buffering and excludes its own wait from the
+underrun margin. A repair-induced restart preserves the intact backlog.
+The controller cushion and actual queued latency have separate measurements
+in the deterministic evaluation described in [ENGINE.md](ENGINE.md#audio).
+The measured comparison includes cases with higher actual queued latency
+while the controller cushion decreases. Wire bytes and protocol-1 negotiation
+remain compatible with 6.0.0 peers in both directions.
 
 Each coded audio frame is at most `MAX_DATAGRAM - 18` (1 182) bytes,
 leaving room for the 16-byte audio header and the parity packet's two-byte

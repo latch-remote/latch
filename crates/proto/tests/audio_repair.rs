@@ -227,3 +227,77 @@ fn audio_repair_parity_before_reordered_data_at_every_position() {
         replay(packets, lost);
     }
 }
+
+#[test]
+fn audio_repair_startup_allows_a_three_plus_one_capture_split() {
+    for lost in 0..4 {
+        replay(tape(&schedule([0, 0, 0, 22], 40), 5), lost);
+    }
+}
+
+#[test]
+fn audio_repair_duplicates_do_not_change_delivery_or_deadlines() {
+    for lost in 0..4 {
+        let mut packets = tape(&schedule([0, 5, 10, 15], 20), 19);
+        let duplicates: Vec<_> = packets
+            .iter()
+            .map(|(at, bytes)| (at + 1, bytes.clone()))
+            .collect();
+        packets.extend(duplicates);
+        packets.sort_by_key(|(at, _)| *at);
+        replay(packets, lost);
+    }
+}
+
+#[test]
+fn audio_repair_pause_then_each_loss_position_with_and_without_parity() {
+    let start = Instant::now();
+    for pause in [0, 61, 1000] {
+        for lost in 0..4 {
+            for lose_parity in [false, true] {
+                let mut packets = tape(&schedule([0, 5, 10, 15], 20), 0);
+                for (at, bytes) in &mut packets {
+                    let Datagram::Audio { packet, .. } = wire::parse(bytes).unwrap() else {
+                        panic!()
+                    };
+                    if packet.seq >= 32 {
+                        *at += pause;
+                    }
+                }
+                let mut events = packets.iter().peekable();
+                let mut receiver = AudioReceiver::with_format(1, 240, 48_000);
+                let mut output = Vec::new();
+                let mut concealed_at = None;
+                for ms in 0..=packets.last().unwrap().0 + 100 {
+                    let now = start + Duration::from_millis(ms);
+                    while let Some((_, bytes)) = events.next_if(|(at, _)| *at == ms) {
+                        let Datagram::Audio { packet, .. } = wire::parse(bytes).unwrap() else {
+                            panic!()
+                        };
+                        if (!packet.parity && packet.seq == 32 + lost)
+                            || (packet.parity && packet.seq == 32 && lose_parity)
+                        {
+                            continue;
+                        }
+                        receiver.push(&packet, now);
+                    }
+                    while let Some(frame) = receiver.pop(now) {
+                        if matches!(frame, AudioOut::Missing { .. }) {
+                            assert_eq!(frame, AudioOut::Missing { seq: 32 + lost });
+                            concealed_at = Some(ms);
+                        }
+                        output.push(frame);
+                    }
+                }
+                assert_eq!(output.len(), (GROUPS * 4) as usize);
+                assert_eq!(receiver.stats().1, u64::from(!lose_parity));
+                assert_eq!(receiver.stats().2, u64::from(lose_parity));
+                assert_eq!(
+                    concealed_at,
+                    lose_parity.then_some(160 + pause + if lost == 3 { 40 } else { 35 })
+                );
+                assert_eq!(receiver.next_deadline(), None);
+            }
+        }
+    }
+}

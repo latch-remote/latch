@@ -20,6 +20,8 @@
 mod wasapi;
 use anyhow::{bail, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use latch_proto::audio::{AudioOut, AudioReceiver, AUDIO_PLAYBACK_HOLD};
+use latch_proto::wire::AudioPacket;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -39,7 +41,7 @@ const MAX_TRIM: f64 = 0.002;
 /// The slack error that gets the whole trim.
 const TRIM_FULL_MS: f64 = 4.0;
 /// The slack the mixer steers for at least, and at most after underruns;
-/// each underrun widens it by [`MARGIN_MS`].
+/// each genuine underrun widens it by at least [`MARGIN_MS`].
 const MARGIN_MS: f64 = 2.0;
 const MAX_MARGIN_MS: f64 = 40.0;
 /// How fast a margin widened by an underrun narrows again.
@@ -88,6 +90,14 @@ struct Link {
     /// The margin the mixer keeps, µs.
     margin_us: AtomicU32,
     underruns: AtomicU64,
+    /// Source time consumed by the most recent output callback.
+    pull_us: AtomicU32,
+    repairing: AtomicBool,
+    loss_seen: AtomicBool,
+    #[cfg(test)]
+    discarded_samples: AtomicU64,
+    #[cfg(test)]
+    delivered: Mutex<Vec<u32>>,
 }
 
 impl Link {
@@ -118,6 +128,9 @@ pub struct Player {
     pcm: Vec<i16>,
     link: Arc<Link>,
     arrivals: Arrivals,
+    arrival_seq: Option<u32>,
+    arrival_seen: u64,
+    resume_until: Option<Instant>,
     /// The last frame played, faded out in place of a lost one.
     last: Vec<f32>,
     /// Interleaved samples at the stream's rate and channel count.
@@ -215,6 +228,9 @@ impl Player {
             pcm: Vec::with_capacity(samples_per_frame * channels),
             link,
             arrivals: Arrivals::default(),
+            arrival_seq: None,
+            arrival_seen: 0,
+            resume_until: None,
             last: Vec::new(),
             queue,
             _output_thread: stop,
@@ -241,10 +257,10 @@ impl Player {
     /// the last one is repeated, fading, so a gap is a dip rather than a
     /// click.
     pub fn push(&mut self, packet: &[u8]) {
-        self.push_at(packet, Instant::now());
+        self.push_at(packet, Some(Instant::now()));
     }
 
-    fn push_at(&mut self, packet: &[u8], now: Instant) {
+    fn push_at(&mut self, packet: &[u8], arrival: Option<Instant>) {
         if packet.is_empty() {
             self.lost += 1;
             if self.last.is_empty() {
@@ -254,7 +270,9 @@ impl Player {
             for (i, s) in self.last.iter_mut().enumerate() {
                 *s *= 0.5 * (1.0 - i as f32 / n);
             }
-            self.arrived(now);
+            if let Some(now) = arrival {
+                self.arrived(now);
+            }
             self.queue_samples();
             return;
         }
@@ -286,8 +304,105 @@ impl Player {
         self.last.clear();
         self.last
             .extend(self.pcm.iter().map(|&v| f32::from(v) / 32768.0));
-        self.arrived(now);
+        if let Some(now) = arrival {
+            self.arrived(now);
+        }
         self.queue_samples();
+    }
+
+    /// Measure the network before in-order repair can delay delivery.
+    pub(crate) fn observe_packet(&mut self, packet: &AudioPacket<'_>, now: Instant) {
+        if packet.parity {
+            return;
+        }
+        let resumed = self
+            .arrivals
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) >= PAUSE);
+        let secs = self.samples_per_frame as f64 / f64::from(self.rate);
+        if let Some(seq) = self.arrival_seq {
+            if !latch_proto::video::before(seq, packet.seq) {
+                let distance = seq.wrapping_sub(packet.seq);
+                if distance < 64 {
+                    let bit = 1u64 << distance;
+                    if self.arrival_seen & bit == 0 {
+                        self.arrival_seen |= bit;
+                        self.arrivals.note_late(now, f64::from(distance + 1) * secs);
+                    }
+                }
+                return;
+            }
+            // Account for absent media without inventing arrival samples
+            // for either concealments or reconstructed packets.
+            let distance = packet.seq.wrapping_sub(seq);
+            self.arrival_seen = self.arrival_seen.checked_shl(distance).unwrap_or(0);
+            if distance > 64 {
+                self.arrivals = Arrivals::default();
+            } else {
+                self.arrivals.media += f64::from(distance - 1) * secs;
+            }
+        }
+        if resumed {
+            self.resume_until = Some(now + AUDIO_PLAYBACK_HOLD);
+            // Late packets from the previous sound cannot affect this epoch.
+            let distance = self
+                .arrival_seq
+                .map_or(0, |seq| packet.seq.wrapping_sub(seq));
+            self.arrival_seen = u64::MAX.checked_shl(distance).unwrap_or(0);
+        }
+        self.arrival_seen |= 1;
+        self.arrival_seq = Some(packet.seq);
+        if let Some(measured) = self.arrivals.note(now, secs) {
+            self.link.publish(measured);
+        }
+    }
+
+    fn repair_deadline(&self, now: Instant) -> Instant {
+        if self.link.target_us.load(Ordering::Relaxed) == 0 {
+            // Playback has not started, so no sounding queue can underrun.
+            return now + AUDIO_PLAYBACK_HOLD;
+        }
+        let frames = self.queue.lock().len() / self.channels;
+        let resume = self
+            .resume_until
+            .filter(|&deadline| deadline > now)
+            .unwrap_or(now);
+        if frames == 0 && !self.link.repairing.load(Ordering::Relaxed) {
+            return resume;
+        }
+        let queued = Duration::from_secs_f64(frames as f64 / f64::from(self.rate));
+        let pull = Duration::from_micros(u64::from(self.link.pull_us.load(Ordering::Relaxed)));
+        // Spend at most 3 ms past queued source time to save a 5 ms
+        // concealment. Larger output callbacks reduce this allowance.
+        let grace = Duration::from_millis(3)
+            .saturating_sub(pull.saturating_sub(Duration::from_micros(2500)));
+        (now + queued.saturating_add(grace).min(AUDIO_PLAYBACK_HOLD)).max(resume)
+    }
+
+    /// Drain against the current queue reserve on arrivals and timer wakeups.
+    pub(crate) fn receive(&mut self, receiver: &mut AudioReceiver, now: Instant) {
+        loop {
+            receiver.set_playout_deadline(self.repair_deadline(now));
+            let Some(frame) = receiver.pop(now) else {
+                self.link
+                    .repairing
+                    .store(receiver.next_deadline().is_some(), Ordering::Relaxed);
+                break;
+            };
+            match frame {
+                AudioOut::Frame { seq, payload, .. } => {
+                    #[cfg(test)]
+                    self.link.delivered.lock().push(seq);
+                    #[cfg(not(test))]
+                    let _ = seq;
+                    self.push_at(&payload, None);
+                }
+                AudioOut::Missing { .. } => {
+                    self.link.loss_seen.store(true, Ordering::Relaxed);
+                    self.push_at(&[], None);
+                }
+            }
+        }
     }
 
     /// Notes `last` arriving now, for the jitter estimate.
@@ -312,6 +427,11 @@ impl Player {
             };
             let keep = (target * self.rate as usize / 1_000_000).max(1) * self.channels;
             let drop = q.len().saturating_sub(keep);
+            #[cfg(test)]
+            self.link.discarded_samples.fetch_add(
+                q.iter().take(drop).filter(|&&s| s == 0.5).count() as u64,
+                Ordering::Relaxed,
+            );
             q.drain(..drop);
         }
     }
@@ -391,6 +511,18 @@ impl Arrivals {
 
     /// Frames this close together came at one moment.
     const TOGETHER: Duration = Duration::from_millis(1);
+
+    /// A reordered original contributes its actual network lateness while
+    /// the media clock remains at the highest sequence already observed.
+    fn note_late(&mut self, now: Instant, behind: f64) {
+        let Some(origin) = self.origin else {
+            return;
+        };
+        let offset = now.saturating_duration_since(origin).as_secs_f64() - self.media + behind;
+        let (_, min, max) = self.block.get_or_insert((now, offset, offset));
+        *min = min.min(offset);
+        *max = max.max(offset);
+    }
 
     /// Notes a frame of `secs` arriving at `now`; the jitter and the burst
     /// so far, in seconds, once there is enough to tell.
@@ -902,6 +1034,9 @@ struct Mixer {
     last_pull: Option<Instant>,
     /// When the queue ran dry, until sound comes back.
     dry_at: Option<Instant>,
+    /// A receiver repair wait drained the queue. Resume its intact backlog
+    /// directly and keep that local wait out of the network margin.
+    dry_repair: bool,
     scratch: Vec<f32>,
     /// From the device's callback timestamps.
     device_delay: Duration,
@@ -945,6 +1080,7 @@ impl Mixer {
             level: 0.0,
             last_pull: None,
             dry_at: None,
+            dry_repair: false,
             scratch: Vec::new(),
             device_delay: Duration::ZERO,
             probe_quiet: std::env::var_os("LATCH_AUDIO_PROBE").map(|_| 0),
@@ -999,6 +1135,11 @@ impl Mixer {
         // Source samples this pull takes, the interpolation's one ahead
         // included.
         let need = ((frames_out as f64 * self.step).ceil() as usize + 1) * self.src_channels;
+        self.link.pull_us.store(
+            (frames_out as f64 * self.step / (self.per_ms / self.src_channels as f64) * 1000.0)
+                as u32,
+            Ordering::Relaxed,
+        );
         let dt = self
             .last_pull
             .map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
@@ -1012,13 +1153,25 @@ impl Mixer {
             if let Some(dry) = self.dry_at.filter(|_| !q.is_empty()) {
                 // Sound came back: soon means it was late, not paused.
                 let gap = now.saturating_duration_since(dry);
-                if steer && gap < PAUSE {
-                    self.margin_ms = (self.margin_ms + MARGIN_MS).min(MAX_MARGIN_MS);
+                if steer && gap < PAUSE && !self.dry_repair {
+                    let missing = if self.link.loss_seen.load(Ordering::Relaxed) {
+                        // Learn the reserve a real network outage needed.
+                        // Local repair waits are handled by dry_repair.
+                        (gap.as_secs_f64() * 1000.0)
+                            .clamp(MARGIN_MS, AUDIO_PLAYBACK_HOLD.as_secs_f64() * 1000.0)
+                    } else {
+                        MARGIN_MS
+                    };
+                    self.margin_ms = (self.margin_ms + missing).min(MAX_MARGIN_MS);
                     self.link.underruns.fetch_add(1, Ordering::Relaxed);
                 }
                 self.dry_at = None;
             }
-            let cushion = self.cushion(need);
+            let cushion = if self.dry_repair {
+                self.src_channels
+            } else {
+                self.cushion(need)
+            };
             if q.len() < cushion {
                 drop(q);
                 out.fill(0.0);
@@ -1026,14 +1179,20 @@ impl Mixer {
                 return;
             }
             self.started = true;
-            if cushion > 0 {
+            if cushion > 0 && !self.dry_repair {
                 // Out of silence, start from the newest cushion's worth: a
                 // backlog a stall left behind would stay as added delay.
                 let excess = (q.len() - cushion) / self.src_channels * self.src_channels;
+                #[cfg(test)]
+                self.link.discarded_samples.fetch_add(
+                    q.iter().take(excess).filter(|&&s| s == 0.5).count() as u64,
+                    Ordering::Relaxed,
+                );
                 q.drain(..excess);
             }
             self.low = q.len() as f64 - need as f64;
             self.level = q.len() as f64;
+            self.dry_repair = false;
         }
         // Steer the low point of the slack to the margin, so clock drift
         // neither grows the delay nor drains it into a gap, and the delay
@@ -1072,10 +1231,11 @@ impl Mixer {
                         self.next[c] = q.pop_front().unwrap_or(0.0);
                     }
                 } else if self.started {
-                    // Ran dry: rebuild the cushion before playing on, or
-                    // every later jitter spike would click too.
+                    // A local repair wait resumes without discarding its
+                    // intact backlog. Other gaps rebuild the cushion.
                     self.started = false;
                     self.dry_at = Some(now);
+                    self.dry_repair = self.link.repairing.load(Ordering::Relaxed);
                 }
             }
             let t = self.pos as f32;
@@ -1589,3 +1749,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "audio_repair_evaluation.rs"]
+mod repair_evaluation;

@@ -10,9 +10,14 @@ pub const GROUP: u32 = 4;
 pub const MAX_PAYLOAD: usize = crate::MAX_DATAGRAM - 16 - 2;
 /// Reordering allowance after a group's estimated parity arrival.
 pub const AUDIO_HOLD: Duration = Duration::from_millis(20);
-/// Maximum hold from gap detection, including time until parity is due.
-/// Bounds recovery even if capture stops or parity never arrives.
+/// Fallback hold for callers without a playback deadline. Desktop output
+/// additionally applies its queue reserve and [`AUDIO_PLAYBACK_HOLD`].
 pub const AUDIO_MAX_HOLD: Duration = Duration::from_millis(60);
+/// Desktop playback never waits longer than a capture callback and one
+/// small device pull, even when its queue has more room.
+pub const AUDIO_PLAYBACK_HOLD: Duration = Duration::from_millis(25);
+const PAUSE: Duration = AUDIO_MAX_HOLD;
+const SPACING_GROUPS: usize = 8;
 
 /// Numbers encoded audio frames and sends a parity packet after every
 /// [`GROUP`] of them.
@@ -114,11 +119,12 @@ pub struct AudioReceiver {
     parity: std::collections::HashMap<u32, (Instant, Vec<u8>)>,
     latest: Option<u32>,
     last_arrival: Option<Instant>,
-    spacing: Duration,
+    spacing: [(u32, Duration); SPACING_GROUPS],
     /// Last observed data position and arrival in each group.
     group_arrival: std::collections::HashMap<u32, (u32, Instant)>,
     /// Since when `next` has been known missing.
     held: Option<Instant>,
+    playout_deadline: Option<Instant>,
     stats: (u64, u64, u64),
 }
 
@@ -138,9 +144,10 @@ impl AudioReceiver {
             parity: Default::default(),
             latest: None,
             last_arrival: None,
-            spacing: Duration::from_micros(u64::from(packet_us)).min(AUDIO_MAX_HOLD),
+            spacing: [(0, Duration::ZERO); SPACING_GROUPS],
             group_arrival: Default::default(),
             held: None,
+            playout_deadline: None,
             stats: (0, 0, 0),
         }
     }
@@ -163,6 +170,7 @@ impl AudioReceiver {
             self.parity.clear();
             self.latest = None;
             self.last_arrival = None;
+            self.spacing.fill((0, Duration::ZERO));
             self.group_arrival.clear();
             self.held = None;
         }
@@ -185,12 +193,18 @@ impl AudioReceiver {
                 .is_none_or(|n| crate::video::before(n, packet.seq))
             {
                 if let Some(arrival) = self.last_arrival {
-                    // Keep the largest forward-arrival interval so the
-                    // zero intervals inside a capture burst cannot erase it.
-                    // Losses may enlarge this conservative estimate, but
-                    // neither the interval nor the total hold is unbounded.
                     let spacing = now.saturating_duration_since(arrival);
-                    self.spacing = self.spacing.max(spacing).min(AUDIO_MAX_HOLD);
+                    if spacing >= PAUSE {
+                        // Sequence numbers do not advance during silence.
+                        self.spacing.fill((0, Duration::ZERO));
+                    } else if !spacing.is_zero() {
+                        let group = packet.seq - packet.seq % GROUP;
+                        let entry = &mut self.spacing[(group / GROUP) as usize % SPACING_GROUPS];
+                        if entry.0 != group {
+                            *entry = (group, Duration::ZERO);
+                        }
+                        entry.1 = entry.1.max(spacing);
+                    }
                 }
                 self.last_arrival = Some(now);
                 self.latest = Some(packet.seq);
@@ -200,6 +214,34 @@ impl AudioReceiver {
                 .insert(packet.seq - position, (position, now));
         }
         self.rebuild(packet.seq - packet.seq % GROUP);
+    }
+
+    fn spacing(&self) -> Duration {
+        let latest = self.latest.unwrap_or(0);
+        let group = latest - latest % GROUP;
+        self.spacing
+            .iter()
+            .filter(|&&(n, interval)| {
+                group.wrapping_sub(n) < GROUP * SPACING_GROUPS as u32 && !interval.is_zero()
+            })
+            .map(|&(_, interval)| interval)
+            // Before the first callback interval, allow a capture burst.
+            .max()
+            .unwrap_or(AUDIO_HOLD)
+            .max(Duration::from_micros(u64::from(self.packet_us)))
+            .min(AUDIO_MAX_HOLD)
+    }
+
+    /// The output queue's latest safe release time. Update before each
+    /// `pop`, including timer wakeups. A pending gap's deadline can only
+    /// move earlier. This enables the low-latency playback policy.
+    pub fn set_playout_deadline(&mut self, deadline: Instant) {
+        self.playout_deadline = Some(if self.held.is_some() {
+            self.playout_deadline
+                .map_or(deadline, |old| old.min(deadline))
+        } else {
+            deadline
+        });
     }
 
     fn rebuild(&mut self, group: u32) {
@@ -283,21 +325,140 @@ impl AudioReceiver {
         let held = self.held?;
         let seq = self.next?;
         let group = seq - seq % GROUP;
+        let cap = self
+            .playout_deadline
+            .map_or(held + AUDIO_MAX_HOLD, |deadline| {
+                deadline.min(held + AUDIO_PLAYBACK_HOLD)
+            });
+        if self.playout_deadline.is_some()
+            && self
+                .latest
+                .is_some_and(|n| !crate::video::before(n, group.wrapping_add(GROUP + 1)))
+        {
+            // Retain main's progress cutoff in playback. Extra waiting
+            // after two packets of the next group risks its intact audio.
+            return Some(held);
+        }
         if let Some((arrival, _)) = self.parity.get(&group) {
+            if self.playout_deadline.is_some() {
+                // A single loss was already rebuilt by push. Playback
+                // conceals an unrepairable group immediately.
+                return Some(held);
+            }
             // Parity is already here. Only reordered data can still help.
-            return Some((*arrival + AUDIO_HOLD).min(held + AUDIO_MAX_HOLD));
+            return Some((*arrival + AUDIO_HOLD).min(cap));
         }
         let due = self
             .group_arrival
             .get(&group)
             .map_or(held, |&(position, arrival)| {
-                arrival + self.spacing * (GROUP - 1 - position)
+                arrival + self.spacing() * (GROUP - 1 - position)
             });
-        Some((due + AUDIO_HOLD).min(held + AUDIO_MAX_HOLD))
+        Some((due + AUDIO_HOLD).min(cap))
     }
 
     /// Counters: packets received, rebuilt from parity, given up on.
     pub fn stats(&self) -> (u64, u64, u64) {
         self.stats
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    #[test]
+    fn spacing_shrinks_after_eight_groups_and_resets_after_resynchronization() {
+        let mut receiver = AudioReceiver::with_format(1, 240, 48_000);
+        let start = Instant::now();
+        for seq in 0..48 {
+            let ms = if seq < 4 {
+                seq * 30
+            } else {
+                90 + (seq - 3) * 5
+            };
+            receiver.push(
+                &AudioPacket {
+                    parity: false,
+                    seq,
+                    pts: seq * 5000,
+                    payload: &[0],
+                },
+                start + Duration::from_millis(u64::from(ms)),
+            );
+            if seq == 3 {
+                assert_eq!(receiver.spacing(), Duration::from_millis(30));
+            }
+        }
+        assert_eq!(receiver.spacing(), Duration::from_millis(5));
+        receiver.push(
+            &AudioPacket {
+                parity: false,
+                seq: 200,
+                pts: 1_000_000,
+                payload: &[0],
+            },
+            start + Duration::from_secs(2),
+        );
+        assert_eq!(receiver.spacing(), AUDIO_HOLD);
+    }
+
+    #[test]
+    fn playback_deadline_only_tightens_and_never_exceeds_twenty_five_ms() {
+        let start = Instant::now();
+        for reserve in [Duration::from_millis(13), Duration::from_secs(1)] {
+            let mut receiver = AudioReceiver::with_format(1, 240, 48_000);
+            receiver.set_playout_deadline(start + reserve);
+            receiver.push(
+                &AudioPacket {
+                    parity: false,
+                    seq: 1,
+                    pts: 5000,
+                    payload: &[1],
+                },
+                start,
+            );
+            assert_eq!(receiver.pop(start), None);
+            let deadline = start + reserve.min(AUDIO_PLAYBACK_HOLD);
+            assert_eq!(receiver.next_deadline(), Some(deadline));
+            receiver.set_playout_deadline(start + Duration::from_secs(2));
+            assert_eq!(receiver.next_deadline(), Some(deadline));
+            assert_eq!(receiver.pop(deadline - Duration::from_nanos(1)), None);
+            assert_eq!(receiver.pop(deadline), Some(AudioOut::Missing { seq: 0 }));
+        }
+    }
+
+    #[test]
+    fn playback_conceals_an_unrepairable_group_as_soon_as_parity_arrives() {
+        let start = Instant::now();
+        let mut packets = Vec::new();
+        let mut sender = AudioPacketizer::new(1);
+        for seq in 0..GROUP {
+            sender.packetize(seq * 5000, &[seq as u8], |bytes| {
+                packets.push(bytes.to_vec())
+            });
+        }
+        let mut receiver = AudioReceiver::with_format(1, 240, 48_000);
+        receiver.set_playout_deadline(start + AUDIO_PLAYBACK_HOLD);
+        for index in [0, 3, 4] {
+            let crate::wire::Datagram::Audio { packet, .. } =
+                crate::wire::parse(&packets[index]).unwrap()
+            else {
+                panic!()
+            };
+            receiver.push(&packet, start);
+        }
+        assert!(matches!(
+            receiver.pop(start),
+            Some(AudioOut::Frame { seq: 0, .. })
+        ));
+        assert_eq!(receiver.pop(start), Some(AudioOut::Missing { seq: 1 }));
+        assert_eq!(receiver.pop(start), Some(AudioOut::Missing { seq: 2 }));
+        assert!(matches!(
+            receiver.pop(start),
+            Some(AudioOut::Frame { seq: 3, .. })
+        ));
+        assert_eq!(receiver.pop(start), None);
+        assert_eq!(receiver.next_deadline(), None);
     }
 }
