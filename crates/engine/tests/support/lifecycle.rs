@@ -929,6 +929,7 @@ fn reopen_refuses_an_old_picture_held_in_the_send_queue() {
         config(),
         |_| Ok(Box::new(open(true))),
         tx,
+        Arc::new(|_| {}),
     );
     let old = rx.recv().unwrap();
     let new = rx.recv().unwrap();
@@ -1290,6 +1291,176 @@ fn fallback_refits_geometry_and_prepares_the_final_mode() {
     let last = calls.last().unwrap();
     assert_eq!((last.width, last.height, last.fps), expected);
     assert_eq!(prepared_sizes.lock().last(), Some(&expected));
+}
+
+#[test]
+fn cursor_mailbox_retains_shape_when_updates_are_coalesced() {
+    let mailbox = CursorMailbox::default();
+    let shape = control::CursorShape::new(1, 1, 1, 0, 0, &[255; 4]);
+    mailbox.publish(control::Cursor {
+        visible: true,
+        shape: Some(shape.clone()),
+    });
+    for visible in [false, true].into_iter().cycle().take(100) {
+        mailbox.publish(control::Cursor {
+            visible,
+            shape: None,
+        });
+    }
+    let latest = mailbox.pending.lock().take().unwrap();
+    assert!(latest.visible);
+    assert_eq!(latest.shape, Some(shape));
+    mailbox.publish(control::Cursor {
+        visible: false,
+        shape: None,
+    });
+    assert!(mailbox.pending.lock().as_ref().unwrap().shape.is_none());
+}
+
+#[test]
+fn cursor_mailbox_deduplicates_the_shared_wire_state() {
+    let mailbox = CursorMailbox::default();
+    mailbox.publish(control::Cursor {
+        visible: true,
+        shape: None,
+    });
+    mailbox.pending.lock().take().unwrap();
+    for _ in 0..100 {
+        mailbox.publish(control::Cursor {
+            visible: true,
+            shape: None,
+        });
+        assert!(mailbox.pending.lock().is_none());
+    }
+    for _ in 0..100 {
+        mailbox.publish(control::Cursor {
+            visible: false,
+            shape: None,
+        });
+    }
+    assert!(!mailbox.pending.lock().take().unwrap().visible);
+    mailbox.publish(control::Cursor {
+        visible: false,
+        shape: None,
+    });
+    assert!(mailbox.pending.lock().is_none());
+}
+
+#[test]
+fn cursor_mailboxes_send_fresh_shapes_for_each_viewer() {
+    let shape = control::CursorShape::new(1, 1, 1, 0, 0, &[255; 4]);
+    for _ in 0..2 {
+        let mailbox = CursorMailbox::default();
+        mailbox.publish(control::Cursor {
+            visible: true,
+            shape: Some(shape.clone()),
+        });
+        let first = mailbox.pending.lock().take().unwrap();
+        assert!(first.visible);
+        assert_eq!(first.shape, Some(shape.clone()));
+    }
+}
+
+#[test]
+fn synthetic_dxgi_session_delivers_cursor_while_video_waits() {
+    use crate::windows_cursor::{Control, Plane, ShapeInfo};
+    struct PointerVideo {
+        plane: Plane,
+        commands: mpsc::Receiver<u8>,
+    }
+    impl VideoPipeline for PointerVideo {
+        fn info(&self) -> VideoInfo {
+            info()
+        }
+        fn set_cursor_sink(&mut self, sink: video::CursorSink) {
+            *self.plane.control.sink.lock() = Some(sink);
+        }
+        fn set_cursor_drawn(&mut self, drawn: bool) -> bool {
+            self.plane.control.drawn.store(drawn, Ordering::Relaxed);
+            true
+        }
+        fn next(&mut self, _: bool, _: Duration) -> anyhow::Result<EncodedVideo> {
+            let metadata = ShapeInfo {
+                kind: 1,
+                width: 32,
+                height: 64,
+                pitch: 4,
+                hot_x: 2,
+                hot_y: 4,
+            };
+            let mut bytes = vec![255; 256];
+            bytes[128..].fill(0);
+            bytes[128] = 192; // A 2×2 inverting region survives half-size scaling.
+            bytes[132] = 192;
+            self.plane.shape(metadata, &bytes, (64, 64), (32, 32));
+            while let Ok(command) = self.commands.recv() {
+                match command {
+                    0 | 1 => self.plane.publish(true, self.plane.separate(true, false)),
+                    2 => self.plane.publish(false, self.plane.separate(true, false)),
+                    3 => self.plane.invalidate(),
+                    _ => break,
+                }
+            }
+            anyhow::bail!("synthetic video stopped before producing a frame")
+        }
+    }
+    let server = Server::bind(
+        0,
+        Options {
+            relay: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut session = session("127.0.0.1:9".parse().unwrap());
+    let state = Arc::get_mut(&mut session).unwrap();
+    state.cursor_supported = true;
+    state.draw_cursor.store(false, Ordering::Relaxed);
+    let (host, mut viewer) = sockets();
+    *session.control_writer.lock() = Some(host);
+    let (commands, receive) = mpsc::channel();
+    let pipeline = PointerVideo {
+        plane: Plane::new(Control::composited()),
+        commands: receive,
+    };
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            send_video(&server, &session, Box::new(pipeline), config(), |_| {
+                anyhow::bail!("unused reopen")
+            })
+        });
+        let read_cursor = |viewer: &mut TcpStream| match control::read_message(viewer).unwrap() {
+            Message::Cursor(cursor) => cursor,
+            other => panic!("expected cursor, received {other:?}"),
+        };
+        commands.send(0).unwrap();
+        let first = read_cursor(&mut viewer);
+        assert!(first.visible);
+        let shape = first.shape.unwrap();
+        assert_eq!(
+            (shape.width, shape.height, shape.hot_x, shape.hot_y),
+            (17, 17, 1, 2)
+        );
+        commands.send(1).unwrap();
+        commands.send(2).unwrap();
+        assert!(!read_cursor(&mut viewer).visible);
+        commands.send(3).unwrap();
+        commands.send(1).unwrap(); // Still composited/invisible after invalidation.
+        viewer
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let error = viewer.peek(&mut [0]).unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "{error}"
+        );
+        assert_eq!(session.frames.load(Ordering::Relaxed), 0);
+        session.stop.store(true, Ordering::Release);
+        commands.send(4).unwrap();
+    });
 }
 
 #[test]

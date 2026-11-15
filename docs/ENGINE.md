@@ -184,8 +184,64 @@ KeyframeRequest (fallback, older hosts) ────▶ next frame is IDR
 | Host | Capture | Encode |
 | --- | --- | --- |
 | macOS | ScreenCaptureKit, NV12 IOSurface at the stream size and up to the display's refresh, cursor included | VideoToolbox (HEVC, H.264 High, or Constrained Baseline; negotiated HEVC Main10 from P010), real time, no frame reordering, two frames in flight ([MACOS.md](MACOS.md#sharing-this-mac-the-video-pipeline)) |
-| Windows | DXGI Output5 Desktop Duplication (BGRA or scRGB FP16); GPU cursor/colour pass and D3D11 video processor to NV12/P010 | AMF HEVC on AMD, or the GPU's Media Foundation HEVC/AV1/H.264 encoder (Microsoft's CPU encoder for H.264 if needed) ([WINDOWS.md](WINDOWS.md#the-video-pipeline)); `latch-codec` if neither works |
+| Windows | DXGI Output5 Desktop Duplication (BGRA or scRGB FP16); separate DXGI cursor plane or GPU cursor/colour pass, and D3D11 video processor to NV12/P010 | AMF HEVC on AMD, or the GPU's Media Foundation HEVC/AV1/H.264 encoder (Microsoft's CPU encoder for H.264 if needed) ([WINDOWS.md](WINDOWS.md#the-video-pipeline)); `latch-codec` if neither works |
 | Linux (X11) | MIT-SHM `GetImage` through `x11rb` of only the rectangles X Damage reports, cursor from XFixes | NVENC or VA-API from NV12 the CPU converts, when a probe at start finds one ([below](#linux-hardware-encoding)); else `latch-codec`, threads by slice |
+
+Windows negotiates separate cursor drawing through `cursor` and `DrawCursor`.
+DXGI colour shapes retain straight sRGB alpha. Monochrome AND/XOR and masked
+colour shapes use transparent/copy pixels directly, with white inverted regions
+and a one-pixel dark outline. Arbitrary colour XOR remains in the GPU compositor.
+Malformed shapes, unknown visibility and desktop-embedded pointers also keep
+composition enabled. If DXGI shape retrieval fails, GetIconInfo/GetDIBits recover
+a system cursor for composition, with the shared system arrow as the final
+readable-shape fallback. Cursor recovery never delays a usable desktop frame.
+If both reads fail, video continues immediately with the last readable bitmap,
+or without one if none is available, with one warning per failure episode and
+retries every 250 ms. An idle capture tick repaints the retained desktop when a bitmap becomes available.
+Hidden/suppressed and off-output cursors stay hidden.
+
+Shapes already contain the host's physical DPI sizing. The shared scaler scales
+Windows shapes and hotspots to stream-content pixels, including the 96×96 wire
+bound. Windows and Mac use `cursor::Tracker` for shape comparison, cached pixels,
+visibility deduplication and a single process-wide serial allocator. Native
+Windows shape changes call `set_shape`; ordinary capture ticks use `publish`,
+which compares visibility and serial without copying or comparing bitmap bytes.
+The GDI fallback uses the shared `cursor::unpremultiply` conversion.
+
+Pointer-only DXGI acquisitions publish shape/visibility through a coalescing
+mailbox and a separate control sender before conversion/encoding. They leave
+the retained video picture alone while the separate plane is active. The
+mailbox retains unsent pixels across visibility changes and deduplicates each
+viewer's wire state. Main's shape/visibility protocol is used on all platforms.
+Pointer movement uses the viewer's local input and needs no host sampler thread.
+
+The captured output is the viewer-selected monitor, including its physical
+desktop origin. Reopening the same output retains the raw bitmap, rescales the
+plane after a resolution change and re-sends its shape with a fresh shared
+serial. Output changes clear per-output pointer state. A selected monitor
+disappearing reopens on the host's default output with fresh cursor state.
+Choosing another display reconnects and uses the shared viewer reconnect reset
+to discard the cached cursor texture. Windows reports the actual captured
+display identity for hardware and software encoding so the chooser reflects
+missing-display fallback.
+
+While a focused free-mouse viewer drives the pointer, its local position is
+authoritative. If an application warps the host pointer or another mouse moves
+it, the drawn cursor stays at the local position until the user next moves the
+mouse. Hover effects on the host can diverge while the local pointer is still.
+An unfocused viewer keeps its local OS arrow, paints no plane and sends no
+`DrawCursor` updates. If focus is lost while the local pointer is over the
+stream, the last `DrawCursor(false)` stays in force: the host does not draw
+the pointer into the video and the viewer paints none, so pointer motion made
+at the host is invisible until the viewer is focused again. Mac hosts behave
+the same.
+
+Separate cursor bytes remain sRGB on SDR and HDR desktops/sessions. The viewer
+renders them with its SDR UI white, including over native HDR presentation. The
+host's SDR white level is used by the existing scRGB tone mapping and composited
+HDR cursor pass, without applying that luminance multiplier to the RGBA bytes.
+Live HDR cursor appearance and mixed-DPI multi-output transitions still need
+interactive hardware qualification.
 
 | Viewer | Decode |
 | --- | --- |
@@ -577,7 +633,8 @@ refresh; GPU completion, compositor, panel response and scanout are unmeasured.
   enlargements use bilinear filtering. Filter footprints map capture damage
   into output damage, including neighbouring chroma pairs. Equal-size frames
   retain the original SIMD conversion path. Separate cursor shapes and
-  hotspots use output pixels; the viewer supplies the pointer position.
+  hotspots use stream-content pixels. Free-mouse viewers place the cursor at
+  their local pointer on every host platform.
   Conversion, software encoding, and the capacity probe share a worker
   selection function of available parallelism and output dimensions. Its
   conservative table remains capped at four pending a quiet-machine sweep;

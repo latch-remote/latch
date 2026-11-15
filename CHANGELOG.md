@@ -45,6 +45,29 @@ GitHub release notes, so each version gets a heading of the form
   key-position extension and the original 6.0.0 egui/text path. Expand native keyboard maps,
   macOS media events and shared cross-platform event-construction tests.
 
+### Windows streaming
+
+- Windows hosts send the pointer's shape and visibility apart from the video,
+  and a focused viewer in free-mouse mode draws the pointer itself at its own
+  mouse position, so the pointer no longer waits for a video frame, including
+  on a static desktop. Colour, monochrome and masked-colour pointers are
+  converted, with an outline where a pointer inverts what is under it.
+  Live Windows capture of the separate plane is unverified.
+- The pointer stays in the video, as in 6.0.0, when the viewer does not
+  support the separate pointer, in captured mouse mode for games, and whenever
+  Windows cannot supply a readable pointer shape. Video continues if every
+  shape read fails. If Windows never supplies a readable shape, the pointer
+  stays absent until one becomes readable.
+- While the focused viewer drives the pointer, its own position wins: when an
+  application or another mouse moves the host pointer, the drawn pointer stays
+  put until the viewer's mouse next moves. A viewer that loses focus while its
+  pointer is over the stream shows no host pointer until it is focused again.
+- Pointer shapes survive resolution changes and capture restarts, and reset
+  when the viewer reconnects or chooses another display. Windows reports the
+  display it actually captures to the display chooser, including after a
+  missing display falls back to the default.
+- Windows and Mac hosts share one pointer tracker and the same wire messages.
+
 ### Deployment
 
 - Upgrade the single Seoul relay to native TLS and HTTPS WebSocket on TCP 443,
