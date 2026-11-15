@@ -428,6 +428,77 @@ fn linux_download_due(
     Ok((running, due))
 }
 
+#[cfg(target_os = "linux")]
+const LINUX_RETRY_FILE: &str = "linux-update-retry.toml";
+
+#[cfg(target_os = "linux")]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct LinuxRetry {
+    version: Option<Version>,
+    attempts: u32,
+    retry_at: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxRetry {
+    fn offer(&mut self, version: &Version, explicit: bool) {
+        if explicit || self.version.as_ref() != Some(version) {
+            *self = Self {
+                version: Some(version.clone()),
+                ..Self::default()
+            };
+        }
+    }
+
+    fn after_attempt(&mut self, now: std::time::SystemTime) -> Duration {
+        self.attempts = self.attempts.saturating_add(1).min(8);
+        let delay = RETRY_AFTER
+            .saturating_mul(1 << (self.attempts - 1))
+            .min(Duration::from_secs(24 * 3600));
+        self.retry_at = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_add(delay.as_secs());
+        delay
+    }
+
+    fn attempted(&mut self) -> Duration {
+        let delay = self.after_attempt(std::time::SystemTime::now());
+        self.persist();
+        delay
+    }
+
+    fn remaining(&self, now: std::time::SystemTime) -> Duration {
+        let seconds = self.retry_at.saturating_sub(
+            now.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
+        // Recheck after a clock rollback or an invalid persisted deadline.
+        if seconds > 24 * 3600 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(seconds)
+        }
+    }
+
+    fn succeeded(&mut self) {
+        if self.attempts != 0 {
+            self.attempts = 0;
+            self.retry_at = 0;
+            self.persist();
+        }
+    }
+
+    fn persist(&self) {
+        if let Err(error) = latch_core::config::save(LINUX_RETRY_FILE, self) {
+            tracing::warn!("could not persist Linux update retry back-off: {error:#}");
+        }
+    }
+}
+
 /// Desktop pulls use the local service to serialize installation with streams.
 fn spawn_desktop(
     state: Arc<Mutex<State>>,
@@ -442,6 +513,10 @@ fn spawn_desktop(
         let mut explicit = false;
         #[cfg(target_os = "linux")]
         let mut offered_at = Instant::now();
+        #[cfg(target_os = "linux")]
+        let mut retry: LinuxRetry = latch_core::config::load(LINUX_RETRY_FILE);
+        #[cfg(target_os = "linux")]
+        let mut observed_success: Option<String> = None;
         loop {
             std::thread::sleep(TICK);
             let cfg = ClientConfig::load();
@@ -454,6 +529,20 @@ fn spawn_desktop(
             {
                 let mut st = state.lock();
                 if st.latest.as_ref() == Some(&outcome.version) {
+                    if outcome.phase == update::linux::Phase::Succeeded
+                        && observed_success.as_deref() != Some(&outcome.unit)
+                    {
+                        observed_success = Some(outcome.unit.clone());
+                        if retry.attempts != 0
+                            && runs_at_least(
+                                SocketAddr::from((Ipv4Addr::LOCALHOST, CONTROL_PORT)),
+                                &outcome.version,
+                                Duration::ZERO,
+                            )
+                        {
+                            retry.succeeded();
+                        }
+                    }
                     st.message = outcome.reason;
                     st.notice = Some((
                         if outcome.phase == update::linux::Phase::Failed {
@@ -470,6 +559,10 @@ fn spawn_desktop(
                 #[cfg(target_os = "linux")]
                 {
                     explicit = state.lock().check_now;
+                    if explicit {
+                        retry = LinuxRetry::default();
+                        retry.persist();
+                    }
                 }
                 state.lock().check_now = false;
                 #[cfg(target_os = "linux")]
@@ -481,7 +574,13 @@ fn spawn_desktop(
                         next = Instant::now() + CHECK_EVERY;
                         #[cfg(target_os = "linux")]
                         {
-                            offered_at = Instant::now();
+                            retry.offer(&rel.version, explicit);
+                            retry.persist();
+                            let remaining = retry.remaining(std::time::SystemTime::now());
+                            offered_at = Instant::now() + remaining;
+                            if !remaining.is_zero() {
+                                next = Instant::now() + CHECK_EVERY.min(remaining);
+                            }
                         }
                         let newer = rel.is_newer_than(&update::current());
                         let can_update = desktop_can_update();
@@ -510,7 +609,14 @@ fn spawn_desktop(
                         pending = (newer && can_update).then_some(rel);
                     }
                     Err(e) => {
-                        next = Instant::now() + RETRY_AFTER;
+                        #[cfg(target_os = "linux")]
+                        {
+                            next = Instant::now() + retry.attempted().min(CHECK_EVERY);
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            next = Instant::now() + RETRY_AFTER;
+                        }
                         pending = None;
                         let mut st = state.lock();
                         st.checked = Some(Instant::now());
@@ -536,6 +642,16 @@ fn spawn_desktop(
                 let result = (|| -> Result<bool> {
                     #[cfg(target_os = "linux")]
                     {
+                        if !explicit && Instant::now() < offered_at {
+                            state.lock().message = format!(
+                                "Update retry in {} minutes.",
+                                retry
+                                    .remaining(std::time::SystemTime::now())
+                                    .as_secs()
+                                    .div_ceil(60)
+                            );
+                            return Ok(false);
+                        }
                         // Recheck immediately before any archive download. The
                         // service can have updated while this old window stayed open.
                         let previous =
@@ -551,12 +667,21 @@ fn spawn_desktop(
                         if !due {
                             let mut st = state.lock();
                             st.message = if running >= rel.version {
+                                retry.succeeded();
                                 format!("Latch {} is installed. Reopen Latch.", rel.version)
                             } else {
                                 previous
                                     .as_ref()
                                     .map(|s| s.reason.clone())
-                                    .unwrap_or_default()
+                                    .unwrap_or_else(|| {
+                                        format!(
+                                            "Update retry in {} minutes.",
+                                            retry
+                                                .remaining(std::time::SystemTime::now())
+                                                .as_secs()
+                                                .div_ceil(60)
+                                        )
+                                    })
                             };
                             st.notice = Some((Tone::Info, st.message.clone()));
                             return Ok(false);
@@ -568,7 +693,13 @@ fn spawn_desktop(
                     #[cfg(target_os = "linux")]
                     let bytes = {
                         update::linux::owned(&std::env::current_exe()?)?;
-                        update::linux::download_release(rel)?
+                        let name = update::linux::asset_name()?;
+                        let asset = rel.asset(name).context("Linux release asset")?;
+                        let path = updates_dir(rel)?.join(name);
+                        update::linux::download_asset(asset, &path)?;
+                        let bytes = std::fs::read(path)?;
+                        update::verify_host_asset(rel, &rel.version, &bytes, name)?;
+                        bytes
                     };
                     #[cfg(not(target_os = "linux"))]
                     let bytes = {
@@ -589,6 +720,10 @@ fn spawn_desktop(
                 })();
                 match result {
                     Ok(true) => {
+                        #[cfg(target_os = "linux")]
+                        {
+                            next = Instant::now() + retry.attempted().min(CHECK_EVERY);
+                        }
                         state.lock().message = format!(
                             "Installing Latch {}. Reopen Latch after the service restarts.",
                             rel.version
@@ -623,7 +758,14 @@ fn spawn_desktop(
                     }
                     Err(e) => {
                         state.lock().message = format!("Could not update this PC: {e:#}");
-                        next = Instant::now() + RETRY_AFTER;
+                        #[cfg(target_os = "linux")]
+                        {
+                            next = Instant::now() + retry.attempted().min(CHECK_EVERY);
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            next = Instant::now() + RETRY_AFTER;
+                        }
                         pending = None;
                     }
                 }
@@ -1515,6 +1657,68 @@ mod tests {
             }
         }
         assert_eq!(downloads, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_retry_backoff_persists_and_resets_on_an_injected_clock() {
+        let root = std::env::temp_dir().join(format!(
+            "latch-retry-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "update::tests::linux_retry_fixture",
+                "--nocapture",
+            ])
+            .env("LATCH_LINUX_RETRY_FIXTURE", "1")
+            .env("LATCH_DATA_DIR", &root)
+            .status()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(result.success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_retry_fixture() {
+        if std::env::var_os("LATCH_LINUX_RETRY_FIXTURE").is_none() {
+            return;
+        }
+        let version = Version::new(999, 0, 0);
+        let mut policy = LinuxRetry::default();
+        policy.offer(&version, false);
+        let mut now = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        for minutes in [15, 30, 60, 120, 240, 480, 960, 1440, 1440] {
+            let delay = policy.after_attempt(now);
+            assert_eq!(delay, Duration::from_secs(minutes * 60));
+            policy.persist();
+            policy = latch_core::config::try_load(LINUX_RETRY_FILE).unwrap();
+            policy.offer(&version, false);
+            assert_eq!(policy.remaining(now), delay);
+            assert_eq!(
+                policy.remaining(now + delay - Duration::from_secs(1)),
+                Duration::from_secs(1)
+            );
+            assert_eq!(policy.remaining(now + delay), Duration::ZERO);
+            now += delay;
+        }
+        policy.offer(&version, true);
+        assert_eq!(policy.remaining(now), Duration::ZERO);
+        assert_eq!(policy.after_attempt(now), RETRY_AFTER);
+        policy.offer(&Version::new(999, 0, 1), false);
+        assert_eq!(policy.after_attempt(now), RETRY_AFTER);
+        policy.after_attempt(now);
+        policy.succeeded();
+        let cleared: LinuxRetry = latch_core::config::try_load(LINUX_RETRY_FILE).unwrap();
+        assert_eq!(cleared.attempts, 0);
+        assert_eq!(cleared.remaining(now), Duration::ZERO);
+        assert_eq!(policy.after_attempt(now), RETRY_AFTER);
+        policy.retry_at = u64::MAX;
+        assert_eq!(policy.remaining(now), Duration::ZERO);
     }
 
     #[test]

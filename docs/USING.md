@@ -401,7 +401,11 @@ private upload into a `0700` sibling directory and re-hashes it against the
 manifest. The archive is downloaded once. Linux self-update archive and manifest
 transfers have a size-derived deadline of expected bytes / 32 KiB/s + 60 seconds,
 a 30-second socket timeout, and a 32 KiB/s minimum average rate after 30 seconds.
-Manifests use a 1 MiB size allowance. The underlying TLS transport additionally
+Manifests use a 1 MiB size allowance. The 32 KiB/s floor also applies to
+manifests, so a stalled small manifest normally fails the first rate check after
+30 seconds. A blocked read can add the 30-second socket timeout. The size-derived
+92-second manifest deadline is an upper bound. Redirect hops have separate byte
+counts and share elapsed time. The underlying TLS transport additionally
 checks a 128 B/s floor. Other downloads retain their existing transport behavior. Only the selected binary member is
 written, initially `0600`. After digest and ELF architecture verification,
 it becomes `0755` and must report the exact release version with `--version`.
@@ -429,14 +433,20 @@ The added running-service monitor case awaits passing CI evidence. If restoratio
 itself fails, the update becomes terminal Failed with the recovery copy retained
 and its path reported. The next update can proceed. A journal flock and phase
 compare-and-set serialize writers. Unsafe or unparsable journals are moved aside
-with at most three diagnostic copies. Unknown fields and missing fields are
+with at most three diagnostic copies, pruning the oldest modification times.
+A journal read I/O error retains the journal for a later retry. Unknown fields and missing fields are
 tolerated, and unknown phases become terminal failures. Maintenance failures
 appear in service setup/status and logs while the service continues starting.
 
 The window reads the local service version before downloading. Supervisor
 installation and recovery failures persist with their reason and suppress only
 the exact failed version. A newer release remains eligible. Transport failures
-retain the 15-minute retry back-off without persistent release suppression. **Check now** or `latch-host --self-update`
+use persisted per-release exponential retry delays of 15 minutes, 30 minutes,
+1 hour, 2 hours, 4 hours, 8 hours, 16 hours and then a 24-hour ceiling. Successful
+installation, a newly offered release and **Check now** reset the delay. The
+window rechecks manifests at least every six hours while archive retries wait.
+Verified cached archives are rechecked and reused. Transient errors keep the
+release eligible. **Check now** or `latch-host --self-update`
 explicitly retries it. The window, service status and CLI report the outcome.
 Reopen the window after a successful update. Locks live in the data directory.
 At startup, cleanup checks directory names, ownership, private permissions,
@@ -468,11 +478,13 @@ Docker with Ubuntu 24.04/glibc 2.39. No Linux machine outside CI and containers 
 this work. The `Linux updater systemd` CI jobs passed at `5d2959f` on x64 and arm64 Ubuntu 24.04 runners. They install a fixture `latch.service`, launch the real supervisor from its control group, and check successful probation, wrong-version rollback and rollback after the supervisor is killed following the swap.
 The fixture adds a replacement that crashes on start, including the start
 limit and `reset-failed`, and monitor recovery while the service keeps running.
-These two added cases await passing CI evidence. The inspected arm64 job logged
-all three baseline PASS cases, then timed out waiting for the crash case's start
-limit before reaching the monitor case. The crash fixture now waits for the
-start job to complete before exiting, and the driver reports any earlier update
-failure directly.
+These two added cases await passing CI evidence. The fixture gates its crash
+on a new MainPID with ActiveState=active and SubState=running. The start-limit
+check requires a failed unit, at least three fixture starts, a stable restart
+counter and exit status 7. It accepts exit-code and start-limit-hit results.
+Timeouts print full service/supervisor unit state, recent journals and fixture
+history. The previously inspected jobs timed out at an incorrect activation
+predicate, before reaching monitor recovery.
 The test is ignored during ordinary test runs and requires explicit opt-in
 through the dedicated script, which refuses an existing `latch.service`.
 The fixture bypasses supervisor argv parsing, self-pinning, installation ownership

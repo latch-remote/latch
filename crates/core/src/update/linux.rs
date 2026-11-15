@@ -354,6 +354,16 @@ pub fn process_start(pid: u32) -> Option<String> {
     fields.get(19).map(|s| (*s).to_owned())
 }
 
+#[derive(Debug)]
+struct InvalidJournal;
+
+impl std::fmt::Display for InvalidJournal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid Linux update journal content or metadata")
+    }
+}
+impl std::error::Error for InvalidJournal {}
+
 impl UpdateState {
     pub fn request(
         exe: &Path,
@@ -440,22 +450,39 @@ impl UpdateState {
     }
 
     fn load_for_uid(path: &Path, uid: u32) -> Result<Option<Self>> {
-        let file = match OpenOptions::new()
+        let meta = match fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Self::check_metadata(&meta, uid)?;
+        let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-        {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let meta = file.metadata()?;
-        ensure!(
-            meta.is_file() && meta.uid() == uid && meta.mode() & 0o077 == 0,
-            "unsafe Linux update journal"
-        );
-        let value: serde_json::Value = serde_json::from_reader(file.take(64 * 1024))?;
-        let mut state: Self = serde_json::from_value(value.clone())?;
+            .open(path)?;
+        Self::check_metadata(&file.metadata()?, uid)?;
+        Self::decode(file).map(Some)
+    }
+
+    fn check_metadata(meta: &fs::Metadata, uid: u32) -> Result<()> {
+        if !meta.is_file() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+            return Err(anyhow::Error::new(InvalidJournal).context("unsafe Linux update journal"));
+        }
+        Ok(())
+    }
+
+    fn decode(file: impl Read) -> Result<Self> {
+        let mut bytes = Vec::new();
+        file.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 64 * 1024 {
+            return Err(
+                anyhow::Error::new(InvalidJournal).context("Linux update journal exceeds 64 KiB")
+            );
+        }
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| anyhow::Error::new(error).context(InvalidJournal))?;
+        let mut state: Self = serde_json::from_value(value.clone())
+            .map_err(|error| anyhow::Error::new(error).context(InvalidJournal))?;
         state.observed_phase = state.phase;
         if state.phase == Phase::Unknown || !state.exe.is_absolute() || state.unit.is_empty() {
             state.phase = Phase::Failed;
@@ -470,48 +497,67 @@ impl UpdateState {
             // failure records had none and remain retryable after migration.
             state.failure = FailureKind::Installation;
         }
-        Ok(Some(state))
+        Ok(state)
     }
 
     /// Quarantine a bad journal while holding the same lock as its writers.
     /// The returned diagnostic remains visible in the running service's status.
     pub fn repair(path: &Path) -> Result<Option<String>> {
+        Self::repair_with(path, Self::load_unlocked)
+    }
+
+    fn repair_with(
+        path: &Path,
+        load: impl FnOnce(&Path) -> Result<Option<Self>>,
+    ) -> Result<Option<String>> {
         let _journal = JournalLock::acquire(path)?;
-        if let Err(error) = Self::load_unlocked(path) {
-            let parent = path.parent().context("journal directory")?;
-            let keep = tempfile::Builder::new()
-                .prefix("linux-update.json.bad-")
-                .tempfile_in(parent)?;
-            fs::rename(path, keep.path())
-                .context("quarantine unsafe or invalid Linux update journal")?;
-            let (_, quarantined) = keep.keep()?;
+        let error = match load(path) {
+            Ok(_) => return Ok(None),
+            Err(error) if error.downcast_ref::<InvalidJournal>().is_some() => error,
+            Err(error) => {
+                return Err(error.context("read Linux update journal, retained for retry"))
+            }
+        };
+        let parent = path.parent().context("journal directory")?;
+        let keep = tempfile::Builder::new()
+            .prefix("linux-update.json.bad-")
+            .tempfile_in(parent)?;
+        fs::rename(path, keep.path())
+            .context("quarantine unsafe or invalid Linux update journal")?;
+        let (_, quarantined) = keep.keep()?;
+        let diagnostic = format!(
+            "Linux update journal was quarantined at {} because {error:#}",
+            quarantined.display()
+        );
+        let prune = (|| -> Result<()> {
             File::open(parent)?.sync_all()?;
-            let mut old: Vec<_> = fs::read_dir(parent)?
-                .filter_map(|entry| {
-                    let entry = entry.ok()?;
-                    (entry
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with("linux-update.json.bad-")
-                        && entry.path() != quarantined
-                        && entry
-                            .file_type()
-                            .ok()
-                            .is_some_and(|kind| kind.is_file() || kind.is_symlink()))
-                    .then_some(entry.path())
-                })
-                .collect();
+            let mut old = Vec::new();
+            for entry in fs::read_dir(parent)? {
+                let entry = entry?;
+                let path = entry.path();
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("linux-update.json.bad-")
+                    && path != quarantined
+                {
+                    let meta = fs::symlink_metadata(&path)?;
+                    if meta.is_file() || meta.is_symlink() {
+                        old.push((meta.modified()?, path));
+                    }
+                }
+            }
             old.sort();
             let excess = old.len().saturating_sub(2);
-            for entry in old.into_iter().take(excess) {
-                fs::remove_file(entry)?;
+            for (_, path) in old.into_iter().take(excess) {
+                fs::remove_file(path)?;
             }
-            return Ok(Some(format!(
-                "Linux update journal was quarantined at {} because {error:#}",
-                quarantined.display()
-            )));
-        }
-        Ok(None)
+            Ok(())
+        })();
+        Ok(Some(match prune {
+            Ok(()) => diagnostic,
+            Err(error) => format!("{diagnostic}. Diagnostic cleanup failed: {error:#}"),
+        }))
     }
 
     pub fn save(&mut self, path: &Path) -> Result<()> {
@@ -1257,7 +1303,10 @@ fn manifest(url: &str) -> Result<Release> {
     super::parse_manifest(&body)
 }
 
-fn download_asset(asset: &Asset, dest: &Path) -> Result<()> {
+pub fn download_asset(asset: &Asset, dest: &Path) -> Result<()> {
+    if super::verify_asset(asset, dest).is_ok() {
+        return Ok(());
+    }
     super::download_with(asset, dest, |url, sink| {
         fetch(url, "application/octet-stream", asset.size, sink)
     })
@@ -1625,6 +1674,93 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn a_transient_journal_read_error_preserves_swapping_state_for_retry() {
+        struct ReadError;
+        impl Read for ReadError {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            }
+        }
+        let (dir, exe) = install();
+        let path = dir.path().join("linux-update.json");
+        let mut state = UpdateState::request(&exe, &Version::new(999, 0, 0), &[], &path).unwrap();
+        state.phase = Phase::Swapping;
+        state.save(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+        let error = UpdateState::repair_with(&path, |_| UpdateState::decode(ReadError).map(Some))
+            .unwrap_err();
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        assert!(error.downcast_ref::<InvalidJournal>().is_none());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(
+            UpdateState::load(&path).unwrap().unwrap().phase,
+            Phase::Swapping
+        );
+        assert!(UpdateState::repair(&path).unwrap().is_none());
+        assert!(!fs::read_dir(dir.path()).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("linux-update.json.bad-")));
+        state.phase = Phase::Failed;
+        state.save(&path).unwrap();
+        assert!(UpdateState::request(&exe, &Version::new(999, 0, 1), &[], &path).is_ok());
+    }
+
+    #[test]
+    fn quarantine_pruning_keeps_the_newest_diagnostics_by_modification_time() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, age) in [("z-oldest", 1), ("m-middle", 2), ("a-newest", 3)] {
+            let path = dir.path().join(format!("linux-update.json.bad-{name}"));
+            fs::write(&path, name).unwrap();
+            File::open(path)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(age)),
+                )
+                .unwrap();
+        }
+        let path = dir.path().join("linux-update.json");
+        fs::write(&path, b"invalid").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let diagnostic = UpdateState::repair(&path).unwrap().unwrap();
+        assert!(diagnostic.contains("quarantined"));
+        assert!(!dir.path().join("linux-update.json.bad-z-oldest").exists());
+        assert!(dir.path().join("linux-update.json.bad-a-newest").exists());
+        assert!(dir.path().join("linux-update.json.bad-m-middle").exists());
+        assert_eq!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("linux-update.json.bad-"))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_verified_linux_archive_cache_is_reused_and_tampering_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive.tar.gz");
+        let bytes = b"verified archive";
+        let asset = Asset {
+            name: asset_name().unwrap().into(),
+            size: bytes.len() as u64,
+            sha256: Some(super::super::sha256_hex(bytes)),
+            url: "https://unapproved.invalid/archive".into(),
+        };
+        fs::write(&path, bytes).unwrap();
+        download_asset(&asset, &path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::write(&path, b"tampered archive").unwrap();
+        assert!(download_asset(&asset, &path).is_err());
     }
 
     #[test]

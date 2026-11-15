@@ -109,13 +109,147 @@ fn linux_systemd_update_survives_restart_rolls_back_and_recovers() {
 }
 
 fn wait_for(description: &str, mut condition: impl FnMut() -> bool) {
+    let _diagnostics = FixtureDiagnostics;
     let deadline = Instant::now() + Duration::from_secs(110);
     while !condition() {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {description}"
-        );
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for {description}");
+        }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+// systemd v255 formats string states verbatim and u/i counters as decimal.
+// Job has a special formatter which emits an empty value for the idle (0, /).
+// See systemctl-show.c print_property() and org.freedesktop.systemd1.xml.
+#[derive(Debug)]
+struct UnitState {
+    active: String,
+    sub: String,
+    result: String,
+    restarts: u32,
+    exit_status: i32,
+    pid: u32,
+}
+
+impl UnitState {
+    fn read() -> Result<Self> {
+        let output = Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                "--property=ActiveState,SubState,Result,NRestarts,ExecMainStatus,MainPID",
+                "latch.service",
+            ])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "read fixture unit state: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Self::parse(&String::from_utf8(output.stdout)?)
+    }
+
+    fn parse(text: &str) -> Result<Self> {
+        let properties: std::collections::BTreeMap<_, _> = text
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+        let value = |name| {
+            properties
+                .get(name)
+                .copied()
+                .with_context(|| format!("missing unit property {name}"))
+        };
+        Ok(Self {
+            active: value("ActiveState")?.into(),
+            sub: value("SubState")?.into(),
+            result: value("Result")?.into(),
+            restarts: value("NRestarts")?.parse()?,
+            exit_status: value("ExecMainStatus")?.parse()?,
+            pid: value("MainPID")?.parse()?,
+        })
+    }
+
+    fn running(&self, previous_pid: u32) -> bool {
+        self.active == "active"
+            && self.sub == "running"
+            && self.pid != 0
+            && self.pid != previous_pid
+    }
+
+    fn crash_limited(&self, starts: usize) -> bool {
+        self.active == "failed"
+            && self.sub == "failed"
+            && self.pid == 0
+            && matches!(self.result.as_str(), "exit-code" | "start-limit-hit")
+            && self.exit_status == 7
+            && starts >= 3
+            && self.restarts >= 2
+    }
+}
+
+fn systemd_diagnostics() {
+    if std::env::var_os("LATCH_SYSTEMD_FIXTURE").is_none() {
+        return;
+    }
+    let mut units = vec!["latch.service".to_string()];
+    if let Some(root) = std::env::var_os("LATCH_DATA_DIR").map(PathBuf::from) {
+        for name in [
+            "linux-update.json",
+            "starts.log",
+            "health.log",
+            "monitor-started",
+        ] {
+            match fs::read_to_string(root.join(name)) {
+                Ok(text) => {
+                    eprintln!("fixture {name}\n{text}");
+                    if name == "linux-update.json" {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let Some(unit) = value.get("unit").and_then(|unit| unit.as_str()) {
+                                units.push(unit.into());
+                            }
+                        }
+                    }
+                }
+                Err(error) => eprintln!("fixture {name}: {error}"),
+            }
+        }
+    }
+    for unit in units {
+        for (program, args) in [
+            ("systemctl", vec!["--user", "show", "--all", unit.as_str()]),
+            (
+                "journalctl",
+                vec![
+                    "--user",
+                    "--unit",
+                    unit.as_str(),
+                    "--lines=80",
+                    "--no-pager",
+                    "--output=short-monotonic",
+                ],
+            ),
+        ] {
+            match Command::new(program).args(&args).output() {
+                Ok(output) => eprintln!(
+                    "{program} {args:?} ({})\n{}\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                Err(error) => eprintln!("{program} {args:?}: {error}"),
+            }
+        }
+    }
+}
+
+struct FixtureDiagnostics;
+impl Drop for FixtureDiagnostics {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            systemd_diagnostics();
+        }
     }
 }
 
@@ -148,8 +282,8 @@ const SYSTEMD_FIXTURE_SOURCE: &str = r#"
             let mut starts = std::fs::OpenOptions::new().create(true).append(true).open(data.join("starts.log")).unwrap();
             writeln!(starts, "{}", env!("FIXTURE_VERSION")).unwrap();
             if env!("FIXTURE_MODE") == "exit" {
-                // Let the driver observe the completed systemd start job before
-                // crashing, so this case reaches the automatic restart limit.
+                // Let the driver observe active/running before crashing, so
+                // this case reaches the automatic restart limit.
                 while !data.join("crash-release").exists() {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
@@ -311,19 +445,10 @@ fn systemd_fixture_session() {
                     "replacement failed before activation: {}",
                     current.reason
                 );
-                main_pid().is_ok_and(|pid| pid != 0 && pid != old_pid)
-                    && Command::new("systemctl")
-                        .args([
-                            "--user",
-                            "show",
-                            "--property=Job",
-                            "--value",
-                            "latch.service",
-                        ])
-                        .output()
-                        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "0")
+                UnitState::read().is_ok_and(|unit| unit.running(old_pid))
             });
             fs::write(dir.join("crash-release"), []).unwrap();
+            let mut failed_since = None;
             wait_for("replacement start limit", || {
                 let current = linux::UpdateState::load(&path).unwrap().unwrap();
                 assert!(
@@ -331,18 +456,27 @@ fn systemd_fixture_session() {
                     "replacement finished before the start limit: {}",
                     current.reason
                 );
-                Command::new("systemctl")
-                    .args([
-                        "--user",
-                        "show",
-                        "--property=Result",
-                        "--value",
-                        "latch.service",
-                    ])
-                    .output()
-                    .is_ok_and(|output| {
-                        String::from_utf8_lossy(&output.stdout).trim() == "start-limit-hit"
-                    })
+                let starts = fs::read_to_string(dir.join("starts.log"))
+                    .unwrap()
+                    .lines()
+                    .filter(|line| *line == version)
+                    .count();
+                let Ok(unit) = UnitState::read() else {
+                    return false;
+                };
+                if !unit.crash_limited(starts) {
+                    failed_since = None;
+                    return false;
+                }
+                match failed_since {
+                    Some((restarts, since)) if restarts == unit.restarts => {
+                        Instant::now().duration_since(since) >= Duration::from_millis(250)
+                    }
+                    _ => {
+                        failed_since = Some((unit.restarts, Instant::now()));
+                        false
+                    }
+                }
             });
             assert!(
                 fs::read_to_string(dir.join("starts.log"))
@@ -378,8 +512,40 @@ fn systemd_fixture_session() {
         }
         let expected = "999.0.0";
         wait_for("retained or restored service", || {
-            super::super::answering_version().as_deref() == Some(expected)
+            UnitState::read().is_ok_and(|unit| {
+                unit.running(0)
+                    && answering_process(
+                        unit.pid,
+                        &exe,
+                        latch_core::CONTROL_PORT,
+                        super::super::answering_version,
+                    )
+                    .as_deref()
+                        == Some(expected)
+            })
         });
+        if scenario == "crash-on-start" {
+            assert_eq!(outcome.failure, linux::FailureKind::Installation);
+            assert!(
+                outcome.reason.contains("did not answer within 60 s"),
+                "{}",
+                outcome.reason
+            );
+            assert!(
+                outcome
+                    .reason
+                    .contains("previous Linux release was restored and restarted"),
+                "{}",
+                outcome.reason
+            );
+            let restored = UnitState::read().unwrap();
+            assert_eq!(restored.result, "success");
+            assert_eq!(restored.exit_status, 0);
+            assert_eq!(
+                restored.restarts, 0,
+                "reset-failed must clear the restart counter"
+            );
+        }
         linux::verify_version(&exe, &Version::parse(expected).unwrap()).unwrap();
         wait_for("staging cleanup", || {
             !outcome.stage.as_ref().unwrap().exists()
@@ -707,4 +873,97 @@ fn crashing_fixture_waits_for_completed_activation_before_exiting() {
         stop.0.try_wait().unwrap().is_some()
     });
     assert_eq!(stop.0.wait().unwrap().code(), Some(7));
+}
+
+#[test]
+fn systemd_255_properties_gate_activation_and_automatic_restart_exhaustion() {
+    let running = "ActiveState=active\nSubState=running\nResult=success\nNRestarts=0\nExecMainStatus=0\nMainPID=123\nJob=\n";
+    let unit = UnitState::parse(running).unwrap();
+    assert!(unit.running(42));
+    assert!(!unit.running(123));
+    assert!(!unit.crash_limited(3));
+    assert!(
+        !UnitState::parse(&running.replace("MainPID=123", "MainPID=0"))
+            .unwrap()
+            .running(42)
+    );
+    assert!(
+        !UnitState::parse(&running.replace("SubState=running", "SubState=auto-restart"))
+            .unwrap()
+            .running(42)
+    );
+    for result in ["exit-code", "start-limit-hit"] {
+        let failed = format!("ActiveState=failed\nSubState=failed\nResult={result}\nNRestarts=3\nExecMainStatus=7\nMainPID=0\nJob=\n");
+        let unit = UnitState::parse(&failed).unwrap();
+        assert!(unit.crash_limited(3));
+        assert!(!unit.crash_limited(2));
+        for (from, to) in [
+            ("ActiveState=failed", "ActiveState=activating"),
+            ("SubState=failed", "SubState=auto-restart"),
+            ("NRestarts=3", "NRestarts=1"),
+            ("ExecMainStatus=7", "ExecMainStatus=0"),
+            ("MainPID=0", "MainPID=123"),
+        ] {
+            assert!(!UnitState::parse(&failed.replace(from, to))
+                .unwrap()
+                .crash_limited(3));
+        }
+    }
+    assert!(UnitState::parse("ActiveState=active").is_err());
+    assert!(UnitState::parse(&running.replace("NRestarts=0", "NRestarts=unknown")).is_err());
+}
+
+#[test]
+fn a_failed_systemd_wait_reports_both_units_and_fixture_history() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("linux-update.json");
+    let state =
+        linux::UpdateState::request(Path::new("/unused"), &Version::new(999, 0, 0), &[], &path)
+            .unwrap();
+    fs::write(
+        root.path().join("starts.log"),
+        "999.0.0\n999.0.0\n999.0.0\n",
+    )
+    .unwrap();
+    for name in ["systemctl", "journalctl"] {
+        let script = root.path().join(name);
+        fs::write(&script, format!("#!/bin/sh\nprintf '%s %s\\n' '{name}' \"$*\" >> \"$LATCH_DATA_DIR/calls\"\nprintf 'ActiveState=failed\\nNRestarts=3\\nfixture journal lines\\n'\n")).unwrap();
+        fs::set_permissions(script, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let output = helper("diagnostic_wait_fixture_entry")
+        .env("LATCH_SYSTEMD_FIXTURE", "1")
+        .env("LATCH_DATA_DIR", root.path())
+        .env("PATH", root.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let calls = fs::read_to_string(root.path().join("calls")).unwrap();
+    for unit in ["latch.service", &state.unit] {
+        assert!(
+            calls.contains(&format!("systemctl --user show --all {unit}")),
+            "{calls}"
+        );
+        assert!(
+            calls.contains(&format!("journalctl --user --unit {unit} --lines=80")),
+            "{calls}"
+        );
+    }
+    let error = String::from_utf8_lossy(&output.stderr);
+    for text in [
+        "ActiveState=failed",
+        "NRestarts=3",
+        "fixture starts.log",
+        "fixture linux-update.json",
+        "injected failed wait",
+    ] {
+        assert!(error.contains(text), "{error}");
+    }
+}
+
+#[test]
+fn diagnostic_wait_fixture_entry() {
+    if std::env::var_os("LATCH_SYSTEMD_FIXTURE").is_some() {
+        wait_for("injected failure", || panic!("injected failed wait"));
+    }
 }
