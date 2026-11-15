@@ -60,6 +60,8 @@ impl DisplayRect {
 pub trait InputSink: Send {
     /// Select negotiated physical positions while preserving legacy injection.
     fn set_key_positions(&mut self, _accepted: bool) {}
+    /// Interrupt platform I/O when the stream is stopping.
+    fn set_stopping(&mut self, _stopping: std::sync::Arc<std::sync::atomic::AtomicBool>) {}
 
     /// An explicit monitor choice can fill one X screen on a multi-screen host.
     fn set_display_selected(&mut self, _selected: bool) {}
@@ -596,6 +598,108 @@ pub mod keymap {
         })
     }
 
+    /// The Linux input-event code (`KEY_*`, linux/input-event-codes.h) of
+    /// the physical key [`vk_to_xkb_name`] names: what the RemoteDesktop
+    /// portal and uinput take. XKB's `evdev` keycodes are these plus 8.
+    pub fn vk_to_evdev(vk: u16) -> Option<u16> {
+        use latch_proto::keyboard::*;
+        match vk {
+            KEYPAD_ENTER => Some(96),
+            KEYPAD_EQUAL => Some(117),
+            INTL_RO => Some(89),
+            INTL_YEN => Some(124),
+            KANA => Some(93),
+            CONVERT | 0x1c => Some(92),
+            NON_CONVERT | 0x1d => Some(94),
+            0x15 => Some(122),
+            0x19 => Some(123),
+            0xe2 => Some(86),
+            0x6c => Some(121),
+            0xad => Some(113),
+            0xae => Some(114),
+            0xaf => Some(115),
+            0xb0 => Some(163),
+            0xb1 => Some(165),
+            0xb2 => Some(166),
+            0xb3 => Some(164),
+            _ => vk_to_xkb_name(vk).and_then(xkb_name_to_evdev),
+        }
+    }
+
+    fn xkb_name_to_evdev(name: [u8; 4]) -> Option<u16> {
+        const ROWS: [(&[u8; 2], u16, u8); 4] = [
+            // Row, the code of its first key, how many: AE01..AE12, AD01..
+            (b"AE", 2, 12),
+            (b"AD", 16, 12),
+            (b"AC", 30, 11),
+            (b"AB", 44, 10),
+        ];
+        let digits = |a: u8, b: u8| -> Option<u16> {
+            (a.is_ascii_digit() && b.is_ascii_digit())
+                .then(|| u16::from((a - b'0') * 10 + b - b'0'))
+        };
+        for (row, first, count) in ROWS {
+            if name[..2] == row[..] {
+                let n = digits(name[2], name[3])?;
+                return (1..=u16::from(count)).contains(&n).then(|| first + n - 1);
+            }
+        }
+        if &name[..2] == b"FK" {
+            return match digits(name[2], name[3])? {
+                n @ 1..=10 => Some(58 + n),
+                11 => Some(87),
+                12 => Some(88),
+                n @ 13..=24 => Some(170 + n),
+                _ => None,
+            };
+        }
+        if &name[..2] == b"KP" && name[2].is_ascii_digit() && name[3] == 0 {
+            return Some([82, 79, 80, 81, 75, 76, 77, 71, 72, 73][usize::from(name[2] - b'0')]);
+        }
+        Some(match &name {
+            b"ESC\0" => 1,
+            b"BKSP" => 14,
+            b"TAB\0" => 15,
+            b"RTRN" => 28,
+            b"LCTL" => 29,
+            b"TLDE" => 41,
+            b"LFSH" => 42,
+            b"BKSL" => 43,
+            b"RTSH" => 54,
+            b"KPMU" => 55,
+            b"LALT" => 56,
+            b"SPCE" => 57,
+            b"CAPS" => 58,
+            b"NMLK" => 69,
+            b"SCLK" => 70,
+            b"KPSU" => 74,
+            b"KPAD" => 78,
+            b"KPDL" => 83,
+            b"RCTL" => 97,
+            b"KPDV" => 98,
+            b"PRSC" => 99,
+            b"RALT" => 100,
+            b"HOME" => 102,
+            b"UP\0\0" => 103,
+            b"PGUP" => 104,
+            b"LEFT" => 105,
+            b"RGHT" => 106,
+            b"END\0" => 107,
+            b"DOWN" => 108,
+            b"PGDN" => 109,
+            b"INS\0" => 110,
+            b"DELE" => 111,
+            b"PAUS" => 119,
+            b"KPCO" => 121,
+            b"LWIN" => 125,
+            b"RWIN" => 126,
+            // XKB's <MENU> is the compose key's code.
+            b"MENU" => 127,
+            b"HELP" => 138,
+            _ => return None,
+        })
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -610,6 +714,7 @@ pub mod keymap {
                     case.xkb
                 );
                 assert_eq!(vk_to_mac(case.vk), case.mac);
+                assert_eq!(vk_to_evdev(case.vk), Some(case.linux - 8));
             }
             for vk in 0x7c..=0x87 {
                 assert!(vk_to_xkb_name(vk).is_some());
@@ -619,6 +724,58 @@ pub mod keymap {
                 assert!(vk_to_xkb_name(vk).is_some(), "{vk:#x}");
                 assert!(vk_to_mac(vk).is_some(), "{vk:#x}");
             }
+        }
+
+        #[test]
+        fn every_named_key_has_its_linux_code() {
+            for vk in 0..=255 {
+                if let Some(name) = vk_to_xkb_name(vk) {
+                    assert!(vk_to_evdev(vk).is_some(), "no code for {vk:#x} ({name:?})");
+                }
+            }
+            // linux/input-event-codes.h
+            for (vk, code) in [
+                (0x1B, 1),   // KEY_ESC
+                (0x31, 2),   // KEY_1
+                (0x30, 11),  // KEY_0
+                (0xBD, 12),  // KEY_MINUS
+                (0xBB, 13),  // KEY_EQUAL
+                (0x51, 16),  // KEY_Q
+                (0x50, 25),  // KEY_P
+                (0xDB, 26),  // KEY_LEFTBRACE
+                (0xDD, 27),  // KEY_RIGHTBRACE
+                (0x41, 30),  // KEY_A
+                (0x4C, 38),  // KEY_L
+                (0xBA, 39),  // KEY_SEMICOLON
+                (0xDE, 40),  // KEY_APOSTROPHE
+                (0x5A, 44),  // KEY_Z
+                (0x4D, 50),  // KEY_M
+                (0xBC, 51),  // KEY_COMMA
+                (0xBE, 52),  // KEY_DOT
+                (0xBF, 53),  // KEY_SLASH
+                (0x70, 59),  // KEY_F1
+                (0x79, 68),  // KEY_F10
+                (0x7A, 87),  // KEY_F11
+                (0x7B, 88),  // KEY_F12
+                (0x7C, 183), // KEY_F13
+                (0x87, 194), // KEY_F24
+                (0x60, 82),  // KEY_KP0
+                (0x61, 79),  // KEY_KP1
+                (0x65, 76),  // KEY_KP5
+                (0x69, 73),  // KEY_KP9
+                (0x0C, 76),  // VK_CLEAR is keypad 5 without Num Lock
+                (0xA3, 97),  // KEY_RIGHTCTRL
+                (0xA5, 100), // KEY_RIGHTALT
+                (0x2C, 99),  // KEY_SYSRQ
+                (0x5B, 125), // KEY_LEFTMETA
+                (0x5D, 127), // KEY_COMPOSE
+                (0x2F, 138), // KEY_HELP
+            ] {
+                assert_eq!(vk_to_evdev(vk), Some(code), "{vk:#x}");
+            }
+            assert_eq!(xkb_name_to_evdev(*b"AE13"), None);
+            assert_eq!(xkb_name_to_evdev(*b"FK25"), None);
+            assert_eq!(xkb_name_to_evdev(*b"AC1x"), None);
         }
 
         #[test]

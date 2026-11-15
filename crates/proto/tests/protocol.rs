@@ -1133,6 +1133,7 @@ fn av1_offer_is_additive_and_unknown_codecs_still_fall_through() {
     use latch_proto::control::StreamRequest;
     let mut request: serde_json::Value = serde_json::to_value(StreamRequest {
         key_positions: false,
+        startup_timeout_secs: 0,
         relay: false,
         prefer_color: false,
         color: Default::default(),

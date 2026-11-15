@@ -6,6 +6,8 @@ GitHub release notes, so each version gets a heading of the form
 
 ## Unreleased
 
+- Add Linux Wayland screen sharing through the desktop portal and runtime-loaded PipeWire, with linear DMA-BUF capture, shared-memory fallback, RemoteDesktop input, and persisted portal approvals in Sharing setup.
+
 ### Input
 
 - Preserve the previous default Command/Ctrl and clipboard mapping in every mouse
