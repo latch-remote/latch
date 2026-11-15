@@ -118,7 +118,18 @@ impl TransportLimits {
     }
 }
 
-type ProxyDiscovery = dyn Fn() -> (Option<ProxyConfig>, bool) + Send + Sync;
+/// Route preference for settings supplied by asynchronous proxy discovery.
+#[derive(Clone, Copy, Debug)]
+pub enum ProxyOrder {
+    /// Allow direct access while reusing a recently successful proxy first.
+    Automatic,
+    ProxyFirst,
+    /// Probe direct access before a retained proxy, including a cached winner.
+    DirectFirst,
+}
+
+type ProxyDiscovery = dyn Fn() -> (Option<ProxyConfig>, ProxyOrder) + Send + Sync;
+type ProxyConnected = dyn Fn(&ProxyConfig) + Send + Sync;
 
 #[derive(Clone)]
 pub struct ClientConfig {
@@ -133,6 +144,7 @@ pub struct ClientConfig {
     hints: Arc<Mutex<PathHints>>,
     opening: Arc<Mutex<()>>,
     proxy_discovery: Option<Arc<ProxyDiscovery>>,
+    proxy_connected: Option<Arc<ProxyConnected>>,
 }
 impl fmt::Debug for ClientConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -152,7 +164,30 @@ impl ClientConfig {
         discover: impl Fn() -> (Option<ProxyConfig>, bool) + Send + Sync + 'static,
     ) {
         self.proxy = discover().0;
+        self.proxy_discovery = Some(Arc::new(move || {
+            let (proxy, direct) = discover();
+            (
+                proxy,
+                if direct {
+                    ProxyOrder::Automatic
+                } else {
+                    ProxyOrder::ProxyFirst
+                },
+            )
+        }));
+        self.proxy_connected = None;
+    }
+
+    /// Select discovery route order and observe successful verified proxy connections.
+    /// Clones use these callbacks for grants, renewals, and both attachment lanes.
+    pub fn set_proxy_discovery_policy(
+        &mut self,
+        discover: impl Fn() -> (Option<ProxyConfig>, ProxyOrder) + Send + Sync + 'static,
+        connected: impl Fn(&ProxyConfig) + Send + Sync + 'static,
+    ) {
+        self.proxy = discover().0;
         self.proxy_discovery = Some(Arc::new(discover));
+        self.proxy_connected = Some(Arc::new(connected));
     }
 
     /// Step down to 1200, then 512 bytes for 30 seconds after a path-MTU stall.
@@ -219,6 +254,7 @@ impl ClientConfig {
             hints: Arc::new(Mutex::new(PathHints::default())),
             opening: Arc::new(Mutex::new(())),
             proxy_discovery: None,
+            proxy_connected: None,
         })
     }
 }
@@ -715,8 +751,12 @@ fn connect_tcp(
     }
 }
 
-fn direct_first(direct_allowed: bool, proxy_won: bool) -> bool {
-    direct_allowed && !proxy_won
+fn direct_first(order: ProxyOrder, proxy_won: bool) -> bool {
+    match order {
+        ProxyOrder::Automatic => !proxy_won,
+        ProxyOrder::ProxyFirst => false,
+        ProxyOrder::DirectFirst => true,
+    }
 }
 fn rung_budget(budget_ms: u64, mss_hint: Option<(Instant, MssReason, u32)>) -> Duration {
     // Both lanes share this intermediate probe. A concurrent lane must not
@@ -742,7 +782,7 @@ fn open(
     let Some(discover) = &config.proxy_discovery else {
         return open_carriers(config, cancel, deadline);
     };
-    let (proxy, direct_allowed) = discover();
+    let (proxy, order) = discover();
     let mut direct = config.clone();
     direct.proxy = None;
     let mut proxied = config.clone();
@@ -757,7 +797,7 @@ fn open(
         .winning
         .as_ref()
         .is_some_and(|path| path.matches(&proxied));
-    let paths = if direct_first(direct_allowed, proxy_won) {
+    let paths = if direct_first(order, proxy_won) {
         [&direct, &proxied]
     } else {
         [&proxied, &direct]
@@ -767,6 +807,9 @@ fn open(
     for path in paths {
         match open_carriers(path, cancel, deadline) {
             Ok((socket, mut info)) => {
+                if let (Some(proxy), Some(connected)) = (&path.proxy, &config.proxy_connected) {
+                    connected(proxy);
+                }
                 attempts.append(&mut info.earlier_failures);
                 info.earlier_failures = attempts;
                 return Ok((socket, info));
@@ -2509,9 +2552,12 @@ mod tests {
     }
     #[test]
     fn discovery_order_and_total_budget_use_injected_clock() {
-        assert!(direct_first(true, false));
-        assert!(!direct_first(false, false));
-        assert!(!direct_first(true, true));
+        assert!(direct_first(ProxyOrder::Automatic, false));
+        assert!(!direct_first(ProxyOrder::ProxyFirst, false));
+        assert!(!direct_first(ProxyOrder::Automatic, true));
+        assert!(direct_first(ProxyOrder::DirectFirst, true));
+        assert!(direct_first(ProxyOrder::DirectFirst, false));
+        assert!(!direct_first(ProxyOrder::ProxyFirst, true));
         let now = Instant::now();
         let end = bounded_deadline(now + Duration::from_secs(10), now, Duration::from_secs(4));
         assert_eq!(end, now + Duration::from_secs(4));

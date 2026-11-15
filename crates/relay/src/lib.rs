@@ -15,7 +15,8 @@ mod wire;
 
 pub use carrier::WEBSOCKET_PATH;
 pub use client::{
-    create_grant, create_grant_with_info, ClientConfig, Endpoint, Event, Transport, TransportLimits,
+    create_grant, create_grant_with_info, ClientConfig, Endpoint, Event, ProxyOrder, Transport,
+    TransportLimits,
 };
 pub use crypto::{ensure_supported_cpu, SessionKeys};
 pub use diagnostics::{AttemptFailure, Carrier, ConnectError, ConnectionInfo, Failure, MssReason};
