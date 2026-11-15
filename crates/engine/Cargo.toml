@@ -19,7 +19,7 @@ tracing.workspace = true
 rand.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = { version = "0.13", features = ["shm", "xfixes", "randr", "xtest", "damage", "xkb"] }
+x11rb = { version = "0.14", features = ["shm", "xfixes", "randr", "xtest", "damage", "xkb"] }
 libc = "0.2"
 pulseaudio = "0.3.2"
 # Gamepads through /dev/uinput; pure Rust ioctls.
@@ -27,7 +27,7 @@ evdev = "0.13"
 futures = "0.3"
 # The GPU vendors' encoders (libva, libnvidia-encode) are opened at run
 # time, when present: nothing is linked.
-libloading = "0.8"
+libloading = "0.9"
 
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.58"
@@ -85,5 +85,5 @@ tracing-subscriber.workspace = true
 socket2 = "0.6"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-x11rb = "0.13"
+x11rb = "0.14"
 libc = "0.2"

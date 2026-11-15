@@ -2,8 +2,8 @@
 use super::macos_zero_copy::{CVMetalTextureWrapper, MetalTextureCache};
 use latch_stream::{video::NativeFrame, Frame};
 use metal::{foreign_types::ForeignType, *};
-use objc2::{msg_send, runtime::AnyObject};
-use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
+use objc2::{msg_send, runtime::AnyObject, MainThreadMarker};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use std::{
     collections::VecDeque,
     ffi::c_void,
@@ -511,9 +511,8 @@ mod tests {
         let object = edr.layer.as_ptr() as *mut AnyObject;
         // SAFETY: CALayer calls on layers only this test uses.
         unsafe {
-            let root: Retained<AnyObject> = objc2::msg_send_id![objc2::class!(CALayer), new];
-            let surface: Retained<AnyObject> =
-                objc2::msg_send_id![objc2::class!(CAMetalLayer), new];
+            let root: Retained<AnyObject> = msg_send![objc2::class!(CALayer), new];
+            let surface: Retained<AnyObject> = msg_send![objc2::class!(CAMetalLayer), new];
             let _: () = msg_send![&*root, addSublayer: &*surface];
             let root_ptr = Retained::as_ptr(&root) as *mut AnyObject;
             let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(320.0, 180.0));
