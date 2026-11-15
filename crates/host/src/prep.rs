@@ -10,6 +10,20 @@ use std::time::{Duration, Instant};
 type Undo = Option<Box<dyn FnOnce() + Send>>;
 
 pub fn prepare(cfg: &HostConfig, req: &StreamRequest) -> Result<Undo> {
+    let held = crate::streamer::hold_displays();
+    let undo = prepare_desktop(cfg, req)?;
+    if held.is_none() && undo.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Box::new(move || {
+        if let Some(undo) = undo {
+            undo();
+        }
+        drop(held);
+    })))
+}
+
+fn prepare_desktop(cfg: &HostConfig, req: &StreamRequest) -> Result<Undo> {
     let size = [
         req.width.clamp(64, latch_proto::control::MAX_SIDE) & !1,
         req.height.clamp(64, latch_proto::control::MAX_SIDE) & !1,
@@ -34,7 +48,8 @@ pub fn prepare(cfg: &HostConfig, req: &StreamRequest) -> Result<Undo> {
     if !cfg!(windows) && !crate::streamer::display_follows_viewer() {
         return Ok(None);
     }
-    let previous = latch_engine::display::prepare(size[0], size[1], size[2])?;
+    let previous =
+        latch_engine::display::prepare(size[0], size[1], size[2], req.display.as_deref())?;
     Ok(previous.map(|previous| {
         Box::new(move || {
             if let Err(e) = latch_engine::display::restore(&previous) {

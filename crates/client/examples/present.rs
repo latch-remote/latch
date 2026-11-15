@@ -264,6 +264,7 @@ fn main() -> anyhow::Result<()> {
                             gamepads: false,
                             mic: false,
                             color: Default::default(),
+                            display: None,
                         },
                         frames.clone(),
                         tx,
