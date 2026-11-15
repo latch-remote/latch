@@ -1703,7 +1703,11 @@ impl Drop for Session {
 fn offer(settings: &Settings) -> Vec<Codec> {
     video::decodable()
         .into_iter()
-        .filter(|&c| (settings.hevc || c != Codec::Hevc) && (settings.av1 || c != Codec::Av1))
+        .filter(|&c| {
+            (settings.hevc || c != Codec::Hevc)
+                && (settings.av1 || c != Codec::Av1)
+                && video::decodable_at(c, settings.width, settings.height)
+        })
         .collect()
 }
 
@@ -1785,10 +1789,11 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
                 && video::decoder_available_for(SocketAddr::new(server.address, server.port), c)
         })
         .collect();
+    let color = video::decoder_color(settings.color, settings.width, settings.height);
     let request = StreamRequest {
         relay: inner.configured_relay.lock().is_some(),
         prefer_color: settings.prefer_color,
-        color: settings.color,
+        color,
         protocol: latch_proto::PROTOCOL,
         width: settings.width,
         height: settings.height,
@@ -1904,8 +1909,8 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         );
     }
     if !accept.color.supported()
-        || (accept.color.bit_depth == 10 && !settings.color.ten_bit)
-        || (accept.color.is_hdr() && (!settings.color.hdr || settings.color.peak_nits == 0))
+        || (accept.color.bit_depth == 10 && !color.ten_bit)
+        || (accept.color.is_hdr() && (!color.hdr || color.peak_nits == 0))
     {
         return fail("starting", "host selected unoffered colour format".into());
     }
@@ -3143,10 +3148,14 @@ fn decode(
             Err(_) => (tries, errors) = (tries + 1, errors + 1),
         }
         if codec != Codec::H264Baseline
-            && (tries >= HARDWARE_PROBATION || errors >= HARDWARE_ERRORS)
+            && (tries >= HARDWARE_PROBATION
+                || errors >= HARDWARE_ERRORS
+                || decoded
+                    .as_ref()
+                    .is_err_and(|e| e.is::<video::HardwareFailed>()))
         {
             let why = match &decoded {
-                Err(e) if errors >= HARDWARE_ERRORS => {
+                Err(e) if errors >= HARDWARE_ERRORS || e.is::<video::HardwareFailed>() => {
                     format!(
                         "{} failed {errors} times without a picture: {e:#}",
                         decoder.name()
@@ -4279,6 +4288,27 @@ mod tests {
         fn name(&self) -> &'static str {
             "test hardware"
         }
+    }
+
+    #[test]
+    fn a_fatal_device_failure_renegotiates_without_repeated_driver_calls() {
+        struct Removed;
+        impl video::Decoder for Removed {
+            fn decode(
+                &mut self,
+                _: &[u8],
+                _: bool,
+                _: Option<video::Frame>,
+            ) -> anyhow::Result<Option<video::Frame>> {
+                Err(video::HardwareFailed("device removed".into()).into())
+            }
+            fn name(&self) -> &'static str {
+                "removed hardware"
+            }
+        }
+        let (codec, why) = give_up_on(Codec::Hevc, Box::new(Removed), 1).expect("renegotiation");
+        assert_eq!(codec, Codec::Hevc);
+        assert!(why.contains("device removed"));
     }
 
     #[test]

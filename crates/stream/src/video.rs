@@ -11,10 +11,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(any(target_os = "macos", test))]
 mod av1;
 mod software;
+#[cfg(any(target_os = "linux", test))]
+mod vaapi;
 #[cfg(target_os = "macos")]
 mod videotoolbox;
 #[cfg(any(windows, test))]
 mod worker_deadline;
+
+#[cfg(target_os = "linux")]
+pub use vaapi::dmabuf::{render_on_dmabuf, NativeFrame, Plane as DmaBufPlane};
 
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
@@ -123,7 +128,7 @@ pub struct Frame {
     pub format: PixelFormat,
     /// Viewer clock, immediately after decode, before health checks or rendering.
     pub decoded_at: Option<std::time::Instant>,
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub native: Option<NativeFrame>,
 }
 
@@ -154,7 +159,7 @@ impl Frame {
         self.y.extend_from_slice(y);
         self.uv.clear();
         self.uv.extend_from_slice(uv);
-        #[cfg(any(target_os = "macos", windows))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         {
             self.native = None;
         }
@@ -484,7 +489,11 @@ fn probed() -> Vec<Codec> {
             })
             .clone()
     }
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(target_os = "linux")]
+    {
+        vaapi::codecs(vaapi::capabilities())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         vec![Codec::H264Baseline]
     }
@@ -521,7 +530,7 @@ pub fn new_decoder_for_color(
         color.supported() && (color.bit_depth == 8 || codec == Codec::Hevc),
         "unsupported stream colour"
     );
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     anyhow::ensure!(color.bit_depth == 8, "10-bit decoding is unavailable");
     let decoder = platform_decoder_for_stream(codec, width, height, color.bit_depth)?;
     Ok(match Broken::wanted(codec) {
@@ -548,7 +557,17 @@ fn platform_decoder_for_stream(
         }
         Err(e) => Err(e),
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    return match vaapi::open(codec, _width, _height, depth == 10) {
+        Ok(d) if codec == Codec::H264Baseline => Ok(Box::new(Fallback::new(Box::new(d)))),
+        Ok(d) => Ok(Box::new(d)),
+        Err(e) if codec == Codec::H264Baseline => {
+            tracing::info!("VA-API: {e:#}; decoding in software");
+            Ok(Box::new(software::Software::new()))
+        }
+        Err(e) => Err(e),
+    };
+    #[cfg(not(any(windows, target_os = "linux")))]
     new_decoder_with_format(
         codec,
         if depth == 10 {
@@ -560,7 +579,25 @@ fn platform_decoder_for_stream(
 }
 
 pub fn new_decoder_with_format(codec: Codec, format: PixelFormat) -> Result<Box<dyn Decoder>> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    anyhow::ensure!(
+        format == PixelFormat::Nv12 || codec == Codec::Hevc,
+        "P010 decoding requires HEVC"
+    );
+    #[cfg(target_os = "linux")]
+    return platform_decoder_for_stream(
+        codec,
+        0,
+        0,
+        if format == PixelFormat::P010 { 10 } else { 8 },
+    );
+    #[cfg(not(target_os = "linux"))]
+    new_platform_decoder_with_format(codec, format)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn new_platform_decoder_with_format(codec: Codec, format: PixelFormat) -> Result<Box<dyn Decoder>> {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     anyhow::ensure!(
         format == PixelFormat::Nv12,
         "P010 output is available on macOS only"
@@ -595,6 +632,40 @@ pub fn new_decoder_with_format(codec: Codec, format: PixelFormat) -> Result<Box<
         Codec::H264Baseline => Ok(Box::new(software::Software::new())),
         other => anyhow::bail!("this machine cannot decode {}", other.name()),
     }
+}
+
+/// A platform failure that prevents further use of this decoder. Baseline
+/// can switch locally to software, other codecs use session renegotiation.
+#[derive(Debug)]
+pub struct HardwareFailed(pub String);
+
+impl std::fmt::Display for HardwareFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HardwareFailed {}
+
+/// Whether a codec can take the requested geometry. Unknown dimensions are
+/// checked again when the host accepts and when parameter sets arrive.
+pub fn decodable_at(codec: Codec, _width: u32, _height: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    return vaapi::fits(vaapi::capabilities(), codec, _width, _height);
+    #[cfg(not(target_os = "linux"))]
+    decodable().contains(&codec)
+}
+
+/// Retain display colour support only where a decoder can produce it.
+pub fn decoder_color(
+    color: latch_proto::color::ColorCapabilities,
+    _width: u32,
+    _height: u32,
+) -> latch_proto::color::ColorCapabilities {
+    #[cfg(target_os = "linux")]
+    return vaapi::color(vaapi::capabilities(), color, _width, _height);
+    #[cfg(not(target_os = "linux"))]
+    color
 }
 
 /// Access units a platform decoder may take without giving a picture or
@@ -641,6 +712,11 @@ impl Decoder for Fallback {
                 .as_ref()
                 .is_err_and(|e| e.is::<worker_deadline::ReopenFailed>())
             {
+                self.proven = false;
+                self.tries = PROBATION - 1;
+            }
+            #[cfg(any(target_os = "linux", test))]
+            if result.as_ref().is_err_and(|e| e.is::<HardwareFailed>()) {
                 self.proven = false;
                 self.tries = PROBATION - 1;
             }
@@ -842,6 +918,11 @@ mod tests {
         assert_eq!(decoder.name(), "Latch H.264 (software)");
         // From then on software fills the renderer's spare buffers.
         let spare = Frame {
+            format: PixelFormat::P010,
+            color: latch_proto::color::ColorDescription {
+                bit_depth: 10,
+                ..Default::default()
+            },
             y: Vec::with_capacity(64 * 64 * 2),
             uv: Vec::with_capacity(64 * 64),
             ..Default::default()
@@ -852,6 +933,8 @@ mod tests {
             .unwrap()
             .expect("software's picture");
         assert_eq!((frame.y.as_ptr(), frame.uv.as_ptr()), (y_ptr, uv_ptr));
+        assert_eq!(frame.format, PixelFormat::Nv12);
+        assert_eq!(frame.color.bit_depth, 8);
     }
 
     #[test]
@@ -865,6 +948,34 @@ mod tests {
         }
         assert!(decoder.decode(&[0, 0, 1, 0x41], false, None).is_err());
         assert_eq!(decoder.name(), "Latch H.264 (software)");
+    }
+
+    #[test]
+    fn a_proven_hardware_decoder_failure_switches_to_software_and_requests_an_idr() {
+        struct FailsAfterPicture(bool);
+        impl Decoder for FailsAfterPicture {
+            fn decode(&mut self, _: &[u8], _: bool, _: Option<Frame>) -> Result<Option<Frame>> {
+                if self.0 {
+                    return Err(HardwareFailed("device removed".into()).into());
+                }
+                self.0 = true;
+                Ok(Some(Frame::default()))
+            }
+            fn name(&self) -> &'static str {
+                "test hardware"
+            }
+        }
+        let mut decoder = Fallback::new(Box::new(FailsAfterPicture(false)));
+        assert!(decoder.decode(&[], true, None).unwrap().is_some());
+        let error = decoder
+            .decode(&[], false, None)
+            .err()
+            .expect("keyframe request");
+        assert!(error.to_string().contains("waiting for a keyframe"));
+        assert_eq!(decoder.name(), "Latch H.264 (software)");
+        let (idr, width, height) = vaapi::probe_baseline();
+        let frame = decoder.decode(&idr, true, None).unwrap().unwrap();
+        assert_eq!((frame.width, frame.height), (width, height));
     }
 
     #[test]

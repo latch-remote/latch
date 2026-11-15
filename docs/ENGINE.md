@@ -319,6 +319,46 @@ viewer's order is unchanged. Each encoder fallback refits width, height, FPS
 and bitrate from the original request, including software limits, and undoes
 and repeats desktop preparation for that geometry.
 
+Linux viewers load `libva.so.2` and `libva-drm.so.2` at runtime and probe
+DRM render nodes for H.264 Constrained Baseline/Main/High and HEVC Main/Main10.
+Each profile needs a VLD entry point, a compatible render target format, and
+a successfully decoded 256×256 probe with the expected visible pixels.
+Driver surface attributes supply maximum width and height per profile, with
+config attributes as a fallback. Unknown dimensions remain unknown. The
+probe establishes codec availability and reports driver limits, without
+claiming a measured maximum frame rate. Every candidate render node retains
+its own limits. Requested dimensions filter codec offers, accepted dimensions
+are checked again on open, and coded SPS dimensions are checked before surface
+allocation. Ten-bit colour is offered only with a matching Main10 probe.
+AV1 remains unavailable through this Linux decoder.
+
+On an EGL/GLES wgpu renderer with DMA-BUF import support, VA-API exports
+separate Y and UV planes. EGL imports their DRM formats, offsets, pitches and
+modifiers. Surface leases prevent reuse while the renderer or submitted GPU
+work holds a picture. Export/import failure disables this path for the
+process. Vulkan, unsupported EGL layouts and cropped pictures use NV12/P010
+readback into reusable CPU buffers and the existing renderer upload path.
+The Linux GUI offers ten-bit SDR when the renderer supports normalized
+16-bit textures. Native Linux HDR display output requires further work.
+
+Hardware calls run on a decoder worker, with a five-second open deadline and
+a one-second access-unit deadline. A timeout disables further VA-API opens
+for the process, bounding abandoned workers. The capability probe has its own
+ten-second deadline. A Baseline hardware failure switches to `latch-codec`
+and requests a keyframe when needed, including after successful hardware
+pictures. A fatal High/HEVC device failure immediately enters the existing
+codec renegotiation chain, eventually reaching software Baseline. Bitstream
+errors invalidate references and request a keyframe. Missing libva, missing
+render nodes and failed probes leave software Baseline available.
+
+`LATCH_LINUX_DECODER=software` disables VA-API. The default is `auto` and
+`vaapi` enables the same probed path. `LATCH_VAAPI_DEVICE` names the DRM render
+node to try first, followed by the other render nodes. Pure-Rust parser,
+negotiation, crop/layout and fallback tests run without GPU hardware on all
+CI platforms. On Linux, `LATCH_TEST_VAAPI=1 cargo test -p latch-stream
+video::vaapi` requires a working VA-API device. Real Intel/AMD decode and
+presentation verification remains outstanding.
+
 The queue of encoded frames waiting for the decoder is bounded by age: three
 frame intervals, clamped to 12–100 ms. Up to eight frames may wait, so the
 burst a network stall releases is decoded rather than discarded. Past either

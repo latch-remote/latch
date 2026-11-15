@@ -8,6 +8,8 @@ mod hdr10;
 #[cfg(any(target_os = "macos", windows))]
 mod presenter;
 use egui_wgpu::wgpu;
+#[cfg(target_os = "linux")]
+mod linux_dmabuf;
 #[cfg(any(target_os = "macos", windows))]
 use egui_wgpu::wgpu::hal;
 use latch_stream::video::PixelFormat;
@@ -184,6 +186,23 @@ struct InFlightFrame {
     bind_group: wgpu::BindGroup,
 }
 
+#[cfg(target_os = "linux")]
+struct DmaBufFrame {
+    frame: Option<Frame>,
+    queue: wgpu::Queue,
+    _textures: [wgpu::Texture; 2],
+    bind_group: wgpu::BindGroup,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for DmaBufFrame {
+    fn drop(&mut self) {
+        if let Some(frame) = self.frame.take() {
+            self.queue.on_submitted_work_done(move || drop(frame));
+        }
+    }
+}
+
 /// Transparent where the EDR layer below egui's shows the picture.
 #[cfg(target_os = "macos")]
 const HOLE: &str = r#"
@@ -320,6 +339,8 @@ struct Planes {
 /// Lives in egui-wgpu's callback resources for the life of the window.
 pub struct Resources {
     retained: Option<Frame>,
+    #[cfg(target_os = "linux")]
+    dmabuf: Option<DmaBufFrame>,
     #[cfg(windows)]
     hdr10: Option<hdr10::Hdr10>,
     #[cfg(windows)]
@@ -491,6 +512,8 @@ impl Resources {
         });
         Self {
             retained: None,
+            #[cfg(target_os = "linux")]
+            dmabuf: None,
             #[cfg(windows)]
             hdr10: None,
             #[cfg(windows)]
@@ -533,6 +556,10 @@ impl Resources {
     }
 
     fn bind_group(&self) -> Option<&wgpu::BindGroup> {
+        #[cfg(target_os = "linux")]
+        if let Some(imported) = &self.dmabuf {
+            return Some(&imported.bind_group);
+        }
         #[cfg(target_os = "macos")]
         if let Some(in_flight) = self.in_flight_ring.back() {
             return Some(&in_flight.bind_group);
@@ -754,8 +781,77 @@ impl Resources {
             }
             return;
         }
+        #[cfg(target_os = "linux")]
+        if frame.native.is_some() {
+            match self.upload_dmabuf(device, queue, frame) {
+                Ok(()) => slot.rendered(decoded_at),
+                Err(reason) => {
+                    tracing::warn!("DMA-BUF import failed ({reason}); using VA-API readback");
+                    latch_stream::video::render_on_dmabuf(false);
+                    self.retire_dmabuf(queue);
+                }
+            }
+            return;
+        }
         self.upload_cpu(device, queue, frame, slot);
         slot.rendered(decoded_at);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retire_dmabuf(&mut self, queue: &wgpu::Queue) {
+        if let Some(old) = self.dmabuf.take() {
+            queue.on_submitted_work_done(move || drop(old));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn upload_dmabuf(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: Frame,
+    ) -> Result<(), String> {
+        let textures = linux_dmabuf::import(device, &frame)?;
+        let views = textures
+            .each_ref()
+            .map(|t| t.create_view(&Default::default()));
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("latch DMA-BUF picture"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&views[0]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&views[1]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.uniforms.as_entire_binding(),
+                },
+            ],
+        });
+        let u = Uniforms {
+            full_range: frame.full_range as u32,
+            srgb_target: self.srgb_target as u32,
+            ten_bit: (frame.format == PixelFormat::P010) as u32,
+            hdr: frame.color.is_hdr() as u32,
+        };
+        queue.write_buffer(&self.uniforms, 0, &u.bytes());
+        self.retire_dmabuf(queue);
+        self.dmabuf = Some(DmaBufFrame {
+            frame: Some(frame),
+            queue: queue.clone(),
+            _textures: textures,
+            bind_group,
+        });
+        Ok(())
     }
 
     /// Draw a decoder's shared texture where it is: open it on the window's
@@ -1097,6 +1193,8 @@ impl Resources {
         frame: Frame,
         slot: &FrameSlot,
     ) {
+        #[cfg(target_os = "linux")]
+        self.retire_dmabuf(queue);
         #[cfg(target_os = "macos")]
         while let Some(old) = self.in_flight_ring.pop_front() {
             queue.on_submitted_work_done(move || drop(old));
@@ -1215,6 +1313,8 @@ impl egui_wgpu::CallbackTrait for Paint {
 
 /// Install the shared GPU resources; call once when the window is created.
 pub fn install(ctx: &egui::Context, render_state: &egui_wgpu::RenderState) {
+    #[cfg(target_os = "linux")]
+    latch_stream::video::render_on_dmabuf(linux_dmabuf::supported(&render_state.device));
     let res = Resources::new(&render_state.device, render_state.target_format);
     render_state.renderer.write().callback_resources.insert(res);
     // Hardware-decoded pictures can stay on the GPU when this window draws

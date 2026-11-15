@@ -4,6 +4,12 @@ The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
 `## X.Y.Z (date)`.
 
+## Unreleased
+
+- Add runtime-loaded Linux VA-API H.264 and HEVC/Main10 viewer decoding,
+  profile and resolution probing, EGL DMA-BUF presentation with readback
+  fallback, and automatic software recovery after hardware failures.
+
 ## 6.0.0 (2026-11-14)
 
 ### Streaming and recovery

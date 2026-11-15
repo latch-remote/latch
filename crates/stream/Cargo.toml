@@ -60,6 +60,8 @@ objc2-core-haptics = { version = "0.3", default-features = false, features = ["s
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSError", "NSString"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# Runtime-loaded VA-API, optional on machines without libva.
+libloading = "0.8"
 # Gamepads through evdev; pure Rust ioctls.
 evdev = "0.13"
 # The output device's channel map (cpal's own ALSA binding).
