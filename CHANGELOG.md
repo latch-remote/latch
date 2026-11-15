@@ -48,7 +48,7 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Streaming
 
-- Fix stale Mac-host pictures and decoder buffering on Windows. Declare
+- Fix stale or missing host pictures and decoder buffering on Windows. Declare
   zero H.264/HEVC reordering on hosts, normalize legacy hosts' parameter
   sets in the Windows viewer, preserve decoder output identities, and
   expose held-picture counters in stream statistics.

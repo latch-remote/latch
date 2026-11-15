@@ -40,3 +40,12 @@ measure raw steady-state withholding and require each patched access unit
 to return its own sample time immediately, through software and optional
 real DXVA. The original six-frame-IDR pair tape is retained separately in
 `tests/pairs/mac-vt-6.0.0.h264`.
+
+`linux-aarch64-capture.h264` contains the 24 original access units from
+`capture.session.json` in run 43707807239's `pairs-recording-linux-aarch64`
+artifact at PR #107 head `d2e4d3c`. The Windows native clean cell in job
+132794819079 intermittently lost decoded identities 2–5. Its Rust-encoder
+SPS already declares POC type 2, zero reordered frames and one buffer slot.
+MF tests require all 24 sample times and reference pixels. A deterministic
+collector test makes pictures 2–6 ready in one drain and verifies that each
+is returned in order, independently of decoder timing and SPS rewriting.

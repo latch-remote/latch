@@ -106,6 +106,21 @@ impl Drop for SharedSurface {
     }
 }
 type Pictures = Vec<(i64, DecodedNv12)>;
+/// Consume every ready output before asking the MFT for another input.
+/// Keep partial output on error so a retry can still return its identities.
+fn drain_output<T>(
+    pictures: &mut Vec<T>,
+    mut next: impl FnMut() -> Result<Option<T>>,
+) -> Result<()> {
+    for _ in 0..64 {
+        match next()? {
+            Some(picture) => pictures.push(picture),
+            None => return Ok(()),
+        }
+    }
+    bail!("decoder produced too many outputs without needing input")
+}
+
 struct Request {
     bytes: Vec<u8>,
     time: i64,
@@ -1059,6 +1074,12 @@ impl State {
                 other => other?,
             }
         }
+        let mut pictures = std::mem::take(&mut self.pictures);
+        let result = drain_output(&mut pictures, || self.read_output());
+        self.pictures = pictures;
+        result
+    }
+    fn read_output(&mut self) -> Result<Option<(i64, DecodedNv12)>> {
         // SAFETY: ManuallyDrop output fields are released on every HRESULT. All
         // output buffers are copied before the transform can recycle its sample.
         unsafe {
@@ -1086,7 +1107,7 @@ impl State {
                 let sample = ManuallyDrop::take(&mut output.pSample);
                 ManuallyDrop::drop(&mut output.pEvents);
                 match result {
-                    Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
+                    Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
                     Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
                         self.output_type()?;
                         continue;
@@ -1149,10 +1170,10 @@ impl State {
                 let time = sample
                     .GetSampleTime()
                     .context("decoder output has no sample time")?;
-                self.pictures.push((time, picture));
+                return Ok(Some((time, picture)));
             }
         }
-        bail!("decoder produced too many outputs without needing input")
+        bail!("decoder changed output format too many times")
     }
 }
 impl Drop for State {
@@ -1178,6 +1199,44 @@ impl Drop for State {
 mod tests {
     use super::*;
     #[test]
+    fn one_drain_returns_every_ready_picture_in_order() -> Result<()> {
+        // Reproduce the missing Linux capture identities 2..5: all five
+        // pictures become ready before the next ProcessInput. The source
+        // is deterministic and uses the collector State::drain calls.
+        let mut ready: std::collections::VecDeque<(i64, Vec<u8>)> = (2..=6)
+            .map(|identity| (identity * 166667, vec![identity as u8; 6]))
+            .collect();
+        let mut pictures = Vec::new();
+        drain_output(&mut pictures, || Ok(ready.pop_front()))?;
+        assert!(ready.is_empty());
+        assert_eq!(
+            pictures,
+            (2..=6)
+                .map(|i| (i * 166667, vec![i as u8; 6]))
+                .collect::<Vec<_>>()
+        );
+        // A later drain leaves the returned batch intact.
+        drain_output(&mut pictures, || Ok(None))?;
+        assert_eq!(pictures.len(), 5);
+        Ok(())
+    }
+    #[test]
+    fn a_partial_drain_keeps_output_across_an_error_and_retry() -> Result<()> {
+        let mut pictures = Vec::new();
+        let mut outputs = [
+            Ok(Some(2)),
+            Ok(Some(3)),
+            Err(anyhow::anyhow!("MFT failure")),
+        ]
+        .into_iter();
+        assert!(drain_output(&mut pictures, || outputs.next().unwrap()).is_err());
+        assert_eq!(pictures, [2, 3]);
+        let mut ready = [4, 5, 6].into_iter();
+        drain_output(&mut pictures, || Ok(ready.next()))?;
+        assert_eq!(pictures, [2, 3, 4, 5, 6]);
+        Ok(())
+    }
+    #[test]
     fn installed_hardware_decoders_produce_visible_pixels() {
         let codecs = supported();
         eprintln!("hardware decoders: {codecs:?}");
@@ -1194,6 +1253,36 @@ mod tests {
             assert!(frame.y[192 * frame.y_stride + 128] <= 20);
             assert_eq!(decoder.name(), "Media Foundation (DXVA)");
         }
+    }
+    #[test]
+    fn linux_capture_outputs_keep_their_sample_times_and_pixels() -> Result<()> {
+        let _runtime = Runtime::new()?;
+        let bytes = include_bytes!("../../tests/fixtures/linux-aarch64-capture.h264");
+        let units = latch_codec::h264::nal::access_units(bytes);
+        assert_eq!(units.len(), 24);
+        let mut state = State::new(Codec::H264Baseline, false, None, 160, 98, 8)?;
+        let mut reference = latch_codec::h264::Decoder::new();
+        for (index, unit) in units.into_iter().enumerate() {
+            assert!(
+                matches!(
+                    latch_codec::bitstream::low_delay(unit, latch_codec::bitstream::Format::H264)?,
+                    std::borrow::Cow::Borrowed(_)
+                ),
+                "Linux software SPS already declares zero reordering"
+            );
+            let time = index as i64 * 166667;
+            let pictures = state.decode(unit, time)?;
+            assert_eq!(
+                pictures.iter().map(|p| p.0).collect::<Vec<_>>(),
+                [time],
+                "Linux capture input {index}"
+            );
+            check_picture(
+                &pictures[0].1,
+                reference.decode(unit)?.context("Linux reference picture")?,
+            );
+        }
+        Ok(())
     }
     fn tape() -> Vec<&'static [u8]> {
         latch_codec::h264::nal::access_units(include_bytes!(

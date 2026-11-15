@@ -111,6 +111,13 @@ five reference-buffer slots, with latency-increase-plus-one zero. Host
 normalization makes the latency bound explicit as one and preserves those
 five slots.
 
+The separate Linux ARM64 capture → Windows MF failure at PR #107 head
+`d2e4d3c` lost identities 2–5 even though the Rust encoder's SPS already
+declares zero reordering. The shared output collector preserves every
+ready sample, independently of SPS rewriting. Its deterministic multi-output
+and partial-error/retry tests cover that loss mechanism, and the recorded
+Linux tape checks all 24 timestamps and picture contents.
+
 Mac VideoToolbox and the Rust decoder pass local zero-delay replay. Linux
 software, Windows software/MF and Mac VideoToolbox combinations run in the
 pair grid, including the committed 6.0.0 Mac tape. Linux NVENC/VA-API and
