@@ -102,9 +102,10 @@ GitHub release notes, so each version gets a heading of the form
   and preserve short-timer precision on Windows.
 - Keep anonymous connectivity checks and certificate challenges responsive
   while the relay is idle, and enforce their request and admission deadlines.
-- Forward relayed video, audio and input as soon as sockets or local send
-  queues are ready, reducing latency on busy machines and systems with coarse
-  timers while retaining bounded queues, deadlines and durable quotas.
+- Restore the relay daemon's previous forwarding cadence for active connections
+  and sessions after WAN video acknowledgments regressed with readiness waits.
+  The cause remains unresolved. Idle admission and HTTP checks retain readiness
+  waits, and client send queues retain immediate wake-ups.
 - Retain working PAC proxies across incomplete discovery, promptly recheck after
   sign-in, and measure portal waiting from detection. Report host-labelled
   network failures and preserve TLS interception evidence across routes.

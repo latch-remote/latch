@@ -952,25 +952,31 @@ and HKDF-SHA256 protect records end to end. Session tickets and keys travel
 only over the original authorized Tailscale control connection, which
 remains required. Frame, queue and acknowledgment deadlines bound stalls.
 
-Relay daemon and client media lanes use level-triggered socket readiness
-(`poll` on Linux and macOS). Windows checks readiness with zero-timeout
-`WSAPoll` calls between high-resolution Rust sleeps of at most two milliseconds.
-This preserves the previous timer precision for control pacing, keepalive,
-quota completion and deadline housekeeping without relying on the system tick
-or a process-wide timer-resolution request. The engine does not call
-`timeBeginPeriod`. Local send queues and cancellation signal connected loopback
-UDP sockets. If those sockets are unavailable, one warning is logged and the
-lane or daemon uses the two-millisecond polling cap.
-Buffered TLS plaintext is processed before waiting, including WebSocket
-headers and frames. Each turn retains the bounded socket I/O and per-lane
-record budget. Active connections and pending quota reservations retain a
-two-millisecond maximum housekeeping wait. An empty daemon waits for new
-connections, cancellation or session expiry. The optional HTTP listener and
-in-flight probe/challenge requests participate in the same readiness wait.
-Their header, response, accept-retry and admission-window deadlines bound
-that wait. WebSocket controls retain a
-two-millisecond cadence to bound control-flood responses. DNS, address racing and carrier setup
-still use short bounded polling waits during connection establishment.
+The relay daemon retains its previous forwarding cadence whenever a relay
+connection or session exists, including connection setup and unattached grants.
+After a turn that transfers no TCP bytes, it sleeps for two milliseconds before
+the next turn. Turns that transfer bytes continue immediately. Readiness-driven
+forwarding regressed video acknowledgment deadlines over a real WAN, and the
+cause remains unresolved. Each turn retains the bounded socket I/O and per-lane
+record budget, with the existing backpressure, quota and deadline checks.
+
+With no relay connections or sessions, the daemon waits for listener readiness
+or cancellation. The optional HTTP listener and in-flight probe/challenge
+requests participate in that wait. Their header, response, accept-retry and
+admission-window deadlines bound the timeout. Pending quota reservations retain
+the two-millisecond housekeeping cap.
+
+Client media lanes use level-triggered socket readiness (`poll` on Linux and
+macOS), with local send queues and cancellation signaling connected loopback
+UDP sockets. Buffered TLS plaintext is processed before waiting, including
+WebSocket headers and frames. If wake sockets are unavailable, one warning is
+logged and the lane or idle daemon uses the two-millisecond polling cap.
+Windows checks readiness with zero-timeout `WSAPoll` calls between
+high-resolution Rust sleeps of at most two milliseconds, preserving the previous
+timer precision without relying on the system tick. The engine does not call
+`timeBeginPeriod`. WebSocket controls retain a two-millisecond cadence to bound
+control-flood responses. DNS, address racing and carrier setup still use short
+bounded polling waits during connection establishment.
 
 Relay failure restores UDP routing. Recovered-UDP switch-back and grant
 lifecycle refinements remain under validation.

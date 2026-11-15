@@ -7,7 +7,6 @@ use crate::{
     Attachment, Cancel, Grant, Role,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-#[cfg(test)]
 use std::thread;
 use std::{
     io,
@@ -333,12 +332,23 @@ impl Daemon {
                 Ordering::Relaxed,
             );
             if self.metrics.network_bytes.load(Ordering::Relaxed) == before {
-                self.wait(&wake, TICK)?;
+                self.wait_after_turn(&wake)?;
             }
         }
         self.metrics.active_connections.store(0, Ordering::Relaxed);
         self.metrics.active_sessions.store(0, Ordering::Relaxed);
         Ok(())
+    }
+    fn wait_after_turn(&self, wake: &crate::readiness::Wake) -> io::Result<()> {
+        if self.connections.iter().any(Option::is_some) || self.sessions.iter().any(Option::is_some)
+        {
+            // Restore the previous forwarding cadence while the WAN ACK
+            // regression with active readiness waits remains unexplained.
+            thread::sleep(TICK);
+            Ok(())
+        } else {
+            self.wait(wake, TICK)
+        }
     }
     fn wait(&self, wake: &crate::readiness::Wake, housekeeping: Duration) -> io::Result<()> {
         let mut sockets = vec![latch_proto::transport::SocketInterest {
@@ -881,6 +891,44 @@ mod tests {
         .unwrap();
         config.initialize_quota = true;
         (Daemon::bind(config).unwrap(), path)
+    }
+    #[test]
+    fn connections_and_unattached_grants_retain_the_previous_wait_cadence() {
+        use std::io::Write;
+        use std::net::TcpStream;
+
+        let (mut daemon, path) = test_daemon();
+        let wake = crate::readiness::Wake::new();
+        wake.notify();
+        daemon.wait_after_turn(&wake).unwrap();
+
+        let mut peer = TcpStream::connect(daemon.local_addr().unwrap()).unwrap();
+        daemon.listener.set_nonblocking(false).unwrap();
+        let (tcp, address) = daemon.listener.accept().unwrap();
+        daemon.listener.set_nonblocking(true).unwrap();
+        let tls = rustls::ServerConnection::new(daemon.config.tls.clone()).unwrap();
+        daemon.connections[0] = Some(Connection {
+            socket: TlsSocket::new(tls.into(), tcp).unwrap(),
+            ip: address.ip(),
+            opened: Instant::now(),
+            phase: Phase::Request,
+        });
+        peer.write_all(b"readable input").unwrap();
+        wake.notify();
+        let start = Instant::now();
+        daemon.wait_after_turn(&wake).unwrap();
+        assert!(start.elapsed() >= TICK);
+
+        daemon.create(0).unwrap();
+        daemon.connections[0] = None;
+        assert!(daemon.sessions.iter().any(Option::is_some));
+        let start = Instant::now();
+        daemon.wait_after_turn(&wake).unwrap();
+        assert!(start.elapsed() >= TICK);
+
+        drop(peer);
+        drop(daemon);
+        std::fs::remove_file(path).unwrap();
     }
     #[test]
     fn low_credit_sockets_wake_when_durable_refill_is_available() {
