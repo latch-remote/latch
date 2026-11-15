@@ -335,10 +335,7 @@ pub(super) fn portal() -> CaptivePortal {
         unsafe {
             (factory.vtable().GetInternetConnectionProfile)(factory.as_raw(), &mut raw).ok()?;
         }
-        if raw.is_null() {
-            return Ok(Level::None);
-        }
-        let profile = unsafe { ConnectionProfile::from_raw(raw) };
+        let profile: ConnectionProfile = unsafe { windows::core::Type::from_abi(raw)? };
         profile.GetNetworkConnectivityLevel()
     }
     // Release every WinRT object and COM-backed error before closing the
