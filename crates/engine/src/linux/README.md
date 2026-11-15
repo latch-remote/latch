@@ -37,11 +37,10 @@ The helper process needs the running executable to remain executable.
 
 Every X round trip fails after 2 s without a byte from the server (RandR:
 10 s), so a stalled X server ends a grab with an error instead of holding the
-session's stop and display restore. Rootless Xwayland (the XWAYLAND
-extension, or RandR outputs named `XWAYLAND*`) is refused with a message to
-log in to an Xorg session; so is a failed connection while
-`WAYLAND_DISPLAY`/`XDG_SESSION_TYPE` say Wayland. A separate Xorg server on
-`DISPLAY` inside a Wayland session still works.
+session's stop and display restore. With `LATCH_LINUX_BACKEND=x11`, rootless Xwayland (the XWAYLAND
+extension, or RandR outputs named `XWAYLAND*`) is refused with instructions
+to enable the Wayland backend. A separate Xorg server on `DISPLAY` inside
+a Wayland session still works.
 
 RandR sizes follow the CRTC's rotation: a request is a size on screen, and a
 quarter-turned CRTC gets the mode with swapped sides. Modes that `prepare`
@@ -65,6 +64,122 @@ acknowledgement that a client has consumed a key event, so each character
 allows 12 ms before the mapping is reused or restored. This was verified
 with XFCE Terminal, including Latin and Greek text. A stalled application
 or another client remapping the same spare keycode remains a race.
+
+## Wayland
+
+Latch selects Wayland when `WAYLAND_DISPLAY` is nonempty or
+`XDG_SESSION_TYPE=wayland`, except when `DISPLAY` reaches a separate Xorg
+desktop. `LATCH_LINUX_BACKEND=wayland` or `x11` overrides detection, and
+`auto` restores it. X11 sessions continue through the existing X11 backend.
+
+Install PipeWire, a session manager such as WirePlumber, `xdg-desktop-portal`,
+and the portal backend for the compositor. Distribution package names vary.
+On Ubuntu/Debian, use the following packages for your desktop.
+
+| Desktop | Portal package | Input |
+| --- | --- | --- |
+| GNOME | `xdg-desktop-portal-gnome` | RemoteDesktop keyboard and pointer |
+| KDE Plasma | `xdg-desktop-portal-kde` | RemoteDesktop keyboard and pointer |
+| sway / wlroots | `xdg-desktop-portal-wlr` | uinput fallback when RemoteDesktop is absent |
+
+Log in again after installing the packages. Run Latch as the desktop user.
+In **Sharing**, choose **Run setup** and approve the compositor's screen and
+input prompt. This uses a combined RemoteDesktop/ScreenCast session when
+available. ScreenCast-only portals still permit viewing. The wlroots uinput
+fallback needs the `/dev/uinput` permissions described under Gamepads in
+`deploy/native/README.md`, supports physical keys, buttons, motion and scroll,
+and maps absolute positions across the compositor's layout. Unicode text
+requires RemoteDesktop. A denied RemoteDesktop input grant is reported to
+the viewer.
+
+Portal restore tokens are rotated after each successful Start and stored
+in `$XDG_STATE_HOME/latch/wayland-portal.json`, defaulting to
+`~/.local/state/latch/wayland-portal.json`, with owner-only permissions and
+atomic replacement. Setup and streaming serialize token use across
+processes. `LATCH_WAYLAND_TOKEN_FILE` overrides the path. Tokens for
+RemoteDesktop and ScreenCast are kept separately. Restoration requires
+RemoteDesktop version 2 or ScreenCast version 4 and a backend that supports
+persistence. Older backends, including some xdg-desktop-portal-wlr releases,
+ask again per session. Revocation or expired tokens can also prompt again.
+Session-only approval completes Sharing setup and enables autostart. The
+setup log explains that each connection needs approval on this screen.
+Current viewers allow 180 seconds for startup, including up to 90 seconds
+of portal approval. Older viewers retain their 60-second startup budget,
+with portal approval capped at 15 seconds to leave time for preparation.
+Closing the viewer dismisses its pending portal request.
+
+The background user service must have the desktop session's environment.
+GNOME and Plasma normally import it. For sway, run the following from the
+compositor session, and restart `latch.service` if it was already running.
+
+```sh
+dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE
+systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE
+systemctl --user restart latch.service
+```
+
+Set `XDG_CURRENT_DESKTOP=sway` in the sway session and configure portal
+routing in `~/.config/xdg-desktop-portal/portals.conf` if multiple portal
+backends are installed. The session bus, PipeWire socket and compositor
+must belong to the same user. A user service requires a logged-in graphical
+session to share that desktop.
+
+PipeWire is runtime-loaded from `libpipewire-0.3.so.0`. Compilation needs
+no PipeWire headers or linker libraries. Latch negotiates BGRx/BGRA/RGBx/RGBA
+and prefers linear DMA-BUFs that can be CPU-mapped. Mapping failure renegotiates
+shared memory. `LATCH_WAYLAND_DMABUF=0` forces shared memory for diagnosis.
+Tiled GPU modifiers are excluded from the offer. Frames are copied into the
+existing BGRA CPU pipeline, including its hardware encoders, damage tracking
+and frame pacer. Missing damage metadata means a full update, and pending
+damage accumulates when the consumer skips pictures. The compositor draws
+the cursor when its portal supports embedded cursors. The selected monitor
+keeps its compositor resolution and scales to the negotiated stream size.
+Absolute input follows the portal backend's coordinate convention. GNOME's
+Mutter-backed NotifyPointerMotionAbsolute consumes stream pixels and divides
+by monitor scale. KDE consumes logical coordinates. Latch identifies the
+backend object for the actual portal session. The uinput fallback reads the
+compositor's xdg-output logical layout, applies the selected monitor's origin,
+and normalizes across the whole desktop, including negative origins. Layout
+requests have a one-second deadline.
+
+SPA VideoTransform metadata is requested and its rotation/reflection is
+undone before encoding. Pointer mapping follows the oriented picture.
+Packed linear DMA-BUF mapping sizes come from stride and height, including
+exporters that report zero maxsize and a sentinel chunk size.
+
+Session.Closed and PipeWire termination end streaming with a reason for the
+viewer and release held input. PipeWire pauses have a two-second grace period
+for format renegotiation. The consumer requests graph processing while waiting
+for its initial picture, so an idle producer's queued first frame reaches it.
+
+### Headless verification
+
+Linux CI runs `scripts/test-wayland.sh` on both native architectures after
+building `cargo build -p latch-engine --example wayland_smoke`. It creates a
+private sway desktop, session bus, PipeWire server and real ScreenCast portal,
+verifies idle startup, changed background pixels, an H.264 encode/decode round
+trip, asymmetric rotated-output pixels and producer shutdown,
+and cleans up its processes and state. The test forces SHM and uses an
+automatic monitor choice in its private portal configuration. Run it as an
+unprivileged user with sway, swaybg, PipeWire, WirePlumber,
+xdg-desktop-portal-wlr, grim and dbus installed. Docker Desktop can run the same
+script with a software renderer. Ubuntu 24.04's xdg-desktop-portal-wlr 0.7
+requires DMA-BUF even for SHM. CI builds upstream 0.7.1 at commit
+`74428f2a8fa7f252e2a46fdf5b697536c66c8a1c` with the explicit
+`scripts/wayland-portal-shm.patch` fixture workaround using Meson and Ninja, then passes
+its binary through `LATCH_TEST_PORTAL_WLR`. The patch changes only the
+pre-negotiation DMA-BUF requirement. Product code handles initial graph
+processing. CI also runs the ignored live layout test under a fresh private
+two-output sway session, checking left and right monitor centers against
+the absolute device's whole-desktop range. Physical uinput injection still
+requires a machine with `/dev/uinput` access. The CI workflow lists its build
+dependencies. PipeWire development packages are installed for that fixture
+after the Rust compile and test steps.
+
+Real GNOME/KDE approval dialogs, RemoteDesktop injection, persisted grants
+across compositor restarts, and hardware DMA-BUF mappings require real-desktop
+verification. Unit tests cover backend selection, POD negotiation, damage,
+input translation and token persistence independently of those services.
 
 ## Reproduce the checks
 

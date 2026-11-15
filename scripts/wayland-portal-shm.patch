@@ -1,0 +1,24 @@
+From: Latch headless test fixture
+Subject: Allow ScreenCast with wl_shm when the compositor has no DMA-BUF
+
+xdg-desktop-portal-wlr 0.7.1 checks for DMA-BUF before it negotiates the
+consumer's buffer type. A pixman headless compositor only offers wl_shm.
+Keep the SHM format requirement and exercise the existing SHM producer.
+
+The fixture changes only the pre-negotiation DMA-BUF check. PipeWire graph
+triggering and first-frame recovery are exercised by the shipping consumer.
+
+diff --git a/src/screencast/screencast.c b/src/screencast/screencast.c
+--- a/src/screencast/screencast.c
++++ b/src/screencast/screencast.c
+@@ -201,9 +201,7 @@ static int start_screencast(struct xdpw_screencast_instance *cast) {
+ 	wl_display_dispatch(cast->ctx->state->wl_display);
+ 	wl_display_roundtrip(cast->ctx->state->wl_display);
+ 
+-	if (cast->screencopy_frame_info[WL_SHM].format == DRM_FORMAT_INVALID ||
+-			(cast->ctx->state->screencast_version >= 3 &&
+-			 cast->screencopy_frame_info[DMABUF].format == DRM_FORMAT_INVALID)) {
++	if (cast->screencopy_frame_info[WL_SHM].format == DRM_FORMAT_INVALID) {
+ 		logprint(INFO, "wlroots: unable to receive a valid format from wlr_screencopy");
+ 		return -1;
+ 	}

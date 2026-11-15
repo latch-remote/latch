@@ -85,6 +85,11 @@ impl EventHook {
     pub fn id() -> egui::Id {
         egui::Id::new("egui-winit-event-hook")
     }
+
+    /// Independent native-key observer, run before the dispatch callback.
+    pub fn keyboard_id() -> egui::Id {
+        egui::Id::new("egui-winit-keyboard-hook")
+    }
 }
 
 /// Handles the integration between egui and a winit Window.
@@ -270,11 +275,10 @@ impl State {
             .or_default()
             .native_pixels_per_point = Some(window.scale_factor() as f32);
 
-        if let Some(hook) = self
-            .egui_ctx
-            .data(|d| d.get_temp::<EventHook>(EventHook::id()))
-        {
-            (hook.on_frame)(self.viewport_id);
+        for id in [EventHook::keyboard_id(), EventHook::id()] {
+            if let Some(hook) = self.egui_ctx.data(|d| d.get_temp::<EventHook>(id)) {
+                (hook.on_frame)(self.viewport_id);
+            }
         }
         self.egui_input.take()
     }
@@ -536,16 +540,15 @@ impl State {
     }
 
     fn notify_event(&self, event: Option<&winit::event::WindowEvent>, first_event: usize) {
-        if let Some(hook) = self
-            .egui_ctx
-            .data(|d| d.get_temp::<EventHook>(EventHook::id()))
-        {
-            (hook.on_event)(
-                self.viewport_id,
-                event,
-                &self.egui_input.events[first_event..],
-                self.egui_input.modifiers,
-            );
+        for id in [EventHook::keyboard_id(), EventHook::id()] {
+            if let Some(hook) = self.egui_ctx.data(|d| d.get_temp::<EventHook>(id)) {
+                (hook.on_event)(
+                    self.viewport_id,
+                    event,
+                    &self.egui_input.events[first_event..],
+                    self.egui_input.modifiers,
+                );
+            }
         }
     }
 
@@ -1186,7 +1189,8 @@ fn key_from_named_key(named_key: winit::keyboard::NamedKey) -> Option<egui::Key>
     })
 }
 
-fn key_from_key_code(key: winit::keyboard::KeyCode) -> Option<egui::Key> {
+/// The egui key for a physical position reported by winit.
+pub fn key_from_key_code(key: winit::keyboard::KeyCode) -> Option<egui::Key> {
     use egui::Key;
     use winit::keyboard::KeyCode;
 

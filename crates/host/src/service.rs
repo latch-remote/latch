@@ -89,7 +89,7 @@ pub struct Service {
     nat: Mutex<Option<NatReport>>,
     nat_running: AtomicBool,
     update_running: Arc<AtomicBool>,
-    admission: Mutex<()>,
+    admission: Arc<Mutex<()>>,
     power_pending: Arc<AtomicBool>,
 }
 
@@ -145,7 +145,7 @@ impl Service {
             nat: Mutex::new(None),
             nat_running: AtomicBool::new(false),
             update_running: Arc::new(AtomicBool::new(false)),
-            admission: Mutex::new(()),
+            admission: Arc::new(Mutex::new(())),
             power_pending: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -159,8 +159,24 @@ impl Service {
     }
 
     fn stop_stream(&self) -> bool {
+        let Some(_admission) = self.begin_stop() else {
+            return false;
+        };
         let server = self.server.lock().clone();
-        server.is_none_or(|server| server.stop(end::HOST_STOPPING, "This host is stopping."))
+        let stopped =
+            server.is_none_or(|server| server.stop(end::HOST_STOPPING, "This host is stopping."));
+        if !stopped {
+            self.power_pending.store(false, Ordering::Release);
+        }
+        stopped
+    }
+
+    fn begin_stop(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        // Portal approval observes this flag while admission is held by prepare.
+        if self.power_pending.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        Some(self.admission.lock())
     }
 
     fn streaming_status(&self) -> Streamer {
@@ -536,6 +552,8 @@ impl Service {
         }
         #[cfg(target_os = "macos")]
         setup.extend(crate::unix_setup::permission_items());
+        #[cfg(target_os = "linux")]
+        setup.extend(latch_engine::linux::wayland_setup_item());
         if wake.magic_packet == Some(false) {
             setup.push(format!("Wake-on-LAN is off on {}.", wake.adapter));
         }
@@ -988,28 +1006,59 @@ impl Service {
                 &Ack::err("could not resolve the streaming peer's Tailscale address"),
             );
         }
-        match server.prepare(request, peer) {
-            Ok(prepared) => {
-                let lease = self.clipboard_lease.clone();
-                let id = Instant::now();
-                *lease.lock() = Some(ClipboardLease {
-                    peer: peer.ip(),
-                    generation: id,
-                    active: false,
-                });
-                Response::switching(control::UPGRADE, move |tcp| {
-                    if let Some(current) = lease.lock().as_mut().filter(|l| l.generation == id) {
-                        current.active = true;
-                    }
+        let lease = self.clipboard_lease.clone();
+        let admission = self.admission.clone();
+        let updating = self.update_running.clone();
+        let stopping = self.power_pending.clone();
+        Response::switching(control::UPGRADE, move |mut tcp| {
+            let prepared = {
+                let _admission = admission.lock();
+                if updating.load(Ordering::Acquire) || stopping.load(Ordering::Acquire) {
+                    let _ = control::write_message(
+                        &mut tcp,
+                        &control::Message::End(control::End {
+                            code: control::end::ENDED,
+                            message: "the host is updating or stopping".into(),
+                        }),
+                    );
+                    return;
+                }
+                let prepared = server.prepare_connected(request, peer, &tcp, stopping.clone());
+                if stopping.load(Ordering::Acquire) {
+                    drop(prepared);
+                    let _ = control::write_message(
+                        &mut tcp,
+                        &control::Message::End(control::End {
+                            code: end::HOST_STOPPING,
+                            message: "the host is stopping".into(),
+                        }),
+                    );
+                    return;
+                }
+                prepared
+            };
+            match prepared {
+                Ok(prepared) => {
+                    let id = Instant::now();
+                    *lease.lock() = Some(ClipboardLease {
+                        peer: peer.ip(),
+                        generation: id,
+                        active: true,
+                    });
                     let _stream = ClipboardStream {
                         lease,
                         generation: id,
                     };
                     server.run(prepared, tcp);
-                })
+                }
+                Err(refusal) => {
+                    let _ = control::write_message(
+                        &mut tcp,
+                        &control::Message::End(refusal.into_end()),
+                    );
+                }
             }
-            Err(refusal) => Response::json(refusal.status, &Ack::err(refusal.message)),
-        }
+        })
     }
 
     /// Everything that decides whether a capture can see the desktop.
@@ -1072,10 +1121,9 @@ impl Service {
             self.log(format!("{what} requested by {from}, refused: {why}"));
             return Response::json(200, &Ack::err(why));
         }
-        let _admission = self.admission.lock();
-        if self.power_pending.swap(true, Ordering::AcqRel) {
+        let Some(_admission) = self.begin_stop() else {
             return Response::json(409, &Ack::err("a power action is already pending"));
-        }
+        };
         self.log(format!("{what} requested by {from}"));
         let server = self.server.lock().clone();
         let log = self.log.clone();
@@ -1612,6 +1660,110 @@ mod tests {
         svc.update_running.store(false, Ordering::Release);
         svc.power_pending.store(true, Ordering::Release);
         assert_eq!(svc.stream(peer, &req).status, 409);
+    }
+
+    #[test]
+    fn preparation_failure_preserves_retryability_after_upgrade() {
+        for (codecs, expected) in [
+            (vec!["h264-baseline"], end::TRANSPORT_FAILED),
+            (vec![], end::CAPTURE_FAILED),
+        ] {
+            let svc = Arc::new(Service::new());
+            *svc.server.lock() = Some(
+                Server::bind(
+                    0,
+                    Options {
+                        prepare: Some(Box::new(|_| anyhow::bail!("temporary desktop failure"))),
+                        ..Options::default()
+                    },
+                )
+                .unwrap(),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                http::serve_with_peer_check(
+                    listener,
+                    |_| true,
+                    move |_, req| svc.stream("100.64.0.1:1234".parse().unwrap(), req),
+                )
+            });
+            let body = serde_json::to_vec(&serde_json::json!({
+                "protocol": latch_proto::PROTOCOL, "width": 64, "height": 64, "fps": 30,
+                "bitrate_kbps": 1000, "codecs": codecs, "udp_port": 9, "audio": false
+            }))
+            .unwrap();
+            let mut tcp = http::upgrade(
+                address,
+                control::PATH,
+                control::UPGRADE,
+                &body,
+                Duration::from_secs(5),
+            )
+            .unwrap()
+            .unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            assert!(
+                matches!(control::read_message(&mut tcp).unwrap(), control::Message::End(e) if e.code == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn stopping_preempts_preparation_before_waiting_for_admission() {
+        let svc = Arc::new(Service::new());
+        let stopping = svc.power_pending.clone();
+        let (entered, preparing) = std::sync::mpsc::channel();
+        *svc.server.lock() = Some(
+            Server::bind(
+                0,
+                Options {
+                    prepare: Some(Box::new(move |_| {
+                        entered.send(()).unwrap();
+                        let deadline = Instant::now() + Duration::from_secs(3);
+                        while !stopping.load(Ordering::Acquire) && Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        anyhow::bail!("cancelled pending approval")
+                    })),
+                    ..Options::default()
+                },
+            )
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = svc.clone();
+        std::thread::spawn(move || {
+            http::serve_with_peer_check(
+                listener,
+                |_| true,
+                move |_, req| serving.stream("100.64.0.1:1234".parse().unwrap(), req),
+            )
+        });
+        let body = serde_json::to_vec(&serde_json::json!({
+            "protocol": latch_proto::PROTOCOL, "width": 64, "height": 64, "fps": 30,
+            "bitrate_kbps": 1000, "codecs": ["h264-baseline"], "udp_port": 9, "audio": false
+        }))
+        .unwrap();
+        let _tcp = http::upgrade(
+            address,
+            control::PATH,
+            control::UPGRADE,
+            &body,
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .unwrap();
+        preparing.recv_timeout(Duration::from_secs(5)).unwrap();
+        let now = Instant::now();
+        let stopped = svc.stop_stream();
+        let elapsed = now.elapsed();
+        // Unblock the fixture even when the old implementation misses cancellation.
+        svc.power_pending.store(true, Ordering::Release);
+        assert!(stopped, "pending approval prevented local quit");
+        assert!(elapsed < Duration::from_secs(1), "stop took {elapsed:?}");
+        assert!(!svc.someone_watching());
     }
 
     #[test]

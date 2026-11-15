@@ -6,6 +6,56 @@ GitHub release notes, so each version gets a heading of the form
 
 ## Unreleased
 
+- Add Linux Wayland screen sharing through the desktop portal and runtime-loaded PipeWire, with linear DMA-BUF capture, shared-memory fallback, RemoteDesktop input, and persisted portal approvals in Sharing setup.
+
+### Input
+
+- Preserve the previous default Command/Ctrl and clipboard mapping in every mouse
+  mode, including hosts running Latch 6.0.0 or older. Mac Control stays Ctrl
+  by default. Add an off-by-default **Control key acts as Windows key** choice
+  beside **Send keys as pressed**, mapping Control to Win/Super with a free
+  mouse and back to Ctrl during game capture. Re-target held modifiers on
+  capture changes. Disable the Control-key choice for older hosts and while
+  Send keys as pressed is selected, with an explanation. Keep Send keys as
+  pressed as the explicit all-mode opt-out. Restore the Mac Quit
+  and Hide menu override in windowed free-mouse streams. Preserve native
+  paste fallback when the viewer clipboard contains an image or no text.
+- Move Windows keyboard capture to a dedicated message-loop thread with a
+  bounded queue, all-modifier ordering and a 250 ms UI watchdog. Pump Windows
+  messages with GetMessageW and stop with a posted WM_QUIT. Renew capture
+  every 83 ms independently of video. Drop unmatched ordering barriers after
+  8 ms once the UI keyboard queue is idle, preserving stalled chords without
+  releasing held input. Release X11 grabs after a 250 ms UI stall and replay grabbed media controls locally.
+  Leave the X11 watchdog idle without a grab. After a two-second lock stall,
+  probe the X server on a separate connection and log then abort only if it
+  answers while the display lock remains stuck. Wait for a slow server to recover.
+  Constructed-event tests cover every viewer/host pair and default mouse
+  state, with exact native event sequences and previous-release byte recordings.
+  The Linux CI Xvfb step requires exactly one passing isolated test for local
+  media replay, real UI-heartbeat renewal, grab expiry, slow-server recovery
+  and stuck-display recovery.
+  Real-hardware verification remains open for Windows hook latency and timeout
+  recovery, remappers such as AutoHotkey and PowerToys, global hotkeys,
+  media-key daemons, non-US layouts and IMEs. The capture-click sequence
+  Win↓ … Ctrl↓ Win↑ against Windows also awaits hardware verification,
+  with the Start menu expected to stay closed.
+
+- Restore legacy keyboard compatibility, negotiate elevated helper positions,
+  and acknowledge unknown future positions without blocking input. Recover
+  native Mac ISO/JIS positions, scope system-key capture to fullscreen or
+  captured mouse, and keep modifiers reachable with a safe shortcut swap.
+
+- Send viewer mouse and keyboard input directly from OS events on macOS,
+  Windows and Linux, preserving input ordering, capture, focus and local
+  shortcuts while avoiding the next UI frame for ordinary input.
+- Preserve sided native modifiers and focused Win/Super/Command input
+  between viewers and hosts. Add a Command/Ctrl mapping choice on every
+  viewer, toolbar actions for reserved shortcuts and native focus-loss
+  releases.
+- Preserve ISO, numpad and Japanese/Korean positions with a negotiated
+  key-position extension and the original 6.0.0 egui/text path. Expand native keyboard maps,
+  macOS media events and shared cross-platform event-construction tests.
+
 ### Windows streaming
 
 - Windows hosts send the pointer's shape and visibility apart from the video,
@@ -90,6 +140,8 @@ GitHub release notes, so each version gets a heading of the form
   ladder with fresh DNS after stale cached paths, invalidate shortcuts on local
   source changes, and require large-segment loss evidence for automatic MSS hints.
   Cover 280 ms RTT recovery and retry non-blocking test accepts with deadlines.
+
+
 
 ### Streaming
 

@@ -160,9 +160,15 @@ mod imp {
     }
 }
 
-/// While `owned`, ⌘Q, ⌘H and ⌥⌘H go to the stream (and so to the PC)
-/// instead of quitting or hiding Latch. Cheap to call every frame.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_OWNS_KEYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While owned, route the app menu shortcuts to the stream.
 pub fn stream_owns_keys(owned: bool) {
+    #[cfg(test)]
+    TEST_OWNS_KEYS.set(owned);
     imp::stream_owns_keys(owned);
 }
 
