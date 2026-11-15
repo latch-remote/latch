@@ -399,15 +399,19 @@ impl Daemon {
             // Reserve durable transfer credit before even the TLS handshake.
             let mut credit = 0;
             let mut credit_epoch = 0;
-            if let Err(error) = self.quota.credit(&mut credit, &mut credit_epoch) {
-                if error.kind() != io::ErrorKind::PermissionDenied {
-                    return Err(error);
+            match self.quota.credit(&mut credit, &mut credit_epoch) {
+                Ok(()) => (),
+                // The bounded connection slot waits for durable credit before
+                // its TLS pump can read or write any network bytes.
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    self.metrics
+                        .rejected_connections
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.diagnose(None, &error);
+                    continue;
                 }
-                self.metrics
-                    .rejected_connections
-                    .fetch_add(1, Ordering::Relaxed);
-                self.diagnose(None, &error);
-                continue;
+                Err(error) => return Err(error),
             }
             let tls = rustls::ServerConnection::new(self.config.tls.clone())
                 .map_err(|_| invalid("TLS server setup failed"))?;
@@ -442,6 +446,13 @@ impl Daemon {
         }
         let before = conn.socket.transferred;
         let pumped = conn.socket.pump(Some(&mut self.quota));
+        if matches!(&pumped, Err(error) if error.kind() == io::ErrorKind::PermissionDenied)
+            && matches!(conn.phase, Phase::Request)
+        {
+            self.metrics
+                .rejected_connections
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let delta = conn.socket.transferred - before;
         self.metrics
             .network_bytes
@@ -734,12 +745,25 @@ mod tests {
             assert!(Instant::now() < deadline);
             thread::sleep(TICK);
         }
+        while daemon.connections[0].as_ref().unwrap().socket.credit == 0 {
+            daemon.step(0).unwrap();
+            assert!(Instant::now() < deadline);
+            thread::sleep(TICK);
+        }
         let credit = daemon.connections[0].as_ref().unwrap().socket.credit;
         assert_eq!(credit, 64 * 1024);
         let second = TcpStream::connect(address).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while daemon.metrics.rejected_connections.load(Ordering::Relaxed) == 0 {
             daemon.accept().unwrap();
+            for index in 0..daemon.connections.len() {
+                if daemon.connections[index].is_some() {
+                    if let Err(error) = daemon.step(index) {
+                        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                        daemon.remove_connection(index);
+                    }
+                }
+            }
             assert!(Instant::now() < deadline);
             thread::sleep(TICK);
         }

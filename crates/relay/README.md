@@ -157,8 +157,12 @@ target/release/latch-relay --listen 0.0.0.0:443 \
 
 ### Durable accounting
 
-Every socket reserves 64 KiB byte leases in a locked 32-byte ledger and fsyncs
-before reading or writing TLS bytes. Each lease covers encrypted TCP payload
+Every socket obtains 64 KiB byte leases from a durably reserved pool backed by
+a locked 32-byte ledger. A dedicated persistence worker fsyncs batches of up to
+4 MiB before the network loop can use them. The shared pool and its pending
+refill total at most 6 MiB. Each batch fits the unreserved monthly budget.
+Connections awaiting credit perform no TLS I/O. Existing credited connections
+keep running while a refill is pending. Each lease covers encrypted TCP payload
 bytes in both directions, including handshakes, capabilities and forwarding.
 Unused credit remains charged after disconnect or restart. Missing, truncated,
 corrupt or concurrently locked ledgers fail closed. IO errors are sticky and
