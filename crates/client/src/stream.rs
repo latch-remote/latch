@@ -2355,7 +2355,7 @@ impl View {
     }
 
     fn map_shortcuts(&self, cfg: &ClientConfig) -> bool {
-        cfg.cmd_is_ctrl && (!crate::keyboard::available() || (!self.captured && !cfg.capture_mouse))
+        cfg.cmd_is_ctrl && !self.captured && !cfg.capture_mouse
     }
 
     /// Whether ⌘ goes to the PC as Ctrl. A Mac there gets Command whatever
@@ -2930,6 +2930,16 @@ pub(crate) mod tests {
         cfg.capture_mouse = true;
         assert!(!view.map_shortcuts(&cfg));
         crate::keyboard::test_install(false);
+        assert!(
+            !view.map_shortcuts(&cfg),
+            "legacy hosts also use as-pressed in game mode"
+        );
+        cfg.capture_mouse = false;
+        view.captured = true;
+        assert!(
+            !view.map_shortcuts(&cfg),
+            "legacy hosts also use as-pressed during relative capture"
+        );
     }
 
     #[test]
@@ -4603,6 +4613,9 @@ pub(crate) mod tests {
     #[test]
     fn command_z_with_command_let_go_in_the_same_frame_is_still_undo() {
         let (mut h, tap) = recording(View::default(), true);
+        h.state_mut().cfg.capture_mouse = false;
+        h.state_mut().view.captured = false;
+        h.run_steps(1);
         frame(&mut h, vec![key(Key::Z, true, CMD)], Modifiers::NONE);
         assert_eq!(
             tap.take(),
@@ -4615,8 +4628,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn legacy_game_and_relative_capture_send_command_as_pressed() {
+        for os in ["windows", "linux", "macos"] {
+            for (capture_mouse, captured) in [(true, false), (false, true)] {
+                let (mut h, tap) = recording_on(View::default(), true, os);
+                h.state_mut().cfg.capture_mouse = capture_mouse;
+                h.state_mut().view.captured = captured;
+                h.run_steps(1);
+                assert!(!crate::keyboard::available());
+                frame(
+                    &mut h,
+                    vec![key(Key::Z, true, CMD), key(Key::Z, false, CMD)],
+                    Modifiers::NONE,
+                );
+                assert_eq!(
+                    tap.take(),
+                    [
+                        Sent::Key(VK_LWIN, true, latch_stream::input::MOD_META),
+                        Sent::Key(VK_Z, true, latch_stream::input::MOD_META),
+                        Sent::Key(VK_Z, false, latch_stream::input::MOD_META),
+                        Sent::Key(VK_LWIN, false, 0),
+                    ],
+                    "{os}, capture_mouse={capture_mouse}, captured={captured}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_mac_there_gets_command_as_command() {
         let (mut h, tap) = recording_on(View::default(), true, "macOS");
+        h.state_mut().cfg.capture_mouse = false;
+        h.state_mut().view.captured = false;
+        h.run_steps(1);
         assert!(h.state().cfg.cmd_is_ctrl, "the default, for Windows");
         frame(&mut h, vec![key(Key::Z, true, CMD)], CMD);
         assert_eq!(tap.keys(), [(VK_LWIN, true), (VK_Z, true)]);
@@ -5198,6 +5242,9 @@ pub(crate) mod tests {
     fn a_paste_goes_before_what_was_typed_after_it() {
         // Nothing to send first (an image on the Mac): at once, in order.
         let (mut h, tap) = recording(View::default(), true);
+        h.state_mut().cfg.capture_mouse = false;
+        h.state_mut().view.captured = false;
+        h.run_steps(1);
         frame(
             &mut h,
             vec![
@@ -5218,6 +5265,9 @@ pub(crate) mod tests {
         );
         // Text on its way: Return waits for it, then follows the paste.
         let (mut h, tap) = recording(View::default(), true);
+        h.state_mut().cfg.capture_mouse = false;
+        h.state_mut().view.captured = false;
+        h.run_steps(1);
         frame(&mut h, vec![], CMD);
         assert_eq!(tap.keys(), [(VK_CONTROL, true)]);
         h.state_mut().view.pending = Some(PendingPaste {
@@ -5259,6 +5309,9 @@ pub(crate) mod tests {
     #[test]
     fn a_paste_that_waits_too_long_goes_once_and_losing_focus_drops_it() {
         let (mut h, tap) = recording(View::default(), true);
+        h.state_mut().cfg.capture_mouse = false;
+        h.state_mut().view.captured = false;
+        h.run_steps(1);
         h.state_mut().view.pending = Some(PendingPaste {
             id: 7,
             until: Instant::now(),
@@ -5305,6 +5358,9 @@ pub(crate) mod tests {
         // egui swallows ⌘V's press when the Mac's clipboard has no text;
         // only the V let go shows.
         let (mut h, tap) = recording(View::default(), true);
+        h.state_mut().cfg.capture_mouse = false;
+        h.state_mut().view.captured = false;
+        h.run_steps(1);
         frame(&mut h, vec![], CMD);
         assert_eq!(tap.keys(), [(VK_CONTROL, true)]);
         frame(&mut h, vec![key(Key::V, false, CMD)], CMD);
