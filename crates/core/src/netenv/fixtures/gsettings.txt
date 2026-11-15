@@ -1,0 +1,12 @@
+org.gnome.system.proxy autoconfig-url ''
+org.gnome.system.proxy ignore-hosts ['localhost', '*.internal.test', '127.0.0.0/8', '::1']
+org.gnome.system.proxy mode 'manual'
+org.gnome.system.proxy use-same-proxy false
+org.gnome.system.proxy.http authentication-password 'p\'ass'
+org.gnome.system.proxy.http authentication-user 'alice'
+org.gnome.system.proxy.http host 'plain-proxy.test'
+org.gnome.system.proxy.http port 8080
+org.gnome.system.proxy.http use-authentication true
+org.gnome.system.proxy.https host 'secure-proxy.test'
+org.gnome.system.proxy.https port 3128
+org.gnome.system.proxy.socks host ''

@@ -10,6 +10,7 @@ pub mod dates;
 pub mod http;
 pub mod icon;
 pub mod legacy;
+pub mod netenv;
 pub mod screens;
 pub mod tailscale;
 pub mod update;
