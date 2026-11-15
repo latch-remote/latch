@@ -2064,6 +2064,7 @@ dependencies = [
  "glow",
  "image",
  "latch-core",
+ "latch-engine",
  "latch-proto",
  "latch-stream",
  "latch-ui",
@@ -2083,6 +2084,7 @@ dependencies = [
  "wgpu",
  "windows 0.58.0",
  "windows-sys 0.61.2",
+ "x11-dl",
  "x11rb 0.14.0",
 ]
 
@@ -2122,6 +2124,7 @@ name = "latch-engine"
 version = "6.0.0"
 dependencies = [
  "anyhow",
+ "async-io",
  "block2 0.6.2",
  "dispatch2",
  "evdev",
@@ -2148,9 +2151,12 @@ dependencies = [
  "socket2",
  "tracing",
  "tracing-subscriber",
+ "wayland-client",
+ "wayland-protocols",
  "windows 0.58.0",
  "windows-core 0.58.0",
  "x11rb 0.14.0",
+ "zbus",
 ]
 
 [[package]]

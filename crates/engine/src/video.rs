@@ -20,6 +20,18 @@ pub struct VideoConfig {
     pub display: Option<String>,
 }
 
+/// Capture permission or its producer ended. Retrying must require a new session.
+#[derive(Debug)]
+pub struct CaptureEnded(pub String);
+
+impl std::fmt::Display for CaptureEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for CaptureEnded {}
+
 /// One encoded frame: an Annex B access unit (SPS/PPS, or VPS/SPS/PPS for
 /// HEVC, in band before every keyframe).
 #[derive(Debug, Clone)]
@@ -64,7 +76,13 @@ pub struct CursorUpdate {
     pub shape: Option<latch_proto::control::CursorShape>,
 }
 
+/// A non-blocking sink for cursor updates independent of encoded frames.
+pub type CursorSink = std::sync::Arc<dyn Fn(latch_proto::control::Cursor) + Send + Sync>;
+
 pub trait VideoPipeline: Send {
+    /// Capture paths with pointer-only events publish them before encoding.
+    fn set_cursor_sink(&mut self, _sink: CursorSink) {}
+
     fn info(&self) -> VideoInfo;
 
     /// The next encoded frame: as soon as the screen changes (at most `fps`

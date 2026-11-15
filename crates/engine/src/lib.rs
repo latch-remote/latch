@@ -11,7 +11,7 @@ pub mod audio;
 #[cfg(any(windows, test))]
 mod bitstream;
 mod congestion;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 mod cursor;
 pub mod display;
 pub mod gamepad;
@@ -24,6 +24,8 @@ pub mod server;
 pub mod software;
 pub mod testmode;
 pub mod video;
+#[cfg(any(windows, test))]
+mod windows_cursor;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -35,3 +37,16 @@ pub mod windows;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "linux/x11.rs"]
 mod x11_bootstrap_tests;
+
+/// The platform-free parts of the Wayland backend (backend choice, the
+/// PipeWire format negotiation, restore tokens, damage), tested on every
+/// build machine rather than only on Linux.
+#[cfg(all(test, not(target_os = "linux")))]
+#[path = "linux/wayland"]
+#[allow(dead_code)]
+mod wayland_tests {
+    mod backend;
+    mod frame;
+    mod pod;
+    mod token;
+}

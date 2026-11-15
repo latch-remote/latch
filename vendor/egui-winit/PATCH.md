@@ -18,4 +18,8 @@ available to the normal UI integration.
 files retain their published contents. Keep the callback points when
 updating the dependency, or remove this patch when upstream offers an
 equivalent event-time API. Latch's callback integration is exercised by
-`early::tests` in `latch-client`.
+the native keyboard and stream recorder tests in `latch-client`.
+
+The keyboard observer uses `EventHook::keyboard_id()` independently of
+`EventHook::id()`, which preserves the event-dispatch callback slot. The
+physical key-code translator is public for reuse by the keyboard observer.

@@ -199,6 +199,7 @@ pub struct ClientApp {
 
 impl Drop for ClientApp {
     fn drop(&mut self) {
+        crate::keyboard::shutdown();
         self.commit();
         self.save_tx.take();
         if let Some(worker) = self.save_worker.take() {
@@ -213,6 +214,7 @@ impl Drop for ClientApp {
 impl ClientApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::early::install(&cc.egui_ctx);
+        crate::keyboard::install(cc);
         let discovery = Arc::new(Mutex::new(Discovery::default()));
         let stop = session::spawn_discovery(discovery.clone(), cc.egui_ctx.clone());
         let mut app =
@@ -1176,6 +1178,10 @@ impl eframe::App for ClientApp {
                             self.cfg.stream.fullscreen = on;
                             self.dirty = true;
                         }
+                        Action::ToggleControlAsMeta => {
+                            self.cfg.control_as_meta = !self.cfg.control_as_meta;
+                            self.dirty = true;
+                        }
                         Action::ToggleCmd => {
                             self.cfg.cmd_is_ctrl = !self.cfg.cmd_is_ctrl;
                             self.dirty = true;
@@ -2089,16 +2095,14 @@ impl ClientApp {
             ) {
                 self.dirty = true;
             }
-            if cfg!(target_os = "macos") {
-                ui::row_separator(ui);
-                if ui::toggle_row(
-                    ui,
-                    &mut self.cfg.cmd_is_ctrl,
-                    "Command acts as Ctrl",
-                    Some("So Command-C, V and Z copy, paste and undo on Windows and Linux. Off, Command is the Windows key. A Mac always gets Command."),
-                ) {
-                    self.dirty = true;
-                }
+            ui::row_separator(ui);
+            if ui::toggle_row(
+                ui,
+                &mut self.cfg.cmd_is_ctrl,
+                "Map Command ↔ Ctrl",
+                Some("Map Command from a Mac viewer to Ctrl on Windows/Linux, and Ctrl to Command in the reverse direction. Turn off to send physical modifiers as pressed."),
+            ) {
+                self.dirty = true;
             }
         });
         ui::section(ui, "Power", |ui| {
@@ -3370,6 +3374,10 @@ pub(crate) mod snapshots {
             local_focus: false,
             mouse: true,
             cmd_is_ctrl: true,
+            host_mac: false,
+            viewer_mac: cfg!(target_os = "macos"),
+            map_shortcuts: false,
+            control_as_meta: false,
             motion_scale: 1.0,
             video: region,
             pointer_region: region,

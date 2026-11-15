@@ -130,6 +130,18 @@ impl Refusal {
             message: message.into(),
         }
     }
+
+    /// Preserve HTTP retry behavior when preparation follows the upgrade.
+    pub fn into_end(self) -> End {
+        End {
+            code: if matches!(self.status, 408 | 429 | 500..=599) {
+                end::TRANSPORT_FAILED
+            } else {
+                end::CAPTURE_FAILED
+            },
+            message: self.message,
+        }
+    }
 }
 
 pub struct Server {
@@ -191,6 +203,11 @@ impl Server {
 
     /// Ends the running session, if any.
     pub fn stop(&self, code: u32, message: &str) -> bool {
+        // Preparation can finish just before run installs the current session.
+        // Wait for that reservation to be dropped or installed before stopping.
+        if !self.opening.wait_idle(Instant::now() + TAKEOVER_WAIT) {
+            return false;
+        }
         let current = self.current.lock().clone();
         if let Some(session) = current {
             session.end(code, message);
@@ -221,6 +238,32 @@ impl Server {
             video::limits,
             video::open,
         )
+    }
+
+    /// Prepare after HTTP upgrade so an approval request can observe the
+    /// viewer closing its control connection, including older viewers.
+    pub fn prepare_connected(
+        &self,
+        req: StreamRequest,
+        peer: SocketAddr,
+        tcp: &TcpStream,
+        stopping: Arc<AtomicBool>,
+    ) -> Result<Prepared, Refusal> {
+        #[cfg(target_os = "linux")]
+        {
+            // Reserve time for takeover, encoder and media setup. Older
+            // viewers advertise no deadline and still stop at 60 seconds.
+            let approval = crate::linux::wayland::portal::approval_budget(req.startup_timeout_secs);
+            crate::linux::wayland::portal::during_startup(tcp, approval, stopping, || {
+                self.prepare(req, peer)
+            })
+            .map_err(|e| Refusal::new(500, format!("could not track the viewer connection: {e}")))?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (tcp, stopping);
+            self.prepare(req, peer)
+        }
     }
 
     fn prepare_using(
@@ -396,8 +439,14 @@ impl Server {
                 _ => break,
             }
         }
-        let pipeline = opened
-            .map_err(|e| Refusal::new(500, format!("could not capture the screen: {e:#}")))?;
+        let pipeline = opened.map_err(|e| {
+            let status = if e.is::<video::CaptureEnded>() {
+                403
+            } else {
+                500
+            };
+            Refusal::new(status, format!("could not capture the screen: {e:#}"))
+        })?;
         config.color = pipeline.info().color;
         prepared.info = Some(pipeline.info());
         prepared.pipeline = Some((pipeline, config));
@@ -422,6 +471,7 @@ impl Server {
                     prepared.input_problem =
                         Some(format!("move pointer into the captured display: {e:#}"));
                 }
+                sink.set_key_positions(prepared.req.key_positions);
                 prepared.input = Some(sink);
             }
             Err(e) => prepared.input_problem = Some(format!("{e:#}")),
@@ -472,6 +522,10 @@ impl Server {
         let feedback = prepared.feedback.clone();
         feedback.start(id);
         let relay_enabled = prepared.req.relay && self.options.relay.is_some();
+        let stop = Arc::new(AtomicBool::new(false));
+        if let Some(sink) = prepared.input.as_mut() {
+            sink.set_stopping(stop.clone());
+        }
         let session = Arc::new(Session {
             relay: RelayRoute::new(
                 id,
@@ -485,7 +539,7 @@ impl Server {
             addr: Mutex::new(None),
             ended: Mutex::new(None),
             audio_notice: Mutex::new(None),
-            stop: AtomicBool::new(false),
+            stop,
             finished: Mutex::new(false),
             finished_cv: Condvar::new(),
             keyframe: AtomicBool::new(true),
@@ -554,6 +608,7 @@ impl Server {
         }
         let audio = prepared.audio.take();
         let accept = Accept {
+            key_positions: prepared.req.key_positions,
             relay: relay_enabled,
             color: info.color,
             session: id,
@@ -708,16 +763,25 @@ impl Server {
         let (messages, inbox) = mpsc::sync_channel(128);
         let reader = tcp.try_clone();
         if let Ok(mut reader) = reader {
+            let session = session.clone();
             let _ = std::thread::Builder::new()
                 .name("stream-control".into())
                 .spawn(move || loop {
                     match control::read_message(&mut reader) {
                         Ok(m) => {
+                            // Wake input I/O and route maintenance even when the
+                            // control owner is waiting for an input transaction.
+                            if matches!(m, Message::End(_)) {
+                                session.stop.store(true, Ordering::Release);
+                            }
                             if messages.send(m).is_err() {
                                 return;
                             }
                         }
-                        Err(_) => return,
+                        Err(_) => {
+                            session.stop.store(true, Ordering::Release);
+                            return;
+                        }
                     }
                 });
         }
@@ -1070,6 +1134,16 @@ struct Opening {
 }
 
 impl Opening {
+    fn wait_idle(&self, deadline: Instant) -> bool {
+        let mut busy = self.busy.lock();
+        while *busy {
+            if self.cv.wait_until(&mut busy, deadline).timed_out() && *busy {
+                return false;
+            }
+        }
+        true
+    }
+
     /// The reservation, once the one holding it lets go; None after `limit`.
     fn lock(self: &Arc<Self>, limit: Duration) -> Option<OpeningGuard> {
         let deadline = Instant::now() + limit;
@@ -1102,7 +1176,7 @@ struct OpeningGuard(Arc<Opening>);
 impl Drop for OpeningGuard {
     fn drop(&mut self) {
         *self.0.busy.lock() = false;
-        self.0.cv.notify_one();
+        self.0.cv.notify_all();
     }
 }
 
@@ -1167,7 +1241,7 @@ struct Session {
     ended: Mutex<Option<End>>,
     audio_notice: Mutex<Option<String>>,
     /// The media threads stop.
-    stop: AtomicBool,
+    stop: Arc<AtomicBool>,
     finished: Mutex<bool>,
     finished_cv: Condvar,
     keyframe: AtomicBool,
@@ -1340,7 +1414,14 @@ impl Session {
         // Stop old input before the first packet on the new route can be
         // applied and acknowledged. Cleaning up on the next control-loop turn
         // could unplug a pad whose replacement snapshot was already ACKed.
-        let mut input = self.input.lock();
+        let mut input = loop {
+            if self.stopping() {
+                return true;
+            }
+            if let Some(input) = self.input.try_lock_for(Duration::from_millis(10)) {
+                break input;
+            }
+        };
         let mut pads = self.pads.lock();
         let was_active = self.relay.active();
         let ok = update(&self.relay);
@@ -1397,19 +1478,26 @@ impl Session {
     }
 
     fn end(&self, code: u32, message: &str) {
-        let mut input = self.input.lock();
-        if let Some(mut sink) = input.sink.take() {
-            sink.release_all();
-        }
-        drop(input);
-        self.unplug_pads();
-        let mut ended = self.ended.lock();
-        if ended.is_none() {
+        {
+            let mut ended = self.ended.lock();
+            if ended.is_some() {
+                return;
+            }
+            // Let control and capture stop even while input cleanup is pending.
             *ended = Some(End {
                 code,
                 message: message.into(),
             });
         }
+        self.stop.store(true, Ordering::Release);
+        // An in-flight apply owns cleanup until it returns. The control owner
+        // must be able to publish End and stop capture while that I/O unwinds.
+        if let Some(mut input) = self.input.try_lock() {
+            if let Some(mut sink) = input.sink.take() {
+                sink.release_all();
+            }
+        }
+        self.unplug_pads();
     }
 
     fn unplug_pads(&self) {
@@ -1524,6 +1612,9 @@ fn dispatch_datagram(
     session.heard(server.now_us());
     match datagram {
         Datagram::Input { first, events, .. } => {
+            if session.stopping() {
+                return;
+            }
             let next = {
                 let mut guard = session.input.lock();
                 if session.stopping() {
@@ -1532,7 +1623,10 @@ fn dispatch_datagram(
                 let state = &mut *guard;
                 let display = state.display;
                 let sink = &mut state.sink;
-                state.receiver.try_receive(first, events.iter(), |event| {
+                let next = state.receiver.try_receive(first, events.iter(), |event| {
+                    if session.stopping() {
+                        anyhow::bail!("the stream stopped during input");
+                    }
                     let Some(sink) = sink.as_mut() else {
                         return Ok(());
                     };
@@ -1541,7 +1635,13 @@ fn dispatch_datagram(
                         return Err(e);
                     }
                     Ok(())
-                })
+                });
+                if session.stopping() {
+                    if let Some(mut sink) = state.sink.take() {
+                        sink.release_all();
+                    }
+                }
+                next
             };
             wire::write_input_ack(&mut out, session.id, next);
             send(&server.udp, session, &out, from);
@@ -1665,6 +1765,44 @@ fn play_mic(session: &Session, packet: Option<&latch_proto::wire::AudioPacket<'_
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CursorWireState {
+    visible: bool,
+    serial: u32,
+}
+/// Latest cursor state with pending shapes retained across coalesced moves.
+/// The capture worker never waits for a socket write or an encoded picture.
+#[derive(Default)]
+struct CursorMailbox {
+    pending: Mutex<Option<control::Cursor>>,
+    ready: Condvar,
+    last: Mutex<Option<CursorWireState>>,
+}
+impl CursorMailbox {
+    fn publish(&self, mut cursor: control::Cursor) {
+        let mut last = self.last.lock();
+        // Compare the shared wire state by serial without retaining pixels.
+        let serial = cursor.shape.as_ref().map_or_else(
+            || last.as_ref().map_or(0, |state| state.serial),
+            |shape| shape.serial,
+        );
+        let state = CursorWireState {
+            visible: cursor.visible,
+            serial,
+        };
+        if *last == Some(state) {
+            return;
+        }
+        *last = Some(state);
+        let mut pending = self.pending.lock();
+        if cursor.shape.is_none() {
+            cursor.shape = pending.as_mut().and_then(|old| old.shape.take());
+        }
+        *pending = Some(cursor);
+        self.ready.notify_one();
+    }
+}
+
 fn send_video(
     server: &Server,
     session: &Session,
@@ -1672,10 +1810,40 @@ fn send_video(
     config: VideoConfig,
     mut reopen: impl FnMut(&VideoConfig) -> anyhow::Result<Box<dyn VideoPipeline>>,
 ) {
+    let mailbox = Arc::new(CursorMailbox::default());
+    let done = AtomicBool::new(false);
     std::thread::scope(|scope| {
+        let sink: video::CursorSink = {
+            let mailbox = mailbox.clone();
+            Arc::new(move |cursor| mailbox.publish(cursor))
+        };
+        let mailbox = &mailbox;
+        let done = &done;
+        if session.cursor_supported {
+            scope.spawn(move || {
+                while !done.load(Ordering::Acquire) && !session.stopping() {
+                    let mut pending = mailbox.pending.lock();
+                    if pending.is_none() {
+                        mailbox
+                            .ready
+                            .wait_for(&mut pending, Duration::from_millis(100));
+                    }
+                    let cursor = pending.take();
+                    drop(pending);
+                    if let Some(cursor) = cursor {
+                        if !session.send_control(&Message::Cursor(cursor)) {
+                            session.end(end::TRANSPORT_FAILED, "Cursor control connection failed.");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
         let (tx, rx) = mpsc::sync_channel(2);
         scope.spawn(move || paced_video(server, session, rx));
-        encode_video(server, session, pipeline, config, &mut reopen, tx);
+        encode_video(server, session, pipeline, config, &mut reopen, tx, sink);
+        done.store(true, Ordering::Release);
+        mailbox.ready.notify_one();
     });
 }
 
@@ -1691,8 +1859,12 @@ fn encode_video(
     mut config: VideoConfig,
     mut reopen: impl FnMut(&VideoConfig) -> anyhow::Result<Box<dyn VideoPipeline>>,
     tx: mpsc::SyncSender<(video::EncodedVideo, Instant)>,
+    cursor_sink: video::CursorSink,
 ) {
     crate::priority::media_thread();
+    if session.cursor_supported {
+        pipeline.set_cursor_sink(cursor_sink.clone());
+    }
     let mut generation = 0;
     let mut last_keyframe: Option<Instant> = None;
     let mut info = pipeline.info();
@@ -1752,6 +1924,10 @@ fn encode_video(
                 if session.stopping() {
                     return;
                 }
+                if e.is::<video::CaptureEnded>() {
+                    session.end(end::CAPTURE_FAILED, &format!("Screen sharing ended: {e:#}"));
+                    return;
+                }
                 if video::Unencodable::is(&e) {
                     server.log(format!("video stopped: {e:#}"));
                     session.end(end::ENCODER_FAILED, &unencodable(config.codec, &e));
@@ -1778,6 +1954,9 @@ fn encode_video(
                     match reopen(&config) {
                         Ok(p) => {
                             pipeline = p;
+                            if session.cursor_supported {
+                                pipeline.set_cursor_sink(cursor_sink.clone());
+                            }
                             // Queued frames can still arrive from the old pipeline.
                             generation += 1;
                             session.recovery.sent.lock().clear();

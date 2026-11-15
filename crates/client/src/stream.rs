@@ -104,6 +104,7 @@ pub enum Action {
     Power(PowerAction),
     Fullscreen(bool),
     ToggleCmd,
+    ToggleControlAsMeta,
     /// Install a new Latch Host on the PC through the stream.
     InstallHost,
     ApplySettings(StreamSettings),
@@ -268,9 +269,9 @@ pub struct View {
     /// let go that the PC never saw pressed, with ⌘ seen and no paste.
     pasted_since_v_up: bool,
     cmd_since_v_up: bool,
-    /// The other machine is a Mac: ⌘ is Command there, whatever the
-    /// "Command acts as Ctrl" setting says for Windows and Linux.
+    /// Whether the host uses Command for its application shortcuts.
     host_mac: bool,
+    viewer_mac: bool,
     /// Texture handle and shape serial for rendering host cursor locally.
     cursor_texture: Option<(u32, egui::TextureHandle)>,
     /// Whether the host is currently told to draw its pointer into video.
@@ -307,6 +308,7 @@ struct PendingPaste {
 
 /// Input held back behind a paste.
 enum Queued {
+    Physical(crate::keyboard::Key),
     /// An event, with where it was going when it arrived.
     Event(Event, At),
     /// The modifiers held at the end of a frame: egui has no events for
@@ -369,6 +371,7 @@ impl Default for View {
             pasted_since_v_up: false,
             cmd_since_v_up: false,
             host_mac: false,
+            viewer_mac: cfg!(target_os = "macos"),
             cursor_texture: None,
             host_cursor_drawn: false,
             caps: None,
@@ -446,6 +449,8 @@ impl View {
             self.held.release_all(out);
         }
         crate::macos::stream_owns_keys(false);
+        crate::keyboard::owns_keys(false);
+        crate::keyboard::key_positions(false);
         ctx.options_mut(|o| o.zoom_with_keyboard = true);
         self.set_captured(ctx, false);
         self.bar_shown = false;
@@ -1460,24 +1465,56 @@ impl View {
             ),
             ("Windows key", &[input::VK_LWIN][..]),
             ("Alt+Tab", &[input::VK_MENU, input::VK_TAB][..]),
+            ("Command+Tab", &[input::VK_LWIN, input::VK_TAB][..]),
+            ("Command+Space", &[input::VK_LWIN, 0x20][..]),
+            ("Win+L", &[input::VK_LWIN, 0x4c][..]),
             ("Escape", &[input::VK_ESCAPE][..]),
             ("Print Screen", &[input::VK_SNAPSHOT][..]),
         ] {
+            if !toolbar_key_for_host(label, self.host_mac) {
+                continue;
+            }
             if ui::menu_item(ui, label).clicked() {
                 self.held.chord(input, keys);
             }
         }
-        if cfg!(target_os = "macos") {
-            ui::menu_separator(ui);
-            if self.host_mac {
-                ui::menu_note(ui, "Command is Command on another Mac.");
-            } else if ui::menu_choice(ui, "Command acts as Ctrl", cfg.cmd_is_ctrl)
-                .on_hover_text("On: Command-C, V and Z copy, paste and undo there. Off: Command is the Windows key. A Mac there always gets Command.")
-                .clicked()
+        ui::menu_separator(ui);
+        for (label, mapped) in [
+            ("Send keys as pressed", false),
+            ("Map Command ↔ Ctrl", true),
+        ] {
+            if ui::menu_choice(ui, label, cfg.cmd_is_ctrl == mapped).clicked()
+                && cfg.cmd_is_ctrl != mapped
             {
                 actions.push(Action::ToggleCmd);
             }
         }
+        if self.viewer_mac && !self.host_mac {
+            let reason = if !crate::keyboard::available() {
+                Some("Requires Latch Host newer than 6.0.0.")
+            } else if !cfg.cmd_is_ctrl {
+                Some("Enable Command/Ctrl mapping to use this.")
+            } else {
+                None
+            };
+            if ui::menu_choice_enabled(
+                ui,
+                reason.is_none(),
+                "Control key acts as Windows key",
+                cfg.control_as_meta,
+            )
+            .clicked()
+            {
+                actions.push(Action::ToggleControlAsMeta);
+            }
+            if let Some(reason) = reason {
+                ui::menu_note(ui, reason);
+            }
+        }
+        ui::menu_note(
+            ui,
+            "Win/Super is Command on a Mac. Ctrl+Alt+Delete cannot open Windows secure attention.",
+        );
     }
 
     fn mouse_menu(
@@ -1626,7 +1663,10 @@ impl View {
 
     /// Capture the mouse and take the toolbar away: the picture is all.
     fn grab(&mut self, ctx: &egui::Context, out: &(impl Sink + ?Sized)) {
-        self.held.release_all(out);
+        self.held.release_for_capture(
+            out,
+            crate::keyboard::available() && self.viewer_mac && !self.host_mac,
+        );
         self.motion = (0.0, 0.0);
         // A captured mouse sends every click to the PC, while egui still
         // sees them at the frozen pointer: a panel, question or menu left
@@ -1642,7 +1682,10 @@ impl View {
 
     /// Give the mouse back.
     fn release(&mut self, ctx: &egui::Context, out: &(impl Sink + ?Sized)) {
-        self.held.release_all(out);
+        self.held.release_for_capture(
+            out,
+            crate::keyboard::available() && self.viewer_mac && !self.host_mac,
+        );
         self.set_captured(ctx, false);
     }
 
@@ -1673,6 +1716,7 @@ impl View {
         // its pointer in the picture. The last session's reset left this
         // true, and a captured reconnect would then never ask for it.
         self.host_cursor_drawn = false;
+        crate::keyboard::key_positions(live.session.key_positions());
         // Shape serials belong to the host session. A reconnect may reuse one.
         self.cursor_texture = None;
         live.session.set_volume(if self.muted {
@@ -1739,6 +1783,118 @@ impl View {
         }
     }
 
+    fn paint_cursor(
+        &mut self,
+        link: &Link<'_, impl Sink + ?Sized>,
+        pointer: Option<Pos2>,
+        focused: bool,
+        over_stream: bool,
+    ) {
+        let Link {
+            ctx,
+            live,
+            video,
+            connected,
+            ..
+        } = *link;
+        let cursor = live.session.cursor();
+        let Some(host_should_draw) = host_cursor_drawn(self.captured, focused, over_stream) else {
+            return;
+        };
+        if live.session.cursor_supported()
+            && connected
+            && self.host_cursor_drawn != host_should_draw
+        {
+            self.host_cursor_drawn = host_should_draw;
+            live.session.draw_cursor(host_should_draw);
+        }
+        if local_cursor_hidden(focused, over_stream, self.captured, connected) {
+            ctx.set_cursor_icon(CursorIcon::None);
+        }
+        let stats = live.session.stats();
+        let size = if stats.width > 0 && stats.height > 0 {
+            (stats.width, stats.height)
+        } else {
+            (live.requested.0, live.requested.1)
+        };
+        self.paint_cursor_image(
+            ctx,
+            cursor.filter(|_| connected),
+            pointer,
+            focused,
+            over_stream,
+            video,
+            size,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_cursor_image(
+        &mut self,
+        ctx: &egui::Context,
+        cursor: Option<latch_stream::session::CursorState>,
+        pointer: Option<Pos2>,
+        focused: bool,
+        over_stream: bool,
+        video: Rect,
+        size: (u32, u32),
+    ) {
+        if self.captured {
+            return;
+        }
+        let Some(cursor) = cursor.filter(|state| state.visible) else {
+            return;
+        };
+        let Some(pos) = cursor_pointer(pointer, focused, over_stream, video, size) else {
+            return;
+        };
+        let Some(shape) = cursor.shape else {
+            return;
+        };
+        let texture = match &self.cursor_texture {
+            Some((serial, handle)) if *serial == shape.serial => Some(handle.clone()),
+            _ => {
+                if let Ok(rgba) = latch_proto::base64::decode(&shape.rgba) {
+                    if rgba.len() == (shape.width as usize) * (shape.height as usize) * 4 {
+                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                            [shape.width as usize, shape.height as usize],
+                            &rgba,
+                        );
+                        let handle =
+                            ctx.load_texture("host-cursor", image, egui::TextureOptions::LINEAR);
+                        self.cursor_texture = Some((shape.serial, handle.clone()));
+                        Some(handle)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(texture) = texture {
+            let rect = host_cursor_rect(
+                pos,
+                video,
+                size.0,
+                shape.hot_x,
+                shape.hot_y,
+                shape.width,
+                shape.height,
+            );
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Middle,
+                egui::Id::new(video::PAINTED_OVERLAYS[1]),
+            ));
+            painter.image(
+                texture.id(),
+                rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+    }
+
     /// [`View::input`], sending through `out`. Returns what the OS event
     /// hook may send until the next frame (see [`early`]).
     #[allow(clippy::too_many_arguments)]
@@ -1756,6 +1912,7 @@ impl View {
             self.held.release_all(out);
             self.set_captured(ctx, false);
             crate::macos::stream_owns_keys(false);
+            crate::keyboard::owns_keys(false);
             return None;
         }
         let (events, modifiers, pointer, focused) = ctx.input(|i| {
@@ -1802,7 +1959,18 @@ impl View {
         // ⌘Q and ⌘H belong to the PC too while it has the keys, and so do
         // ⌘+, ⌘- and ⌘0: egui would zoom Latch's own window on them while
         // they zoomed the browser on the PC.
+        let system_capture = crate::keyboard::capture_system_keys(
+            keys_to_pc,
+            ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)),
+            self.captured,
+        );
         crate::macos::stream_owns_keys(keys_to_pc);
+        let owned = system_capture && crate::keyboard::available();
+        crate::keyboard::capture_heartbeat(ctx, owned);
+        crate::keyboard::owns_keys(owned);
+        if keys_to_pc && crate::keyboard::available() && self.viewer_mac && !self.host_mac {
+            self.held.retarget_modifiers(out, self.mapping(cfg));
+        }
         if ctx.options(|o| o.zoom_with_keyboard) == keys_to_pc {
             ctx.options_mut(|o| o.zoom_with_keyboard = !keys_to_pc);
         }
@@ -1852,7 +2020,7 @@ impl View {
         // the toolbar opens (games and the Start menu react to one), nor a
         // lone Alt when Control is let go first (Windows opens the menu bar).
         // Before the stream connects it can still free a captured mouse.
-        let ctrl_alt = modifiers.ctrl && modifiers.alt;
+        let ctrl_alt = modifiers.ctrl && modifiers.alt && !crate::keyboard::alt_gr();
         if ctrl_alt || (self.capture_chord_held && (modifiers.ctrl || modifiers.alt)) {
             if ctrl_alt && !self.capture_chord_held && (connected || self.captured) {
                 self.capture_chord_held = true;
@@ -1897,93 +2065,19 @@ impl View {
             self.held.release_all(out);
         }
 
-        if live.session.cursor_supported() && connected {
-            let host_should_draw = self.captured || !over_stream;
-            if self.host_cursor_drawn != host_should_draw {
-                self.host_cursor_drawn = host_should_draw;
-                live.session.draw_cursor(host_should_draw);
-            }
-        }
-
-        if (over_stream || self.captured) && connected {
-            ctx.set_cursor_icon(CursorIcon::None);
-        }
-
-        if live.session.cursor_supported() && !self.captured && over_stream && connected {
-            if let Some(pos) = pointer {
-                if let Some(cursor_state) = live.session.cursor() {
-                    if cursor_state.visible {
-                        if let Some(shape) = cursor_state.shape {
-                            let texture = match &self.cursor_texture {
-                                Some((s, h)) if *s == shape.serial => Some(h.clone()),
-                                _ => {
-                                    if let Ok(rgba) = latch_proto::base64::decode(&shape.rgba) {
-                                        if rgba.len()
-                                            == (shape.width as usize) * (shape.height as usize) * 4
-                                        {
-                                            let img = egui::ColorImage::from_rgba_unmultiplied(
-                                                [shape.width as usize, shape.height as usize],
-                                                &rgba,
-                                            );
-                                            let handle = ctx.load_texture(
-                                                "host-cursor",
-                                                img,
-                                                egui::TextureOptions::LINEAR,
-                                            );
-                                            self.cursor_texture =
-                                                Some((shape.serial, handle.clone()));
-                                            Some(handle)
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                }
-                            };
-                            if let Some(tex) = texture {
-                                let stats = live.session.stats();
-                                let vw = if stats.width > 0 {
-                                    stats.width
-                                } else {
-                                    live.requested.0
-                                };
-                                let cursor_rect = host_cursor_rect(
-                                    pos,
-                                    video,
-                                    vw,
-                                    shape.hot_x,
-                                    shape.hot_y,
-                                    shape.width,
-                                    shape.height,
-                                );
-                                let painter = ctx.layer_painter(egui::LayerId::new(
-                                    egui::Order::Middle,
-                                    egui::Id::new(video::PAINTED_OVERLAYS[1]),
-                                ));
-                                painter.image(
-                                    tex.id(),
-                                    cursor_rect,
-                                    Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
-                                    Color32::WHITE,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
+        self.paint_cursor(&link, pointer, focused, over_stream);
         let at = At {
             keys_to_pc,
             over_stream,
         };
+        let events = crate::keyboard::take()
+            .unwrap_or_else(|| events.into_iter().map(|e| (e, None, false)).collect());
         let physical_text = events.iter().any(
-            |ev| matches!(ev, Event::Key { key, pressed: true, .. } if input::vk(*key).is_some()),
+            |(ev, native, _)| matches!(ev, Event::Key { key, pressed: true, .. } if native.as_ref().map_or_else(|| input::vk(*key).is_some(), |k| crate::keyboard::text_position(k.vk))),
         );
         let commits: Vec<_> = events
             .iter()
-            .filter_map(|ev| match ev {
+            .filter_map(|(ev, _, _)| match ev {
                 Event::Ime(egui::ImeEvent::Commit(t)) => Some(t.clone()),
                 _ => None,
             })
@@ -1992,8 +2086,8 @@ impl View {
         // after it in the same frame are new typing and go to the PC.
         let last_commit = events
             .iter()
-            .rposition(|ev| matches!(ev, Event::Ime(egui::ImeEvent::Commit(_))));
-        for (i, ev) in events.into_iter().enumerate() {
+            .rposition(|(ev, _, _)| matches!(ev, Event::Ime(egui::ImeEvent::Commit(_))));
+        for (i, (ev, native, literal)) in events.into_iter().enumerate() {
             match &ev {
                 Event::Ime(egui::ImeEvent::Enabled | egui::ImeEvent::Preedit(_)) => {
                     self.composing = true
@@ -2007,14 +2101,32 @@ impl View {
                     ..
                 } if (self.composing || last_commit.is_some_and(|c| i < c))
                     && !modifiers.ctrl
-                    && !modifiers.command =>
+                    && !modifiers.command
+                    && native
+                        .as_ref()
+                        .is_none_or(|k| !matches!(k.vk, 0xa0..=0xa5 | 0x5b | 0x5c)) =>
                 {
                     continue
                 }
                 _ => {}
             }
-            if matches!(&ev, Event::Text(t) if self.composing || physical_text || commits.contains(t))
+            if !literal
+                && matches!(&ev, Event::Text(t) if self.composing || physical_text || commits.contains(t))
             {
+                continue;
+            }
+            if let Some(key) = native {
+                if self.early.claim(Ahead::Physical(key.vk, key.down)) {
+                    self.cmd_since_v_up |= key.down && matches!(key.vk, 0x5b | 0x5c | 0xa2 | 0xa3);
+                    if key.vk == input::VK_V as u16 && !key.down {
+                        self.pasted_since_v_up = false;
+                        self.cmd_since_v_up = false;
+                    }
+                    continue;
+                }
+                if keys_to_pc {
+                    self.dispatch(&link, Queued::Physical(key));
+                }
                 continue;
             }
             // Sent already, from the OS event.
@@ -2081,6 +2193,10 @@ impl View {
                     local_focus: !keys_belong_to_pc,
                     mouse,
                     cmd_is_ctrl: self.cmd_is_ctrl(cfg),
+                    host_mac: self.host_mac,
+                    viewer_mac: self.viewer_mac,
+                    map_shortcuts: self.map_shortcuts(cfg),
+                    control_as_meta: cfg.control_as_meta,
                     motion_scale,
                     video,
                     pointer_region: if free_mouse {
@@ -2154,6 +2270,18 @@ impl View {
         let out = link.out;
         let cmd_is_ctrl = self.cmd_is_ctrl(link.cfg);
         let (ev, at) = match item {
+            Queued::Physical(key) => {
+                self.cmd_since_v_up |= key.down && matches!(key.vk, 0x5b | 0x5c | 0xa2 | 0xa3);
+                if key.vk == input::VK_V as u16 && !key.down {
+                    let pasted = std::mem::take(&mut self.pasted_since_v_up);
+                    let cmd = std::mem::take(&mut self.cmd_since_v_up);
+                    if swallowed_paste(self.held.is_down(input::VK_V), pasted, cmd) {
+                        self.paste(link, String::new());
+                    }
+                }
+                self.held.shortcut_key(out, key, self.mapping(link.cfg));
+                return;
+            }
             Queued::Modifiers(m) => {
                 self.cmd_since_v_up |= m.command;
                 self.held.modifiers(out, m, cmd_is_ctrl);
@@ -2176,7 +2304,7 @@ impl View {
             } if at.keys_to_pc && (pressed || !repeat) => {
                 // The host key never reaches the PC, even when it was
                 // pressed and let go inside one frame.
-                if m.ctrl && m.alt {
+                if m.ctrl && m.alt && !crate::keyboard::alt_gr() {
                     return;
                 }
                 // Each key goes with the modifiers held when it was pressed:
@@ -2218,12 +2346,12 @@ impl View {
             Event::Paste(text) if at.keys_to_pc => self.paste(link, text),
             Event::Text(text) if at.keys_to_pc => {
                 if !text.is_empty() {
-                    out.text(&text);
+                    self.held.text(out, &text);
                 }
             }
             Event::Ime(egui::ImeEvent::Commit(text)) if at.keys_to_pc => {
                 if !text.is_empty() {
-                    out.text(&text);
+                    self.held.text(out, &text);
                 }
             }
             Event::PointerButton {
@@ -2249,6 +2377,9 @@ impl View {
                     self.bar_shown = false;
                     if link.cfg.capture_mouse {
                         self.grab(link.ctx, out);
+                        if crate::keyboard::available() && self.viewer_mac && !self.host_mac {
+                            self.held.retarget_modifiers(out, self.mapping(link.cfg));
+                        }
                     }
                 }
                 if at.keys_to_pc && !(m.ctrl && m.alt) {
@@ -2334,15 +2465,31 @@ impl View {
         crate::macos::caps_lock()
     }
 
+    fn mapping(&self, cfg: &ClientConfig) -> crate::keyboard::Mapping {
+        crate::keyboard::Mapping {
+            viewer_mac: self.viewer_mac,
+            host_mac: self.host_mac,
+            enabled: self.map_shortcuts(cfg),
+            relative: self.captured,
+            control_as_meta: cfg.control_as_meta,
+        }
+    }
+
+    fn map_shortcuts(&self, cfg: &ClientConfig) -> bool {
+        cfg.cmd_is_ctrl
+    }
+
     /// Whether ⌘ goes to the PC as Ctrl. A Mac there gets Command whatever
     /// the setting, which is about Windows and Linux.
     fn cmd_is_ctrl(&self, cfg: &ClientConfig) -> bool {
-        cfg.cmd_is_ctrl && !self.host_mac
+        self.map_shortcuts(cfg) && !self.host_mac
     }
 
     /// What ⌘ stands for in a clipboard shortcut.
     fn clipboard_modifier(&self, cfg: &ClientConfig) -> i16 {
-        if self.host_mac || (cfg!(target_os = "macos") && !cfg.cmd_is_ctrl) {
+        if (self.host_mac && self.map_shortcuts(cfg))
+            || (self.viewer_mac && !self.map_shortcuts(cfg))
+        {
             input::VK_LWIN
         } else {
             input::VK_CONTROL
@@ -2352,12 +2499,54 @@ impl View {
     /// egui swallows Cmd/Ctrl+C/X/V into clipboard events; replay them as
     /// the key chord the PC expects.
     fn clipboard_chord<S: Sink + ?Sized>(&mut self, link: &Link<'_, S>, edit: Edit) {
-        let (keys, alone) = link.live.shortcuts.keys(
+        let shortcuts = if self.map_shortcuts(link.cfg) {
+            link.live.shortcuts
+        } else {
+            crate::clipboard::Shortcuts::Letters
+        };
+        let (keys, alone) = shortcuts.keys(
             edit,
             self.clipboard_modifier(link.cfg),
             link.live.clipboard.pastes_to_selection(),
         );
-        if alone {
+        // Clipboard transport has completed. Replay the editing key through
+        // the same sided swap as ordinary native shortcuts when its source
+        // modifier is still held. A delayed paste can outlive that modifier.
+        if crate::keyboard::available()
+            && !self.viewer_mac
+            && self.host_mac
+            && self.map_shortcuts(link.cfg)
+            && !self.captured
+            && [0xa2, 0xa3, 0x5b, 0x5c]
+                .iter()
+                .any(|&vk| self.held.physical_down(vk))
+        {
+            let vk = match edit {
+                Edit::Copy => input::VK_C,
+                Edit::Cut => input::VK_X,
+                Edit::Paste => input::VK_V,
+            } as u16;
+            for down in [true, false] {
+                self.held.shortcut_key(
+                    link.out,
+                    crate::keyboard::Key { vk, down },
+                    crate::keyboard::Mapping {
+                        viewer_mac: false,
+                        host_mac: true,
+                        enabled: true,
+                        relative: false,
+                        control_as_meta: false,
+                    },
+                );
+            }
+            return;
+        }
+        if alone
+            || (crate::keyboard::available()
+                && !self.viewer_mac
+                && self.host_mac
+                && self.map_shortcuts(link.cfg))
+        {
             self.held.chord_alone(link.out, &keys);
         } else {
             self.held.chord(link.out, &keys);
@@ -2371,6 +2560,10 @@ struct EarlyGate {
     local_focus: bool,
     mouse: bool,
     cmd_is_ctrl: bool,
+    host_mac: bool,
+    viewer_mac: bool,
+    map_shortcuts: bool,
+    control_as_meta: bool,
     motion_scale: f32,
     video: Rect,
     pointer_region: Rect,
@@ -2388,6 +2581,10 @@ impl EarlyGate {
             local_focus: self.local_focus,
             mouse: self.mouse,
             cmd_is_ctrl: self.cmd_is_ctrl,
+            host_mac: self.host_mac,
+            viewer_mac: self.viewer_mac,
+            map_shortcuts: self.map_shortcuts,
+            control_as_meta: self.control_as_meta,
             motion_scale: self.motion_scale,
             video: self.video,
             pointer_region: self.pointer_region,
@@ -2433,6 +2630,26 @@ pub(crate) fn wheel_to_host(unit: egui::MouseWheelUnit, delta: Vec2) -> (f32, f3
         egui::MouseWheelUnit::Page => 1200.0,
     };
     (-delta.x * scale, delta.y * scale)
+}
+
+fn local_cursor_hidden(focused: bool, over_stream: bool, captured: bool, connected: bool) -> bool {
+    focused && (over_stream || captured) && connected
+}
+
+fn host_cursor_drawn(captured: bool, focused: bool, over_stream: bool) -> Option<bool> {
+    focused.then_some(captured || !over_stream)
+}
+
+/// Free-mouse placement uses local input, independently of video and control.
+/// Unfocused viewers keep their OS pointer and do not paint a second one.
+fn cursor_pointer(
+    local: Option<Pos2>,
+    focused: bool,
+    over_stream: bool,
+    video: Rect,
+    size: (u32, u32),
+) -> Option<Pos2> {
+    local.filter(|pos| focused && over_stream && size.0 > 0 && size.1 > 0 && video.contains(*pos))
 }
 
 /// Position and bounding rectangle for the host cursor rendered locally in free mouse mode.
@@ -2775,6 +2992,14 @@ fn toolbar_rule(ui: &mut egui::Ui) {
     );
 }
 
+fn toolbar_key_for_host(label: &str, host_mac: bool) -> bool {
+    match label {
+        "Command+Tab" | "Command+Space" => host_mac,
+        "Windows key" | "Win+L" | "Ctrl+Alt+Delete" | "Alt+Tab" | "Print Screen" => !host_mac,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     #[test]
@@ -2815,6 +3040,88 @@ pub(crate) mod tests {
     use crate::session::Live;
     use egui_kittest::kittest::Queryable;
 
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn native_pc_copy_to_mac_uses_the_held_modifier_side() {
+        for (source, target) in [(0xa2, 0x5b), (0xa3, 0x5c)] {
+            let (mut h, tap) = recording_on(View::default(), true, "macos");
+            crate::keyboard::test_install(true);
+            crate::keyboard::test_frame(vec![
+                (
+                    key(Key::F35, true, Modifiers::NONE),
+                    Some(crate::keyboard::Key {
+                        vk: source,
+                        down: true,
+                    }),
+                    false,
+                ),
+                (Event::Copy, None, false),
+            ]);
+            frame(&mut h, vec![], Modifiers::CTRL);
+            assert_eq!(
+                tap.take(),
+                [
+                    Sent::Key(source as i16, true, 2),
+                    Sent::Key(source as i16, false, 0),
+                    Sent::Key(target, true, 8),
+                    Sent::Key(input::VK_C, true, 8),
+                    Sent::Key(target, false, 0),
+                    Sent::Key(source as i16, true, 2),
+                    Sent::Key(input::VK_C, false, 2),
+                ]
+            );
+            crate::keyboard::test_install(false);
+        }
+    }
+
+    #[test]
+    fn mac_clipboard_replay_temporarily_releases_sided_control() {
+        let held = input::SharedHeld::default();
+        let out = Recorder::default();
+        out.connected.set(true);
+        held.physical_key(&out, 0xa2, true, 0xa2);
+        out.take();
+        held.chord_alone(&out, &[input::VK_LWIN, input::VK_C]);
+        assert_eq!(
+            out.take(),
+            [
+                Sent::Key(0xa2, false, 0),
+                Sent::Key(input::VK_LWIN, true, 8),
+                Sent::Key(input::VK_C, true, 8),
+                Sent::Key(input::VK_C, false, 8),
+                Sent::Key(input::VK_LWIN, false, 0),
+                Sent::Key(0xa2, true, 2),
+            ]
+        );
+        assert!(held.is_down(0xa2));
+    }
+
+    #[test]
+    fn toolbar_keys_follow_host_and_mapping_is_independent_of_mouse_mode() {
+        for host_mac in [false, true] {
+            for label in ["Command+Tab", "Command+Space"] {
+                assert_eq!(toolbar_key_for_host(label, host_mac), host_mac);
+            }
+            for label in [
+                "Windows key",
+                "Win+L",
+                "Ctrl+Alt+Delete",
+                "Alt+Tab",
+                "Print Screen",
+            ] {
+                assert_eq!(toolbar_key_for_host(label, host_mac), !host_mac);
+            }
+        }
+        let mut cfg = ClientConfig::default();
+        let mut view = View::default();
+        assert!(cfg.capture_mouse);
+        assert!(view.map_shortcuts(&cfg));
+        view.captured = true;
+        assert!(view.map_shortcuts(&cfg));
+        cfg.cmd_is_ctrl = false;
+        assert!(!view.map_shortcuts(&cfg));
+    }
+
     #[test]
     fn a_capture_puts_a_pointer_off_the_window_on_the_picture() {
         let commands = |pointer: Option<Pos2>| {
@@ -2845,6 +3152,207 @@ pub(crate) mod tests {
             .iter()
             .position(|c| matches!(c, ViewportCommand::CursorGrab(_)));
         assert!(warp.is_some() && warp < grab, "{off:?}");
+    }
+
+    #[test]
+    fn free_cursor_drawing_rule_covers_focus_and_local_pointer() {
+        let video = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(960.0, 540.0));
+        // All host platforms use these same local placements, even while
+        // video is blocked and the host has sent no new control updates.
+        for local in [None, Some(Pos2::new(111.0, 222.0)), Some(video.center())] {
+            for focused in [false, true] {
+                for inside in [false, true] {
+                    let expected = local.filter(|_| focused && inside);
+                    assert_eq!(
+                        cursor_pointer(local, focused, inside, video, (1920, 1080)),
+                        expected
+                    );
+                    assert_eq!(
+                        host_cursor_drawn(false, focused, inside),
+                        focused.then_some(!inside)
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn no_position_hosts_keep_main_cursor_controls_byte_for_byte() {
+        use latch_proto::control::{self, DrawCursor, Message};
+        for focused in [false, true] {
+            for inside in [false, true] {
+                for captured in [false, true] {
+                    for was_drawn in [false, true] {
+                        let mut actual = Vec::new();
+                        let mut main = Vec::new();
+                        if let Some(draw) = host_cursor_drawn(captured, focused, inside) {
+                            if draw != was_drawn {
+                                control::write_message(
+                                    &mut actual,
+                                    &Message::DrawCursor(DrawCursor { draw }),
+                                )
+                                .unwrap();
+                            }
+                        }
+                        // Main returns on focus loss before it handles cursors.
+                        // Its focused path uses this exact draw condition.
+                        let draw = captured || !inside;
+                        if focused && draw != was_drawn {
+                            control::write_message(
+                                &mut main,
+                                &Message::DrawCursor(DrawCursor { draw }),
+                            )
+                            .unwrap();
+                        }
+                        assert_eq!(actual, main);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_waits_for_geometry_and_uses_local_motion_without_video_updates() {
+        let video = Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 540.0));
+        for size in [(0, 0), (1920, 0), (0, 1080)] {
+            assert_eq!(
+                cursor_pointer(Some(video.center()), true, true, video, size),
+                None
+            );
+        }
+        for local in [video.min, video.center(), Pos2::new(900.0, 500.0)] {
+            assert_eq!(
+                cursor_pointer(Some(local), true, true, video, (1920, 1080)),
+                Some(local)
+            );
+        }
+    }
+    #[test]
+    fn viewer_paints_one_cursor_across_host_and_viewer_states() {
+        use latch_stream::session::CursorState;
+        use std::sync::Arc;
+        let video = Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 540.0));
+        for focused in [false, true] {
+            for size in [(1920, 1080), (960, 540)] {
+                for inside in [false, true] {
+                    for captured in [false, true] {
+                        // Hidden, host-composited/embedded, and separately visible.
+                        for host_state in ["hidden", "composited", "plane"] {
+                            let host_draws = host_state == "composited";
+                            let plane_visible = host_state == "plane";
+                            let local = inside.then_some(Pos2::new(100.0, 200.0));
+                            let shape =
+                                latch_proto::control::CursorShape::new(1, 2, 2, 0, 0, &[255; 16]);
+                            let cursor = CursorState {
+                                visible: plane_visible,
+                                shape: Some(Arc::new(shape)),
+                            };
+                            let ctx = egui::Context::default();
+                            let mut view = View {
+                                captured,
+                                ..Default::default()
+                            };
+                            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                                view.paint_cursor_image(
+                                    ctx,
+                                    Some(cursor.clone()),
+                                    local,
+                                    focused,
+                                    inside,
+                                    video,
+                                    size,
+                                );
+                            });
+                            let meshes: Vec<_> = output
+                                .shapes
+                                .iter()
+                                .filter_map(|shape| {
+                                    if let egui::Shape::Mesh(mesh) = &shape.shape {
+                                        Some(mesh)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            let viewer_should_draw =
+                                plane_visible && !captured && focused && inside;
+                            assert_eq!(meshes.len(), usize::from(viewer_should_draw),
+                                "focused={focused}, size={size:?}, inside={inside}, captured={captured}, host={host_state}");
+                            assert!(meshes.is_empty() || !host_draws);
+                            if let Some(mesh) = meshes.first() {
+                                let expected = local.unwrap();
+                                assert_eq!(mesh.calc_bounds().min, expected);
+                            }
+                            // In the steady separate-plane state, exactly one
+                            // of the viewer plane and local OS arrow is visible
+                            // over the stream. Captured/outside focused states
+                            // ask the host for composition instead.
+                            let request = host_cursor_drawn(captured, focused, inside);
+                            if plane_visible && request == Some(false) {
+                                let local_arrow =
+                                    inside && !local_cursor_hidden(focused, inside, captured, true);
+                                assert_eq!(meshes.len() + usize::from(local_arrow), 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn viewer_cursor_requires_decodable_shape_and_valid_geometry() {
+        use latch_stream::session::CursorState;
+        use std::sync::Arc;
+        let video = Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 540.0));
+        for invalid in [
+            "base64",
+            "length",
+            "missing",
+            "geometry",
+            "off-output",
+            "disconnected",
+        ] {
+            let mut shape = latch_proto::control::CursorShape::new(1, 2, 2, 0, 0, &[255; 16]);
+            if invalid == "base64" {
+                shape.rgba = "?".into();
+            }
+            if invalid == "length" {
+                shape.rgba.clear();
+            }
+            let cursor = CursorState {
+                visible: true,
+                shape: (invalid != "missing").then(|| Arc::new(shape)),
+            };
+            let size = if invalid == "geometry" {
+                (0, 0)
+            } else {
+                (1920, 1080)
+            };
+            let ctx = egui::Context::default();
+            let mut view = View::default();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                view.paint_cursor_image(
+                    ctx,
+                    (invalid != "disconnected").then_some(cursor.clone()),
+                    Some(if invalid == "off-output" {
+                        Pos2::new(961.0, 541.0)
+                    } else {
+                        video.center()
+                    }),
+                    true,
+                    true,
+                    video,
+                    size,
+                );
+            });
+            assert!(
+                !output
+                    .shapes
+                    .iter()
+                    .any(|shape| matches!(&shape.shape, egui::Shape::Mesh(_))),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
@@ -3869,6 +4377,58 @@ pub(crate) mod tests {
     const LAST_POWER_ITEM: &str = "Update Latch Host… (runs 3.0.0)";
 
     #[test]
+    fn control_key_option_is_disabled_with_a_reason_and_fits_the_menu() {
+        for (positions, mapped) in [(false, true), (true, false), (true, true)] {
+            for (size, trigger) in [
+                (Vec2::new(640.0, 420.0), "More"),
+                (Vec2::new(OVERFLOW_BELOW, 420.0), "Keys"),
+            ] {
+                crate::keyboard::test_install(positions);
+                let mut view = view_with_bar();
+                view.viewer_mac = true;
+                let mut f = fixture(view, windows_old_host());
+                f.cfg.cmd_is_ctrl = mapped;
+                let mut h = harness_with(size, 1.0, false, f);
+                h.get_by_label(trigger).simulate_click();
+                h.run_steps(3);
+                let menu = latch_ui::open_menu_rect(&h.ctx).unwrap();
+                let bounds = node_rect(&h.get_by_label("Control key acts as Windows key"));
+                if bounds.bottom() > menu.bottom() {
+                    h.input_mut().events.extend([
+                        Event::PointerMoved(menu.center()),
+                        Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: Vec2::new(0.0, menu.bottom() - bounds.bottom() - 48.0),
+                            modifiers: Modifiers::NONE,
+                        },
+                    ]);
+                    h.run_steps(10);
+                }
+                let choice = h.get_by_label("Control key acts as Windows key");
+                assert_eq!(choice.is_disabled(), !(positions && mapped));
+                let menu = latch_ui::open_menu_rect(&h.ctx).unwrap();
+                assert_inside("Control option", node_rect(&choice), menu);
+                if !positions {
+                    h.get_by_label("Requires Latch Host newer than 6.0.0.");
+                } else if !mapped {
+                    h.get_by_label("Enable Command/Ctrl mapping to use this.");
+                }
+                choice.simulate_click();
+                h.run_steps(2);
+                assert_eq!(
+                    h.state().actions,
+                    if positions && mapped {
+                        vec![Action::ToggleControlAsMeta]
+                    } else {
+                        vec![]
+                    }
+                );
+                crate::keyboard::test_install(false);
+            }
+        }
+    }
+
+    #[test]
     fn every_toolbar_menu_fits_the_smallest_window_and_scrolls_to_its_end() {
         let min = Vec2::new(640.0, 420.0);
         let mut h = harness_with(
@@ -3881,11 +4441,7 @@ pub(crate) mod tests {
         // The separate menus exist from this width up; at the minimum
         // height they must fit too.
         let short = Vec2::new(OVERFLOW_BELOW, 420.0);
-        let last_key = if cfg!(target_os = "macos") {
-            "Command acts as Ctrl"
-        } else {
-            "Print Screen"
-        };
+        let last_key = "Map Command ↔ Ctrl";
         for (trigger, last) in [
             ("Keys", last_key),
             ("Mouse", "Free, for desktops (follows this cursor)"),
@@ -3978,11 +4534,7 @@ pub(crate) mod tests {
         use crate::app::snapshots::{file_name, save};
         let min = Vec2::new(640.0, 420.0);
         let short = Vec2::new(OVERFLOW_BELOW, 420.0);
-        let last_key = if cfg!(target_os = "macos") {
-            "Command acts as Ctrl"
-        } else {
-            "Print Screen"
-        };
+        let last_key = "Map Command ↔ Ctrl";
         for ppp in [1.0, 2.0] {
             for (name, size, trigger, last) in [
                 ("more-end", min, "More", LAST_POWER_ITEM),
@@ -4402,7 +4954,7 @@ pub(crate) mod tests {
 
     /// A stream view at the smallest window whose input goes to a
     /// recording instead of the PC, with the other machine running `os`.
-    fn recording_on(
+    pub(super) fn recording_on(
         view: View,
         connected: bool,
         os: &str,
@@ -4429,7 +4981,7 @@ pub(crate) mod tests {
         recording_on(view, connected, "windows")
     }
 
-    fn key(key: Key, pressed: bool, modifiers: Modifiers) -> Event {
+    pub(super) fn key(key: Key, pressed: bool, modifiers: Modifiers) -> Event {
         Event::Key {
             key,
             physical_key: Some(key),
@@ -4449,7 +5001,11 @@ pub(crate) mod tests {
     }
 
     /// One frame with these events, ending with `end` held.
-    fn frame(h: &mut egui_kittest::Harness<'_, Fixture>, events: Vec<Event>, end: Modifiers) {
+    pub(super) fn frame(
+        h: &mut egui_kittest::Harness<'_, Fixture>,
+        events: Vec<Event>,
+        end: Modifiers,
+    ) {
         h.input_mut().events.extend(events);
         h.input_mut().modifiers = end;
         h.run_steps(1);
@@ -4471,6 +5027,62 @@ pub(crate) mod tests {
             (Some(false), false)
         );
         assert_eq!(caps_tap(Some(false), Some(true), true), (Some(true), true));
+    }
+
+    #[test]
+    fn native_sided_keys_release_on_focus_loss_and_disconnect() {
+        for os in ["windows", "macos", "linux"] {
+            let (mut h, tap) = recording_on(View::default(), true, os);
+            for vk in [0xa1, 0xa3, 0xa5, 0x5c, latch_proto::keyboard::KEYPAD_ENTER] {
+                crate::keyboard::test_frame(vec![(
+                    key(Key::F35, true, Modifiers::NONE),
+                    Some(crate::keyboard::Key { vk, down: true }),
+                    false,
+                )]);
+                frame(&mut h, vec![], Modifiers::NONE);
+            }
+            assert!(h.state().view.held.any_down());
+            tap.take();
+            frame(&mut h, vec![Event::WindowFocused(false)], Modifiers::NONE);
+            assert!(!h.state().view.held.any_down());
+            let mut released = if cfg!(target_os = "macos") && os != "macos" {
+                vec![0xa1, 0xa3, 0xa5, latch_proto::keyboard::KEYPAD_ENTER]
+            } else {
+                vec![0x5c, 0xa1, 0xa3, 0xa5, latch_proto::keyboard::KEYPAD_ENTER]
+            };
+            released.sort_unstable();
+            let mut expected: Vec<_> = released
+                .into_iter()
+                .map(|vk| Sent::Key(vk as i16, false, 0))
+                .collect();
+            expected.push(Sent::ReleaseAll);
+            assert_eq!(tap.take(), expected, "{os}");
+            tap.connected.set(false);
+            frame(&mut h, vec![], Modifiers::NONE);
+            assert!(!h.state().view.held.any_down());
+        }
+    }
+
+    #[test]
+    fn native_dead_key_text_survives_another_physical_key_in_the_same_frame() {
+        let (mut h, tap) = recording(View::default(), true);
+        crate::keyboard::test_frame(vec![
+            (Event::Text("é".into()), None, true),
+            (
+                key(Key::A, true, Modifiers::NONE),
+                Some(crate::keyboard::Key {
+                    vk: 0x41,
+                    down: true,
+                }),
+                false,
+            ),
+            (Event::Text("a".into()), None, false),
+        ]);
+        frame(&mut h, vec![], Modifiers::NONE);
+        assert_eq!(
+            tap.take(),
+            [Sent::Text("é".into()), Sent::Key(0x41, true, 0)]
+        );
     }
 
     #[test]
@@ -4543,6 +5155,44 @@ pub(crate) mod tests {
                 Sent::Key(VK_CONTROL, false, 0),
             ]
         );
+    }
+
+    #[test]
+    fn legacy_command_mapping_survives_default_game_and_relative_modes() {
+        for os in ["windows", "linux", "macos"] {
+            for captured in [false, true] {
+                let (mut h, tap) = recording_on(
+                    View {
+                        captured,
+                        ..View::default()
+                    },
+                    true,
+                    os,
+                );
+                assert!(h.state().cfg.capture_mouse);
+                assert!(!crate::keyboard::available());
+                frame(
+                    &mut h,
+                    vec![key(Key::Z, true, CMD), key(Key::Z, false, CMD)],
+                    Modifiers::NONE,
+                );
+                let (modifier, mask) = if os == "macos" {
+                    (VK_LWIN, latch_stream::input::MOD_META)
+                } else {
+                    (VK_CONTROL, MOD_CTRL)
+                };
+                assert_eq!(
+                    tap.take(),
+                    [
+                        Sent::Key(modifier, true, mask),
+                        Sent::Key(VK_Z, true, mask),
+                        Sent::Key(VK_Z, false, mask),
+                        Sent::Key(modifier, false, 0),
+                    ],
+                    "{os}, captured={captured}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5545,7 +6195,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn each_session_starts_with_the_host_pointer_off() {
+    fn each_session_resets_host_pointer_and_cached_cursor_texture() {
         // The last session's reset leaves the host drawing; a new session
         // starts with it off, so a captured reconnect must ask again.
         let ctx = egui::Context::default();
@@ -5555,8 +6205,8 @@ pub(crate) mod tests {
             cursor_texture: Some((
                 1,
                 ctx.load_texture(
-                    "previous-cursor",
-                    egui::ColorImage::new([1, 1], Color32::WHITE),
+                    "old-host-cursor",
+                    egui::ColorImage::new([1, 1], Color32::RED),
                     egui::TextureOptions::LINEAR,
                 ),
             )),
@@ -5564,7 +6214,10 @@ pub(crate) mod tests {
         };
         view.stream_started(&ctx, &live, false);
         assert!(!view.host_cursor_drawn);
-        assert!(view.cursor_texture.is_none());
+        assert!(
+            view.cursor_texture.is_none(),
+            "a restarted host can reuse serial 1 for different pixels"
+        );
     }
 
     #[test]
@@ -5800,4 +6453,14 @@ pub(crate) mod tests {
         h.run_steps(1);
         assert!(h.state().actions.contains(&Action::Reconnect));
     }
+}
+
+#[cfg(test)]
+mod keyboard_regressions {
+    use super::tests::*;
+    use super::*;
+    use crate::input::{Sent, VK_CONTROL, VK_LWIN};
+    use egui::{Event, Key, Modifiers};
+    include!("keyboard/stream_fixture.rs");
+    include!("keyboard/stream_regressions.rs");
 }

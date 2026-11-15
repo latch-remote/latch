@@ -42,6 +42,7 @@ Content-Length: <n>
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `protocol` | u32 | 1 |
+| `startup_timeout_secs` | u32 | optional total startup budget, currently 180 seconds. Absence retains the older viewer's 60-second budget. Wayland hosts reserve 45 seconds for preparation and allow at most 90 seconds for portal approval |
 | `width`, `height` | u32 | picture size the viewer wants (even numbers) |
 | `fps` | u32 | frames per second wanted |
 | `bitrate_kbps` | u32 | video bitrate wanted (a ceiling: the host's rate control comes down from it) |
@@ -55,6 +56,7 @@ Content-Length: <n>
 | `audio_channels` | u32 | optional; most channels the viewer plays (6 for 5.1, 8 for 7.1). Absent, or below 3, means stereo |
 | `mic` | bool | optional, default false; the viewer offers its microphone (datagram kind 13) |
 | `probe_trains` | bool | optional, default false; the viewer times probe trains (datagram kind 16) and reports their rate |
+| `key_positions` | bool | optional, default false; offers additional physical keyboard positions in input kind 8 |
 | `relay` | bool | optional, default false; the viewer supports the two-lane authenticated relay extension |
 | `display` | string | optional; the host display to share, by an `id` from its status `streamer.displays` (see [Choosing a display](#choosing-a-display-additive)); absent leaves the choice to the host |
 
@@ -89,7 +91,7 @@ type byte and the payload and is at most 65 536. Payloads are JSON objects.
 | 3 | `Keepalive` | either | `{}` |
 | 4 | `Notice` | host → viewer | `{"kind": "audio" \| "video" \| "input", "message": string}`; `message` empty clears it |
 | 5 | `Report` | either | `{"fps", "loss_pct", "decode_ms", "rtt_ms"}`, every 50 ms (older viewers: 250 ms or once a second), for bitrate and FEC feedback |
-| 6 | `Cursor` | host → viewer | `{"visible": bool, "shape": null \| {"serial": u32, "width": u32, "height": u32, "hot_x": u32, "hot_y": u32, "rgba": "<base64>"}}`; only after an `Accept` with `cursor` true; sent when visibility or shape changes (`shape` null: unchanged); straight-alpha RGBA, at most 96×96 |
+| 6 | `Cursor` | host → viewer | `{"visible": bool, "shape": null \| {"serial": u32, "width": u32, "height": u32, "hot_x": u32, "hot_y": u32, "rgba": "<base64>"}}`; only after an `Accept` with `cursor` true; sent when visibility or shape changes (`shape` null: unchanged); straight-alpha sRGB RGBA, at most 96×96 |
 | 7 | `DrawCursor` | viewer → host | `{"draw": bool}`; tells host whether to composite pointer into video |
 | 8 | `Relay` | either | `{"session": u32, "attempt": u64, "action": RelayAction}`; negotiated only when request and accept both set `relay` |
 
@@ -98,6 +100,57 @@ active. Codes 0 (intentional end), 1 (takeover), and 5 (host stopping) stop
 automatic reconnect. Code 6 is a recoverable transport failure, including
 priority backpressure or a full bounded control inbox. Every cursor update
 uses the original ordered connection, regardless of its serialized size.
+
+Windows and Mac hosts use the shared shape/visibility tracker and serial
+allocator. Protocol 1 carries the same `Cursor` and `DrawCursor` objects on
+all host platforms. In focused free-mouse mode the viewer places the shape at
+its local pointer, including while stationary and while video is blocked.
+If an application warps the host pointer or another mouse moves it while the
+focused viewer is driving it, the drawn cursor stays at the local position
+until the user next moves the mouse. Host hover effects can therefore diverge
+from the drawn cursor while local input is stationary.
+An unfocused viewer keeps its OS pointer, paints no local plane and sends no
+`DrawCursor` updates. Captured mode uses the host-composited cursor. Drawing
+waits for valid stream geometry, using the negotiated size until complete stats
+arrive. Shapes and visibility remain host-authoritative in every mode.
+
+Windows publishes pointer-only DXGI shape and visibility changes through a
+coalescing control mailbox before video conversion or encoding. The shared
+tracker retains readable pixels across temporary failures and assigns a fresh
+process-wide serial when the shape changes or capture restarts. Visibility-only
+publication compares scalar state and copies pixels only for a new serial.
+The mailbox retains an unsent shape across coalesced visibility updates and
+deduplicates each viewer's wire state by serial and visibility. Local pointer
+motion requires no cursor control traffic or host position sampling thread.
+
+Colour cursors use straight-alpha sRGB on the wire. DXGI colour buffers are
+straight-alpha BGRA, matching Microsoft's Desktop Duplication sample, which
+uploads those bytes unchanged and blends using `SRC_ALPHA` and
+`INV_SRC_ALPHA`. The GDI bitmap fallback unpremultiplies its colour bitmap
+once on read. Mac sources that supply premultiplied pixels must likewise
+unpremultiply before sending. Monochrome inversion uses white pixels with a
+dark outline, and masked colour uses copy/transparent pixels plus the same
+outlined inversion. Arbitrary colour XOR and unreadable shapes stay
+composited, with plane visibility false during fallback. Hidden and off-output
+pointers are reported invisible. The fallback caches by system cursor handle
+and retries unsuccessful reads after 250 ms. Video has a zero cursor-wait bound.
+If both the current bitmap and system arrow are unreadable, frames continue
+with the last readable bitmap, or without one if none is available. The host logs
+once per failure episode, and idle capture ticks repaint the pointer when a
+bitmap becomes readable. Reopening the same captured output retains and
+rescales its shape, including when the resolution changes, and re-sends it.
+Changing outputs resets per-output cursor state. Reconnect resets the viewer's
+cached texture because a restarted host can reuse shape serials.
+[Microsoft's colour-buffer upload and blend state](https://github.com/microsoft/Windows-classic-samples/blob/main/Samples/DXGIDesktopDuplication/cpp/OutputManager.cpp)
+
+On native HDR output, separate RGBA uses the viewer's SDR UI white, mapped by
+its local compositor. The composited HDR path encodes the cursor at the host
+SDR white level in nits (the host's white multiplier × 80, then BT.2020/PQ).
+The cursor protocol carries no SDR white luminance metadata, so the viewer
+cannot reproduce the host's chosen luminance in its UI plane. Consequently,
+captured/free switches can change cursor brightness when those white levels
+differ. SDR output uses sRGB white in both paths. Physical HDR cursor
+brightness and live Windows capture of the separate plane remain unverified.
 
 `Accept`:
 
@@ -114,6 +167,7 @@ uses the original ordered connection, regardless of its serialized size.
 | `audio_problem` | string | why there is no audio, when `audio` is null |
 | `cursor` | bool | optional, default false; host supports omitting pointer from video and sending shape updates |
 | `gamepads` | u8 | optional, default 0; gamepad slots the host emulates (0: none, so the viewer sends none) |
+| `key_positions` | bool | optional, default false; accepts input kind 8, only when offered in the request |
 | `gamepad_kinds` | [string] | optional; the pad kinds the host emulates as themselves, of `"xbox"`, `"playstation"`, `"generic"`; unknown names are skipped |
 | `gamepad_problem` | string | optional; why the host takes no gamepads although the viewer offered them |
 | `reference_invalidation` | bool | optional, default false; true only when the viewer asked and the session's encoder makes recovery frames |
@@ -269,6 +323,59 @@ Events, each `u8 kind` then a fixed payload:
 | 5 | scroll | `i16 vertical, i16 horizontal` (120 per notch; up and right positive) |
 | 6 | text | `u8 len` (1–64), UTF-8 bytes |
 | 7 | release everything held | none |
+| 8 | additional key position | `u16 usage` (USB HID keyboard page), `u8 down`, `u8 modifiers` with the same mask as kind 4. Negotiated with `key_positions`. |
+
+Keys name physical US positions, interpreted using the host layout. Kind 4
+preserves left/right modifiers with VK_LSHIFT/RSHIFT (`a0/a1`),
+VK_LCONTROL/RCONTROL (`a2/a3`), VK_LMENU/RMENU (`a4/a5`) and
+VK_LWIN/RWIN (`5b/5c`). Generic `10/11/12` from older viewers mean the
+left side. The modifier mask describes aggregate held state and carries
+no side information. UTF-8 text carries committed IME/dead-key characters.
+Viewers suppress the physical presses that composed a text commit.
+
+`StreamRequest.key_positions` and `Accept.key_positions` are optional
+booleans, default false and omitted when false. A host answers true only
+when the viewer offered true. Kind 8 is sent only after that acceptance.
+Supported keyboard-page usages are `58` (keypad Enter), `67` (keypad
+Equals), `87` (IntlRo), `88` (Kana), `89` (IntlYen), `8a` (Convert) and
+`8b` (NonConvert), all hexadecimal. Unknown usages are parsed as fixed five-byte events and ignored individually.
+The receiver acknowledges their sequence numbers and logs only the first
+unknown usage per receiver. Datagram size and the existing reorder window
+bound their memory use. Invalid lengths and boolean fields are rejected.
+Other keys keep kind 4. Internally the Rust input type represents a kind-8
+position as `Event::Key.vk = 0x100 + usage`. Those internal values never
+appear as a kind-4 payload from the sender.
+
+The Mac injector applies its ISO native-code swap only when the viewer
+offered `key_positions`, preserving legacy injection for a 6.0.0 viewer.
+
+A viewer connected to a host without `key_positions` uses the 6.0.0
+egui/text translation path. Only the historical `input::vk` image and
+existing modifier, Caps Lock and toolbar events can enter kind 4. ISO and
+other native-only positions retain their old text behavior. The negotiated
+native path is selected before physical-text suppression. An older viewer
+sends its existing kind-4 keys to a new host. Input ordering, retransmission
+and InputAck cover kind 8 in the same sequence space as every other event.
+
+Default shortcut mapping preserves main's Mac Command → PC Ctrl and
+clipboard Command toward Mac hosts in every mouse mode, including relative
+capture and a 6.0.0 host. Recorded `bf5da0d` datagrams cover all viewer/host
+pairs with default settings and released/relative mouse states. Negotiated
+native input adds sided identities and the USING.md modifier swaps.
+Only the new swap halves stop during actual relative capture. The explicit
+Send keys as pressed setting sends physical modifiers, including clipboard
+chords, in every mode. These are viewer policies and require no additional
+wire capability. Viewer media controls remain local. Windows hook and X11
+grab watchdogs release capture on a stalled UI and release remote held state
+when UI dispatch resumes. Constructed-event tests verify serialization and
+mapping. They provide no real-keyboard or cross-machine acceptance record.
+
+The Windows elevated helper negotiates its pipe separately. New clients
+try `LATCHIN2` and reconnect with `LATCHIN1` for an old helper. A new helper
+echoes either handshake, preserving v1 clients. Only a v2 echo advertises
+kind 8. A v1 helper receives legacy VK forms for extended positions.
+Length-delimited unsupported requests receive an error reply and leave
+the connection usable for later input and releases.
 
 Input is reliable without retransmission timers: the viewer numbers every
 event and keeps it until the host acknowledges it. Each `Input` datagram
@@ -497,6 +604,10 @@ Switching displays mid-stream is a new session; there is no control
 message for it. The host places the pointer in the new picture before
 relative input resumes. Windows codec negotiation probes the adapter that
 drives the selected output, with capability results cached per adapter.
+Windows cursor positions use the actual captured output's physical origin and
+stream-content fit. Pointers on other outputs are reported invisible for both
+separate-plane and composited drawing. Missing-display fallback switches cursor
+ownership to the fallback output.
 
 Windows choices saved as GDI source names by earlier versions follow the
 missing-display fallback. New choices use monitor device paths so source
@@ -504,8 +615,8 @@ renumbering preserves the selected monitor. Windows keeps the pre-session
 list throughout preparation and restoration as well as capture.
 
 `streamer.captured_display`, when present, names the display the running
-pipeline actually captures. macOS reports this even when a missing choice
-fell back to another display. The viewer uses it to mark the current
+pipeline actually captures. macOS and Windows report this even when a missing
+choice fell back to another display. The viewer uses it to mark the current
 capture and allows choosing the requested display again after reconnecting
 it. Older hosts omit this additive status field.
 

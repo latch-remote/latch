@@ -99,6 +99,12 @@ impl Codec {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamRequest {
+    /// Viewer offers the additional physical key positions (input kind 8).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub key_positions: bool,
+    /// Total viewer startup budget in seconds. Absent on older viewers (60 s).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub startup_timeout_secs: u32,
     /// Both peers support authenticated, two-lane relay attempts.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub relay: bool,
@@ -209,6 +215,9 @@ pub struct AudioFormat {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Accept {
+    /// True only when the viewer offered input kind 8.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub key_positions: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub relay: bool,
     #[serde(default)]
@@ -583,6 +592,18 @@ mod tests {
             "name": "old-viewer"
         }"#;
         let req: StreamRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.startup_timeout_secs, 0,
+            "older viewers retain their 60-second startup budget"
+        );
+        let mut current = serde_json::to_value(&req).unwrap();
+        current["startup_timeout_secs"] = 180.into();
+        assert_eq!(
+            serde_json::from_value::<StreamRequest>(current)
+                .unwrap()
+                .startup_timeout_secs,
+            180
+        );
         assert_eq!(req.name, "old-viewer");
         assert!(!req.cursor);
 
@@ -697,6 +718,17 @@ mod tests {
         let mut read_slice = &buf[..];
         let decoded = read_message(&mut read_slice).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn cursor_uses_main_wire_format_and_ignores_unrecognized_position_fields() {
+        let cursor: Cursor =
+            serde_json::from_str(r#"{"visible":true,"shape":null,"position":[-10,20]}"#).unwrap();
+        assert!(cursor.visible && cursor.shape.is_none());
+        assert_eq!(
+            serde_json::to_string(&cursor).unwrap(),
+            r#"{"visible":true,"shape":null}"#
+        );
     }
 
     #[test]

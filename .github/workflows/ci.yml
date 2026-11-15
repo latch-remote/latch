@@ -251,16 +251,45 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
+      # The Wayland unit tests load libpipewire at runtime, and its context
+      # needs client.conf, which pipewire-bin ships.
       - name: native deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libpipewire-0.3-dev pipewire-bin
       - name: clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --locked --workspace --all-targets
       - name: Linux updater local-manifest fixture and rollback
         run: cargo test --locked -p latch-core -j 4 linux_release_fixture_updates_and_rolls_back -- --nocapture
+      - name: X11 capture recovery and media replay
+        run: |
+          set -o pipefail
+          sudo apt-get install -y --no-install-recommends xvfb xauth
+          xvfb-run -a cargo test --locked -p latch-client --lib -j 4 keyboard::linux::tests::watchdog_and_media_replay_restore_local_x11_delivery -- --ignored --exact 2>&1 | tee /tmp/latch-x11-test.log
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          output = Path("/tmp/latch-x11-test.log").read_text()
+          output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+          assert len(re.findall(r"^test result: ok\. 1 passed; 0 failed; 0 ignored;", output, re.MULTILINE)) == 1, output
+          assert not re.search(r"^test result:.*\b0 passed;", output, re.MULTILINE), output
+          PY
       - name: release host
         run: cargo build --locked --release -p latch-host
+      - name: headless Wayland portal capture
+        run: |
+          sudo apt-get install -y --no-install-recommends sway swaybg grim pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr dbus-daemon meson ninja-build libpipewire-0.3-dev libinih-dev libgbm-dev libdrm-dev libsystemd-dev wayland-protocols
+          cargo build --locked -p latch-engine --example wayland_smoke
+          # Ubuntu 24.04 ships xdpw 0.7, which requires DMA-BUF even for SHM.
+          # Apply the SHM-only fixture workaround after the Rust checks.
+          git clone --depth 1 --branch v0.7.1 https://github.com/emersion/xdg-desktop-portal-wlr.git "$RUNNER_TEMP/xdpw"
+          test "$(git -C "$RUNNER_TEMP/xdpw" rev-parse HEAD)" = 74428f2a8fa7f252e2a46fdf5b697536c66c8a1c
+          git -C "$RUNNER_TEMP/xdpw" apply "$GITHUB_WORKSPACE/scripts/wayland-portal-shm.patch"
+          meson setup "$RUNNER_TEMP/xdpw/build" "$RUNNER_TEMP/xdpw" -Dman-pages=disabled -Dc_args="-include unistd.h"
+          ninja -C "$RUNNER_TEMP/xdpw/build"
+          LATCH_TEST_PORTAL_WLR="$RUNNER_TEMP/xdpw/build/xdg-desktop-portal-wlr" scripts/test-wayland.sh
+          layout_test=$(cargo test --locked -p latch-engine --lib --no-run --message-format=json | python3 -c 'import json,sys; print([m["executable"] for line in sys.stdin if (m := json.loads(line)).get("executable") and m.get("target", {}).get("name") == "latch_engine"][0])')
+          LATCH_TEST_PORTAL_WLR="$RUNNER_TEMP/xdpw/build/xdg-desktop-portal-wlr" scripts/test-wayland.sh "$layout_test" --ignored --exact linux::wayland::layout::tests::live_layout_maps_each_monitor_into_the_whole_desktop
       - name: native TCP relay deployment checks
         run: |
           cargo build --locked -p latch-relay
