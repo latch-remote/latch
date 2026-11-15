@@ -13,9 +13,9 @@ pub fn proxy() -> (UdpSocket, TcpListener) {
 
 #[allow(dead_code)]
 pub fn host() -> (Arc<Server>, TcpListener) {
-    ports::retry_bind(|| {
-        let server = Server::bind(0, Options::default())?;
-        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, server.port()))?;
+    ports::retry_bind(|port| {
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+        let server = Server::bind(tcp.local_addr()?.port(), Options::default())?;
         Ok((server, tcp))
     })
 }
