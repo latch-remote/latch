@@ -634,6 +634,7 @@ impl ClientApp {
     }
 
     fn disconnect(&mut self) {
+        self.view.early.disarm();
         self.pending_hdr = None;
         self.reconnect = None;
         self.view.interrupted = None;
@@ -3356,6 +3357,38 @@ pub(crate) mod snapshots {
         });
         harness.run_steps(3);
         harness
+    }
+
+    #[test]
+    fn reconnect_disarms_os_input_before_the_next_frame() {
+        let mut h = build(Setup::new(Discovery::default()), TYPICAL, 1.0, false);
+        let out = std::rc::Rc::new(crate::input::Recorder::default());
+        out.connected.set(true);
+        let region = egui::Rect::from_min_size(egui::Pos2::ZERO, TYPICAL);
+        h.state().view.early.arm(crate::early::Gate {
+            keys: true,
+            local_focus: false,
+            mouse: true,
+            cmd_is_ctrl: true,
+            motion_scale: 1.0,
+            video: region,
+            pointer_region: region,
+            ctx: h.ctx.clone(),
+            over_stream: true,
+            ppp: 1.0,
+            free_clicks: false,
+            caps: None,
+            out: out.clone(),
+        });
+        assert!(h.state().view.early.armed());
+        // Display selection calls disconnect before queuing its new session.
+        h.state_mut().disconnect();
+        assert!(!h.state().view.early.armed());
+        assert!(!h.state().view.early.deliver(
+            crate::early::Native::Motion { dx: 10.0, dy: 20.0 },
+            Instant::now(),
+        ));
+        assert!(out.take().is_empty());
     }
 
     /// Every widget sits inside the window, and no two controls overlap.

@@ -1,5 +1,5 @@
 use super::capture::Gpu;
-use super::{display, mf};
+use super::mf;
 use crate::bitstream::{vbv_bits, Format, Sequence};
 use crate::video::{Codec, VideoConfig};
 use anyhow::{bail, Context, Result};
@@ -218,12 +218,15 @@ pub(super) fn available() -> bool {
             .is_ok()
     }
 }
-pub(super) fn codec_available(codec: Codec, output: &display::Output) -> bool {
+pub(super) fn codec_available(
+    codec: Codec,
+    device: &windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
+) -> bool {
     if matches!(codec, Codec::H264High | Codec::H264Baseline) {
         return available();
     }
-    // SAFETY: The output owns the adapter interface.
-    let Ok(desc) = (unsafe { output.adapter.GetDesc1() }) else {
+    // SAFETY: The caller owns this adapter interface.
+    let Ok(desc) = (unsafe { device.GetDesc1() }) else {
         return false;
     };
     let adapter = (desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart);
@@ -234,7 +237,7 @@ pub(super) fn codec_available(codec: Codec, output: &display::Output) -> bool {
         return false;
     }
     // No device now says nothing about the encoder: try again next connection.
-    let Ok(gpu) = Gpu::new(&output.adapter) else {
+    let Ok(gpu) = Gpu::new(device) else {
         return false;
     };
     let config = VideoConfig {
@@ -244,7 +247,7 @@ pub(super) fn codec_available(codec: Codec, output: &display::Output) -> bool {
         fps: 60,
         bitrate_kbps: 10_000,
         codec,
-        display: Some(output.id.clone()),
+        display: None,
     };
     match probe_keyframe(&config, &gpu) {
         Ok(()) => {
@@ -995,6 +998,7 @@ mod output_tests {
 
 #[cfg(test)]
 mod hardware_tests {
+    use super::super::display;
     use super::*;
 
     /// Run in the signed-in desktop; never run hardware probes in CI/session 0.
@@ -1059,7 +1063,7 @@ mod hardware_tests {
                 eprintln!("{name}");
             }
             let output = display::select()?;
-            let proven = codec_available(codec, &output);
+            let proven = codec_available(codec, &output.adapter);
             eprintln!("{codec:?} proven: {proven}");
             if codec == Codec::Av1 && hardware(codec)?.is_empty() {
                 assert!(!proven);

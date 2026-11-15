@@ -660,10 +660,10 @@ pub fn encodable(display: Option<&str>) -> Vec<Codec> {
                 return vec![Codec::H264Baseline];
             };
             let _dpi = display::DpiAwareness::physical();
-            let output = display::select_named(display.as_deref()).ok();
+            let adapter = display::encoding_adapter(display.as_deref()).ok();
             let mut codecs = Vec::new();
             for codec in [Codec::Av1, Codec::Hevc] {
-                if output
+                if adapter
                     .as_ref()
                     .is_some_and(|o| encode::codec_available(codec, o))
                 {

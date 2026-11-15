@@ -1,5 +1,6 @@
 use crate::display::Previous;
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeMap;
 use windows::{
     core::PCWSTR,
     Win32::{
@@ -40,6 +41,8 @@ struct Saved {
     previous: Previous,
     paths: Vec<DISPLAYCONFIG_PATH_INFO>,
     modes: Vec<DISPLAYCONFIG_MODE_INFO>,
+    adapters: BTreeMap<String, (i32, u32)>,
+    default_adapter: (i32, u32),
 }
 static SAVED: parking_lot::Mutex<Option<Saved>> = parking_lot::Mutex::new(None);
 fn topology() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>)> {
@@ -276,6 +279,38 @@ pub(super) fn select_named(wanted: Option<&str>) -> Result<Output> {
     };
     Ok(outputs.swap_remove(index))
 }
+
+/// Probe the adapter a display will use after the active session restores its
+/// topology. Physical outputs disabled for virtual capture remain selectable.
+pub(super) fn encoding_adapter(wanted: Option<&str>) -> Result<IDXGIAdapter1> {
+    let saved_adapter = SAVED
+        .lock()
+        .as_ref()
+        .map(|saved| adapter_choice(&saved.adapters, saved.default_adapter, wanted));
+    let Some((high, low)) = saved_adapter else {
+        return Ok(select_named(wanted)?.adapter);
+    };
+    // SAFETY: The saved LUID identifies an adapter, independent of active outputs.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1()?;
+        Ok(factory.EnumAdapterByLuid(windows::Win32::Foundation::LUID {
+            HighPart: high,
+            LowPart: low,
+        })?)
+    }
+}
+
+fn adapter_choice(
+    adapters: &BTreeMap<String, (i32, u32)>,
+    default: (i32, u32),
+    wanted: Option<&str>,
+) -> (i32, u32) {
+    wanted
+        .and_then(|id| adapters.get(id))
+        .copied()
+        .unwrap_or(default)
+}
+
 /// Join DXGI's current GDI sources to persistent monitor identities and labels.
 fn monitor_names() -> Vec<([u16; 32], String, String)> {
     let Ok((paths, _)) = topology() else {
@@ -474,6 +509,19 @@ pub(super) fn prepare(
     let mut saved = SAVED.lock();
     anyhow::ensure!(saved.is_none(), "display topology already prepared");
     let (paths, modes) = topology()?;
+    // Record adapter identity before only_virtual detaches physical outputs.
+    let attached = outputs()?;
+    let default = pick(&keys(&attached), None).context("no default display")?;
+    let adapter_id = |output: &Output| -> Result<(i32, u32)> {
+        // SAFETY: Output owns this adapter interface.
+        let luid = unsafe { output.adapter.GetDesc1()? }.AdapterLuid;
+        Ok((luid.HighPart, luid.LowPart))
+    };
+    let default_adapter = adapter_id(&attached[default])?;
+    let adapters = attached
+        .iter()
+        .map(|output| Ok((output.id.clone(), adapter_id(output)?)))
+        .collect::<Result<_>>()?;
     only_virtual(&output.desc.DeviceName, &paths, &modes)?;
     if let Err(e) = change(&output.desc.DeviceName, &mode) {
         apply_topology(&paths, &modes).context("restore topology after mode failure")?;
@@ -483,6 +531,8 @@ pub(super) fn prepare(
         previous: previous.clone(),
         paths,
         modes,
+        adapters,
+        default_adapter,
     });
     Ok(Some(previous))
 }
@@ -765,5 +815,35 @@ mod hdr_live_test {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod adapter_choice_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_physical_outputs_keep_their_adapter_for_negotiation() {
+        let primary = (0, 10);
+        let secondary = (1, 20);
+        let virtual_gpu = (0, 30);
+        let adapters = BTreeMap::from([
+            ("av1-primary".into(), primary),
+            ("h264-secondary".into(), secondary),
+            ("virtual".into(), virtual_gpu),
+        ]);
+        assert_eq!(
+            adapter_choice(&adapters, virtual_gpu, Some("h264-secondary")),
+            secondary
+        );
+        assert_eq!(
+            adapter_choice(&adapters, virtual_gpu, Some("av1-primary")),
+            primary
+        );
+        assert_eq!(adapter_choice(&adapters, virtual_gpu, None), virtual_gpu);
+        assert_eq!(
+            adapter_choice(&adapters, virtual_gpu, Some("unplugged")),
+            virtual_gpu
+        );
     }
 }

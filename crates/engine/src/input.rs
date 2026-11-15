@@ -14,6 +14,17 @@ pub struct DisplayRect {
 }
 
 impl DisplayRect {
+    /// Keep a desktop position inside this display's last addressable pixel.
+    pub fn clamp(&self, x: i32, y: i32) -> (i32, i32) {
+        let axis = |p: i32, start: i32, size: u32| {
+            i64::from(p).clamp(
+                i64::from(start),
+                i64::from(start) + i64::from(size.saturating_sub(1)),
+            ) as i32
+        };
+        (axis(x, self.x, self.width), axis(y, self.y, self.height))
+    }
+
     /// The centred content rectangle when this display is fitted into a picture.
     /// Capture and injection share this rounding so bars never shift a click.
     pub fn fitted(&self, pw: u32, ph: u32) -> Self {
@@ -71,7 +82,7 @@ pub trait InputSink: Send {
         )
     }
 
-    /// Applies one event. `display` is where absolute positions land.
+    /// Applies one event, keeping absolute and relative positions in `display`.
     fn apply(&mut self, event: &Event, display: DisplayRect) -> anyhow::Result<()>;
 
     /// Releases every key and button this sink pressed and has not
@@ -584,6 +595,48 @@ pub mod keymap {
 #[cfg(test)]
 mod mapping_tests {
     use super::*;
+
+    #[test]
+    fn relative_destinations_and_absolute_bar_clicks_stay_in_the_shared_display() {
+        for display in [
+            DisplayRect {
+                x: -3840,
+                y: -2160,
+                width: 3840,
+                height: 2160,
+            },
+            DisplayRect {
+                x: 1920,
+                y: 500,
+                width: 2560,
+                height: 1440,
+            },
+            DisplayRect {
+                x: -1,
+                y: 200,
+                width: 1,
+                height: 1,
+            },
+        ] {
+            let last = (
+                display.x + display.width as i32 - 1,
+                display.y + display.height as i32 - 1,
+            );
+            let mut point = (display.x, display.y);
+            for _ in 0..3 {
+                point = display.clamp(point.0 - 32768, point.1 - 32768);
+                assert_eq!(point, (display.x, display.y));
+            }
+            for _ in 0..3 {
+                point = display.clamp(point.0 + 32767, point.1 + 32767);
+                assert_eq!(point, last);
+            }
+            assert_eq!(display.map(0, 0, 1920, 1080), (display.x, display.y));
+            assert_eq!(display.map(u16::MAX, u16::MAX, 1920, 1080), last);
+            // A local cursor moved to another monitor returns to this display.
+            assert_eq!(display.clamp(i32::MIN, i32::MAX), (display.x, last.1));
+        }
+    }
 
     #[test]
     fn aspect_fit_and_bar_clicks() {

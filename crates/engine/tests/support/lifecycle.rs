@@ -1290,9 +1290,8 @@ fn fallback_refits_geometry_and_prepares_the_final_mode() {
     assert_eq!(prepared_sizes.lock().last(), Some(&expected));
 }
 
-#[cfg(windows)]
 #[test]
-fn display_codec_negotiation_waits_for_the_previous_capture_to_release_its_topology() {
+fn compatible_display_offer_probes_before_takeover_and_opens_after_cleanup() {
     let server = Server::bind(0, Options::default()).unwrap();
     let old = session("127.0.0.1:9".parse().unwrap());
     *server.current.lock() = Some(old.clone());
@@ -1316,16 +1315,18 @@ fn display_codec_negotiation_waits_for_the_previous_capture_to_release_its_topol
         req,
         "127.0.0.1:9".parse().unwrap(),
         || {
-            assert!(old.stopping());
-            assert!(
-                *old.finished.lock(),
-                "probe must follow topology restoration"
-            );
+            assert!(!old.stopping(), "probe must preserve the current viewer");
+            assert!(!*old.finished.lock());
             // The selected adapter supports H.264, even if the old one used AV1.
             vec![Codec::H264Baseline]
         },
         video::Limits::level,
         |config| {
+            assert!(old.stopping());
+            assert!(
+                *old.finished.lock(),
+                "capture must follow topology restoration"
+            );
             opened.push(config.clone());
             Err(video::Unencodable("injected open failure".into()).into())
         },
@@ -1337,27 +1338,40 @@ fn display_codec_negotiation_waits_for_the_previous_capture_to_release_its_topol
     assert_eq!(opened[0].display.as_deref(), Some("secondary-monitor"));
 }
 
-#[cfg(not(windows))]
 #[test]
-fn an_unsupported_codec_preserves_the_current_capture_when_topology_is_unchanged() {
+fn an_unsupported_display_codec_preserves_the_current_capture() {
     let server = Server::bind(0, Options::default()).unwrap();
     let old = session("127.0.0.1:9".parse().unwrap());
     *server.current.lock() = Some(old.clone());
     let req: StreamRequest = serde_json::from_value(serde_json::json!({
         "protocol": 1, "width": 64, "height": 64, "fps": 30,
         "bitrate_kbps": 1000, "codecs": ["av1"],
-        "udp_port": 9, "audio": false
+        "udp_port": 9, "audio": false, "display": "h264-only-secondary"
     }))
     .unwrap();
     let result = server.prepare_using(
         req,
         "127.0.0.1:9".parse().unwrap(),
-        || vec![Codec::H264Baseline],
+        || {
+            assert!(!old.stopping());
+            vec![Codec::H264Baseline]
+        },
         video::Limits::level,
         |_| panic!("an unsupported codec must be refused before capture opens"),
     );
     assert!(matches!(result, Err(Refusal { status: 406, .. })));
     assert!(!old.stopping());
+    assert!(old.ended.lock().is_none(), "no TAKEN_OVER should be sent");
+    assert!(!*old.finished.lock());
+    assert!(server
+        .current
+        .lock()
+        .as_ref()
+        .is_some_and(|s| Arc::ptr_eq(s, &old)));
+    assert!(
+        !*server.opening.busy.lock(),
+        "refusal releases preparation lock"
+    );
 }
 
 #[test]

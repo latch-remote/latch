@@ -252,9 +252,6 @@ impl Server {
                 "another viewer is still starting a stream here; try again",
             ));
         };
-        // Windows must restore physical outputs before probing their adapters.
-        #[cfg(windows)]
-        self.release_current(&req, peer)?;
         let encodable = encodable();
         let original = req.clone();
         // Best first, of those this host encodes at the size it would send.
@@ -287,9 +284,7 @@ impl Server {
                 ),
             ));
         };
-        // Other platforms can reject an unsupported codec while the old
-        // stream continues, before taking its capture over.
-        #[cfg(not(windows))]
+        // Refuse incompatible offers before interrupting the active viewer.
         self.release_current(&req, peer)?;
         // What the encoder for that codec takes here, before the desktop is
         // sized for it: a larger request is scaled down in proportion.
