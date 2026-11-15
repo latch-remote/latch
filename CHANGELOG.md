@@ -4,6 +4,19 @@ The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
 `## X.Y.Z (date)`.
 
+## Unreleased
+
+### Packaging
+
+- Add a Scoop manifest, AUR packages (`latch-remote-bin` from the release
+  binaries, `latch-remote` from the source archive) and a Nix flake that
+  builds Latch from source or packages the release binary. A CI workflow
+  checks them against the published release, and
+  `scripts/bump-packaging.py` updates them after the next one. None is
+  published to a bucket, the AUR or nixpkgs yet.
+- `install-host.ps1` creates the per-user Run key when a Windows profile
+  has none, instead of failing.
+
 ## 6.0.0 (2026-11-14)
 
 ### Streaming and recovery

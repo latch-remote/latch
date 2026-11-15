@@ -1,0 +1,55 @@
+# Maintainer: Latch Contributors <https://github.com/latch-remote/latch>
+#
+# The release's Linux host, as published. Built on Ubuntu 24.04 (glibc 2.39).
+# `latch` and `latch-bin` on the AUR are an unrelated program.
+
+pkgname=latch-remote-bin
+pkgver=6.0.0
+pkgrel=1
+pkgdesc='Low-latency desktop and game streaming between your own computers over Tailscale (release binary)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/latch-remote/latch'
+license=('GPL-3.0-or-later')
+# Linked: alsa-lib, glibc, gcc-libs. The rest is loaded at run time.
+depends=(
+  'alsa-lib'
+  'gcc-libs'
+  'glibc'
+  'libglvnd'
+  'libx11'
+  'libxcursor'
+  'libxi'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'vulkan-icd-loader'
+  'wayland'
+)
+optdepends=(
+  'tailscale: required unless Tailscale is installed some other way'
+  'libva: VA-API video encoding'
+  'nvidia-utils: NVENC video encoding'
+)
+provides=('latch-remote')
+conflicts=('latch-remote')
+options=('!strip' '!debug')
+_releases=https://github.com/latch-remote/latch-releases/releases/download/v${pkgver}
+source=("latch-host-${pkgver}.png::https://raw.githubusercontent.com/latch-remote/latch/v${pkgver}/crates/core/assets/logo-1024.png"
+        'latch-host.desktop')
+source_x86_64=("latch-host-linux-x64-${pkgver}.tar.gz::${_releases}/latch-host-linux-x64.tar.gz")
+source_aarch64=("latch-host-linux-arm64-${pkgver}.tar.gz::${_releases}/latch-host-linux-arm64.tar.gz")
+sha256sums=('559cc1eb2f06a108172398e1fbf47b076c2226ff7950157e0fe739d114a98c4f'
+            '67aaa4ce442653e4b39eac30974a894ea561854f9b665d1aedb12218d12a2aa0')
+sha256sums_x86_64=('1dd411660569fc1967194df4267d0a2d7be6a2118ae8ee6195d2b6ef3e6a7c3d')
+sha256sums_aarch64=('3aec103de4c361caec896105f89f42af3385dc75c44d781d7c4e32a5f3f5c5e4')
+
+package() {
+  local dir
+  case "$CARCH" in
+    x86_64) dir=latch-host-linux-x64 ;;
+    aarch64) dir=latch-host-linux-arm64 ;;
+  esac
+  install -Dm755 "$dir/latch-host" "$pkgdir/usr/bin/latch-host"
+  install -Dm644 "$dir/NOTICE" "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+  install -Dm644 latch-host.desktop "$pkgdir/usr/share/applications/latch-host.desktop"
+  install -Dm644 "latch-host-${pkgver}.png" "$pkgdir/usr/share/pixmaps/latch-host.png"
+}
