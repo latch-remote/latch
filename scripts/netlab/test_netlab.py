@@ -74,7 +74,8 @@ class VerdictTests(unittest.TestCase):
 
     def test_setup_error_and_unexpected_pass_fail_the_job(self):
         expected = {"i": {"failures": ["first_frame_deadline"]}}
-        with tempfile.TemporaryDirectory() as directory, patch("netlab.Lab") as lab:
+        with tempfile.TemporaryDirectory() as directory, patch("netlab.Lab") as lab, \
+                patch.dict("netlab.os.environ", {"GITHUB_STEP_SUMMARY": ""}):
             lab.return_value.execute.side_effect = RuntimeError("private PulseAudio sink unavailable")
             result = run_scenario("i", Path(directory), expected)
             self.assertEqual(result["status"], "ERROR")
