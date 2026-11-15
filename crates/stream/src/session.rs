@@ -60,7 +60,7 @@ struct RelayOffer {
     keys: latch_relay::SessionKeys,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayPhase {
     Idle,
     Preparing,
@@ -259,6 +259,7 @@ pub struct RelayRoute {
     role: latch_relay::Role,
     config: Option<latch_relay::ClientConfig>,
     state: Mutex<RelayAttempt>,
+    diagnosis: Mutex<Option<(Instant, latch_core::netenv::NetworkDiagnosis)>>,
     active: AtomicBool,
     failed: AtomicBool,
     fatal: AtomicBool,
@@ -322,6 +323,7 @@ impl RelayRoute {
                 cancel: latch_relay::Cancel::new(),
                 preparing: None,
             }),
+            diagnosis: Mutex::new(None),
             active: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             fatal: AtomicBool::new(false),
@@ -364,22 +366,10 @@ impl RelayRoute {
         }
     }
     pub fn path_state(&self) -> MediaPathState {
-        let status = self.network_status();
-        let state = self.state.lock();
+        self.path_state_for(&self.state.lock())
+    }
+    fn path_state_for(&self, state: &RelayAttempt) -> MediaPathState {
         let mut path = state.path.clone();
-        if status.needs_sign_in {
-            path.reason = PathReason::CaptivePortal;
-        } else if state.connection_info.is_none() {
-            match &state.failure {
-                Some(latch_relay::Failure::TlsInterception { .. }) => {
-                    path.reason = PathReason::TlsInterception;
-                }
-                Some(latch_relay::Failure::ProxyAuthenticationRequired) => {
-                    path.reason = PathReason::ProxyAuth;
-                }
-                _ => {}
-            }
-        }
         if self.policy_enabled() {
             path.udp_probe_kbps = state.udp_probe.as_ref().map(|probe| probe.kbps);
             path.activity = if state.udp_probe.is_some() {
@@ -392,6 +382,31 @@ impl RelayRoute {
             } else {
                 None
             };
+        }
+        path
+    }
+    fn display_path_state(&self) -> MediaPathState {
+        let status = self.network_status();
+        let state = self.state.lock();
+        let mut path = self.path_state_for(&state);
+        if state.phase == RelayPhase::Idle || state.paused {
+            return path;
+        }
+        if status.needs_sign_in {
+            path.reason = PathReason::CaptivePortal;
+        } else if state.connection_info.is_none() {
+            match &state.failure {
+                Some(latch_relay::Failure::TlsInterception { .. }) => {
+                    path.reason = PathReason::TlsInterception;
+                }
+                Some(latch_relay::Failure::ProxyAuthenticationRequired) => {
+                    path.reason = PathReason::ProxyAuth;
+                }
+                Some(latch_relay::Failure::ProxyRefused { .. }) => {
+                    path.reason = PathReason::ProxyRequired;
+                }
+                _ => {}
+            }
         }
         path
     }
@@ -439,7 +454,19 @@ impl RelayRoute {
         let diagnosis = self
             .config
             .as_ref()
-            .map(|config| crate::network::diagnosis(config.endpoint.host()))
+            .map(|config| {
+                let mut cached = self.diagnosis.lock();
+                if cached
+                    .as_ref()
+                    .is_none_or(|(checked, _)| checked.elapsed() >= Duration::from_millis(250))
+                {
+                    *cached = Some((
+                        Instant::now(),
+                        crate::network::diagnosis(config.endpoint.host()),
+                    ));
+                }
+                cached.as_ref().unwrap().1.clone()
+            })
             .unwrap_or_default();
         let state = self.state.lock();
         crate::network::status(
@@ -1093,6 +1120,7 @@ impl RelayRoute {
             && matches!(state.phase, RelayPhase::Preparing | RelayPhase::Offered)
         {
             let number = state.number;
+            tracing::warn!(role = ?self.role, attempt = number, reason = "UDP no longer requires relay recovery", "relay attempt withdrawn before activation");
             self.reset(&mut state);
             state.cancels = state.cancels.saturating_add(1);
             state.retry_at =
@@ -1235,6 +1263,7 @@ impl RelayRoute {
                         state.grant_bytes = prepared.grant_bytes;
                         state.transport = Some(prepared.transport);
                         state.cached_offer = Some(prepared.offer);
+                        tracing::debug!(role = ?self.role, attempt = state.number, paused = state.paused, "relay grant prepared");
                         state.phase = RelayPhase::Prepared;
                         if !state.paused {
                             let payload = Self::prepared_offer(&mut state);
@@ -1319,6 +1348,7 @@ impl RelayRoute {
         let mut state = self.state.lock();
         if self.role == latch_relay::Role::Host && matches!(message.action, A::Request) {
             if self.policy_enabled() && state.paused && message.attempt > state.number {
+                tracing::debug!(attempt = message.attempt, previous_attempt = state.number, phase = ?state.phase, "resuming parked relay preparation");
                 state.number = message.attempt;
                 state.paused = false;
                 state.started = Instant::now();
@@ -1357,6 +1387,10 @@ impl RelayRoute {
                 }
                 state.grant_starts.push_back(now);
             }
+            tracing::debug!(
+                attempt = message.attempt,
+                "starting relay grant preparation"
+            );
             let config = self.config.as_ref().unwrap().clone();
             state.number = message.attempt;
             state.phase = RelayPhase::Preparing;
@@ -1592,7 +1626,10 @@ impl RelayRoute {
                 state.failures = 1;
                 state.retry_at = Instant::now() + self.handoff_cooldown();
             }
-            A::Abort if state.phase != RelayPhase::Idle => self.reset(&mut state),
+            A::Abort if state.phase != RelayPhase::Idle => {
+                tracing::warn!(role = ?self.role, attempt = state.number, phase = ?state.phase, reason = "peer aborted relay negotiation", "relay attempt ended");
+                self.reset(&mut state);
+            }
             _ => {}
         }
         true
@@ -2451,7 +2488,7 @@ impl Session {
     }
 
     pub fn media_path(&self) -> MediaPathState {
-        self.inner.relay.lock().path_state()
+        self.inner.relay.lock().display_path_state()
     }
 
     pub fn set_udp_path(&self, kind: UdpPath) {
@@ -3039,7 +3076,8 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 }
             });
     }
-    let mut accepted = Instant::now();
+    let accepted = Instant::now();
+    let mut startup_wait_started = accepted;
     let mut portal_since = None;
     let mut last_report = Instant::now();
     let mut last_keepalive = Instant::now();
@@ -3261,7 +3299,7 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 "The stream transport failed. Reconnecting…".into(),
             );
         }
-        if let Some(state) = notices.observe(relay.path_state(), now) {
+        if let Some(state) = notices.observe(relay.display_path_state(), now) {
             inner.emit(Event::PathChanged(state));
         }
         if accept.media_path_policy {
@@ -3322,7 +3360,10 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
             }
         }
         if status.recovered_from(&last_network_status) {
-            accepted = Instant::now();
+            // Network sign-in restarts the first-picture watchdog. UDP policy
+            // keeps its session-start clock so this retry is not withdrawn on
+            // the next turn as though UDP were still in its startup grace.
+            startup_wait_started = Instant::now();
             inner.relay.lock().retry_after_network_change();
             status = inner.relay.lock().network_status();
             status.media_arrived(media_arrived);
@@ -3348,7 +3389,7 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
         drop(health);
         if !waiting_for_sign_in
             && !inner.connected.load(Ordering::Acquire)
-            && accepted.elapsed() >= MEDIA_TIMEOUT
+            && startup_wait_started.elapsed() >= MEDIA_TIMEOUT
         {
             if matches!(
                 inner.relay.lock().failure(),
@@ -4892,6 +4933,68 @@ mod tests {
     }
 
     #[test]
+    fn sign_in_recovery_keeps_the_first_relay_retry_requested() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (events, _received) = mpsc::channel();
+        let inner = Arc::new(Inner::new(events, Arc::default(), Box::new(|| {})));
+        *inner.control_writer.lock() = Some(tcp.try_clone().unwrap());
+        let config = latch_relay::ClientConfig::production(
+            latch_relay::Endpoint::new("localhost", 9).unwrap(),
+        )
+        .unwrap();
+        let route = Arc::new(RelayRoute::new(7, latch_relay::Role::Viewer, Some(config)));
+        route.enable_policy(true);
+        {
+            let mut state = route.state.lock();
+            state.number = 1;
+            state.failures = 1;
+            state.failure = Some(latch_relay::Failure::CaptivePortal);
+        }
+        *inner.relay.lock() = route.clone();
+        let accept: Accept = serde_json::from_value(serde_json::json!({
+            "session": 7, "token": "00000000000000000000000000000000",
+            "codec": "h264-baseline", "width": 64, "height": 64, "fps": 30,
+            "bitrate_kbps": 2000, "encoder": "test", "audio": null,
+            "relay": true, "media_path_policy": true
+        }))
+        .unwrap();
+        let worker_inner = inner.clone();
+        let worker = std::thread::spawn(move || control_loop(&worker_inner, &mut tcp, &accept));
+        // Eight real 50 ms reports put UDP beyond its startup grace before
+        // the portal opens. Socket messages provide the synchronization.
+        let mut reports = 0;
+        while reports < 8 {
+            if matches!(
+                control::read_message(&mut peer).unwrap(),
+                Message::Report(_)
+            ) {
+                reports += 1;
+            }
+        }
+        route.state.lock().failure = None;
+        let mut actions = Vec::new();
+        while reports < 11 {
+            match control::read_message(&mut peer).unwrap() {
+                Message::Report(_) => reports += 1,
+                Message::Relay(message) => actions.push((message.attempt, message.action)),
+                _ => {}
+            }
+        }
+        inner.stop.store(true, Ordering::Release);
+        let _ = peer.shutdown(Shutdown::Both);
+        worker.join().unwrap();
+        assert_eq!(
+            actions.len(),
+            1,
+            "post-sign-in retry was withdrawn: {actions:?}"
+        );
+        assert!(matches!(actions[0], (2, control::RelayAction::Request)));
+    }
+
+    #[test]
     fn control_loop_reports_stall_after_media_despite_a_portal_and_receives_host_notice() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -5752,13 +5855,34 @@ mod media_policy_tests {
                 latch_relay::Failure::ProxyAuthenticationRequired,
                 PathReason::ProxyAuth,
             ),
+            (
+                latch_relay::Failure::ProxyRefused { status: 403 },
+                PathReason::ProxyRequired,
+            ),
         ] {
-            route.state.lock().failure = Some(failure);
-            assert_eq!(route.path_state().reason, reason);
-            assert_eq!(route.path_state().since, since);
+            {
+                let mut state = route.state.lock();
+                state.failure = Some(failure);
+                state.phase = RelayPhase::Preparing;
+                state.path.reason = PathReason::DatagramSize { bytes: 576 };
+            }
+            assert_eq!(route.display_path_state().reason, reason);
+            assert_eq!(
+                route.path_state().reason,
+                PathReason::DatagramSize { bytes: 576 }
+            );
+            assert_eq!(route.display_path_state().since, since);
+            route.state.lock().phase = RelayPhase::Idle;
+            assert_eq!(
+                route.display_path_state().reason,
+                PathReason::DatagramSize { bytes: 576 }
+            );
         }
         route.retry_after_network_change();
-        assert_eq!(route.path_state().reason, PathReason::Initial);
+        assert_eq!(
+            route.display_path_state().reason,
+            PathReason::DatagramSize { bytes: 576 }
+        );
     }
 
     #[test]
@@ -5779,8 +5903,10 @@ mod media_policy_tests {
                         reduced_mss_value: None,
                         earlier_failures: Vec::new(),
                     });
+                    state.failure = Some(latch_relay::Failure::ProxyAuthenticationRequired);
                     route.activate(&mut state);
                 }
+                assert_eq!(route.display_path_state().reason, PathReason::UdpStalled);
                 assert_eq!(route.path_state().carrier, Some(carrier));
                 assert_eq!(route.path_state().via_proxy, via_proxy);
                 route.reset(&mut route.state.lock());
@@ -5789,6 +5915,23 @@ mod media_policy_tests {
                 assert!(!route.path_state().via_proxy);
             }
         }
+    }
+
+    #[test]
+    fn network_diagnosis_is_cached_across_policy_and_display_reads() {
+        let config = latch_relay::ClientConfig::production(
+            latch_relay::Endpoint::new("localhost", 9).unwrap(),
+        )
+        .unwrap();
+        let route = RelayRoute::new(7, latch_relay::Role::Viewer, Some(config));
+        let checked = Instant::now();
+        *route.diagnosis.lock() = Some((checked, Default::default()));
+        for _ in 0..10 {
+            route.path_state();
+            route.display_path_state();
+            route.network_status();
+        }
+        assert_eq!(route.diagnosis.lock().as_ref().unwrap().0, checked);
     }
 
     #[test]

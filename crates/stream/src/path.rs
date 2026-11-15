@@ -78,6 +78,7 @@ pub enum PathReason {
     CaptivePortal,
     TlsInterception,
     ProxyAuth,
+    ProxyRequired,
 }
 
 impl PathReason {
@@ -99,6 +100,7 @@ impl PathReason {
             Self::CaptivePortal => "captive-portal",
             Self::TlsInterception => "tls-interception",
             Self::ProxyAuth => "proxy-auth",
+            Self::ProxyRequired => "proxy-required",
         }
     }
 
@@ -128,6 +130,7 @@ impl PathReason {
             Self::CaptivePortal => "This network requires a browser sign-in".into(),
             Self::TlsInterception => "This network intercepts TLS connections".into(),
             Self::ProxyAuth => "The network proxy requires authentication".into(),
+            Self::ProxyRequired => "This network requires a proxy for relay access".into(),
         }
     }
 }
@@ -172,6 +175,17 @@ pub struct MediaPathState {
 }
 
 impl MediaPathState {
+    /// The persistent diagnosis surface already explains this condition.
+    pub(crate) fn diagnosis_covers_notice(&self) -> bool {
+        matches!(
+            self.reason,
+            PathReason::CaptivePortal
+                | PathReason::TlsInterception
+                | PathReason::ProxyAuth
+                | PathReason::ProxyRequired
+        )
+    }
+
     /// Time on the committed path, suitable for duration fields in logs.
     pub fn age(&self) -> Duration {
         self.since.elapsed()
@@ -204,14 +218,9 @@ impl PathNotices {
     ) -> Option<MediaPathState> {
         let changed_carrier = matches!(self.previous.path, MediaPath::LatchRelay)
             != matches!(current.path, MediaPath::LatchRelay);
-        let changed_reason = self.previous.reason.as_str() != current.reason.as_str()
-            && matches!(
-                current.reason,
-                PathReason::CaptivePortal | PathReason::TlsInterception | PathReason::ProxyAuth
-            );
-        if current.reason == PathReason::RelayRenewal {
+        if current.reason == PathReason::RelayRenewal || current.diagnosis_covers_notice() {
             self.pending = None;
-        } else if (changed_carrier || changed_reason)
+        } else if changed_carrier
             && !(self.previous.reason == PathReason::RelayRenewal
                 && matches!(current.path, MediaPath::LatchRelay))
         {
@@ -231,10 +240,6 @@ impl PathNotices {
         if self.last_emitted.as_ref().is_some_and(|last| {
             matches!(last.path, MediaPath::LatchRelay)
                 == matches!(notice.path, MediaPath::LatchRelay)
-                && !matches!(
-                    notice.reason,
-                    PathReason::CaptivePortal | PathReason::TlsInterception | PathReason::ProxyAuth
-                )
         }) {
             return None;
         }
@@ -571,8 +576,48 @@ mod tests {
         assert!(notices
             .observe(state.clone(), now + Duration::from_secs(42))
             .is_none());
+        assert!(notices
+            .observe(state.clone(), now + Duration::from_secs(61))
+            .is_none());
+        state.path = MediaPath::TailscaleUdp(UdpPath::Direct);
+        state.reason = PathReason::UdpRecovered;
         assert_eq!(
-            notices.observe(state.clone(), now + Duration::from_secs(61)),
+            notices.observe(state.clone(), now + Duration::from_secs(62)),
+            Some(state)
+        );
+    }
+
+    #[test]
+    fn diagnosed_changes_leave_the_notice_window_for_the_next_real_transition() {
+        let now = Instant::now();
+        for reason in [
+            PathReason::CaptivePortal,
+            PathReason::TlsInterception,
+            PathReason::ProxyAuth,
+            PathReason::ProxyRequired,
+        ] {
+            let mut state = MediaPathState::default();
+            let mut notices = PathNotices::new(state.clone());
+            state.reason = reason;
+            assert!(notices.observe(state.clone(), now).is_none());
+            state.path = MediaPath::LatchRelay;
+            state.reason = PathReason::UdpBlocked;
+            assert_eq!(
+                notices.observe(state.clone(), now + Duration::from_millis(1)),
+                Some(state)
+            );
+        }
+        let mut state = MediaPathState::default();
+        let mut notices = PathNotices::new(state.clone());
+        state.path = MediaPath::LatchRelay;
+        state.via_proxy = true;
+        state.reason = PathReason::ProxyRequired;
+        assert!(notices.observe(state.clone(), now).is_none());
+        state.path = MediaPath::TailscaleUdp(UdpPath::Direct);
+        state.via_proxy = false;
+        state.reason = PathReason::UdpRecovered;
+        assert_eq!(
+            notices.observe(state.clone(), now + Duration::from_millis(1)),
             Some(state)
         );
     }
@@ -612,6 +657,7 @@ mod tests {
             (PathReason::CaptivePortal, "captive-portal"),
             (PathReason::TlsInterception, "tls-interception"),
             (PathReason::ProxyAuth, "proxy-auth"),
+            (PathReason::ProxyRequired, "proxy-required"),
         ] {
             assert_eq!(reason.as_str(), code);
             assert!(!reason.description().is_empty());

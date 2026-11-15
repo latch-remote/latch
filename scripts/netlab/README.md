@@ -235,9 +235,11 @@ for expected-failure cases. Test probes are excluded from relay SYN counts.
 fix reference. The comparison requires the recorded failure signature and the recorded
 error pattern where supplied.
 
-The joined media-policy and restrictive-network implementation requires all
-18 scenarios to pass. `expected-failures.json` is empty. CI's Linux `netlab`
-job verifies the joined behavior, including portal waiting and recovery in l/l2.
+CI run 43729254333 passed 16 of 18 joined scenarios. d1 missed the delivered
+video-rate bound and l2 missed the post-sign-in first-frame deadline.
+`expected-failures.json` remains empty, so both failures require resolution.
+The joined behavior, including portal waiting and recovery in l/l2, remains
+subject to the Linux `netlab` job's unchanged assertions.
 
 Previously, d1 and d2 required the recorded requested-video-bitrate failure. Their
 `related_failures` list names accompanying quality failures observed across

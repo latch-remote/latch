@@ -1578,6 +1578,10 @@ impl Session {
     fn update_relay(&self, update: impl FnOnce(&RelayRoute) -> bool) -> bool {
         // Both routes belong to the same authorized session. Keep held keys
         // and virtual devices alive, with input ordered across the transition.
+        // Wait for in-flight input before applying and acknowledging the new
+        // route. Deferred legacy cleanup could otherwise unplug a gamepad after
+        // its replacement snapshot was already acknowledged. Check shutdown
+        // between waits so input cleanup cannot hold the control owner forever.
         let mut input = loop {
             if self.stopping() {
                 return true;

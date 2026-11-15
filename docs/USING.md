@@ -321,7 +321,9 @@ reported path, shown as Direct, Via your relay, or Relayed via a DERP city.
 Stream performance for its Tailscale route or relay carrier, the reason, and how long that media path has been in
 use. A brief notice appears when the path changes, for example “UDP is losing
 17% of packets”, “UDP is blocked on this network”, or “UDP recovered”.
-Path changes keep the session and held input alive.
+The persistent network diagnosis replaces a notice for the same sign-in,
+TLS-interception or proxy condition. An unrelated DERP diagnosis keeps the
+UDP/relay transition notice. Path changes keep the session and held input alive.
 
 With media path policy negotiated, Latch prepares the relay after 350 ms
 without UDP. It lets congestion control adapt to a shared uplink limit.

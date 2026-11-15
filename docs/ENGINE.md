@@ -1200,15 +1200,20 @@ use independently of the TLS or WebSocket carrier.
 `UdpPath` distinguishes Unknown, Direct, PeerRelay and Derp. Non-exhaustive
 `Carrier` values Native, Tls, WebSocket and HttpConnect expose stable
 `as_str()` identifiers. Non-exhaustive `PathReason` carries typed UDP causes,
-`RelayUnavailable(RelayFailure)`, RelayRenewal, CaptivePortal, TlsInterception
-and ProxyAuth, also with stable identifiers and plain descriptions. Raw
+`RelayUnavailable(RelayFailure)`, RelayRenewal, CaptivePortal, TlsInterception,
+ProxyAuth and ProxyRequired, also with stable identifiers and plain descriptions. Raw
 transport errors stay in logs. `set_udp_path` refines discovery independently.
 
-`Event::PathChanged` reports committed media transport changes and actionable
-environment reasons, coalesced to at most one notice per twenty seconds.
-Initial route classification, MTU changes, failed preparation and grant
-renewal are silent. Current diagnostics remain immediately available through
-`media_path()`. The toolbar retains the DERP city hint.
+`Event::PathChanged` reports committed media transport changes, coalesced to
+at most one notice per twenty seconds. The network diagnosis surface owns
+sign-in, TLS-interception and proxy notices. These covered conditions leave
+the path-notice window available for the next real transition. An unrelated
+DERP diagnosis preserves UDP/relay transition notices. Initial route
+classification, MTU changes, failed preparation and grant renewal are silent.
+Current diagnostics remain immediately available through `media_path()`.
+The toolbar retains the DERP city hint. Relay policy reads its unrefined path
+reason. Display refinement applies while a relay route is active or attempted,
+and per-route discovery snapshots are cached for 250 ms.
 
 ### Relay load and quota
 
