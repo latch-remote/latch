@@ -23,13 +23,14 @@ use std::sync::{
 use std::time::Duration;
 
 thread_local! {
-    static STARTUP: RefCell<Option<(TcpStream, Duration)>> = const { RefCell::new(None) };
+    static STARTUP: RefCell<Option<(TcpStream, Duration, Arc<AtomicBool>)>> = const { RefCell::new(None) };
 }
 
 /// Scope the portal prompt to the viewer's connection and advertised deadline.
 pub fn during_startup<T>(
     tcp: &TcpStream,
     limit: Duration,
+    stopping: Arc<AtomicBool>,
     start: impl FnOnce() -> T,
 ) -> std::io::Result<T> {
     struct Reset;
@@ -41,31 +42,28 @@ pub fn during_startup<T>(
         }
     }
     let tcp = tcp.try_clone()?;
-    STARTUP.with(|s| *s.borrow_mut() = Some((tcp, limit)));
+    STARTUP.with(|s| *s.borrow_mut() = Some((tcp, limit, stopping)));
     let _reset = Reset;
     Ok(start())
 }
 
 fn viewer_gone() -> bool {
     STARTUP.with(|s| {
-        s.borrow().as_ref().is_some_and(|(tcp, _)| {
-            let mut byte = 0u8;
-            // MSG_PEEK preserves protocol bytes. MSG_DONTWAIT affects this call
-            // only, so the shared socket stays blocking for the session.
-            let n = unsafe {
-                libc::recv(
-                    tcp.as_raw_fd(),
-                    (&mut byte as *mut u8).cast(),
-                    1,
-                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
-                )
+        s.borrow().as_ref().is_some_and(|(tcp, _, stopping)| {
+            if stopping.load(Ordering::Acquire) {
+                return true;
+            }
+            // Linux reports a receive-side close even with unread control bytes
+            // ahead of FIN. Preserve those bytes for the session control loop.
+            let mut fd = libc::pollfd {
+                fd: tcp.as_raw_fd(),
+                events: libc::POLLRDHUP,
+                revents: 0,
             };
-            n == 0
+            let n = unsafe { libc::poll(&mut fd, 1, 0) };
+            fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
                 || (n < 0
-                    && !matches!(
-                        std::io::Error::last_os_error().kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                    ))
+                    && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted)
         })
     })
 }
@@ -74,7 +72,7 @@ async fn wait_for_viewer() -> anyhow::Result<()> {
     loop {
         ensure!(
             !viewer_gone(),
-            "the viewer disconnected while waiting for screen-sharing approval"
+            "the viewer disconnected or the host stopped while waiting for screen-sharing approval"
         );
         async_io::Timer::after(Duration::from_millis(100)).await;
     }
@@ -99,6 +97,7 @@ pub fn approval_budget(viewer_seconds: u32) -> Duration {
 
 /// How long any other portal request may take.
 const REPLY: Duration = Duration::from_secs(10);
+const CLOSE: Duration = Duration::from_millis(250);
 
 /// `SelectDevices` device types.
 pub const KEYBOARD: u32 = 1;
@@ -383,7 +382,7 @@ where
     .with_context(|| format!("{interface}.{method}"));
     if response.is_err() {
         // Closing a timed-out request dismisses its permission dialog too.
-        let _ = timeout(REPLY, "Request.Close", async {
+        let _ = timeout(CLOSE, "Request.Close", async {
             conn.call_method(
                 Some(DESTINATION),
                 handle,
@@ -400,7 +399,9 @@ where
     let (code, results): (u32, HashMap<String, OwnedValue>) = message.body().deserialize()?;
     match code {
         0 => Ok(results),
-        1 => bail!("sharing this screen was declined on this machine"),
+        1 => bail!(crate::video::CaptureEnded(
+            "sharing this screen was declined on this machine".into()
+        )),
         _ => bail!("the portal ended {interface}.{method} (response {code})"),
     }
 }
@@ -468,7 +469,7 @@ impl Session {
         let approval = STARTUP.with(|s| {
             s.borrow()
                 .as_ref()
-                .map_or(approval, |(_, limit)| approval.min(*limit))
+                .map_or(approval, |(_, limit, _)| approval.min(*limit))
         });
         run(async move {
             ensure!(
@@ -604,12 +605,24 @@ impl Session {
     where
         B: serde::Serialize + zbus::zvariant::DynamicType,
     {
+        self.notify_with_timeout(method, REPLY, args)
+    }
+
+    pub fn notify_with_timeout<B>(
+        &self,
+        method: &'static str,
+        limit: Duration,
+        args: impl FnOnce(OwnedObjectPath) -> B,
+    ) -> anyhow::Result<()>
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType,
+    {
         ensure!(
             self.kind == Kind::RemoteDesktop,
             "this screencast has no input"
         );
         let body = args(self.handle.clone());
-        run(timeout(REPLY, method, async {
+        run(timeout(limit, method, async {
             self.conn
                 .call_method(Some(DESTINATION), PATH, Some(REMOTE_DESKTOP), method, &body)
                 .await?;
@@ -627,16 +640,13 @@ impl Drop for Session {
     fn drop(&mut self) {
         let conn = self.conn.clone();
         let handle = self.handle.clone();
-        let closed = run(async move {
+        let closed = run(timeout(CLOSE, "Session.Close", async move {
             let session =
                 zbus::Proxy::new(&conn, DESTINATION, handle, "org.freedesktop.portal.Session")
                     .await?;
-            timeout(REPLY, "Session.Close", async {
-                session.call_method("Close", &()).await?;
-                Ok(())
-            })
-            .await
-        });
+            session.call_method("Close", &()).await?;
+            Ok(())
+        }));
         if let Err(e) = closed {
             tracing::debug!("closing the portal session: {e:#}");
         }
@@ -688,6 +698,7 @@ mod tests {
     struct Prompt {
         started: Arc<AtomicBool>,
         closed: Arc<AtomicBool>,
+        response: Option<u32>,
     }
     #[zbus::interface(name = "org.freedesktop.portal.ScreenCast")]
     impl Prompt {
@@ -696,6 +707,7 @@ mod tests {
             options: HashMap<String, OwnedValue>,
             #[zbus(header)] header: zbus::message::Header<'_>,
             #[zbus(object_server)] server: &zbus::ObjectServer,
+            #[zbus(connection)] conn: &zbus::Connection,
         ) -> zbus::fdo::Result<OwnedObjectPath> {
             let token = String::try_from(options["handle_token"].try_clone().unwrap()).unwrap();
             let path = OwnedObjectPath::try_from(format!(
@@ -707,6 +719,16 @@ mod tests {
                 .at(path.clone(), PendingRequest(self.closed.clone()))
                 .await?;
             self.started.store(true, Ordering::Release);
+            if let Some(code) = self.response {
+                conn.emit_signal(
+                    None::<&str>,
+                    &path,
+                    "org.freedesktop.portal.Request",
+                    "Response",
+                    &(code, HashMap::<String, OwnedValue>::new()),
+                )
+                .await?;
+            }
             Ok(path)
         }
     }
@@ -717,19 +739,94 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_cancels_the_actual_portal_request_and_dismisses_its_prompt() {
+    fn disconnect_and_host_stop_dismiss_the_actual_portal_prompt() {
         use std::net::{Shutdown, TcpListener};
+        // Cover empty and buffered receive queues, plus host cancellation with
+        // a viewer whose connection stays open throughout cancellation.
+        for (buffered, host_stop) in [(false, false), (true, false), (false, true)] {
+            let bus = Bus::new();
+            run(async {
+                let started = Arc::new(AtomicBool::new(false));
+                let closed = Arc::new(AtomicBool::new(false));
+                let _server = zbus::connection::Builder::address(bus.1.as_str())?
+                    .name(DESTINATION)?
+                    .serve_at(
+                        PATH,
+                        Prompt {
+                            started: started.clone(),
+                            closed: closed.clone(),
+                            response: None,
+                        },
+                    )?
+                    .build()
+                    .await?;
+                let conn = zbus::connection::Builder::address(bus.1.as_str())?
+                    .build()
+                    .await?;
+                let listener = TcpListener::bind("127.0.0.1:0")?;
+                let peer = TcpStream::connect(listener.local_addr()?)?;
+                let (tcp, _) = listener.accept()?;
+                let stopping = Arc::new(AtomicBool::new(false));
+                let cancel = stopping.clone();
+                let disconnect = std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                    while !started.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    let mut peer = peer;
+                    if buffered {
+                        latch_proto::control::write_message(
+                            &mut peer,
+                            &latch_proto::control::Message::Keepalive,
+                        )
+                        .unwrap();
+                    }
+                    if host_stop {
+                        cancel.store(true, Ordering::Release);
+                    } else {
+                        peer.shutdown(Shutdown::Write).unwrap();
+                    }
+                    peer
+                });
+                let now = std::time::Instant::now();
+                let result = during_startup(&tcp, APPROVAL, stopping, || {
+                    run(request(
+                        &conn,
+                        SCREEN_CAST,
+                        "Start",
+                        Duration::from_secs(2),
+                        |token| {
+                            let mut options = no_options();
+                            options.insert("handle_token", token.into());
+                            (options,)
+                        },
+                    ))
+                })?;
+                let _peer = disconnect.join().unwrap();
+                assert!(format!("{:#}", result.unwrap_err()).contains("viewer disconnected"));
+                assert!(
+                    closed.load(Ordering::Acquire),
+                    "Request.Close must dismiss the prompt"
+                );
+                assert!(now.elapsed() < Duration::from_secs(1));
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn declined_portal_approval_is_a_terminal_capture_error() {
         let bus = Bus::new();
         run(async {
-            let started = Arc::new(AtomicBool::new(false));
-            let closed = Arc::new(AtomicBool::new(false));
             let _server = zbus::connection::Builder::address(bus.1.as_str())?
                 .name(DESTINATION)?
                 .serve_at(
                     PATH,
                     Prompt {
-                        started: started.clone(),
-                        closed: closed.clone(),
+                        started: Arc::new(AtomicBool::new(false)),
+                        closed: Arc::new(AtomicBool::new(false)),
+                        response: Some(1),
                     },
                 )?
                 .build()
@@ -737,31 +834,114 @@ mod tests {
             let conn = zbus::connection::Builder::address(bus.1.as_str())?
                 .build()
                 .await?;
-            let listener = TcpListener::bind("127.0.0.1:0")?;
-            let peer = TcpStream::connect(listener.local_addr()?)?;
-            let (tcp, _) = listener.accept()?;
-            let disconnect = std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + Duration::from_secs(3);
-                while !started.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                peer.shutdown(Shutdown::Both).unwrap();
-            });
-            let now = std::time::Instant::now();
-            let result = during_startup(&tcp, APPROVAL, || {
-                run(request(&conn, SCREEN_CAST, "Start", APPROVAL, |token| {
+            let error = request(
+                &conn,
+                SCREEN_CAST,
+                "Start",
+                Duration::from_secs(2),
+                |token| {
                     let mut options = no_options();
                     options.insert("handle_token", token.into());
                     (options,)
-                }))
-            })?;
-            disconnect.join().unwrap();
-            assert!(format!("{:#}", result.unwrap_err()).contains("viewer disconnected"));
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(error.is::<crate::video::CaptureEnded>());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    struct SlowInput(Arc<std::sync::atomic::AtomicUsize>);
+    #[zbus::interface(name = "org.freedesktop.portal.RemoteDesktop")]
+    impl SlowInput {
+        async fn notify_keyboard_keycode(
+            &self,
+            _session: OwnedObjectPath,
+            _options: HashMap<String, OwnedValue>,
+            _key: i32,
+            state: u32,
+        ) {
+            if state == 0 {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                async_io::Timer::after(Duration::from_millis(150)).await;
+            }
+        }
+        async fn notify_pointer_button(
+            &self,
+            session: OwnedObjectPath,
+            options: HashMap<String, OwnedValue>,
+            button: i32,
+            state: u32,
+        ) {
+            self.notify_keyboard_keycode(session, options, button, state)
+                .await;
+        }
+    }
+
+    #[test]
+    fn portal_releases_share_one_budget_and_drop_does_not_retry() {
+        use crate::input::{DisplayRect, Event, InputSink};
+        let bus = Bus::new();
+        run(async {
+            let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let path = OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/input")?;
+            let _server = zbus::connection::Builder::address(bus.1.as_str())?
+                .name(DESTINATION)?
+                .serve_at(PATH, SlowInput(releases.clone()))?
+                .serve_at(path.clone(), TestSession)?
+                .build()
+                .await?;
+            let conn = zbus::connection::Builder::address(bus.1.as_str())?
+                .build()
+                .await?;
+            let session = Arc::new(Session {
+                conn,
+                handle: path,
+                kind: Kind::RemoteDesktop,
+                devices: KEYBOARD | POINTER,
+                streams: vec![Stream {
+                    node: 1,
+                    position: None,
+                    size: None,
+                }],
+                pixel_coordinates: false,
+                kept_approval: false,
+                closed: Arc::new(AtomicBool::new(false)),
+            });
+            let mut sink = super::super::input::Sink::open(Some(session.clone()))?;
+            for vk in 0x41..=0x44 {
+                sink.apply(
+                    &Event::Key {
+                        vk,
+                        down: true,
+                        modifiers: 0,
+                    },
+                    DisplayRect::default(),
+                )?;
+            }
+            sink.apply(
+                &Event::MouseButton {
+                    button: 1,
+                    down: true,
+                },
+                DisplayRect::default(),
+            )?;
+            let now = std::time::Instant::now();
+            sink.release_all();
+            let attempted = releases.load(Ordering::Relaxed);
+            drop(sink);
             assert!(
-                closed.load(Ordering::Acquire),
-                "Request.Close must dismiss the prompt"
+                now.elapsed() < Duration::from_millis(600),
+                "cleanup took {:?}",
+                now.elapsed()
             );
-            assert!(now.elapsed() < Duration::from_secs(3));
+            assert_eq!(
+                releases.load(Ordering::Relaxed),
+                attempted,
+                "drop retried failed releases"
+            );
             Ok(())
         })
         .unwrap();

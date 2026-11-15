@@ -14,6 +14,9 @@ use crate::input::{keymap, DisplayRect, Event, Held, InputSink};
 use anyhow::{bail, ensure, Context};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const RELEASE_BUDGET: Duration = Duration::from_millis(250);
 
 pub const BTN_LEFT: u16 = 0x110;
 pub const BTN_RIGHT: u16 = 0x111;
@@ -78,12 +81,20 @@ pub(super) trait Device: Send {
     fn relative(&mut self, dx: i16, dy: i16) -> anyhow::Result<()>;
     fn scroll(&mut self, vertical: i32, horizontal: i32) -> anyhow::Result<()>;
     fn text(&mut self, text: &str) -> anyhow::Result<()>;
+    fn release(&mut self, code: u16, button: bool, _limit: Duration) -> anyhow::Result<()> {
+        if button {
+            self.button(code, false)
+        } else {
+            self.key(code, false)
+        }
+    }
 }
 
 pub(super) struct WaylandInput<D: ?Sized + Device> {
     pressed: Pressed,
     device: Box<D>,
     session: Option<Arc<Session>>,
+    release_on_drop: bool,
 }
 
 pub(super) type Sink = WaylandInput<dyn Device>;
@@ -103,12 +114,14 @@ impl Sink {
             pressed: Pressed::default(),
             device,
             session,
+            release_on_drop: true,
         })
     }
 }
 
 impl<D: ?Sized + Device> InputSink for WaylandInput<D> {
     fn apply(&mut self, event: &Event, display: DisplayRect) -> anyhow::Result<()> {
+        self.release_on_drop = true;
         if let Some(session) = &self.session {
             if let Err(error) = session.check() {
                 self.release_all();
@@ -160,42 +173,61 @@ impl<D: ?Sized + Device> InputSink for WaylandInput<D> {
                 }
             }
             Event::Text(text) => self.device.text(text)?,
-            Event::ReleaseAll => {
-                self.release_all();
-                ensure!(
-                    self.pressed.held.keys.is_empty() && self.pressed.held.buttons.is_empty(),
-                    "input releases still pending"
-                );
-            }
+            Event::ReleaseAll => self.release_pressed()?,
         }
         Ok(())
     }
 
     fn release_all(&mut self) {
+        if let Err(e) = self.release_pressed() {
+            tracing::warn!("release input: {e:#}");
+        }
+    }
+}
+
+impl<D: ?Sized + Device> WaylandInput<D> {
+    fn release_pressed(&mut self) -> anyhow::Result<()> {
+        // Explicit ReleaseAll retries retain unacknowledged releases. Drop
+        // skips a pass already attempted during teardown, including failures.
+        self.release_on_drop = false;
         let p = &mut self.pressed;
+        let deadline = Instant::now() + RELEASE_BUDGET;
+        let mut release = |code, button| {
+            let left = deadline
+                .checked_duration_since(Instant::now())
+                .context("input release budget exhausted")?;
+            self.device.release(code, button, left)
+        };
+        let mut failure = None;
         for (vk, code) in std::mem::take(&mut p.keys) {
-            if let Err(e) = self.device.key(code, false) {
-                tracing::warn!("release key: {e:#}");
+            if let Err(e) = release(code, false) {
                 p.keys.insert(vk, code);
+                failure = Some(e);
             } else {
                 p.held.keys.remove(&vk);
             }
         }
         for button in std::mem::take(&mut p.held.buttons) {
             if let Ok(code) = button_code(button) {
-                if let Err(e) = self.device.button(code, false) {
-                    tracing::warn!("release button: {e:#}");
+                if let Err(e) = release(code, true) {
                     p.held.buttons.insert(button);
+                    failure = Some(e);
                 }
             }
         }
         p.scroll = [0; 2];
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
 impl<D: ?Sized + Device> Drop for WaylandInput<D> {
     fn drop(&mut self) {
-        self.release_all();
+        if self.release_on_drop {
+            self.release_all();
+        }
     }
 }
 
@@ -226,6 +258,16 @@ impl Portal {
 }
 
 impl Device for Portal {
+    fn release(&mut self, code: u16, button: bool, limit: Duration) -> anyhow::Result<()> {
+        let method = if button {
+            "NotifyPointerButton"
+        } else {
+            "NotifyKeyboardKeycode"
+        };
+        self.session.notify_with_timeout(method, limit, |h| {
+            (h, portal::no_options(), i32::from(code), Self::state(false))
+        })
+    }
     fn key(&mut self, code: u16, down: bool) -> anyhow::Result<()> {
         ensure!(
             self.session.devices & portal::KEYBOARD != 0,
@@ -465,6 +507,7 @@ mod tests {
             pressed: Pressed::default(),
             device: Box::default(),
             session: None,
+            release_on_drop: true,
         }
     }
 
@@ -535,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_releases_remain_held_until_a_retry_succeeds() {
+    fn failed_releases_remain_held_until_an_explicit_retry_succeeds() {
         let mut s = sink();
         s.apply(
             &Event::Key {
@@ -558,6 +601,7 @@ mod tests {
         assert!(s.apply(&Event::ReleaseAll, DISPLAY).is_err());
         assert!(s.pressed.held.keys.contains(&0x41));
         assert!(s.pressed.held.buttons.contains(&1));
+        assert!(!s.release_on_drop);
         s.device.1 = false;
         s.apply(&Event::ReleaseAll, DISPLAY).unwrap();
         assert!(s.pressed.keys.is_empty());

@@ -433,6 +433,76 @@ fn ending_revokes_and_releases_input_immediately() {
 }
 
 #[test]
+fn end_reaches_the_viewer_and_stops_capture_while_input_cleanup_is_pending() {
+    struct SlowSink(mpsc::Sender<()>, mpsc::Receiver<()>);
+    impl InputSink for SlowSink {
+        fn apply(&mut self, _: &input::Event, _: DisplayRect) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn release_all(&mut self) {
+            self.0.send(()).unwrap();
+            let _ = self.1.recv_timeout(Duration::from_secs(5));
+        }
+    }
+    let server = Server::bind(0, Options::default()).unwrap();
+    let session = session("127.0.0.1:9".parse().unwrap());
+    let (entered, cleanup) = mpsc::channel();
+    let (release, blocked) = mpsc::channel();
+    session.input.lock().sink = Some(Box::new(SlowSink(entered, blocked)));
+    let (host, mut peer) = sockets();
+    peer.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let accept: Accept = serde_json::from_value(serde_json::json!({
+        "session": 7, "token": "00000000000000000000000000000000",
+        "codec": "h264-baseline", "width": 64, "height": 64, "fps": 30,
+        "bitrate_kbps": 1000, "encoder": "test", "audio": null
+    }))
+    .unwrap();
+    let held = Arc::new(AtomicBool::new(true));
+    let worker = {
+        let session = session.clone();
+        let held = held.clone();
+        std::thread::spawn(move || {
+            server.control(&session, host, accept, None, || {
+                let video_session = session.clone();
+                let video = std::thread::spawn(move || {
+                    let _capture = Video {
+                        info: info(),
+                        held,
+                        next: Box::new(|_, _, _| unreachable!()),
+                    };
+                    while !video_session.stopping() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                });
+                (Some(video), None)
+            })
+        })
+    };
+    assert!(matches!(
+        control::read_message(&mut peer).unwrap(),
+        Message::Accept(_)
+    ));
+    let ending = {
+        let session = session.clone();
+        std::thread::spawn(move || session.end(end::HOST_STOPPING, "stop"))
+    };
+    cleanup.recv_timeout(Duration::from_secs(1)).unwrap();
+    let ended = control::read_message(&mut peer);
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while held.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let capture_stopped = !held.load(Ordering::Acquire);
+    release.send(()).unwrap();
+    ending.join().unwrap();
+    let _ = peer.shutdown(Shutdown::Both);
+    worker.join().unwrap();
+    assert!(matches!(ended, Ok(Message::End(e)) if e.code == end::HOST_STOPPING));
+    assert!(capture_stopped);
+}
+
+#[test]
 fn video_reopen_failure_uses_remaining_budget() {
     let server = Server::bind(0, Options::default()).unwrap();
     let session = session("127.0.0.1:9".parse().unwrap());
@@ -1429,4 +1499,65 @@ fn an_offer_containing_only_future_codecs_preserves_the_current_capture() {
     );
     assert!(matches!(result, Err(Refusal { status: 406, .. })));
     assert!(!old.stopping());
+}
+
+#[test]
+fn startup_refusals_preserve_transient_statuses_and_terminal_permission_denial() {
+    for (status, retry) in [
+        (500, true),
+        (503, true),
+        (408, true),
+        (429, true),
+        (403, false),
+        (406, false),
+    ] {
+        assert_eq!(
+            Refusal::new(status, "refused").into_end().code == end::TRANSPORT_FAILED,
+            retry
+        );
+    }
+    let server = Server::bind(0, Options::default()).unwrap();
+    for denied in [false, true] {
+        let req: StreamRequest = serde_json::from_value(serde_json::json!({
+            "protocol": latch_proto::PROTOCOL, "width": 64, "height": 64, "fps": 30,
+            "bitrate_kbps": 1000, "codecs": ["h264-baseline"], "udp_port": 9, "audio": false
+        }))
+        .unwrap();
+        let result = server.prepare_using(
+            req,
+            "127.0.0.1:9".parse().unwrap(),
+            || vec![Codec::H264Baseline],
+            video::Limits::level,
+            |_| {
+                if denied {
+                    Err(
+                        anyhow::Error::from(video::CaptureEnded("approval declined".into()))
+                            .context("portal"),
+                    )
+                } else {
+                    anyhow::bail!("temporary native capture failure")
+                }
+            },
+        );
+        let refusal = result.err().expect("injected startup failure");
+        assert_eq!(refusal.status, if denied { 403 } else { 500 });
+    }
+}
+
+#[test]
+fn stop_waits_for_a_preparation_that_is_being_dropped() {
+    let server = Server::bind(0, Options::default()).unwrap();
+    let reservation = server.opening.lock(Duration::ZERO).unwrap();
+    let (tx, result) = mpsc::channel();
+    let stopping = {
+        let server = server.clone();
+        std::thread::spawn(move || tx.send(server.stop(end::HOST_STOPPING, "stop")).unwrap())
+    };
+    assert!(matches!(
+        result.recv_timeout(Duration::from_millis(50)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    drop(reservation);
+    assert!(result.recv_timeout(Duration::from_secs(1)).unwrap());
+    stopping.join().unwrap();
 }

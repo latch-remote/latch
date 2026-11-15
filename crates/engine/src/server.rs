@@ -130,6 +130,18 @@ impl Refusal {
             message: message.into(),
         }
     }
+
+    /// Preserve HTTP retry behavior when preparation follows the upgrade.
+    pub fn into_end(self) -> End {
+        End {
+            code: if matches!(self.status, 408 | 429 | 500..=599) {
+                end::TRANSPORT_FAILED
+            } else {
+                end::CAPTURE_FAILED
+            },
+            message: self.message,
+        }
+    }
 }
 
 pub struct Server {
@@ -191,6 +203,11 @@ impl Server {
 
     /// Ends the running session, if any.
     pub fn stop(&self, code: u32, message: &str) -> bool {
+        // Preparation can finish just before run installs the current session.
+        // Wait for that reservation to be dropped or installed before stopping.
+        if !self.opening.wait_idle(Instant::now() + TAKEOVER_WAIT) {
+            return false;
+        }
         let current = self.current.lock().clone();
         if let Some(session) = current {
             session.end(code, message);
@@ -230,20 +247,21 @@ impl Server {
         req: StreamRequest,
         peer: SocketAddr,
         tcp: &TcpStream,
+        stopping: Arc<AtomicBool>,
     ) -> Result<Prepared, Refusal> {
         #[cfg(target_os = "linux")]
         {
             // Reserve time for takeover, encoder and media setup. Older
             // viewers advertise no deadline and still stop at 60 seconds.
             let approval = crate::linux::wayland::portal::approval_budget(req.startup_timeout_secs);
-            crate::linux::wayland::portal::during_startup(tcp, approval, || self.prepare(req, peer))
-                .map_err(|e| {
-                    Refusal::new(500, format!("could not track the viewer connection: {e}"))
-                })?
+            crate::linux::wayland::portal::during_startup(tcp, approval, stopping, || {
+                self.prepare(req, peer)
+            })
+            .map_err(|e| Refusal::new(500, format!("could not track the viewer connection: {e}")))?
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = tcp;
+            let _ = (tcp, stopping);
             self.prepare(req, peer)
         }
     }
@@ -421,8 +439,14 @@ impl Server {
                 _ => break,
             }
         }
-        let pipeline = opened
-            .map_err(|e| Refusal::new(500, format!("could not capture the screen: {e:#}")))?;
+        let pipeline = opened.map_err(|e| {
+            let status = if e.is::<video::CaptureEnded>() {
+                403
+            } else {
+                500
+            };
+            Refusal::new(status, format!("could not capture the screen: {e:#}"))
+        })?;
         config.color = pipeline.info().color;
         prepared.info = Some(pipeline.info());
         prepared.pipeline = Some((pipeline, config));
@@ -1095,6 +1119,16 @@ struct Opening {
 }
 
 impl Opening {
+    fn wait_idle(&self, deadline: Instant) -> bool {
+        let mut busy = self.busy.lock();
+        while *busy {
+            if self.cv.wait_until(&mut busy, deadline).timed_out() && *busy {
+                return false;
+            }
+        }
+        true
+    }
+
     /// The reservation, once the one holding it lets go; None after `limit`.
     fn lock(self: &Arc<Self>, limit: Duration) -> Option<OpeningGuard> {
         let deadline = Instant::now() + limit;
@@ -1127,7 +1161,7 @@ struct OpeningGuard(Arc<Opening>);
 impl Drop for OpeningGuard {
     fn drop(&mut self) {
         *self.0.busy.lock() = false;
-        self.0.cv.notify_one();
+        self.0.cv.notify_all();
     }
 }
 
@@ -1422,19 +1456,23 @@ impl Session {
     }
 
     fn end(&self, code: u32, message: &str) {
+        {
+            let mut ended = self.ended.lock();
+            if ended.is_some() {
+                return;
+            }
+            // Let control and capture stop even while input cleanup is pending.
+            *ended = Some(End {
+                code,
+                message: message.into(),
+            });
+        }
         let mut input = self.input.lock();
         if let Some(mut sink) = input.sink.take() {
             sink.release_all();
         }
         drop(input);
         self.unplug_pads();
-        let mut ended = self.ended.lock();
-        if ended.is_none() {
-            *ended = Some(End {
-                code,
-                message: message.into(),
-            });
-        }
     }
 
     fn unplug_pads(&self) {
