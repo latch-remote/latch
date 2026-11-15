@@ -214,6 +214,7 @@ impl AudioCapture for SyntheticAudio {
 
 fn request(port: u16) -> StreamRequest {
     StreamRequest {
+        startup_timeout_secs: 0,
         relay: false,
         prefer_color: false,
         color: Default::default(),
