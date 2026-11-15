@@ -247,13 +247,20 @@ pub(super) fn portal() -> CaptivePortal {
         NetworkConnectivityLevel as Level, NetworkInformation,
     };
     use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
+    eprintln!("portal before RoInitialize");
     if unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.is_err() {
         return CaptivePortal::Unknown;
     }
-    let level = NetworkInformation::GetInternetConnectionProfile()
-        .and_then(|profile| profile.GetNetworkConnectivityLevel());
+    eprintln!("portal before GetInternetConnectionProfile");
+    let level = NetworkInformation::GetInternetConnectionProfile().and_then(|profile| {
+        eprintln!("portal before GetNetworkConnectivityLevel");
+        profile.GetNetworkConnectivityLevel()
+    });
+    eprintln!("portal level {level:?}");
     unsafe {
+        eprintln!("portal before RoUninitialize");
         RoUninitialize();
+        eprintln!("portal after RoUninitialize");
     }
     match level {
         Ok(Level::ConstrainedInternetAccess) => CaptivePortal::Captive { portal_url: None },

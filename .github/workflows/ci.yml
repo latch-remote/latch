@@ -39,6 +39,15 @@ jobs:
         run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: diagnose Windows network FFI
+        shell: pwsh
+        run: |
+          cargo test --locked -p latch-core --lib netenv::tests::real_windows_portal_smoke -- --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p latch-core --lib netenv::windows::tests:: -- --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p latch-core --lib netenv:: -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: test
         run: cargo test --locked --workspace --all-targets
       # The setup script is generated, so only a dump of it can be parsed.
