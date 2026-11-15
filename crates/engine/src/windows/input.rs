@@ -408,6 +408,12 @@ impl InputSink for Injector {
             let local = self.local.apply(event, display);
             return remote.and(local);
         }
+        if matches!(event, Event::MouseMove { .. } | Event::MousePosition { .. }) {
+            // Finish a helper handoff before acquiring the host's clip. The
+            // host also confines input forwarded to an older installed helper.
+            let _ = self.client();
+            self.local.confine(display)?;
+        }
         if let Some(result) = self.remote(event, display) {
             return result;
         }
