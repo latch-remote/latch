@@ -53,6 +53,13 @@ GitHub release notes, so each version gets a heading of the form
   profile and resolution probing, EGL DMA-BUF presentation with readback
   fallback, and automatic software recovery after hardware failures.
 
+### Testing
+
+- Add a Linux network-namespace harness and privileged Docker runner for
+  real headless streams through blocked, lossy, proxy, TLS-inspecting,
+  captive-portal and MTU-limited networks. Record decoded video, sound,
+  input and path recovery in CI, with strict expected-failure tracking.
+
 ### Packaging
 
 - Add a Scoop manifest, AUR packages (`latch-remote-bin` from the release
@@ -81,6 +88,11 @@ GitHub release notes, so each version gets a heading of the form
   existing Lightsail instance. Add reproducible socket, queue, forwarding
   offload, descriptor and memory tuning, with bounded before/after measurements,
   bundle and transfer cost estimates, IPv6 findings and completed EC2 teardown.
+
+### Streaming and recovery
+
+- Move relay quota persistence off the network loop and batch durable byte
+  reservations so credited video and priority lanes keep running during disk flushes.
 
 ## 6.0.0 (2026-11-14)
 
