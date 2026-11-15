@@ -1,5 +1,6 @@
 use crate::display::Previous;
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeMap;
 use windows::{
     core::PCWSTR,
     Win32::{
@@ -40,6 +41,8 @@ struct Saved {
     previous: Previous,
     paths: Vec<DISPLAYCONFIG_PATH_INFO>,
     modes: Vec<DISPLAYCONFIG_MODE_INFO>,
+    adapters: BTreeMap<String, (i32, u32)>,
+    default_adapter: (i32, u32),
 }
 static SAVED: parking_lot::Mutex<Option<Saved>> = parking_lot::Mutex::new(None);
 fn topology() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>)> {
@@ -129,6 +132,7 @@ pub(super) struct Output {
     pub output: IDXGIOutput,
     pub desc: DXGI_OUTPUT_DESC,
     pub virtual_display: bool,
+    pub id: String,
 }
 fn text(s: &[u16]) -> String {
     String::from_utf16_lossy(&s[..s.iter().position(|&c| c == 0).unwrap_or(s.len())])
@@ -167,6 +171,7 @@ fn outputs() -> Result<Vec<Output>> {
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().context("create DXGI factory")?;
         let mut outputs = Vec::new();
+        let monitors = monitor_names();
         for a in 0.. {
             let adapter = match factory.EnumAdapters1(a) {
                 Ok(a) => a,
@@ -188,6 +193,11 @@ fn outputs() -> Result<Vec<Output>> {
                         output,
                         desc,
                         virtual_display,
+                        id: monitors
+                            .iter()
+                            .find(|(gdi, _, _)| *gdi == desc.DeviceName)
+                            .map(|(_, id, _)| id.clone())
+                            .unwrap_or_default(),
                     });
                 }
             }
@@ -234,22 +244,162 @@ pub(super) fn sdr_white_level(name: &[u16; 32]) -> f32 {
 fn selection_rank(virtual_display: bool, primary: bool) -> (bool, bool) {
     (!virtual_display, !primary)
 }
+fn primary(output: &Output) -> bool {
+    output.desc.DesktopCoordinates.left == 0 && output.desc.DesktopCoordinates.top == 0
+}
+/// Which of `outputs` a session shares: the one named `wanted` while it is
+/// attached, else the virtual display, else the primary one.
+fn pick(outputs: &[(String, bool, bool)], wanted: Option<&str>) -> Option<usize> {
+    wanted
+        .filter(|w| !w.is_empty())
+        .and_then(|w| outputs.iter().position(|(name, _, _)| name == w))
+        .or_else(|| {
+            outputs
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, v, p))| selection_rank(*v, *p))
+                .map(|(i, _)| i)
+        })
+}
+fn keys(outputs: &[Output]) -> Vec<(String, bool, bool)> {
+    outputs
+        .iter()
+        .map(|o| (o.id.clone(), o.virtual_display, primary(o)))
+        .collect()
+}
 pub(super) fn select() -> Result<Output> {
+    select_named(None)
+}
+/// The output named `wanted` (its monitor device path), or the one
+/// [`select`] takes when that is `None` or not attached now.
+pub(super) fn select_named(wanted: Option<&str>) -> Result<Output> {
     let mut outputs = outputs()?;
-    let index = outputs
+    let Some(index) = pick(&keys(&outputs), wanted) else {
+        bail!("no DXGI output attached to the desktop");
+    };
+    Ok(outputs.swap_remove(index))
+}
+
+/// Probe the adapter a display will use after the active session restores its
+/// topology. Physical outputs disabled for virtual capture remain selectable.
+pub(super) fn encoding_adapter(wanted: Option<&str>) -> Result<IDXGIAdapter1> {
+    let saved_adapter = SAVED
+        .lock()
+        .as_ref()
+        .map(|saved| adapter_choice(&saved.adapters, saved.default_adapter, wanted));
+    let Some((high, low)) = saved_adapter else {
+        return Ok(select_named(wanted)?.adapter);
+    };
+    // SAFETY: The saved LUID identifies an adapter, independent of active outputs.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1()?;
+        Ok(factory.EnumAdapterByLuid(windows::Win32::Foundation::LUID {
+            HighPart: high,
+            LowPart: low,
+        })?)
+    }
+}
+
+fn adapter_choice(
+    adapters: &BTreeMap<String, (i32, u32)>,
+    default: (i32, u32),
+    wanted: Option<&str>,
+) -> (i32, u32) {
+    wanted
+        .and_then(|id| adapters.get(id))
+        .copied()
+        .unwrap_or(default)
+}
+
+/// Join DXGI's current GDI sources to persistent monitor identities and labels.
+fn monitor_names() -> Vec<([u16; 32], String, String)> {
+    let Ok((paths, _)) = topology() else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for path in paths {
+        let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                adapterId: path.sourceInfo.adapterId,
+                id: path.sourceInfo.id,
+            },
+            ..Default::default()
+        };
+        let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
+                adapterId: path.targetInfo.adapterId,
+                id: path.targetInfo.id,
+            },
+            ..Default::default()
+        };
+        // SAFETY: Both device-info packets have the SDK size and matching IDs.
+        unsafe {
+            if DisplayConfigGetDeviceInfo(&mut source.header) == 0
+                && DisplayConfigGetDeviceInfo(&mut target.header) == 0
+            {
+                let name = text(&target.monitorFriendlyDeviceName);
+                let device_path = text(&target.monitorDevicePath);
+                let luid = path.targetInfo.adapterId;
+                let id = monitor_identity(
+                    &device_path,
+                    (luid.HighPart, luid.LowPart, path.targetInfo.id),
+                );
+                names.push((source.viewGdiDeviceName, id, name));
+            }
+        }
+    }
+    names
+}
+fn monitor_identity(device_path: &str, target: (i32, u32, u32)) -> String {
+    if device_path.is_empty() {
+        format!("target:{:x}:{:x}:{}", target.0, target.1, target.2)
+    } else {
+        device_path.to_ascii_lowercase()
+    }
+}
+
+/// Every output attached to the desktop, for a viewer to choose from. The
+/// one [`select`] takes is the default.
+pub(super) fn list() -> Result<Vec<latch_proto::control::HostDisplay>> {
+    let outputs = outputs()?;
+    let default = pick(&keys(&outputs), None);
+    let friendly = monitor_names();
+    Ok(outputs
         .iter()
         .enumerate()
-        .min_by_key(|(_, o)| {
-            selection_rank(
-                o.virtual_display,
-                o.desc.DesktopCoordinates.left == 0 && o.desc.DesktopCoordinates.top == 0,
-            )
+        .filter(|(_, o)| !o.id.is_empty())
+        .map(|(i, o)| {
+            let id = o.id.clone();
+            let r = o.desc.DesktopCoordinates;
+            let name = if o.virtual_display {
+                "Virtual display".to_string()
+            } else {
+                friendly
+                    .iter()
+                    .find(|(gdi, _, name)| *gdi == o.desc.DeviceName && !name.is_empty())
+                    .map(|(_, _, name)| name.clone())
+                    .unwrap_or_else(|| {
+                        text(&o.desc.DeviceName)
+                            .trim_start_matches(r"\\.\")
+                            .to_string()
+                    })
+            };
+            latch_proto::control::HostDisplay {
+                id,
+                name,
+                x: r.left,
+                y: r.top,
+                width: (r.right - r.left).max(0) as u32,
+                height: (r.bottom - r.top).max(0) as u32,
+                primary: primary(o),
+                default: Some(i) == default,
+            }
         })
-        .map_or(0, |(i, _)| i);
-    if outputs.is_empty() {
-        bail!("no DXGI output attached to the desktop");
-    }
-    Ok(outputs.swap_remove(index))
+        .collect())
 }
 
 fn current(output: &Output) -> Result<DEVMODEW> {
@@ -294,8 +444,15 @@ fn refresh_rank(hz: u32, requested: u32) -> (bool, u32) {
         if hz >= requested { hz } else { u32::MAX - hz },
     )
 }
-pub(super) fn prepare(width: u32, height: u32, fps: u32) -> Result<Option<Previous>> {
-    let output = select()?;
+pub(super) fn prepare(
+    width: u32,
+    height: u32,
+    fps: u32,
+    display: Option<&str>,
+) -> Result<Option<Previous>> {
+    // A viewer that chose a real monitor shares it as it is: the virtual
+    // display keeps its size and every monitor stays on.
+    let output = select_named(display)?;
     if !output.virtual_display {
         return Ok(None);
     }
@@ -352,6 +509,19 @@ pub(super) fn prepare(width: u32, height: u32, fps: u32) -> Result<Option<Previo
     let mut saved = SAVED.lock();
     anyhow::ensure!(saved.is_none(), "display topology already prepared");
     let (paths, modes) = topology()?;
+    // Record adapter identity before only_virtual detaches physical outputs.
+    let attached = outputs()?;
+    let default = pick(&keys(&attached), None).context("no default display")?;
+    let adapter_id = |output: &Output| -> Result<(i32, u32)> {
+        // SAFETY: Output owns this adapter interface.
+        let luid = unsafe { output.adapter.GetDesc1()? }.AdapterLuid;
+        Ok((luid.HighPart, luid.LowPart))
+    };
+    let default_adapter = adapter_id(&attached[default])?;
+    let adapters = attached
+        .iter()
+        .map(|output| Ok((output.id.clone(), adapter_id(output)?)))
+        .collect::<Result<_>>()?;
     only_virtual(&output.desc.DeviceName, &paths, &modes)?;
     if let Err(e) = change(&output.desc.DeviceName, &mode) {
         apply_topology(&paths, &modes).context("restore topology after mode failure")?;
@@ -361,6 +531,8 @@ pub(super) fn prepare(width: u32, height: u32, fps: u32) -> Result<Option<Previo
         previous: previous.clone(),
         paths,
         modes,
+        adapters,
+        default_adapter,
     });
     Ok(Some(previous))
 }
@@ -448,6 +620,53 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    fn a_chosen_output_wins_while_it_is_attached() {
+        let outputs = [
+            (r"\\.\DISPLAY1".to_string(), false, true),
+            (r"\\.\DISPLAY2".to_string(), true, false),
+            (r"\\.\DISPLAY3".to_string(), false, false),
+        ];
+        assert_eq!(super::pick(&outputs, None), Some(1), "virtual by default");
+        assert_eq!(super::pick(&outputs, Some(r"\\.\DISPLAY3")), Some(2));
+        assert_eq!(super::pick(&outputs, Some(r"\\.\DISPLAY1")), Some(0));
+        assert_eq!(
+            super::pick(&outputs, Some(r"\\.\DISPLAY9")),
+            Some(1),
+            "a display that has gone falls back to the default"
+        );
+        assert_eq!(super::pick(&[], Some("x")), None);
+        assert_eq!(
+            super::pick(
+                &[
+                    (String::new(), false, false),
+                    ("virtual".into(), true, false)
+                ],
+                Some("")
+            ),
+            Some(1)
+        );
+    }
+    #[test]
+    fn remembered_monitors_follow_device_paths_after_sources_are_renumbered() {
+        let a = super::monitor_identity(r"\\?\DISPLAY#AAA#serial-a", (0, 1, 1));
+        let b = super::monitor_identity(r"\\?\DISPLAY#BBB#serial-b", (0, 1, 2));
+        let before = vec![(a.clone(), false, true), (b.clone(), false, false)];
+        let after = vec![(b.clone(), false, true), (a.clone(), false, false)];
+        assert_eq!(super::pick(&before, Some(&b)), Some(1));
+        assert_eq!(super::pick(&after, Some(&b)), Some(0));
+        assert_eq!(super::pick(&after[1..], Some(&b)), Some(0));
+        assert_eq!(super::pick(&after, Some(r"\\.\DISPLAY2")), Some(0));
+        assert_eq!(
+            a,
+            super::monitor_identity(r"\\?\display#aaa#serial-a", (9, 9, 9))
+        );
+        assert_ne!(
+            super::monitor_identity("", (0, 1, 1)),
+            super::monitor_identity("", (0, 1, 2))
+        );
+    }
+
     #[test]
     fn virtual_output_wins_over_primary() {
         let candidates = [(false, true), (true, false)];
@@ -596,5 +815,35 @@ mod hdr_live_test {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod adapter_choice_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_physical_outputs_keep_their_adapter_for_negotiation() {
+        let primary = (0, 10);
+        let secondary = (1, 20);
+        let virtual_gpu = (0, 30);
+        let adapters = BTreeMap::from([
+            ("av1-primary".into(), primary),
+            ("h264-secondary".into(), secondary),
+            ("virtual".into(), virtual_gpu),
+        ]);
+        assert_eq!(
+            adapter_choice(&adapters, virtual_gpu, Some("h264-secondary")),
+            secondary
+        );
+        assert_eq!(
+            adapter_choice(&adapters, virtual_gpu, Some("av1-primary")),
+            primary
+        );
+        assert_eq!(adapter_choice(&adapters, virtual_gpu, None), virtual_gpu);
+        assert_eq!(
+            adapter_choice(&adapters, virtual_gpu, Some("unplugged")),
+            virtual_gpu
+        );
     }
 }

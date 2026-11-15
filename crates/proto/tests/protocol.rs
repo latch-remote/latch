@@ -1149,6 +1149,7 @@ fn av1_offer_is_additive_and_unknown_codecs_still_fall_through() {
         audio_channels: 0,
         mic: false,
         probe_trains: false,
+        display: None,
     })
     .unwrap();
     assert!(request.get("prefer_color").is_none());
@@ -1162,4 +1163,60 @@ fn av1_offer_is_additive_and_unknown_codecs_still_fall_through() {
         decoded.codecs,
         [Codec::Av1, Codec::Hevc, Codec::H264Baseline]
     );
+}
+
+#[test]
+fn a_display_choice_is_additive_in_both_directions() {
+    use latch_proto::control::{HostDisplay, StreamRequest};
+    // A request from a viewer that predates the field.
+    let old = r#"{"protocol":1,"width":1920,"height":1080,"fps":60,"bitrate_kbps":20000,
+        "codecs":["h264-high"],"udp_port":47880,"audio":true,"name":"mac"}"#;
+    let request: StreamRequest = serde_json::from_str(old).unwrap();
+    assert_eq!(request.display, None);
+    // No choice stays off the wire, so an older host sees what it always did.
+    let json = serde_json::to_value(&request).unwrap();
+    assert!(json.get("display").is_none(), "{json}");
+    // A choice round-trips, and an older host's parser skips the field.
+    let chosen = StreamRequest {
+        display: Some(r"\\.\DISPLAY2".into()),
+        ..request
+    };
+    let json = serde_json::to_string(&chosen).unwrap();
+    assert!(json.contains(r#""display":"\\\\.\\DISPLAY2""#), "{json}");
+    assert_eq!(
+        serde_json::from_str::<StreamRequest>(&json).unwrap(),
+        chosen
+    );
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Before {
+        protocol: u32,
+        width: u32,
+        codecs: Vec<String>,
+    }
+    let before: Before = serde_json::from_str(&json).unwrap();
+    assert_eq!(before.width, 1920);
+
+    // The host's list: every field defaults, and later fields are skipped.
+    let listed: Vec<HostDisplay> = serde_json::from_str(
+        r#"[{"id":"1","name":"Built-in display","x":0,"y":0,"width":3024,"height":1964,
+             "primary":true,"default":true},
+            {"id":"2","name":"External display","x":3024,"y":0,"width":2560,"height":1440,
+             "refresh_hz":144},
+            {"id":"3"}]"#,
+    )
+    .unwrap();
+    assert!(listed[0].default && listed[0].primary);
+    assert!(!listed[1].default && !listed[1].primary);
+    assert_eq!(listed[2].name, "");
+    assert_eq!(HostDisplay::find(&listed, Some("2")).unwrap().width, 2560);
+    assert_eq!(HostDisplay::find(&listed, Some("9")), None);
+    assert_eq!(HostDisplay::find(&listed, None), None);
+    let back: Vec<HostDisplay> =
+        serde_json::from_str(&serde_json::to_string(&listed).unwrap()).unwrap();
+    assert_eq!(back, listed);
+    // `default: false` is the field's absence.
+    assert!(!serde_json::to_string(&listed[1])
+        .unwrap()
+        .contains("default"));
 }

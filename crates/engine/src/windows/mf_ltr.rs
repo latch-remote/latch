@@ -260,6 +260,7 @@ mod tests {
             bitrate_kbps: 1000,
             codec: crate::video::Codec::H264High,
             color: Default::default(),
+            display: None,
         };
         let mut frame = DecodedNv12 {
             bit_depth: 8,
@@ -348,6 +349,7 @@ mod hardware_tests {
             bitrate_kbps: 8000,
             codec: crate::video::Codec::H264High,
             color: Default::default(),
+            display: None,
         };
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)

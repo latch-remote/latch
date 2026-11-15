@@ -66,9 +66,15 @@ impl Drop for Segment {
 
 /// Root-window capture on `$DISPLAY`, authenticated by x11rb using `$XAUTHORITY`.
 /// Every round trip fails after [`super::X11_SILENCE`] without an answer.
+/// With a monitor named, only its rectangle of the root is captured.
 pub struct X11Capture {
     conn: X11,
     root: u32,
+    /// The RandR monitor to capture, by name; the whole root when `None`
+    /// or when no monitor has that name.
+    monitor: Option<String>,
+    /// Where the captured rectangle starts on the root.
+    origin: (i16, i16),
     width: u16,
     height: u16,
     segment: Option<Segment>,
@@ -94,6 +100,12 @@ const MAX_REGIONS: usize = 8;
 
 impl X11Capture {
     pub fn new() -> anyhow::Result<Self> {
+        Self::with_display(None)
+    }
+
+    /// Captures the RandR monitor named `monitor` (see
+    /// [`super::displays`]), or the whole root.
+    pub fn with_display(monitor: Option<&str>) -> anyhow::Result<Self> {
         let (conn, screen) = super::connect(super::X11_SILENCE).map_err(|e| {
             e.context(if super::in_wayland_session() {
                 super::WAYLAND
@@ -128,7 +140,8 @@ impl X11Capture {
                 && visual.blue_mask == 0xff,
             "X11 capture requires a little-endian 32-bit BGR root visual"
         );
-        let geometry = conn.get_geometry(root)?.reply()?;
+        let monitor = monitor.map(str::to_owned);
+        let (origin, (width, height)) = area(&conn, root, monitor.as_deref())?;
         let fixes = xfixes::query_version(&conn, 5, 0)
             .ok()
             .and_then(|c| c.reply().ok())
@@ -162,8 +175,10 @@ impl X11Capture {
         let mut this = Self {
             conn,
             root,
-            width: geometry.width,
-            height: geometry.height,
+            monitor,
+            origin,
+            width,
+            height,
             segment: None,
             damage,
             fixes,
@@ -210,14 +225,16 @@ impl X11Capture {
         self.first = true;
     }
 
-    /// Re-reads the root's size. True, with a fresh image to come, when it changed.
+    /// Re-reads the captured rectangle. True, with a fresh image to come,
+    /// when it moved or changed size.
     fn resize(&mut self) -> anyhow::Result<bool> {
-        let geometry = self.conn.get_geometry(self.root)?.reply()?;
-        if (self.width, self.height) == (geometry.width, geometry.height) {
+        let (origin, (width, height)) = area(&self.conn, self.root, self.monitor.as_deref())?;
+        if (self.origin, self.width, self.height) == (origin, width, height) {
             return Ok(false);
         }
-        self.width = geometry.width;
-        self.height = geometry.height;
+        self.origin = origin;
+        self.width = width;
+        self.height = height;
         self.allocate();
         Ok(true)
     }
@@ -227,14 +244,16 @@ impl X11Capture {
     /// follows repaints of identical content.
     fn pixels(&mut self, area: xproto::Rectangle) -> anyhow::Result<Option<Rect>> {
         let stride = area.width as usize * 4;
+        // Where `area` (in the captured rectangle) is on the root.
+        let (x, y) = (area.x + self.origin.0, area.y + self.origin.1);
         let len = stride * area.height as usize;
         let owned;
         let bytes = if let Some(segment) = &self.segment {
             match shm::get_image(
                 &self.conn,
                 self.root,
-                area.x,
-                area.y,
+                x,
+                y,
                 area.width,
                 area.height,
                 u32::MAX,
@@ -257,8 +276,8 @@ impl X11Capture {
                         .get_image(
                             xproto::ImageFormat::Z_PIXMAP,
                             self.root,
-                            area.x,
-                            area.y,
+                            x,
+                            y,
                             area.width,
                             area.height,
                             u32::MAX,
@@ -274,8 +293,8 @@ impl X11Capture {
                 .get_image(
                     xproto::ImageFormat::Z_PIXMAP,
                     self.root,
-                    area.x,
-                    area.y,
+                    x,
+                    y,
                     area.width,
                     area.height,
                     u32::MAX,
@@ -350,8 +369,8 @@ impl CpuCapture for X11Capture {
     }
     fn display(&self) -> DisplayRect {
         DisplayRect {
-            x: 0,
-            y: 0,
+            x: self.origin.0.into(),
+            y: self.origin.1.into(),
             width: self.width.into(),
             height: self.height.into(),
         }
@@ -367,7 +386,8 @@ impl CpuCapture for X11Capture {
             while let Some(event) = self.conn.poll_for_event()? {
                 match event {
                     Event::DamageNotify(event) => {
-                        add_region(&mut dirty, event.area, self.width, self.height);
+                        let area = offset(event.area, self.origin);
+                        add_region(&mut dirty, area, self.width, self.height);
                     }
                     Event::RandrScreenChangeNotify(_)
                     | Event::RandrNotify(_)
@@ -388,7 +408,12 @@ impl CpuCapture for X11Capture {
                 }];
             }
             let cursor = if self.fixes {
-                Some(xfixes::get_cursor_image(&self.conn)?.reply()?)
+                let mut cursor = xfixes::get_cursor_image(&self.conn)?.reply()?;
+                // The pointer's place on the root, made relative to the
+                // captured rectangle.
+                cursor.x = cursor.x.saturating_sub(self.origin.0);
+                cursor.y = cursor.y.saturating_sub(self.origin.1);
+                Some(cursor)
             } else {
                 None
             };
@@ -571,6 +596,55 @@ fn xwayland(conn: &X11, root: u32, randr: bool) -> anyhow::Result<bool> {
     Ok(super::xwayland_outputs(names.iter().map(Vec::as_slice)))
 }
 
+/// The rectangle to capture: the named monitor's place and size, clipped to
+/// the root, or the whole root when it is `None` or not there now.
+fn area(conn: &X11, root: u32, monitor: Option<&str>) -> anyhow::Result<((i16, i16), (u16, u16))> {
+    let geometry = conn.get_geometry(root)?.reply()?;
+    let monitors = match monitor {
+        Some(_) => super::monitors(conn, root).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    Ok(monitor_area(
+        &monitors,
+        monitor,
+        (geometry.width, geometry.height),
+    ))
+}
+
+fn monitor_area(
+    monitors: &[crate::display::HostDisplay],
+    wanted: Option<&str>,
+    root: (u16, u16),
+) -> ((i16, i16), (u16, u16)) {
+    let whole = ((0, 0), root);
+    let Some(m) = wanted.and_then(|w| monitors.iter().find(|m| m.id == w)) else {
+        return whole;
+    };
+    let left = m.x.clamp(0, root.0.into());
+    let top = m.y.clamp(0, root.1.into());
+    let right = (i64::from(m.x) + i64::from(m.width)).min(root.0.into()) as i32;
+    let bottom = (i64::from(m.y) + i64::from(m.height)).min(root.1.into()) as i32;
+    if right <= left || bottom <= top {
+        return whole;
+    }
+    (
+        (left as i16, top as i16),
+        ((right - left) as u16, (bottom - top) as u16),
+    )
+}
+
+/// `rect` on the root, relative to a captured rectangle at `origin`.
+fn offset(rect: xproto::Rectangle, origin: (i16, i16)) -> xproto::Rectangle {
+    let shift = |v: i16, o: i16| {
+        (i32::from(v) - i32::from(o)).clamp(i16::MIN.into(), i16::MAX.into()) as i16
+    };
+    xproto::Rectangle {
+        x: shift(rect.x, origin.0),
+        y: shift(rect.y, origin.1),
+        ..rect
+    }
+}
+
 /// Adds damage `rect`, clipped to the root, to `regions`: merged into one
 /// it overlaps or touches, and everything merged into one bounding box past
 /// [`MAX_REGIONS`].
@@ -681,6 +755,62 @@ fn composite(frame: &mut Bgra, cursor: &xfixes::GetCursorImageReply) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_chosen_monitor_is_its_rectangle_of_the_root() {
+        let monitor = |id: &str, x, y, width, height| crate::display::HostDisplay {
+            id: id.into(),
+            name: id.into(),
+            x,
+            y,
+            width,
+            height,
+            ..Default::default()
+        };
+        let monitors = [
+            monitor("DP-1", 0, 0, 2560, 1440),
+            monitor("HDMI-1", 2560, 0, 1920, 1080),
+            monitor("off-screen", 9000, 0, 100, 100),
+        ];
+        let root = (4480, 1440);
+        assert_eq!(monitor_area(&monitors, None, root), ((0, 0), root));
+        assert_eq!(
+            monitor_area(&monitors, Some("HDMI-1"), root),
+            ((2560, 0), (1920, 1080))
+        );
+        assert_eq!(
+            monitor_area(&monitors, Some("DP-1"), root),
+            ((0, 0), (2560, 1440))
+        );
+        // Gone, or outside the root: the whole screen, as before.
+        assert_eq!(monitor_area(&monitors, Some("DP-9"), root), ((0, 0), root));
+        assert_eq!(
+            monitor_area(&monitors, Some("off-screen"), root),
+            ((0, 0), root)
+        );
+        // Damage on the root lands in the monitor's own coordinates, and
+        // what lies on another monitor is clipped away.
+        let damage = |x, y| xproto::Rectangle {
+            x,
+            y,
+            width: 100,
+            height: 50,
+        };
+        let mut regions = Vec::new();
+        add_region(
+            &mut regions,
+            offset(damage(2600, 10), (2560, 0)),
+            1920,
+            1080,
+        );
+        add_region(&mut regions, offset(damage(10, 10), (2560, 0)), 1920, 1080);
+        assert_eq!(
+            regions
+                .iter()
+                .map(|r| (r.x, r.y, r.width, r.height))
+                .collect::<Vec<_>>(),
+            [(40, 10, 100, 50)]
+        );
+    }
     #[test]
     fn clips_damage_and_premultiplied_cursor() {
         let rect = xproto::Rectangle {
@@ -809,6 +939,8 @@ mod tests {
         let mut capture = X11Capture {
             conn,
             root: 1,
+            monitor: None,
+            origin: (0, 0),
             width,
             height,
             segment: None,

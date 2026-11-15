@@ -33,6 +33,7 @@ fn request(name: &str) -> StreamRequest {
         audio_channels: 0,
         mic: false,
         probe_trains: false,
+        display: None,
     }
 }
 
@@ -201,6 +202,7 @@ fn post_accept_end_close_and_missing_media_are_reported_as_failures() {
                 cursor: false,
                 gamepads: false,
                 mic: false,
+                display: None,
             },
             Arc::new(FrameSlot::default()),
             tx,
@@ -367,6 +369,7 @@ fn impaired_session(port: u16) -> (Session, Arc<FrameSlot>, mpsc::Receiver<Event
             cursor: false,
             gamepads: false,
             mic: false,
+            display: None,
         },
         frames.clone(),
         tx,

@@ -57,6 +57,7 @@ Content-Length: <n>
 | `mic` | bool | optional, default false; the viewer offers its microphone (datagram kind 13) |
 | `probe_trains` | bool | optional, default false; the viewer times probe trains (datagram kind 16) and reports their rate |
 | `relay` | bool | optional, default false; the viewer supports the two-lane authenticated relay extension |
+| `display` | string | optional; the host display to share, by an `id` from its status `streamer.displays` (see [Choosing a display](#choosing-a-display-additive)); absent leaves the choice to the host |
 
 A request is taken within 64 to 16384 pixels a side, 1 to 500 fps and
 500 kbps to 1 Gbps (`latch_proto::control::MAX_*`). The host then meets
@@ -468,6 +469,46 @@ version. A host that cannot speak the requested version answers 426 with
 an `Ack` naming the versions it speaks. `/v1/status` reports
 `streamer.protocol` (1 here; absent from Latch 4 hosts, which speak only
 GameStream).
+
+## Choosing a display (additive)
+
+`/v1/status` → `streamer.displays` lists the displays a stream can
+share. It is absent from older hosts, which share the display they pick,
+and a viewer then offers no choice.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | string | the opaque ID used by `StreamRequest.display`, with a CGDirectDisplayID on macOS, a monitor device path (or adapter LUID + target ID) on Windows, and a RandR monitor name (`DP-1`) on Linux |
+| `name` | string | for people: `"Built-in display"`, a monitor's own name, `"Virtual display"` |
+| `x`, `y` | i32 | where it sits on the host's desktop, in the platform's desktop coordinates (points on macOS, pixels on Windows and X11) |
+| `width`, `height` | u32 | its size in pixels |
+| `primary` | bool | the system's main display |
+| `default` | bool | optional, default false; what a request naming no display shares. None is on a Linux host, which then shares its whole X screen |
+
+A request naming a display the host does not have now (unplugged, or
+renumbered after a restart) is served as if it named none; it is never
+refused for that. A Windows host that would otherwise size its virtual
+display to the viewer and turn the other monitors off for the session
+does neither when another output is chosen; while a session runs its
+status keeps listing the displays it had before. A Linux host shares one
+RandR 1.5 monitor's rectangle of the X screen and does not resize it when
+several are connected; its `capture_size` stays the whole screen's, and a
+viewer that chose a monitor plans for that monitor's size instead.
+Switching displays mid-stream is a new session; there is no control
+message for it. The host places the pointer in the new picture before
+relative input resumes. Windows codec negotiation probes the adapter that
+drives the selected output, with capability results cached per adapter.
+
+Windows choices saved as GDI source names by earlier versions follow the
+missing-display fallback. New choices use monitor device paths so source
+renumbering preserves the selected monitor. Windows keeps the pre-session
+list throughout preparation and restoration as well as capture.
+
+`streamer.captured_display`, when present, names the display the running
+pipeline actually captures. macOS reports this even when a missing choice
+fell back to another display. The viewer uses it to mark the current
+capture and allows choosing the requested display again after reconnecting
+it. Older hosts omit this additive status field.
 
 ## Encoder limits (5.2, additive)
 

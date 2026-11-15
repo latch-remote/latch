@@ -49,6 +49,7 @@ fn main() -> anyhow::Result<()> {
         bitrate_kbps: 2000,
         codec: Codec::H264Baseline,
         color: Default::default(),
+        display: None,
     };
     // The shipping entry point shares the existing portal session.
     let mut pipeline = latch_engine::linux::open_video(&config)?;

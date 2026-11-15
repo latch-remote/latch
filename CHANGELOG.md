@@ -35,6 +35,17 @@ GitHub release notes, so each version gets a heading of the form
   source changes, and require large-segment loss evidence for automatic MSS hints.
   Cover 280 ms RTT recovery and retry non-blocking test accepts with deadlines.
 
+### Streaming
+
+- Choose which of a host's displays to share. Hosts list their displays in
+  `/v1/status` (`streamer.displays`), and the viewer offers them in the
+  machine's menu in the list and in the stream toolbar, remembered per
+  machine. A choice made during a stream reconnects on that display. Hosts
+  that do not list displays, and viewers that do not choose, keep sharing
+  the display the host picks: the virtual display on Windows, the main
+  display (or `LATCH_MAC_DISPLAY`) on a Mac, the whole X screen on Linux.
+  `StreamRequest.display` is additive and omitted when nothing is chosen.
+
 - Send viewer mouse and keyboard input directly from OS events on macOS,
   Windows and Linux, preserving input ordering, capture, focus and local
   shortcuts while avoiding the next UI frame for ordinary input.
@@ -48,6 +59,17 @@ GitHub release notes, so each version gets a heading of the form
   real headless streams through blocked, lossy, proxy, TLS-inspecting,
   captive-portal and MTU-limited networks. Record decoded video, sound,
   input and path recovery in CI, with strict expected-failure tracking.
+
+### Networking
+
+- Add core network-environment discovery for system proxies, captive portals,
+  Tailscale reachability and IPv4/IPv6/NAT64, with bounded worker calls,
+  credential redaction and a standalone diagnostic example.
+- Keep proxy credentials scoped to their configured host and port, expose
+  typed network warnings, coalesce each network check independently, bound
+  subprocess output and Windows WPAD waits, and validate ambiguous DNS64
+  answers. Refresh the latest requested network generation automatically.
+  Add macOS and Windows system-API smoke tests.
 
 ### Packaging
 

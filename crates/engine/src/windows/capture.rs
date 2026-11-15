@@ -27,6 +27,7 @@ use windows::{
 pub(super) struct Gpu {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
+    pub adapter: (i32, u32),
 }
 impl Gpu {
     pub fn new(adapter: &IDXGIAdapter1) -> Result<Self> {
@@ -49,6 +50,11 @@ impl Gpu {
         let gpu = Self {
             device: device.context("D3D11 returned no device")?,
             context: context.context("D3D11 returned no context")?,
+            // SAFETY: adapter is a live owned DXGI interface.
+            adapter: unsafe {
+                let luid = adapter.GetDesc1()?.AdapterLuid;
+                (luid.HighPart, luid.LowPart)
+            },
         };
         // SAFETY: MF may call the immediate context from driver threads.
         unsafe {
@@ -475,6 +481,8 @@ pub(super) struct Capture {
     white: f32,
     retry: ReopenBackoff,
     staging: Option<ID3D11Texture2D>,
+    /// The output the viewer chose (its GDI name), kept across reopens.
+    wanted: Option<String>,
 }
 struct ReopenBackoff {
     started: Instant,
@@ -546,11 +554,15 @@ unsafe impl Send for Capture {}
 impl Capture {
     #[cfg(test)]
     pub fn new() -> Result<Self> {
-        Self::new_color(Default::default())
+        Self::new_color(Default::default(), None)
     }
-    pub fn new_color(color: latch_proto::color::ColorDescription) -> Result<Self> {
+    /// Duplicates the output named `wanted` (see [`display::select_named`]).
+    pub fn new_color(
+        color: latch_proto::color::ColorDescription,
+        wanted: Option<&str>,
+    ) -> Result<Self> {
         let _dpi = display::DpiAwareness::physical();
-        let output = display::select()?;
+        let output = display::select_named(wanted)?;
         let ten_bit = color.bit_depth == 10;
         let hdr_output = color.is_hdr()
             && unsafe {
@@ -602,6 +614,7 @@ impl Capture {
             white: display::sdr_white_level(&output.desc.DeviceName),
             retry: ReopenBackoff::new(),
             staging: None,
+            wanted: wanted.map(str::to_owned),
         })
     }
     /// See [`Gpu::read`]; the staging texture is kept for the next call.
@@ -615,7 +628,7 @@ impl Capture {
     }
     fn reopen(&mut self) -> Result<()> {
         let _dpi = display::DpiAwareness::physical();
-        let output = display::select()?;
+        let output = display::select_named(self.wanted.as_deref())?;
         // Reuse the device and cursor shaders while the adapter is unchanged.
         // SAFETY: both descriptors are copied from live DXGI interfaces.
         let (old, new) = unsafe {
@@ -638,7 +651,8 @@ impl Capture {
                 color.transfer = 16;
             }
             let hdr_output = self.hdr_output;
-            *self = Self::new_color(color)?;
+            let wanted = self.wanted.clone();
+            *self = Self::new_color(color, wanted.as_deref())?;
             self.hdr_output = hdr_output;
             return Ok(());
         }
@@ -1223,6 +1237,7 @@ mod tests {
         let gpu = Gpu {
             device: device.context("WARP returned no device")?,
             context: context.context("WARP returned no context")?,
+            adapter: (0, 0),
         };
         let white_nits = 203.0f64;
         let nits = |n: f64| n / 80.0;
@@ -1427,7 +1442,7 @@ mod timing_tests {
     fn hardware_capture_rate() -> Result<()> {
         let _runtime = super::super::Runtime::new(false)?;
         for (width, height, fps) in [(1920, 1080, 240), (2560, 1440, 240), (3840, 2160, 120)] {
-            let previous = display::prepare(width, height, fps)?;
+            let previous = display::prepare(width, height, fps, None)?;
             let result = (|| -> Result<()> {
                 let mut capture = Capture::new()?;
                 let start = Instant::now();
@@ -1564,6 +1579,7 @@ mod hdr_probe {
             height: 540,
             fps: 60,
             bitrate_kbps: 20000,
+            display: None,
         };
         let source = gpu.texture(
             960,
