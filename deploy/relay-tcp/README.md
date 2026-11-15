@@ -312,6 +312,13 @@ paths. A run is capped at one hour and a modeled
 frame age, authenticated ACK age, unsent queue age, source drops and priority/
 control echoes are emitted every 30 seconds. The probe checks frame contents
 and ordering. The optional warm-up uses one-quarter frame size at the same fps.
+Latency percentiles and maxima accumulate across the whole run. `received_mbps`
+describes the latest reporting interval, `payload_mbps` includes warm-up and
+drain, and `post_warmup_payload_mbps` measures delivered bytes since the latest
+full-rate transition, including its drain. It includes warm-up frames still in
+flight at that transition. With no warm-up, both cumulative rates cover the run.
+The isolated carrier comparison uses a disposable CA through `PAIRED_PROBE_CA`.
+[Carrier comparison lab](../../scripts/netlab/README.md#carrier-throughput-comparison)
 It rotates a fresh grant and fresh keys before the negotiated session time or
 byte cap. Accepted frames still in flight during a planned rotation are reported
 in `accepted_not_received`. A terminal transport failure exits with an error.

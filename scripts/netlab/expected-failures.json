@@ -5,7 +5,7 @@
     "failures": [
       "tail_video_at_least_75pct_requested"
     ],
-    "observed": "Linux arm64, 16.15% tc loss over real media, tail 26.0 fps, 2.11/6 Mbps, 0 tail stalls, 167 ms tail freeze, 16 clicks, UDP. An earlier run measured 16.26% loss and 21.5 fps at 1.74/6 Mbps. FPS varies across stochastic-loss runs. The requested-bitrate deficit is mandatory for this expected failure.",
+    "observed": "Linux arm64, 16.15% tc loss over real media, tail 26.0 fps, 2.11/6 Mbps, 0 tail stalls, 167 ms tail freeze, 16 clicks, UDP. An earlier run measured 16.26% loss and 21.5 fps at 1.74/6 Mbps. A CI run on Linux x64 measured 16.24% loss, 19.4 fps, 1.66/6 Mbps and two tail stalls with a 532 ms freeze. FPS and stall counts vary across stochastic-loss runs. The requested-bitrate deficit is mandatory for this expected failure.",
     "base_revision": "68ef280",
     "required_assertions": [
       "claimed_tail_path_carried_media",
@@ -14,7 +14,8 @@
     ],
     "related_failures": [
       "tail_decoded_fps_at_least_25",
-      "tail_audio_clicks"
+      "tail_audio_clicks",
+      "at_most_one_tail_decoded_stall"
     ]
   },
   "d2": {
