@@ -9,6 +9,7 @@ pub mod daemon;
 mod diagnostics;
 mod proxy;
 mod quota;
+mod readiness;
 mod wire;
 
 pub use carrier::WEBSOCKET_PATH;
@@ -23,21 +24,44 @@ pub use wire::{Attachment, Grant, Lane, Role};
 use std::io;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex, Weak,
 };
 
 /// Cloneable cancellation signal. Cancellation is permanent for this attempt.
 #[derive(Clone, Default, Debug)]
-pub struct Cancel(Arc<AtomicBool>);
+pub struct Cancel(Arc<Cancellation>);
+#[derive(Default, Debug)]
+struct Cancellation {
+    cancelled: AtomicBool,
+    wakes: Mutex<Vec<Weak<readiness::Wake>>>,
+}
 impl Cancel {
     pub fn new() -> Self {
         Self::default()
     }
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.cancelled.store(true, Ordering::Release);
+        for wake in self
+            .0
+            .wakes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+        {
+            wake.notify();
+        }
     }
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.cancelled.load(Ordering::Acquire)
+    }
+    pub(crate) fn register(&self, wake: &Arc<readiness::Wake>) {
+        let mut wakes = self.0.wakes.lock().unwrap();
+        wakes.retain(|wake| wake.strong_count() != 0);
+        wakes.push(Arc::downgrade(wake));
+        if self.is_cancelled() {
+            wake.notify();
+        }
     }
     pub(crate) fn check(&self) -> io::Result<()> {
         if self.is_cancelled() {

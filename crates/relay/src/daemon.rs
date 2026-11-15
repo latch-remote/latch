@@ -7,6 +7,8 @@ use crate::{
     Attachment, Cancel, Grant, Role,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+#[cfg(test)]
+use std::thread;
 use std::{
     io,
     net::{IpAddr, SocketAddr, TcpListener},
@@ -15,7 +17,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -276,6 +277,8 @@ impl Daemon {
     }
     /// Run until cancellation. Quota persistence failure stops the daemon fail closed.
     pub fn run(mut self, cancel: &Cancel) -> io::Result<()> {
+        let wake = Arc::new(crate::readiness::Wake::new()?);
+        cancel.register(&wake);
         while !cancel.is_cancelled() {
             let before = self.metrics.network_bytes.load(Ordering::Relaxed);
             self.accept()?;
@@ -311,12 +314,67 @@ impl Daemon {
                 Ordering::Relaxed,
             );
             if self.metrics.network_bytes.load(Ordering::Relaxed) == before {
-                thread::sleep(TICK);
+                self.wait(&wake)?;
             }
         }
         self.metrics.active_connections.store(0, Ordering::Relaxed);
         self.metrics.active_sessions.store(0, Ordering::Relaxed);
         Ok(())
+    }
+    fn wait(&self, wake: &crate::readiness::Wake) -> io::Result<()> {
+        let mut sockets = vec![latch_proto::transport::SocketInterest {
+            socket: socket2::SockRef::from(&self.listener),
+            readable: true,
+            writable: false,
+        }];
+        for connection in self.connections.iter().flatten() {
+            let socket = &connection.socket;
+            // Durable quota credit can be pending on its disk worker. Socket
+            // readiness cannot make progress until credit has been granted.
+            if socket.credit < crate::quota::MIN_CREDIT {
+                continue;
+            }
+            let consume = match connection.phase {
+                Phase::Request => socket.idle_write(),
+                Phase::Attached {
+                    session,
+                    role,
+                    lane,
+                } => self.sessions[session]
+                    .as_ref()
+                    .and_then(|s| s.lanes[1 - role][lane])
+                    .and_then(|peer| self.connections[peer].as_ref())
+                    .is_some_and(|peer| peer.socket.idle_write()),
+                _ => false,
+            };
+            if socket.buffered_read() && (consume || !socket.carrier.ready()) {
+                return Ok(());
+            }
+            let interest = socket.interest();
+            if interest.readable || interest.writable {
+                sockets.push(interest);
+            }
+        }
+        // Active sockets and pending durable credit retain the housekeeping
+        // cadence. An empty daemon can wait for admission or cancellation.
+        let timeout =
+            if self.connections.iter().any(Option::is_some) || self.quota.reservation_pending() {
+                TICK
+            } else {
+                self.sessions
+                    .iter()
+                    .flatten()
+                    .map(|session| {
+                        let mut deadline = session.created + self.config.limits.session_lifetime;
+                        if session.used != [3, 3] {
+                            deadline = deadline.min(session.attach_until);
+                        }
+                        deadline.saturating_duration_since(Instant::now())
+                    })
+                    .min()
+                    .unwrap_or(Duration::from_secs(60))
+            };
+        wake.wait(sockets, timeout)
     }
     fn connection_error(&mut self, index: usize, error: &io::Error) {
         let conn = self.connections[index].as_ref().unwrap();

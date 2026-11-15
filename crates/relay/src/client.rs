@@ -997,6 +997,7 @@ struct Shared {
     state: Mutex<State>,
     wake: Condvar,
     cancel: Cancel,
+    lane_wakes: [Arc<crate::readiness::Wake>; 2],
     limits: TransportLimits,
 }
 impl Shared {
@@ -1074,8 +1075,15 @@ impl Transport {
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
             cancel: Cancel::new(),
+            lane_wakes: [
+                Arc::new(crate::readiness::Wake::new()?),
+                Arc::new(crate::readiness::Wake::new()?),
+            ],
             limits: config.limits.clone(),
         });
+        for wake in &shared.lane_wakes {
+            shared.cancel.register(wake);
+        }
         let result = Self {
             shared,
             workers: Mutex::new(Vec::new()),
@@ -1135,6 +1143,7 @@ impl Transport {
         packet.extend_from_slice(bytes);
         state.priority.push_back((packet, Instant::now()));
         state.priority_bytes += cost;
+        self.shared.lane_wakes[Lane::Priority as usize].notify();
         Ok(())
     }
     pub fn try_send_frame(&self, frame: &InFrame) -> io::Result<()> {
@@ -1147,6 +1156,7 @@ impl Transport {
             return Err(io::ErrorKind::WouldBlock.into());
         }
         state.frame = Some((frame.clone(), Instant::now()));
+        self.shared.lane_wakes[Lane::Video as usize].notify();
         Ok(())
     }
     /// Age of the whole unsent frame, or zero when that queue is empty.
@@ -1503,8 +1513,8 @@ fn run_lane(
                 last_sent = Instant::now();
             }
         }
-        if !application_work && before == socket.transferred {
-            thread::sleep(TICK);
+        if !application_work && before == socket.transferred && !socket.buffered_read() {
+            shared.lane_wakes[lane as usize].wait(vec![socket.interest()], TICK)?;
         }
     }
 }
@@ -1635,6 +1645,10 @@ mod tests {
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
             cancel: Cancel::new(),
+            lane_wakes: [
+                Arc::new(crate::readiness::Wake::new().unwrap()),
+                Arc::new(crate::readiness::Wake::new().unwrap()),
+            ],
             limits,
         }
     }

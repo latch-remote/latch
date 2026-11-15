@@ -9,6 +9,7 @@ use std::{
 };
 
 const MAGIC: &[u8; 8] = b"LATCHQ01";
+pub(crate) const MIN_CREDIT: u64 = 2 * 16 * 1024;
 const LEASE: u64 = 64 * 1024;
 // Refill at half a batch. The pool and its pending reservation total at most 6 MiB.
 const BATCH: u64 = 4 * 1024 * 1024;
@@ -76,7 +77,7 @@ impl Quota {
         if *epoch != self.month {
             *credit = 0;
         }
-        if *credit < 2 * 16 * 1024 && self.available >= LEASE {
+        if *credit < MIN_CREDIT && self.available >= LEASE {
             self.available -= LEASE;
             *credit += LEASE;
             *epoch = self.month;
@@ -89,7 +90,7 @@ impl Quota {
                 .map_err(|_| io::Error::other("quota worker stopped"))?;
             self.pending = true;
         }
-        if *credit < 2 * 16 * 1024 {
+        if *credit < MIN_CREDIT {
             return Err(if self.exhausted {
                 denied()
             } else {
@@ -136,6 +137,9 @@ impl Quota {
             }
         }
         Ok(())
+    }
+    pub fn reservation_pending(&self) -> bool {
+        self.pending
     }
     pub fn reserved(&self) -> u64 {
         self.reserved

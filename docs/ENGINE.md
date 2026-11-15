@@ -950,6 +950,18 @@ small control messages on an independent priority lane. ChaCha20-Poly1305
 and HKDF-SHA256 protect records end to end. Session tickets and keys travel
 only over the original authorized Tailscale control connection, which
 remains required. Frame, queue and acknowledgment deadlines bound stalls.
+
+Relay daemon and client media lanes use level-triggered socket readiness
+(`poll` on Linux and macOS, `WSAPoll` on Windows). Local send queues and
+cancellation wake the same wait through connected loopback UDP sockets.
+Buffered TLS plaintext is processed before waiting, including WebSocket
+headers and frames. Each turn retains the bounded socket I/O and per-lane
+record budget. Active connections and pending quota reservations retain a
+two-millisecond maximum housekeeping wait. An empty daemon waits for new
+connections, cancellation or session expiry. WebSocket controls retain a
+two-millisecond cadence to bound control-flood responses. DNS, address racing and carrier setup
+still use short bounded polling waits during connection establishment.
+
 Relay failure restores UDP routing. Recovered-UDP switch-back and grant
 lifecycle refinements remain under validation.
 [Wire and security details](PROTOCOL.md#public-tcptls-relay)

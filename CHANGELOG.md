@@ -93,6 +93,9 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Relay connectivity
 
+- Forward relayed video, audio and input as soon as sockets or local send
+  queues are ready, reducing latency on busy machines and systems with coarse
+  timers while retaining bounded queues, deadlines and durable quotas.
 - Add a repeatable native TLS/WebSocket/CONNECT carrier comparison at four
   emulated path conditions, plus a cross-platform 20-Mbps delayed-path
   regression test. Preserve whole-run probe latency distributions and report
@@ -170,10 +173,10 @@ GitHub release notes, so each version gets a heading of the form
   real headless streams through blocked, lossy, proxy, TLS-inspecting,
   captive-portal and MTU-limited networks. Record decoded video, sound,
   input and path recovery in CI, with strict expected-failure tracking.
-- Keep the relay carrier throughput comparison independent of timer
-  accuracy: its delay shim and sender yield instead of sleeping, so a runner
-  that wakes sleeps late no longer lowers the offered rate or adds to the
-  measured delay. The thresholds are unchanged.
+- Schedule the relay throughput fixture with socket readiness and bounded
+  per-direction delay queues. Wake the sender for received frames or its next
+  send deadline, and report offered, accepted, refused and delivered frames
+  plus gateway deadline lateness for native TLS and WebSocket carriers.
 
 ### Networking
 

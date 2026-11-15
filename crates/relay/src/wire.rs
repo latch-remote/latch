@@ -215,6 +215,8 @@ pub(crate) struct TlsSocket {
     pub credit_epoch: u64,
     pub transferred: u64,
     handshake_bytes: usize,
+    plaintext: usize,
+    control_after: Option<Instant>,
     small_record_received: bool,
     large_write_after_small: bool,
 }
@@ -237,6 +239,8 @@ impl TlsSocket {
             credit_epoch: 0,
             transferred: 0,
             handshake_bytes: 0,
+            plaintext: 0,
+            control_after: None,
             small_record_received: false,
             large_write_after_small: false,
         };
@@ -245,6 +249,22 @@ impl TlsSocket {
     }
     pub fn idle_write(&self) -> bool {
         self.pending.is_empty() && self.control.is_none() && !self.conn.wants_write()
+    }
+    /// Buffered plaintext must be consumed before waiting on the TCP socket.
+    pub fn buffered_read(&self) -> bool {
+        self.plaintext != 0 && self.control.is_none() && !self.closing && self.read_allowed()
+    }
+    fn read_allowed(&self) -> bool {
+        self.control_after
+            .is_none_or(|deadline| Instant::now() >= deadline)
+    }
+    pub fn interest(&self) -> latch_proto::transport::SocketInterest<'_> {
+        latch_proto::transport::SocketInterest {
+            socket: socket2::SockRef::from(&self.tcp),
+            readable: self.conn.wants_read() && self.read_allowed(),
+            writable: self.conn.wants_write()
+                || (!self.conn.is_handshaking() && !self.idle_write()),
+        }
     }
     pub fn queue(&mut self, record: &[u8]) -> io::Result<()> {
         if !self.idle_write() {
@@ -314,7 +334,8 @@ impl TlsSocket {
                     })
                 }
                 Ok(_) => {
-                    self.conn
+                    self.plaintext = self
+                        .conn
                         .process_new_packets()
                         .map_err(|error| match error {
                             rustls::Error::AlertReceived(
@@ -324,7 +345,8 @@ impl TlsSocket {
                                 rustls::InvalidMessage::InvalidContentType,
                             ) if was_handshaking => crate::Failure::CaptivePortal.error(),
                             _ => crate::Failure::TlsRejected.error(),
-                        })?;
+                        })?
+                        .plaintext_bytes_to_read();
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
                 Err(e)
@@ -362,7 +384,10 @@ impl TlsSocket {
             if self.pending.is_empty() {
                 if let Some(control) = self.control.take() {
                     self.set_pending(control);
-                } else if let Some(response) = self.carrier.negotiate(&mut self.conn.reader())? {
+                } else if let Some(response) = self.carrier.negotiate(&mut PlaintextReader {
+                    reader: self.conn.reader(),
+                    remaining: &mut self.plaintext,
+                })? {
                     self.set_pending(response);
                 }
             }
@@ -393,15 +418,28 @@ impl TlsSocket {
         !self.conn.is_handshaking() && self.carrier.ready() && self.idle_write()
     }
     pub fn read_record(&mut self) -> io::Result<Option<Vec<u8>>> {
-        if self.conn.is_handshaking() || self.control.is_some() || self.closing {
+        if self.conn.is_handshaking()
+            || self.control.is_some()
+            || self.closing
+            || !self.read_allowed()
+        {
             return Ok(None);
         }
+        let mut reader = PlaintextReader {
+            reader: self.conn.reader(),
+            remaining: &mut self.plaintext,
+        };
         let record = match &mut self.carrier {
-            crate::carrier::State::Native => self.framer.read(&mut self.conn.reader())?,
+            crate::carrier::State::Native => self.framer.read(&mut reader)?,
             crate::carrier::State::WebSocket(ws) => {
-                let result = ws.read(&mut self.conn.reader())?;
+                let result = ws.read(&mut reader)?;
                 self.control = result.response;
                 self.closing = result.close;
+                if result.control {
+                    // Keep the existing control-flood cadence explicit now
+                    // that buffered application records run without sleeps.
+                    self.control_after = Some(Instant::now() + TICK);
+                }
                 result.record
             }
             _ => None,
@@ -440,6 +478,17 @@ impl TlsSocket {
             ));
         }
         Ok(())
+    }
+}
+struct PlaintextReader<'a> {
+    reader: rustls::Reader<'a>,
+    remaining: &'a mut usize,
+}
+impl Read for PlaintextReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let read = self.reader.read(bytes)?;
+        *self.remaining = self.remaining.saturating_sub(read);
+        Ok(read)
     }
 }
 struct Meter<'a> {
@@ -554,6 +603,45 @@ mod tests {
                 .mss_reason,
             None
         );
+    }
+    #[test]
+    fn buffered_records_progress_without_more_socket_input() {
+        for websocket in [false, true] {
+            let (mut client, mut server) = tls_pair("localhost").unwrap();
+            let mut encoded = Vec::new();
+            for record in [b"first".as_slice(), b"second".as_slice()] {
+                if websocket {
+                    let mut framed = (record.len() as u32).to_be_bytes().to_vec();
+                    framed.extend_from_slice(record);
+                    encoded.extend(crate::carrier::frame(2, &framed, false).unwrap());
+                } else {
+                    encoded.extend((record.len() as u32).to_be_bytes());
+                    encoded.extend(record);
+                }
+            }
+            if websocket {
+                client.carrier =
+                    crate::carrier::State::WebSocket(crate::carrier::WebSocket::new(true));
+            }
+            server.conn.writer().write_all(&encoded).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while !client.buffered_read() || !client.carrier.ready() {
+                server.pump(None).unwrap();
+                client.pump(None).unwrap();
+                assert!(Instant::now() < until);
+                if !client.buffered_read() {
+                    latch_proto::transport::wait_sockets(
+                        &[client.interest(), server.interest()],
+                        TICK,
+                    )
+                    .unwrap();
+                }
+            }
+            assert_eq!(client.read_record().unwrap().unwrap(), b"first");
+            assert!(client.buffered_read());
+            assert_eq!(client.read_record().unwrap().unwrap(), b"second");
+            assert!(!client.buffered_read());
+        }
     }
     fn tls_pair(name: &'static str) -> io::Result<(TlsSocket, TlsSocket)> {
         use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName};

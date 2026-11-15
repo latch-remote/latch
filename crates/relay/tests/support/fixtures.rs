@@ -13,7 +13,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -130,6 +130,7 @@ struct Gateway {
     port: u16,
     recover_native: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    lateness: Arc<Mutex<Vec<Duration>>>,
     worker: Option<JoinHandle<()>>,
 }
 impl Gateway {
@@ -141,6 +142,8 @@ impl Gateway {
         let stopped = stop.clone();
         let recover_native = Arc::new(AtomicBool::new(false));
         let recovered = recover_native.clone();
+        let lateness = Arc::new(Mutex::new(Vec::new()));
+        let timings = lateness.clone();
         let worker = thread::spawn(move || {
             let mut workers = Vec::new();
             while !stopped.load(Ordering::Acquire) {
@@ -148,6 +151,7 @@ impl Gateway {
                     Ok((client, _)) => {
                         let stopped = stopped.clone();
                         let recovered = recovered.clone();
+                        let timings = timings.clone();
                         workers.push(thread::spawn(move || {
                             let _ = run_gateway_connection(
                                 client,
@@ -155,6 +159,7 @@ impl Gateway {
                                 mode,
                                 &stopped,
                                 &recovered,
+                                &timings,
                             );
                         }));
                     }
@@ -172,8 +177,19 @@ impl Gateway {
             port,
             recover_native,
             stop,
+            lateness,
             worker: Some(worker),
         }
+    }
+    #[allow(dead_code)]
+    fn lateness(&self) -> (usize, Duration, Duration, Duration) {
+        let mut samples = self.lateness.lock().unwrap().clone();
+        samples.sort_unstable();
+        if samples.is_empty() {
+            return (0, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        }
+        let last = samples.len() - 1;
+        (samples.len(), samples[last / 2], samples[last * 95 / 100], samples[last])
     }
 }
 impl Drop for Gateway {
@@ -188,6 +204,7 @@ fn run_gateway_connection(
     mode: GatewayMode,
     stopped: &AtomicBool,
     recovered: &AtomicBool,
+    lateness: &Mutex<Vec<Duration>>,
 ) -> io::Result<()> {
     client.set_nonblocking(false)?;
     client.set_read_timeout(Some(Duration::from_secs(1)))?;
@@ -343,64 +360,102 @@ fn run_gateway_connection(
     client.set_nonblocking(true)?;
     server.set_nodelay(true)?;
     client.set_nodelay(true)?;
-    let mut to_server = VecDeque::new();
-    let mut to_client = VecDeque::new();
-    // A late wake-up is added to the modelled delay. Hosted macOS runners wake
-    // a 1 ms sleep tens of milliseconds late, so the delayed path yields.
-    let precise = matches!(mode, GatewayMode::Delay(_));
+    let mut to_server = DelayedDirection::default();
+    let mut to_client = DelayedDirection::default();
     while !stopped.load(Ordering::Acquire) {
-        delayed_forward(&client, &server, &mut to_server, delay)?;
-        delayed_forward(&server, &client, &mut to_client, delay)?;
-        if precise {
-            thread::yield_now();
+        to_server.forward(&client, &server, delay, lateness)?;
+        to_client.forward(&server, &client, delay, lateness)?;
+        let now = Instant::now();
+        // Cancellation is checked at least every 10 ms. Otherwise wake on
+        // incoming bytes, write capacity, or the earliest queued deadline.
+        let timeout = [to_server.deadline(), to_client.deadline()]
+            .into_iter().flatten()
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .filter(|remaining| !remaining.is_zero())
+            .min().unwrap_or(Duration::from_millis(10))
+            .min(Duration::from_millis(10));
+        let sockets = [
+            latch_proto::transport::SocketInterest {
+                socket: socket2::SockRef::from(&client),
+                readable: to_server.buffered < 1 << 20 && !to_server.eof,
+                writable: to_client.due(now),
+            },
+            latch_proto::transport::SocketInterest {
+                socket: socket2::SockRef::from(&server),
+                readable: to_client.buffered < 1 << 20 && !to_client.eof,
+                writable: to_server.due(now),
+            },
+        ];
+        let sockets: Vec<_> = sockets.into_iter()
+            .filter(|socket| socket.readable || socket.writable).collect();
+        if sockets.is_empty() {
+            thread::sleep(timeout);
         } else {
-            thread::sleep(Duration::from_millis(1));
+            latch_proto::transport::wait_sockets(&sockets, timeout)?;
         }
     }
     Ok(())
 }
 
-// Independently schedule each direction so a 140 ms one-way delay models
-// 280 ms RTT, including TLS, HTTP upgrade and the subsequent relay exchanges.
-fn delayed_forward(
-    mut source: &TcpStream,
-    mut destination: &TcpStream,
-    pending: &mut VecDeque<(Instant, Vec<u8>)>,
-    delay: Duration,
-) -> io::Result<()> {
-    // Move everything available on each pass. One chunk per pass made the
-    // shim's capacity depend on how often a busy runner scheduled this thread.
-    let mut buffered: usize = pending.iter().map(|(_, bytes)| bytes.len()).sum();
-    while buffered < 1 << 20 {
-        let mut bytes = vec![0; 64 * 1024];
-        match source.read(&mut bytes) {
-            Ok(0) if pending.is_empty() => return Err(io::ErrorKind::UnexpectedEof.into()),
-            Ok(0) => break,
-            Ok(n) => {
-                bytes.truncate(n);
-                buffered += n;
-                pending.push_back((Instant::now() + delay, bytes));
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
+// Each direction has a bounded FIFO. Monotonic read-time-plus-delay deadlines
+// preserve ordering and independently model the forward and return path.
+#[derive(Default)]
+struct DelayedDirection {
+    pending: VecDeque<(Instant, Vec<u8>, usize)>,
+    buffered: usize,
+    eof: bool,
+}
+impl DelayedDirection {
+    fn deadline(&self) -> Option<Instant> {
+        self.pending.front().map(|(deadline, _, _)| *deadline)
     }
-    while let Some((ready, bytes)) = pending.front_mut() {
-        if Instant::now() < *ready {
-            break;
-        }
-        match destination.write(bytes) {
-            Ok(n) => {
-                bytes.drain(..n);
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
-        if bytes.is_empty() {
-            pending.pop_front();
-        }
+    fn due(&self, now: Instant) -> bool {
+        self.deadline().is_some_and(|deadline| deadline <= now)
     }
-    Ok(())
+    fn forward(
+        &mut self,
+        mut source: &TcpStream,
+        mut destination: &TcpStream,
+        delay: Duration,
+        lateness: &Mutex<Vec<Duration>>,
+    ) -> io::Result<()> {
+        while !self.eof && self.buffered < 1 << 20 {
+            let mut bytes = vec![0; (64 * 1024).min((1 << 20) - self.buffered)];
+            match source.read(&mut bytes) {
+                Ok(0) => self.eof = true,
+                Ok(n) => {
+                    let deadline = Instant::now() + delay;
+                    bytes.truncate(n);
+                    self.buffered += n;
+                    self.pending.push_back((deadline, bytes, 0));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        while let Some((deadline, bytes, offset)) = self.pending.front_mut() {
+            if Instant::now() < *deadline {
+                break;
+            }
+            match destination.write(&bytes[*offset..]) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => {
+                    *offset += n;
+                    self.buffered -= n;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+            if *offset == bytes.len() {
+                lateness.lock().unwrap().push(deadline.elapsed());
+                self.pending.pop_front();
+            }
+        }
+        if self.eof && self.pending.is_empty() {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        Ok(())
+    }
 }
 fn test_server_tls() -> Arc<rustls::ServerConfig> {
     let cert = CertificateDer::from_pem_slice(include_bytes!("../certs/server.pem")).unwrap();

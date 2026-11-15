@@ -30,8 +30,14 @@ fn websocket_matches_native_video_through_a_delayed_path() {
         let mut received = 0;
         let mut bytes = 0;
         let mut ages = Vec::new();
+        let mut offered = 0;
+        let mut refused = 0;
+        let mut pending_event = None;
         while start.elapsed() < duration + Duration::from_millis(750) {
-            while let Some(event) = viewer.recv_timeout(Duration::ZERO) {
+            while let Some(event) = pending_event
+                .take()
+                .or_else(|| viewer.recv_timeout(Duration::ZERO))
+            {
                 match event {
                     Event::Frame(frame) => {
                         let sent: Instant = queued[frame.frame as usize];
@@ -64,17 +70,23 @@ fn websocket_matches_native_video_through_a_delayed_path() {
                     assembly: Duration::ZERO,
                 };
                 let sent = Instant::now();
+                offered += 1;
                 match host.try_send_frame(&frame) {
                     Ok(()) => queued.push(sent),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => refused += 1,
                     Err(error) => panic!("{carrier:?}: {error}"),
                 }
                 next += period;
             }
-            // Offer at most one frame per pass, so a sleep that wakes late lowers
-            // the offered rate and adds to every measured age. Yield instead.
-            thread::yield_now();
+            let deadline = if start.elapsed() < duration {
+                next.min(start + duration)
+            } else {
+                start + duration + Duration::from_millis(750)
+            };
+            pending_event = viewer.recv_timeout(deadline.saturating_duration_since(Instant::now()));
         }
+        let (chunks, p50_late, p95_late, max_late) = gateway.lateness();
+        eprintln!("{carrier:?}: offered={offered}, accepted={}, refused_would_block={refused}, delivered={received}; gateway chunks={chunks}, lateness p50={p50_late:?}, p95={p95_late:?}, max={max_late:?}", queued.len());
         assert_eq!(received, queued.len(), "{carrier:?} failed to drain");
         assert!(host.recv_timeout(Duration::ZERO).is_none());
         ages.sort_unstable();
