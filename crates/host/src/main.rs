@@ -155,9 +155,12 @@ fn main() -> Result<()> {
     if args.background {
         // Started by a window or a supervisor, nobody sees stderr: the
         // reason it could not start belongs in its log.
-        return Service::new()
-            .run_arc(args.replaces.is_some())
-            .inspect_err(|e| tracing::error!("the service could not start: {e:#}"));
+        let run = move || Service::new().run_arc(args.replaces.is_some());
+        #[cfg(target_os = "macos")]
+        let result = latch_engine::mac::with_main_queue(run);
+        #[cfg(not(target_os = "macos"))]
+        let result = run();
+        return result.inspect_err(|e| tracing::error!("the service could not start: {e:#}"));
     }
     if args.setup {
         return run_setup();

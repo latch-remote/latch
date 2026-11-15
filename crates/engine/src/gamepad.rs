@@ -1,8 +1,7 @@
 //! Gamepads into the desktop: one virtual pad per viewer pad, rumble and
 //! lights back. Windows plugs pads into the ViGEmBus driver
 //! (`windows/vigem.rs`), Linux makes them with uinput (`linux/uinput.rs`);
-//! a Mac has no way to add a gamepad without a driver, so a Mac host takes
-//! none.
+//! macOS uses entitlement-gated IOHIDUserDevice (`mac/gamepad.rs`).
 
 use latch_proto::gamepad::{Ack, FeedbackSender, MAX_PADS};
 pub use latch_proto::gamepad::{Feedback, PadKind, PadState};
@@ -42,10 +41,7 @@ pub fn open(feedback: FeedbackFn) -> anyhow::Result<Opened> {
     #[cfg(target_os = "linux")]
     return crate::linux::open_pads(feedback);
     #[cfg(target_os = "macos")]
-    {
-        let _ = feedback;
-        anyhow::bail!("a Mac cannot add a virtual gamepad without a driver")
-    }
+    return crate::mac::gamepad::open(feedback);
 }
 
 /// One platform's way of making virtual pads. A `Pad` unplugs when dropped.
@@ -57,6 +53,10 @@ pub(crate) trait VirtualBus: Send {
     fn kinds(&self) -> &'static [PadKind];
     fn plug(&mut self, slot: u8, kind: PadKind, feedback: FeedbackFn) -> anyhow::Result<Self::Pad>;
     fn submit(&mut self, pad: &mut Self::Pad, state: &PadState) -> anyhow::Result<()>;
+    /// Platforms with asynchronous cancellation can cancel every pad before waiting.
+    fn unplug_all(&mut self, pads: Vec<Self::Pad>) {
+        drop(pads);
+    }
 }
 
 /// A [`VirtualBus`] as a [`PadSink`]: plugs a pad in on its first state,
@@ -108,9 +108,19 @@ impl<B: VirtualBus> PadSink for Pads<B> {
     }
 
     fn unplug_all(&mut self) {
-        for pad in &mut self.pads {
-            *pad = None;
-        }
+        let pads = self
+            .pads
+            .iter_mut()
+            .filter_map(Option::take)
+            .map(|(_, pad)| pad)
+            .collect();
+        self.bus.unplug_all(pads);
+    }
+}
+
+impl<B: VirtualBus> Drop for Pads<B> {
+    fn drop(&mut self) {
+        self.unplug_all();
     }
 }
 
@@ -252,7 +262,7 @@ pub(crate) mod map {
     /// sticks 0–255 with 128 centred and down positive, buttons with the
     /// d-pad as a hat in the low nibble, the PS and touchpad buttons, and
     /// triggers.
-    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    #[cfg_attr(not(any(windows, target_os = "macos", test)), allow(dead_code))]
     pub fn ds4(s: &PadState) -> [u8; 10] {
         let x = |v: i16| ((v as i32 + 32768) >> 8) as u8;
         let y = |v: i16| x(v.saturating_neg());
@@ -477,6 +487,46 @@ mod tests {
                 "unplug 0",
             ]
         );
+    }
+
+    #[test]
+    fn fake_bus_keeps_latest_state_returns_feedback_and_drops_session_slots() {
+        let returned = Arc::new(Mutex::new(Vec::new()));
+        let recorded = returned.clone();
+        let mut opened = Pads::opened(
+            crate::testmode::TestBus,
+            Arc::new(move |slot, feedback| {
+                recorded.lock().push((slot, feedback));
+            }),
+        );
+        let state = PadState {
+            left_trigger: 1234,
+            right_trigger: 5678,
+            ..Default::default()
+        };
+        opened
+            .sink
+            .update(15, Some(PadKind::PlayStation), &state)
+            .unwrap();
+        assert_eq!(
+            crate::testmode::pads()[15],
+            Some((PadKind::PlayStation, state))
+        );
+        assert_eq!(
+            returned.lock()[0],
+            (
+                15,
+                Feedback {
+                    large: 5678,
+                    small: 1234,
+                    ..Default::default()
+                }
+            )
+        );
+        opened.sink.update(15, Some(PadKind::Xbox), &state).unwrap();
+        assert_eq!(crate::testmode::pads()[15].unwrap().0, PadKind::Xbox);
+        drop(opened);
+        assert!(crate::testmode::pads()[15].is_none());
     }
 
     #[test]
