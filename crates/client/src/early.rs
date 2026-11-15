@@ -20,6 +20,10 @@ use std::time::{Duration, Instant};
 /// An input event as the OS delivered it, in the terms the frame uses.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Native {
+    Physical {
+        key: crate::keyboard::Key,
+        mods: Modifiers,
+    },
     /// A modifier key went down or up; these are the modifiers held now.
     Modifiers(Modifiers),
     /// `physical` is the key's place on a US keyboard, `logical` what the
@@ -54,6 +58,7 @@ pub enum Native {
 /// What the hook sent for one event, for the frame to claim.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Ahead {
+    Physical(u16, bool),
     Key(i16, bool),
     Button(u8, bool),
     /// The raw delta, as egui's `MouseMoved` carries it.
@@ -72,6 +77,10 @@ pub struct Gate {
     /// The mouse is captured: buttons and movement go to the PC.
     pub mouse: bool,
     pub cmd_is_ctrl: bool,
+    pub host_mac: bool,
+    pub viewer_mac: bool,
+    pub map_shortcuts: bool,
+    pub control_as_meta: bool,
     /// Stream pixels per unit of raw movement.
     pub motion_scale: f32,
     /// Geometry and hit region from the last completed frame.
@@ -149,6 +158,22 @@ thread_local! {
 
 fn current() -> Option<Early> {
     CURRENT.with(|c| c.borrow().upgrade().map(Early))
+}
+
+/// Low-level Windows capture uses the same sender, focus gate and receipts.
+#[cfg(windows)]
+pub fn physical(key: crate::keyboard::Key, mods: Modifiers) {
+    if let Some(early) = current() {
+        early.deliver(Native::Physical { key, mods }, Instant::now());
+    }
+}
+
+/// Recover remote state when a capture worker loses its delivery lease.
+#[cfg(any(windows, target_os = "linux"))]
+pub fn capture_lost() {
+    if let Some(early) = current() {
+        early.on_event(Some(&WindowEvent::Focused(false)), &[], Modifiers::NONE);
+    }
 }
 
 /// Register the cross-platform callback on the window's context.
@@ -297,14 +322,29 @@ impl Early {
             self.deliver(Native::Local, Instant::now());
             return;
         }
-        if matches!(native, Some(WindowEvent::ModifiersChanged(_))) {
+        if matches!(native, Some(WindowEvent::ModifiersChanged(_))) && !crate::keyboard::available()
+        {
             self.deliver(Native::Modifiers(mods), Instant::now());
         }
+        let events = if matches!(native, Some(WindowEvent::KeyboardInput { .. })) {
+            crate::keyboard::latest()
+        } else {
+            None
+        }
+        .unwrap_or_else(|| events.iter().cloned().map(|e| (e, None, false)).collect());
         let physical_text = events.iter().any(
-            |e| matches!(e, Event::Key { key, pressed: true, .. } if input::vk(*key).is_some()),
+            |(e, native, _)| matches!(e, Event::Key { key, pressed: true, .. } if native.as_ref().map_or_else(|| input::vk(*key).is_some(), |k| crate::keyboard::text_position(k.vk))),
         );
-        for event in events {
-            let ev = match *event {
+        for (event, key, literal) in events {
+            if let Some(key) = key {
+                let mods = match event {
+                    Event::Key { modifiers, .. } => modifiers,
+                    _ => mods,
+                };
+                self.deliver(Native::Physical { key, mods }, Instant::now());
+                continue;
+            }
+            let ev = match event {
                 Event::Key {
                     physical_key,
                     key,
@@ -342,7 +382,7 @@ impl Early {
                 }
                 // Text accompanying a physical key is suppressed by the
                 // frame, too. Standalone text and clipboard events need it.
-                Event::Text(_) if physical_text => continue,
+                Event::Text(_) if physical_text && !literal => continue,
                 Event::Text(_) | Event::Ime(_) | Event::Copy | Event::Cut | Event::Paste(_) => {
                     Native::Local
                 }
@@ -394,6 +434,27 @@ impl State {
     fn route(&mut self, gate: &Gate, ev: Native) -> Outcome {
         let out = &*gate.out;
         match ev {
+            Native::Physical { key, mods } => {
+                if !gate.keys
+                    || host_key(mods)
+                    || (!key.down && !self.held.physical_down(key.vk))
+                    || (key.down && gate.local_focus && matches!(key.vk, 0x09 | 0x1b | 0x25..=0x28))
+                {
+                    return Outcome::Declined;
+                }
+                self.held.shortcut_key(
+                    out,
+                    key,
+                    crate::keyboard::Mapping {
+                        viewer_mac: gate.viewer_mac,
+                        host_mac: gate.host_mac,
+                        enabled: gate.map_shortcuts,
+                        relative: gate.mouse,
+                        control_as_meta: gate.control_as_meta,
+                    },
+                );
+                Outcome::Sent(Some(Ahead::Physical(key.vk, key.down)))
+            }
             // Free mode uses absolute pointer positions, so raw device
             // movement has no remote effect.
             Native::Motion { .. } if !gate.mouse => Outcome::Ignored,
@@ -544,7 +605,7 @@ impl State {
 
 /// Ctrl+Alt, Latch's host key.
 fn host_key(m: Modifiers) -> bool {
-    m.ctrl && m.alt
+    m.ctrl && m.alt && !crate::keyboard::alt_gr()
 }
 
 /// A key press the frame has to see first: egui turns it into a clipboard
@@ -574,6 +635,91 @@ mod tests {
 
     const SHIFT: Modifiers = Modifiers::SHIFT;
 
+    #[test]
+    fn heartbeat_survives_one_second_without_video_and_dead_ui_expires() {
+        use crate::keyboard::{
+            capture_heartbeat,
+            hook::{Lease, HEARTBEAT_MS, LEASE_MS},
+        };
+        let (early, held, out) = armed(true, true);
+        assert!(deliver(&early, key(Key::A, true, SHIFT)));
+        assert!(deliver(
+            &early,
+            Native::Button {
+                button: BUTTON_LEFT,
+                down: true,
+                mods: SHIFT,
+                pos: None,
+            }
+        ));
+        out.take();
+        let lease = Lease::default();
+        let ctx = egui::Context::default();
+        let mut last_heartbeat = 0;
+        // Inject time. Video delivers no frames or input during this interval.
+        for now in (0..=1_000).step_by(HEARTBEAT_MS as usize) {
+            assert!(lease.active(now));
+            ctx.begin_pass(egui::RawInput {
+                time: Some(now as f64 / 1000.0),
+                ..Default::default()
+            });
+            capture_heartbeat(&ctx, true);
+            let output = ctx.end_pass();
+            assert!(
+                output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+                    <= Duration::from_millis(HEARTBEAT_MS)
+            );
+            lease.renew_at(now);
+            last_heartbeat = now;
+            assert!(held.is_down(0x41));
+            assert!(held.any_down());
+            assert!(out.take().is_empty());
+        }
+        assert!(lease.active(1_000));
+        // A dead UI stops heartbeats. Both native workers use this deadline.
+        assert!(lease.active(last_heartbeat + LEASE_MS - 1));
+        assert!(!lease.active(last_heartbeat + LEASE_MS));
+        early.on_event(Some(&WindowEvent::Focused(false)), &[], Modifiers::NONE);
+        assert_eq!(
+            out.take(),
+            [
+                Sent::Key(VK_SHIFT, false, 0),
+                Sent::Key(0x41, false, 0),
+                Sent::Button(BUTTON_LEFT, false),
+                Sent::ReleaseAll
+            ]
+        );
+        assert!(!held.any_down());
+    }
+
+    #[test]
+    fn native_positions_use_the_existing_event_time_gate_and_receipts() {
+        for case in latch_proto::keyboard::CASES {
+            let (early, held, out) = armed(true, false);
+            for down in [true, false] {
+                assert!(deliver(
+                    &early,
+                    Native::Physical {
+                        key: crate::keyboard::Key { vk: case.vk, down },
+                        mods: Modifiers::NONE
+                    }
+                ));
+            }
+            assert!(!held.any_down());
+            assert_eq!(
+                out.take(),
+                [
+                    Sent::Key(case.vk as i16, true, case.mask),
+                    Sent::Key(case.vk as i16, false, 0)
+                ]
+            );
+            early.frame_starts();
+            assert!(early.claim(Ahead::Physical(case.vk, true)));
+            assert!(early.claim(Ahead::Physical(case.vk, false)));
+            assert!(!early.claim(Ahead::Physical(case.vk, true)));
+        }
+    }
+
     fn armed(keys: bool, mouse: bool) -> (Early, SharedHeld, Rc<Recorder>) {
         let held = SharedHeld::default();
         let early = Early::new(held.clone());
@@ -584,6 +730,10 @@ mod tests {
             local_focus: false,
             mouse,
             cmd_is_ctrl: true,
+            host_mac: false,
+            viewer_mac: cfg!(target_os = "macos"),
+            map_shortcuts: false,
+            control_as_meta: false,
             motion_scale: 1.0,
             video: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
             pointer_region: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
@@ -752,6 +902,10 @@ mod tests {
             local_focus: false,
             mouse: true,
             cmd_is_ctrl: true,
+            host_mac: false,
+            viewer_mac: cfg!(target_os = "macos"),
+            map_shortcuts: false,
+            control_as_meta: false,
             motion_scale: 2.0,
             video: Rect::NOTHING,
             pointer_region: Rect::NOTHING,

@@ -339,8 +339,11 @@ pub struct ClientConfig {
     /// asleep, Tailscale is asleep too, and the Mac can only wake the PC
     /// from that PC's own network.
     pub sleep_prompt: bool,
-    /// The Mac's Command key acts as Ctrl on the PC (else as the Windows key).
+    /// Map Command to Ctrl from Mac to W/L, Ctrl to Command from W/L to
+    /// Mac. False preserves physical modifiers. Same-OS input is unchanged.
     pub cmd_is_ctrl: bool,
+    /// Mac Control acts as Windows/Super toward PC hosts with a free mouse.
+    pub control_as_meta: bool,
     /// A click on the picture captures the mouse: the cursor is hidden and
     /// raw movement goes to the PC, which is what games read. Off, the Mac
     /// cursor's position is sent instead and nothing is captured.
@@ -364,6 +367,7 @@ impl Default for ClientConfig {
             stream: StreamSettings::default(),
             sleep_prompt: false,
             cmd_is_ctrl: true,
+            control_as_meta: false,
             capture_mouse: true,
             auto_update: true,
             github_token: None,
@@ -447,6 +451,7 @@ impl ClientConfig {
         }
         changed!(sleep_prompt);
         changed!(cmd_is_ctrl);
+        changed!(control_as_meta);
         changed!(capture_mouse);
         changed!(auto_update);
         // Per machine, so a choice made in another window for another
@@ -470,6 +475,7 @@ impl ClientConfig {
         self.stream = settings.stream.clone();
         self.sleep_prompt = settings.sleep_prompt;
         self.cmd_is_ctrl = settings.cmd_is_ctrl;
+        self.control_as_meta = settings.control_as_meta;
         self.capture_mouse = settings.capture_mouse;
         self.auto_update = settings.auto_update;
         self.displays = settings.displays.clone();
@@ -654,6 +660,17 @@ mod tests {
         assert_eq!(c.stream, s);
         assert_eq!(c.stream.quality, Quality::Auto, "auto unless someone chose");
         assert!(!c.sleep_prompt && c.cmd_is_ctrl && c.auto_update);
+        assert!(
+            !c.control_as_meta,
+            "Mac Control stays Ctrl in existing configurations"
+        );
+        let opted_in: ClientConfig = toml::from_str("control_as_meta = true").unwrap();
+        let encoded = toml::to_string(&opted_in).unwrap();
+        assert!(
+            toml::from_str::<ClientConfig>(&encoded)
+                .unwrap()
+                .control_as_meta
+        );
         assert!(c.capture_mouse, "games need raw movement, so capture is on");
         // A client.toml from 3.0 has no quality key; it gets Auto too.
         let c: ClientConfig = toml::from_str("[stream]\nfps = 90\n").unwrap();

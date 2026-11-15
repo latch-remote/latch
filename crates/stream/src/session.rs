@@ -1321,6 +1321,7 @@ struct Inner {
     done: Mutex<bool>,
     done_cv: Condvar,
     cursor_supported: AtomicBool,
+    key_positions: AtomicBool,
     cursor_state: Mutex<Option<CursorState>>,
     control_writer: Mutex<Option<TcpStream>>,
     /// Gamepad slots the host takes; 0 until it accepts, or if it takes none.
@@ -1407,6 +1408,7 @@ impl Inner {
             done: Mutex::new(false),
             done_cv: Condvar::new(),
             cursor_supported: AtomicBool::new(false),
+            key_positions: AtomicBool::new(false),
             cursor_state: Mutex::new(None),
             control_writer: Mutex::new(None),
             pad_slots: AtomicU32::new(0),
@@ -1628,6 +1630,10 @@ impl Session {
     }
 
     /// Whether the host agreed to stream cursor shapes and omit the host pointer.
+    pub fn key_positions(&self) -> bool {
+        self.inner.key_positions.load(Ordering::Acquire)
+    }
+
     pub fn cursor_supported(&self) -> bool {
         self.inner.cursor_supported.load(Ordering::Acquire)
     }
@@ -1826,6 +1832,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         .map_or(audio_channels, |probe| probe.channels);
     let color = video::decoder_color(settings.color, settings.width, settings.height);
     let request = StreamRequest {
+        key_positions: true,
         startup_timeout_secs: START_TIMEOUT.as_secs() as u32,
         relay: inner.configured_relay.lock().is_some(),
         prefer_color: settings.prefer_color,
@@ -1984,6 +1991,9 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
             };
         }
     }
+    inner
+        .key_positions
+        .store(accept.key_positions, Ordering::Release);
     let player = accept.audio.as_ref().and_then(|a| {
         #[cfg(test)]
         if inner.pair_probe.is_some() {
@@ -2012,7 +2022,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
             udp: send_udp,
             host: media,
             relay: inner.relay.lock().clone(),
-            sender: InputSender::new(accept.session),
+            sender: InputSender::new(accept.session).with_key_positions(accept.key_positions),
             input_progress: None,
             input_failed: false,
             pads: PadSender::new(accept.session),

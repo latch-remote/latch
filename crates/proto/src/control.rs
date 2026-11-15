@@ -99,6 +99,9 @@ impl Codec {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamRequest {
+    /// Viewer offers the additional physical key positions (input kind 8).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub key_positions: bool,
     /// Total viewer startup budget in seconds. Absent on older viewers (60 s).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub startup_timeout_secs: u32,
@@ -212,6 +215,9 @@ pub struct AudioFormat {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Accept {
+    /// True only when the viewer offered input kind 8.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub key_positions: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub relay: bool,
     #[serde(default)]

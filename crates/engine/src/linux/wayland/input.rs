@@ -190,6 +190,7 @@ impl<D: ?Sized + Device> InputSink for WaylandInput<D> {
             }
             Event::Text(text) => self.device.text(text)?,
             Event::ReleaseAll => self.release_pressed()?,
+            Event::UnknownPosition { .. } => {}
         }
         Ok(())
     }
@@ -560,6 +561,42 @@ mod tests {
         }
         fn text(&mut self, _: &str) -> anyhow::Result<()> {
             Ok(())
+        }
+    }
+
+    #[test]
+    fn native_positions_reach_evdev_and_unknown_positions_are_ignored() {
+        let mut s = sink();
+        s.apply(
+            &Event::UnknownPosition {
+                usage: 0xffff,
+                down: true,
+                modifiers: 0,
+            },
+            DISPLAY,
+        )
+        .unwrap();
+        assert!(s.device.0.is_empty());
+        for case in latch_proto::keyboard::CASES {
+            for down in [true, false] {
+                s.apply(
+                    &Event::Key {
+                        vk: case.vk,
+                        down,
+                        modifiers: case.mask,
+                    },
+                    DISPLAY,
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                std::mem::take(&mut s.device.0),
+                [
+                    format!("key {} true", case.linux - 8),
+                    format!("key {} false", case.linux - 8)
+                ]
+            );
+            assert!(s.pressed.keys.is_empty());
         }
     }
 

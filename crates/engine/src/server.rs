@@ -475,6 +475,7 @@ impl Server {
                     prepared.input_problem =
                         Some(format!("move pointer into the captured display: {e:#}"));
                 }
+                sink.set_key_positions(prepared.req.key_positions);
                 prepared.input = Some(sink);
             }
             Err(e) => prepared.input_problem = Some(format!("{e:#}")),
@@ -611,6 +612,7 @@ impl Server {
         }
         let audio = prepared.audio.take();
         let accept = Accept {
+            key_positions: prepared.req.key_positions,
             relay: relay_enabled,
             color: info.color,
             session: id,

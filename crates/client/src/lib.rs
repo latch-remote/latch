@@ -8,6 +8,7 @@ pub mod early;
 pub mod gamepads;
 pub mod handover;
 pub mod input;
+pub mod keyboard;
 pub mod macos;
 pub mod path;
 #[doc(hidden)]

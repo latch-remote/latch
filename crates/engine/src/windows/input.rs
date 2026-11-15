@@ -57,78 +57,8 @@ fn mouse(dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
         },
     }
 }
-/// The set-1 scancode of a key on a US keyboard. The viewer sends keys by
-/// position as US virtual-key codes, and games bind scancodes: mapping them
-/// through the PC's own layout (French AZERTY turns A into scan 0x10, the
-/// US Q) would move every binding. Sunshine uses the same fixed table.
-fn us_scan(vk: u16) -> Option<u16> {
-    const LETTERS: [u16; 26] = [
-        0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18,
-        0x19, 0x10, 0x13, 0x1f, 0x14, 0x16, 0x2f, 0x11, 0x2d, 0x15, 0x2c,
-    ];
-    const NUMPAD: [u16; 10] = [0x52, 0x4f, 0x50, 0x51, 0x4b, 0x4c, 0x4d, 0x47, 0x48, 0x49];
-    const F13_TO_F24: [u16; 12] = [
-        0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x76,
-    ];
-    Some(match vk {
-        0x41..=0x5a => LETTERS[usize::from(vk - 0x41)],
-        0x31..=0x39 => vk - 0x31 + 0x02,
-        0x30 => 0x0b,
-        0x60..=0x69 => NUMPAD[usize::from(vk - 0x60)],
-        0x70..=0x79 => vk - 0x70 + 0x3b, // F1–F10
-        0x7a => 0x57,                    // F11
-        0x7b => 0x58,                    // F12
-        0x7c..=0x87 => F13_TO_F24[usize::from(vk - 0x7c)],
-        0x08 => 0x0e,               // Backspace
-        0x09 => 0x0f,               // Tab
-        0x0d => 0x1c,               // Enter
-        0x10 | 0xa0 => 0x2a,        // Shift, left Shift
-        0xa1 => 0x36,               // right Shift
-        0x11 | 0xa2 | 0xa3 => 0x1d, // Control (right is extended)
-        0x12 | 0xa4 | 0xa5 => 0x38, // Alt (right is extended)
-        0x13 => 0x45,               // Pause
-        0x14 => 0x3a,               // Caps Lock
-        0x1b => 0x01,               // Escape
-        0x20 => 0x39,               // Space
-        0x21 => 0x49,               // Page Up
-        0x22 => 0x51,               // Page Down
-        0x23 => 0x4f,               // End
-        0x24 => 0x47,               // Home
-        0x25 => 0x4b,               // Left
-        0x26 => 0x48,               // Up
-        0x27 => 0x4d,               // Right
-        0x28 => 0x50,               // Down
-        0x2c => 0x37,               // Print Screen
-        0x2d => 0x52,               // Insert
-        0x2e => 0x53,               // Delete
-        0x5b => 0x5b,               // left Windows
-        0x5c => 0x5c,               // right Windows
-        0x5d => 0x5d,               // Menu
-        0x6a => 0x37,               // numpad *
-        0x6b => 0x4e,               // numpad +
-        0x6d => 0x4a,               // numpad -
-        0x6e => 0x53,               // numpad .
-        0x6f => 0x35,               // numpad /
-        0x90 => 0x45,               // Num Lock
-        0x91 => 0x46,               // Scroll Lock
-        0xba => 0x27,               // ;
-        0xbb => 0x0d,               // =
-        0xbc => 0x33,               // ,
-        0xbd => 0x0c,               // -
-        0xbe => 0x34,               // .
-        0xbf => 0x35,               // /
-        0xc0 => 0x29,               // `
-        0xdb => 0x1a,               // [
-        0xdc => 0x2b,               // \
-        0xdd => 0x1b,               // ]
-        0xde => 0x28,               // '
-        0xe2 => 0x56,               // the key between left Shift and Z
-        _ => return None,
-    })
-}
-fn extended(vk: u16) -> bool {
-    matches!(vk, 0x21..=0x28 | 0x2c..=0x2e | 0x5b..=0x5d | 0x6f | 0x90 | 0xa3 | 0xa5)
-}
+use crate::input::keymap::{extended, us_scan};
+
 // Target the middle of a pixel's 1/65536 interval, rather than its left edge.
 fn normalize(n: i32, start: i32, size: i32) -> i32 {
     let size = i64::from(size.max(1));
@@ -140,6 +70,7 @@ fn construct(event: &Event, display: DisplayRect) -> Result<Vec<INPUT>> {
     let _dpi = super::display::DpiAwareness::physical();
     let mut out = Vec::new();
     match event {
+        Event::UnknownPosition { .. } => {}
         Event::Key { vk, down, .. } => {
             // Keys outside the US table (IME and other layout-specific
             // keys) keep the PC's own mapping.
@@ -155,10 +86,23 @@ fn construct(event: &Event, display: DisplayRect) -> Result<Vec<INPUT>> {
             if extended(*vk) {
                 flags |= KEYEVENTF_EXTENDEDKEY;
             }
-            if scan != 0 {
+            // Microsoft KEYBDINPUT specifies that SCANCODE ignores wVk.
+            // Korean/Japanese IME controls need their documented virtual keys.
+            let ime_vk = match *vk {
+                latch_proto::keyboard::KANA | 0x15 => Some(0x15),
+                0x19 => Some(0x19),
+                latch_proto::keyboard::CONVERT | 0x1c => Some(0x1c),
+                latch_proto::keyboard::NON_CONVERT | 0x1d => Some(0x1d),
+                _ => None,
+            };
+            if scan != 0 && ime_vk.is_none() {
                 flags |= KEYEVENTF_SCANCODE;
             }
-            out.push(keyboard(if scan == 0 { *vk } else { 0 }, scan, flags));
+            out.push(keyboard(
+                ime_vk.unwrap_or(if scan == 0 { *vk } else { 0 }),
+                scan,
+                flags,
+            ));
         }
         Event::Text(text) => {
             for ch in text.chars() {
@@ -572,7 +516,58 @@ mod tests {
         ] {
             assert_eq!(us_scan(vk), Some(scan), "vk {vk:#x}");
         }
-        assert_eq!(us_scan(0x15), None, "Hangul keeps the PC's mapping");
+        assert_eq!(us_scan(0x15), Some(0x72));
+    }
+    #[test]
+    fn every_viewer_builds_the_shared_native_keyboard_cases() -> Result<()> {
+        for case in latch_proto::keyboard::CASES {
+            for down in [true, false] {
+                let records = construct(
+                    &Event::Key {
+                        vk: case.vk,
+                        down,
+                        modifiers: case.mask,
+                    },
+                    DisplayRect::default(),
+                )?;
+                // SAFETY: construct returns keyboard INPUT records for keys.
+                let key = unsafe { records[0].Anonymous.ki };
+                assert_eq!(key.wScan, case.scan, "host windows, {:#x}", case.vk);
+                let ime = matches!(
+                    case.vk,
+                    0x15 | 0x19
+                        | latch_proto::keyboard::KANA
+                        | latch_proto::keyboard::CONVERT
+                        | latch_proto::keyboard::NON_CONVERT
+                );
+                assert_eq!(
+                    key.wVk.0,
+                    if ime {
+                        latch_proto::keyboard::helper_legacy(case.vk).unwrap()
+                    } else {
+                        0
+                    }
+                );
+                assert_eq!(key.dwFlags.contains(KEYEVENTF_SCANCODE), !ime);
+                assert_eq!(key.dwFlags.contains(KEYEVENTF_EXTENDEDKEY), case.extended);
+                assert_eq!(key.dwFlags.contains(KEYEVENTF_KEYUP), !down);
+            }
+        }
+
+        for text in latch_proto::keyboard::TEXT_CASES {
+            let records = construct(&Event::Text((*text).into()), DisplayRect::default())?;
+            let units: Vec<_> = records
+                .iter()
+                .filter_map(|record| {
+                    // SAFETY: these records all have INPUT_KEYBOARD discriminators.
+                    let key = unsafe { record.Anonymous.ki };
+                    assert!(key.dwFlags.contains(KEYEVENTF_UNICODE));
+                    (!key.dwFlags.contains(KEYEVENTF_KEYUP)).then_some(key.wScan)
+                })
+                .collect();
+            assert_eq!(String::from_utf16(&units).unwrap(), *text);
+        }
+        Ok(())
     }
     #[test]
     fn constructs_without_posting() -> Result<()> {

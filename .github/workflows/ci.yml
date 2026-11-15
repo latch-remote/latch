@@ -232,6 +232,19 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --locked --workspace --all-targets
+      - name: X11 capture recovery and media replay
+        run: |
+          set -o pipefail
+          sudo apt-get install -y --no-install-recommends xvfb xauth
+          xvfb-run -a cargo test --locked -p latch-client --lib -j 4 keyboard::linux::tests::watchdog_and_media_replay_restore_local_x11_delivery -- --ignored --exact 2>&1 | tee /tmp/latch-x11-test.log
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          output = Path("/tmp/latch-x11-test.log").read_text()
+          output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+          assert len(re.findall(r"^test result: ok\. 1 passed; 0 failed; 0 ignored;", output, re.MULTILINE)) == 1, output
+          assert not re.search(r"^test result:.*\b0 passed;", output, re.MULTILINE), output
+          PY
       - name: release host
         run: cargo build --locked --release -p latch-host
       - name: headless Wayland portal capture

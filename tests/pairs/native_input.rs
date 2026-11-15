@@ -40,6 +40,8 @@ fn reference(events: &[crate::input::Event]) -> Vec<Value> {
                         | (u64::from(keys.contains(&0x11)) << 18)
                         | (u64::from(keys.contains(&0x12)) << 19)
                         | (u64::from(keys.contains(&0x5b)) << 20)
+                        | (u64::from(keys.contains(&0xa1)) << 2)
+                        | (u64::from(keys.contains(&0x5b)) << 3)
                 } else {
                     0
                 };
@@ -104,6 +106,7 @@ fn reference(events: &[crate::input::Event]) -> Vec<Value> {
                     }
                 }
             }
+            Event::UnknownPosition { .. } => panic!("fixture uses known virtual keys"),
             Event::ReleaseAll => panic!("fixture releases keys explicitly"),
         }
     }
