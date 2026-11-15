@@ -6,6 +6,10 @@ GitHub release notes, so each version gets a heading of the form
 
 ## Unreleased
 
+- Send viewer mouse and keyboard input directly from OS events on macOS,
+  Windows and Linux, preserving input ordering, capture, focus and local
+  shortcuts while avoiding the next UI frame for ordinary input.
+
 ### Testing
 
 - Add a Linux network-namespace harness and privileged Docker runner for

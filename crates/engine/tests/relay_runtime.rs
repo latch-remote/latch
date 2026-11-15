@@ -19,6 +19,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "support/relay_pilot.rs"]
 mod relay;
 use relay::Pilot;
@@ -44,6 +46,7 @@ impl Running {
         std::env::set_var("LATCH_TEST_PATTERN", pattern);
         let (udp, listener) = listeners::proxy();
         let port = listener.local_addr().unwrap().port();
+
         let server = Server::bind(
             0,
             Options {

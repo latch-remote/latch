@@ -239,6 +239,7 @@ fn post_accept_end_close_and_missing_media_are_reported_as_failures() {
 fn impaired_host(mode: &'static str) -> (u16, std::thread::JoinHandle<()>) {
     let (udp, listener) = listeners::proxy();
     let port = listener.local_addr().unwrap().port();
+
     let worker = std::thread::spawn(move || {
         let (mut tcp, peer) = listener.accept().unwrap();
         tcp.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
