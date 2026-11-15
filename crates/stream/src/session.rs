@@ -3331,7 +3331,8 @@ fn control_loop_at(
             // damage while the first grant is still in flight. Finish that
             // preparation within its existing six-second negotiation bound,
             // then reassess the offer against current evidence before use.
-            let finishing_preparation = relay.state.lock().phase == RelayPhase::Preparing && {
+            let preparing = relay.state.lock().phase == RelayPhase::Preparing;
+            let finishing_preparation = preparing && {
                 let stats = inner.stats.lock();
                 relay_bandwidth_limited(&stats) || relay_fec_limited(&stats)
             };

@@ -3,10 +3,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 thread_local! {
-    // One timer per producer thread, closed when that thread exits.
+    // One timer per media thread, closed when that thread exits.
     static TIMER: Option<OwnedFd> = {
         // SAFETY: kqueue takes no arguments and returns a new descriptor.
         let fd = unsafe { libc::kqueue() };
+        // SAFETY: a successful kqueue descriptor is uniquely owned here.
         (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
     };
 }
