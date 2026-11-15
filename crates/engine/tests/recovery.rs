@@ -476,6 +476,7 @@ fn videotoolbox_impairment_simulator() {
                     bitrate_kbps: 2500,
                     codec,
                     color: Default::default(),
+                    display: None,
                 };
                 let encoder = latch_engine::testmode::videotoolbox_encoder(&config).unwrap();
                 assert!(

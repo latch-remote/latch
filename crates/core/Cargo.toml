@@ -23,6 +23,8 @@ webpki-roots = "1"
 semver = "1"
 sha2 = "0.10"
 socket2 = "0.6"
+url = "2.5"
+percent-encoding = "2"
 # Decodes and resizes the checked-in logo for the window and file icons.
 image = { version = "0.25", default-features = false, features = ["png"] }
 
@@ -31,3 +33,7 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_IO", "Win32_Networking_WinSock"] }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_System_WinRT", "Networking_Connectivity"]

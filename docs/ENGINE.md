@@ -29,6 +29,128 @@ No crate in the build may compile C, C++ or assembler with `cc`, `cmake`
 or `nasm`. `scripts/audit-native.sh` checks the resolved build graph and
 CI runs it.
 
+## Local network diagnosis
+
+`latch_core::netenv` exposes independent network observations through
+`NetworkDiagnosis`. `discover(&Options)` is a blocking worker entry point.
+UI callers use `NetworkEnvironment::request`, `poll` and `get`, passing a
+network generation that they increment after route, DNS or proxy changes
+and wake, for changed Tailscale health/peer status, or for an explicit
+retry. Changed options also invalidate cached results. `request` returns
+`RequestStatus::{Cached, Started, Pending, Unavailable}`. A refresh already
+in flight finishes first. The cache remembers the latest requested generation
+and options, and `poll` starts that refresh automatically.
+The default six-second deadline is clamped to 100 ms–15 s. Partial results
+retain unknown states. Each check kind has one process-wide in-flight OS job.
+Matching inputs coalesce onto that job. Changed inputs stay pending until
+that kind becomes available, keeping another host's credentials and facts
+scoped to their original inputs. A stalled resolver leaves the other check
+kinds available. Every subprocess exit and output read shares its deadline.
+Timed-out children are killed and reaped. A descendant holding a pipe open
+can outlive its parent, while the caller still returns at the deadline.
+
+Proxy discovery targets an HTTPS host on port 443. An explicit
+`Options::proxy_override`, parsed with `Proxy::parse`, takes precedence over
+all system settings and bypass rules. Parse failures must be shown by the
+caller. Each ordered candidate carries a `ProxySource`. HTTP CONNECT proxy
+credentials have explicit accessors and redacted Debug/Display output.
+Unsupported proxy protocols produce warnings. Credential stores such as
+macOS Keychain and Windows Credential Manager are outside this module.
+
+- macOS reads CFNetwork system settings, including scoped settings and
+  bypass rules, and evaluates PAC with CFNetwork on a private worker run
+  loop. If CFNetwork settings are unavailable, a static `scutil --proxy`
+  fallback reports its limits. WPAD reads DHCP option 252 for the primary
+  service, then tries `http://wpad/wpad.dat`. A successful PAC/WPAD result
+  supplies the complete candidate order, including any explicit DIRECT.
+  Cancellation invalidates and removes the run-loop source before freeing
+  the boxed callback state. A looping-script test verifies the caller's
+  deadline. CFNetwork provides no public guarantee that invalidation stops
+  its internal JavaScript worker, so continued CPU use by a looping PAC
+  script after cancellation remains unverified. Username-only Keychain
+  entries produce `keychain_credentials_unread` with no credentials.
+- Windows evaluates the calling account's Internet settings with WinHTTP,
+  trying DHCP/DNS WPAD before explicit PAC, then static settings. An async
+  resolver handle is cancelled at the deadline, including on networks with
+  no WPAD. Missing WPAD is an ordinary direct result. An explicit PAC
+  failure produces `pac_failed`. Machine
+  WinHTTP defaults provide a fallback. Automatic proxy authentication is
+  disabled during discovery. A service sees its own account's settings
+  and the machine defaults. The signed-in desktop's configuration may
+  differ, so a service can need an explicit override.
+- Linux checks nonempty `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`, then
+  `all_proxy`, with `NO_PROXY`/`no_proxy` bypasses. Uppercase takes
+  precedence. Bypasses support domain label boundaries, optional ports,
+  IP literals, IPv6 and CIDR without DNS lookups. It then reads GNOME
+  through `gsettings` and KDE's XDG `kioslaverc` layers, preferring the
+  current desktop. The commands read the process's desktop session. PAC/WPAD
+  configuration is reported as unevaluated with no candidate because
+  Linux has no shared system PAC evaluator. Set an explicit proxy to
+  resolve that case. Shell and service environments can differ.
+
+`ProbeTarget::new` makes the HTTP destination, expected status and body
+explicit. No external HTTP probe is enabled by default. Windows uses its
+native connectivity profile and Linux uses NetworkManager's cached
+connectivity signal when available. macOS has no public, general-purpose
+portal-status API, so it needs a probe. Probes use direct cleartext HTTP
+with no credentials, cookies, redirects or device identifiers, and bounded
+headers/body/time. A redirect, HTTP 511 or replacement HTML indicates a
+sign-in portal. Filters and authentication failures have a separate
+restricted state. Configured probes run before native hints, allowing a
+successful check to clear a stale OS portal signal. Sign-in URLs omit
+userinfo. `PortalUrl::as_str` exposes the complete path/query/fragment for
+opening a sign-in page. Debug/Display expose only the origin.
+All failed direct probes mean those targets were unreachable. A proxy-only
+network or a failed endpoint can produce the same observation. An ordered
+fallback target can reduce that ambiguity. These checks cannot authenticate
+a cleartext response or prove every internet service is reachable.
+
+A project-controlled primary probe would require
+`http://relay.latch.rune.foo/netenv/probe` on port 80 to return HTTP 204,
+an empty body, `Content-Length: 0` and `Cache-Control: no-store`, without
+redirecting to HTTPS or requiring authentication. An HTTP front end can
+serve it. The existing native TLS relay on 443 does not serve this endpoint.
+The wiring layer chooses and supplies any fallback explicitly. Probe
+operators see public source IP and timing. DNS64 discovery queries only
+`ipv4only.arpa` through the system resolver, following RFC 7050 and RFC 6052.
+Either well-known IPv4 constant identifies an RFC 6052 prefix length.
+Answers matching multiple legal positions or repeating the same constant
+are set aside. Usable answers for both constants must agree on prefixes.
+Resolver order is preserved.
+Interface families describe operational local addresses. They do not prove
+internet access. DNS64 absence is inconclusive. A DNS64 prefix together
+with IPv6 and only CLAT service-continuity IPv4 addresses (192.0.0.0/29)
+is reported as IPv6-only. VPN interfaces can change the apparent family.
+
+Tailscale diagnosis reuses core's status and netcheck parsers. Stable
+`TailscaleReason::code()` values accompany short actionable messages,
+DERP region and peer-relay details. An idle peer's home DERP never establishes
+an active relay path. Only explicit daemon health evidence establishes a
+control/DERP reachability failure. UDP failure alone cannot establish it.
+Unknown or future health formats stay unknown. Netcheck itself probes
+Tailscale infrastructure. No network result is added to the control API or
+used to select a stream transport in this module.
+
+`NetworkDiagnosis::warnings` and `ProxyDiscovery::warnings` contain
+`NetworkWarning` values. Each provides `code()`, `severity()` and `message()`.
+`WarningSeverity` distinguishes `Informational` and `Actionable`. Both enums
+are non-exhaustive. Messages are fixed and credential-free. Stable codes are
+`checks_pending`, `checks_timed_out`, `invalid_proxy`, `invalid_destination`,
+`unsupported_pac_protocol`, `malformed_pac_candidate`,
+`pac_evaluator_unavailable`, `incomplete_system_proxy`, `linux_pac_unavailable`,
+`pac_failed`, `unsupported_system_protocol`, `mac_static_fallback`,
+`mac_settings_unavailable`, `wpad_failed`, `keychain_credentials_unread` and
+`windows_service_settings`. The Windows account note is emitted when the
+current account's Internet settings cannot be read, a service-account hint.
+Real system proxy smoke tests run on macOS and Windows, including WinRT
+connectivity and bounded Windows auto-detection.
+
+Run `cargo run -p latch-core --example netenv -j 4` for local facts. An
+optional HTTP probe URL and peer ID are positional arguments. `LATCH_PROXY`
+is an example-only override. Output describes the current system's proxy
+candidates, Tailscale path and local address families. An absent NAT64 prefix
+is inconclusive. Portal state can stay unknown without an HTTP target.
+
 ## Shape
 
 ```
@@ -443,7 +565,11 @@ refresh; GPU completion, compositor, panel response and scanout are unmeasured.
   viewer is resized by the engine (`xrandr` semantics through RandR) or by
   the owner's prep command; Windows sets the virtual display's mode; macOS
   captures the main display (or `LATCH_MAC_DISPLAY`) and lets
-  ScreenCaptureKit scale it. Linux's CPU pipeline also emits the negotiated
+  ScreenCaptureKit scale it. A viewer can name another display
+  (`display::list`, `StreamRequest.display`): Windows then duplicates that
+  output and leaves the virtual display and topology alone, macOS captures
+  it, and Linux captures that RandR monitor's rectangle of the root without
+  resizing. Linux's CPU pipeline also emits the negotiated
   output size when the display stays at its native size, for software, NVENC
   and VA-API alike. It aspect-fits with centred black bars, using the same
   content rectangle for pointer injection as Windows and macOS. Reductions

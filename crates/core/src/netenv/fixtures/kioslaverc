@@ -1,0 +1,10 @@
+[Other Settings]
+httpsProxy=http://wrong.test 9
+[Proxy Settings]
+ProxyType=1
+httpsProxy=http://kde-proxy.test 8080
+httpProxy=http://plain-proxy.test 3128
+NoProxyFor=localhost,.internal.test,192.168.0.0/16
+ReversedException=false
+[Unrelated]
+ProxyType=0

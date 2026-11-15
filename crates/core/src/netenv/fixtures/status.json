@@ -1,0 +1,13 @@
+{
+ "Version":"1.102.3",
+ "BackendState":"Running",
+ "Self":{"ID":"self","Relay":"lax","Online":true},
+ "Health":null,
+ "Peer":{
+  "direct-key":{"ID":"direct","Online":true,"Active":true,"CurAddr":"192.0.2.1:41641","Relay":"tok","PeerRelay":"100.64.0.2:41641:1:r"},
+  "derp-key":{"ID":"derp","Online":true,"Active":true,"CurAddr":"","Relay":"tok","TailscaleIPs":["100.64.0.10"]},
+  "relay-key":{"ID":"relay","Online":true,"Active":true,"Relay":"tok","PeerRelay":"100.64.0.2:41641:1:r"},
+  "offline-key":{"ID":"offline","Online":false,"CurAddr":"192.0.2.2:41641","Relay":"tok"},
+  "idle-key":{"ID":"idle","Online":true,"Active":false,"Relay":"tok"}
+ }
+}
