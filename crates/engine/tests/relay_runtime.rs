@@ -19,8 +19,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[path = "support/ports.rs"]
-mod ports;
 #[path = "support/relay_pilot.rs"]
 mod relay;
 use relay::Pilot;

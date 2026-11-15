@@ -110,11 +110,11 @@ def evaluate(scenario, events, duration, relay_connections):
                 progress.append(e["elapsed_ms"])
                 previous = e["decoded_seq"]
         gaps = ([b - a for a, b in zip(progress, progress[1:])] +
-                ([samples[-1]["elapsed_ms"] - progress[-1]] if progress and samples else [duration * 1000]))
+                ([duration * 1000 - progress[-1]] if progress else [duration * 1000]))
         maximum_gap = max(gaps)
         tail_start = (duration - 6) * 1000
         tail_progress = [at for at in progress if at >= tail_start]
-        tail_bounds = [tail_start, *tail_progress, samples[-1]["elapsed_ms"] if samples else duration * 1000]
+        tail_bounds = [tail_start, *tail_progress, duration * 1000]
         tail_gaps = [b - a for a, b in zip(tail_bounds, tail_bounds[1:])]
         require("no_decoded_stall_over_5s", bool(progress) and maximum_gap <= 5000)
         late_inputs = [e for e in inputs if e["elapsed_ms"] >= (duration - 7) * 1000]
