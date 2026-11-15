@@ -256,6 +256,12 @@ fn status_and_netcheck_fixtures() {
         }
         assert!(!result.netcheck.unwrap().udp);
         assert!(!result.message.is_empty());
+        if reason == R::PeerRelay {
+            assert!(result
+                .message
+                .contains("one of your own machines acting as a relay"));
+            assert!(!result.message.contains("on your network"));
+        }
         assert!(!reason.code().is_empty());
     }
     assert_eq!(

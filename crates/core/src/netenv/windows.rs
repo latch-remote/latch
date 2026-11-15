@@ -56,6 +56,17 @@ impl Drop for CallbackToken {
     }
 }
 
+fn auto_sources(explicit_pac: bool, auto_detect: bool) -> Vec<ProxySource> {
+    let mut sources = Vec::new();
+    if auto_detect {
+        sources.push(ProxySource::WindowsWpad);
+    }
+    if explicit_pac {
+        sources.push(ProxySource::WindowsPac);
+    }
+    sources
+}
+
 unsafe fn auto_proxy(
     url: &str,
     pac: &str,
@@ -75,10 +86,8 @@ unsafe fn auto_proxy(
     let target: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
     let pac: Vec<u16> = pac.encode_utf16().chain(Some(0)).collect();
     // Match WinHTTP/IE precedence. fAutoLogonIfChallenged stays false.
-    for detect in [true, false] {
-        if (!detect && pac.len() == 1) || (detect && !auto_detect) {
-            continue;
-        }
+    for source in auto_sources(pac.len() > 1, auto_detect) {
+        let detect = source == ProxySource::WindowsWpad;
         if Instant::now() >= deadline {
             break;
         }
@@ -133,11 +142,6 @@ unsafe fn auto_proxy(
         if WinHttpGetProxyResult(resolver.0, &mut info) != 0 {
             continue;
         }
-        let source = if detect {
-            ProxySource::WindowsWpad
-        } else {
-            ProxySource::WindowsPac
-        };
         let result = proxy_result(&info, source);
         WinHttpFreeProxyResult(&mut info);
         return Some(result);
@@ -263,6 +267,15 @@ pub(super) fn portal() -> CaptivePortal {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn auto_sources_follow_windows_precedence() {
+        use ProxySource::{WindowsPac, WindowsWpad};
+        assert_eq!(auto_sources(true, true), [WindowsWpad, WindowsPac]);
+        assert_eq!(auto_sources(true, false), [WindowsPac]);
+        assert_eq!(auto_sources(false, true), [WindowsWpad]);
+        assert!(auto_sources(false, false).is_empty());
+    }
 
     #[test]
     fn absent_wpad_has_no_warning_and_explicit_pac_failure_is_actionable() {
