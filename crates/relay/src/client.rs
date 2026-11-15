@@ -1709,9 +1709,13 @@ mod tests {
         let mut config =
             ClientConfig::production(Endpoint::new("relay.example", 443).unwrap()).unwrap();
         config.limits.max_frame_bytes = 12345;
-        let config = config
-            .with_tls_roots(rustls::RootCertStore::empty())
+        // rustls refuses an empty store, so swap in the test CA.
+        let mut roots = rustls::RootCertStore::empty();
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
+        roots
+            .add(CertificateDer::from_pem_slice(include_bytes!("../tests/certs/ca.pem")).unwrap())
             .unwrap();
+        let config = config.with_tls_roots(roots).unwrap();
         assert!(config.public_only);
         assert_eq!(config.limits.max_frame_bytes, 12345);
         for address in [
