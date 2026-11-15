@@ -429,10 +429,9 @@ Free Tier API reported $162 remaining credits on 2026-11-15. The instance
 costs $12/month. Detailed bundle, overage and credit figures are in the
 operating guide. [Cost model](LIGHTSAIL.md#bundle-and-transfer-economics)
 
-IPv6 is currently disabled at Lightsail and DNS has no AAAA. Cloudflare
-hosts the zone and its A record. Dual-stack enablement, IPv6 firewall rules, the later native listener
-deployment and a DNS-only AAAA are the remaining steps. The assigned IPv6
-address would be separate from the attached IPv4 static allocation.
+The subsequent WebSocket upgrade enabled Lightsail dual-stack, verified the
+new listener over public IPv6 and published a DNS-only AAAA through Cloudflare.
+The assigned IPv6 address is separate from the attached IPv4 static allocation.
 [IPv6 findings](LIGHTSAIL.md#ipv6-and-dns)
 
 The old EC2 instance and security group were removed after backup verification
@@ -483,7 +482,7 @@ The host stayed online throughout the maintenance.
 
 Both roles ran on the UCLA campus Mac over Wi-Fi `en0`. macOS withheld the
 SSID. The existing public IPv4 SSH rule matched the campus connection, and
-public IPv6 HTTPS worked from the Mac. Each run lasted 40 seconds at 60 fps,
+public IPv6 HTTPS worked from the Mac. Each run targeted 40 seconds at 60 fps,
 including a 10-second quarter-rate warm-up. Throughput and frame-delay
 percentiles use the reporting windows identified in the table. Completed
 runs use the final approximately 10-second full-rate window. Failed runs can
@@ -529,7 +528,6 @@ The four recorded interruption intervals total approximately **2.20 seconds**.
 A health attempt overlapping that renewal restart ended with EOF, followed by
 successful native and WebSocket checks after renewal.
 
-
 ### Live verification
 
 - Native ALPN paired health passed immediately after the first upgrade and
@@ -553,7 +551,7 @@ successful native and WebSocket checks after renewal.
 
 The optional full x86-64 library suite under QEMU passed 40 tests and hit an
 emulation limitation in the self-spawning CPU-rejection test. The complete
-Mac suite and native CI provide coverage for that subprocess behavior. The
+Mac suite passed that subprocess test. CI runs it on native runners. The
 required matching-userspace Linux executable selftest passed under QEMU 10.2.3.
 
 ### IPv6 and DNS
@@ -581,8 +579,8 @@ The dated root-only host backup is
 executable, unit/drop-ins, limits, budget, TLS identity, sysctl file, network
 helper and quota snapshots. The Mac backup is
 `/Volumes/Backup/latch-relay-seoul-1-pre-wss-2026-11-15/`, containing
-`pre-wss.tar.gz`, the exact `quota.stopped` and `quota.redeploy-stopped` captured before each replacement,
-and `EXCLUSIONS.txt`. Certificate private keys, ACME account state, SSH keys and
+`pre-wss.tar.gz`, the exact `quota.stopped` and `quota.redeploy-stopped` captured
+before each replacement, and `EXCLUSIONS.txt`. Certificate private keys, ACME account state, SSH keys and
 Tailscale state were excluded from the Mac copy. The archive and ELF executable
 were read back successfully.
 
