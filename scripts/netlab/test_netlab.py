@@ -33,7 +33,8 @@ class VerdictTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "cleanup errors"):
                     lab.close()
                 stop.assert_called_once_with(lab.processes[0])
-                run.assert_called_once_with("ip", "netns", "del", lab.names["v"], check=False)
+                run.assert_any_call("ip", "netns", "del", lab.names["v"], check=False)
+                self.assertEqual(run.call_count, 3)
 
     def test_middlebox_evidence_is_required_even_for_an_expected_failure(self):
         expected = {"failures": ["no_picture"], "required_assertions": ["viewer_reached_middlebox"]}

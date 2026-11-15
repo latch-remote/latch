@@ -192,6 +192,7 @@ class Lab:
         self.scenario = scenario
         self.output = output
         self.names = {role: f"ln{os.getpid()}{scenario}{role}" for role in ("h", "v", "c", "i")}
+        self.root_links = [f"n{os.getpid()}{scenario}{end}" for end in ("x", "y")]
         self.processes = []
         self.files = []
         self.created = []
@@ -673,6 +674,9 @@ add rule inet lab impairment iifname "viewer" drop''')
             finally:
                 for name in reversed(self.created):
                     attempt(lambda name=name: self.run("ip", "netns", "del", name, check=False))
+                # An interruption can leave a veth pair between creation and its namespace move.
+                for device in self.root_links:
+                    attempt(lambda device=device: self.run("ip", "link", "del", device, check=False, timeout=3))
                 for directory in self.etc:
                     attempt(lambda directory=directory: shutil.rmtree(directory))
                 for file in self.files:
