@@ -229,8 +229,8 @@ error pattern where supplied.
 
 d1 and d2 require the recorded requested-video-bitrate failure. Their
 `related_failures` list names accompanying quality failures observed across
-stochastic runs. FPS and audio counts vary, and d2 can also remain on UDP
-with stalls and delayed input. Every numeric assertion still runs and is
+stochastic runs. FPS, audio and stall counts vary, and d2 can also remain on
+UDP with delayed input. Every numeric assertion still runs and is
 reported. A repaired bitrate with a different remaining failure is FAIL.
 Control, sampler, termination, path-counter and middlebox failures always
 remain outside this quality signature.
