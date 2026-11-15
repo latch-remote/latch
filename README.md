@@ -169,7 +169,7 @@ performance and remaining field limits are recorded in the
 |---|---|---|
 | **Windows** | GPU H.264/HEVC, software H.264 fallback, AV1 host untested, HEVC HDR10, ViGEm gamepads | probed GPU H.264/HEVC/AV1, software Baseline fallback, HEVC HDR |
 | **macOS** | VideoToolbox H.264/HEVC, HDR capture on Apple Silicon/macOS 15+, gamepad injection missing | probed VideoToolbox H.264/HEVC/AV1 (supported chips), software Baseline fallback, HEVC HDR |
-| **Linux** | X11 software H.264, untested NVENC H.264/HEVC/AV1 and VA-API H.264/HEVC, uinput gamepads, SDR8 | software Constrained Baseline H.264, SDR8 |
+| **Linux** | X11 software H.264, untested NVENC H.264/HEVC/AV1 and VA-API H.264/HEVC, uinput gamepads, SDR8 | VA-API H.264 and HEVC/Main10 (hardware verification pending), software Constrained Baseline H.264 fallback, SDR output |
 
 The [support matrix](docs/PLATFORMS.md) gives code evidence, verification
 scope, in-flight work and the status of all six host-to-viewer directions.

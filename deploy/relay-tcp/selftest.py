@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Read-only kit checks, optional disposable daemon checks, or a public TLS probe."""
 import argparse
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -33,7 +35,7 @@ def check_kit():
     for setting in (
         "User=latch-relay", "NoNewPrivileges=yes", "ProtectSystem=strict",
         "StateDirectory=latch-relay", "Restart=always", "StartLimitIntervalSec=0",
-        "MemoryMax=512M", "--listen 0.0.0.0:443", "--monthly-bytes ${MONTHLY_BYTES}",
+        "MemoryMax=512M", "--listen [::]:443", "--monthly-bytes ${MONTHLY_BYTES}",
         "CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
     ):
         assert setting in unit, setting
@@ -44,7 +46,7 @@ def check_kit():
         "net.core.rmem_max = 16777216", "net.core.wmem_max = 16777216",
         "net.ipv4.tcp_rmem = 4096 131072 16777216",
         "net.ipv4.tcp_wmem = 4096 65536 16777216",
-        "net.ipv4.tcp_mtu_probing = 1", "net.ipv4.tcp_notsent_lowat = 131072",
+        "net.ipv4.tcp_mtu_probing = 2", "net.ipv4.tcp_notsent_lowat = 131072",
         "net.ipv4.tcp_slow_start_after_idle = 0",
         "net.netfilter.nf_conntrack_max = 131072",
         "rx-udp-gro-forwarding on rx-gro-list off", "LimitNOFILE=65536",
@@ -218,6 +220,82 @@ def check_binary(binary):
                     process.wait(timeout=3)
             process.stderr.close()
 
+        # Exercise the shipped dual-stack listener and HTTP carrier using a
+        # separate ledger so the exhaustion assertions retain their small budget.
+        carrier_args = args.copy()
+        carrier_args[carrier_args.index("127.0.0.1:0")] = "[::]:0"
+        carrier_args[carrier_args.index(str(ledger))] = str(directory / "carrier-quota")
+        carrier_args[carrier_args.index("131072")] = "1048576"
+        process = subprocess.Popen(carrier_args + ["--initialize-quota"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stderr, selectors.EVENT_READ)
+                assert selector.select(timeout=5), "dual-stack daemon did not start"
+                line = process.stderr.readline().decode(errors="replace")
+            match = re.search(r"listening on \[::\]:(\d+)", line)
+            assert match, line
+            port = int(match[1])
+            for address in ("127.0.0.1", "::1"):
+                with socket.create_connection((address, port), timeout=3) as raw:
+                    with tls_context(certificate).wrap_socket(raw, server_hostname="localhost") as tls:
+                        assert tls.selected_alpn_protocol() == "latch-relay/1"
+            for alpn in (["h2", "http/1.1"], []):
+                context = tls_context(certificate)
+                context.set_alpn_protocols(alpn)
+                with socket.create_connection(("127.0.0.1", port), timeout=3) as raw:
+                    with context.wrap_socket(raw, server_hostname="localhost") as tls:
+                        tls.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                        response = tls.recv(1024)
+                        assert response.startswith(b"HTTP/1.1 200 OK\r\n")
+                        assert response.endswith(b"\r\n\r\nOK\n")
+            for request, status in (
+                (b"HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n", 200),
+                (b"GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n", 404),
+                (b"BREW / HTTP/1.1\r\nHost: localhost\r\n\r\n", 405),
+                (b"GET /relay HTTP/1.1\r\nHost: localhost\r\n\r\n", 426),
+                (b"invalid\r\n\r\n", 400),
+                (b"GET / HTTP/1.1\r\nHost: localhost\r\nX: " + b"a" * 8192, 431),
+            ):
+                context = tls_context(certificate)
+                context.set_alpn_protocols(["http/1.1"])
+                with socket.create_connection(("127.0.0.1", port), timeout=3) as raw:
+                    with context.wrap_socket(raw, server_hostname="localhost") as tls:
+                        tls.sendall(request)
+                        response = tls.recv(1024)
+                        assert response.startswith(f"HTTP/1.1 {status} ".encode()), response
+                        if request.startswith(b"HEAD "):
+                            assert response.endswith(b"\r\n\r\n")
+                        if status == 426:
+                            assert b"Sec-WebSocket-Version: 13\r\n" in response
+                        assert b"latch" not in response.lower()
+            context = tls_context(certificate)
+            context.set_alpn_protocols(["h2", "http/1.1"])
+            with socket.create_connection(("::1", port), timeout=3) as raw:
+                with context.wrap_socket(raw, server_hostname="localhost") as tls:
+                    key = base64.b64encode(os.urandom(16))
+                    tls.sendall(b"GET /relay HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + key + b"\r\n\r\n")
+                    response = b""
+                    while not response.endswith(b"\r\n\r\n"):
+                        response += tls.recv(1)
+                        assert len(response) < 8192
+                    expected = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+                    assert response.startswith(b"HTTP/1.1 101 ") and expected in response
+                    mask = os.urandom(4)
+                    record = b"\x00\x00\x00\x01\x01"
+                    tls.sendall(b"\x82\x85" + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(record)))
+                    def read_exact(size):
+                        result = b""
+                        while len(result) < size:
+                            chunk = tls.recv(size - len(result))
+                            assert chunk, "truncated WebSocket grant"
+                            result += chunk
+                        return result
+                    assert read_exact(2) == b"\x82\x7e"
+                    assert int.from_bytes(read_exact(2), "big") == 185
+                    grant = read_exact(185)
+                    assert grant[:5] == b"\x00\x00\x00\xb5\x01"
+        finally:
+            stop(process)
         must_fail()
         assert not ledger.exists(), "ordinary startup recreated a missing ledger"
         process, port = start(["--initialize-quota"])
@@ -269,7 +347,7 @@ def check_binary(binary):
         ledger.write_bytes(b"damaged")
         must_fail()
         assert ledger.read_bytes() == b"damaged", "corruption was silently reset"
-    print("PASS real daemon TLS/ALPN, pilot JSON, private ledger, lock, restart, exhaustion and corruption")
+    print("PASS real daemon dual-stack, TLS/ALPN, HTTP, WebSocket, pilot JSON, private ledger, lock, restart, exhaustion and corruption")
 
 
 def main():
