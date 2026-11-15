@@ -127,7 +127,19 @@ impl Held {
 pub mod keymap {
     /// macOS virtual key code (`kVK_*`, Carbon `Events.h`) for a Windows VK.
     pub fn vk_to_mac(vk: u16) -> Option<u16> {
+        use latch_proto::keyboard::*;
         Some(match vk {
+            KEYPAD_ENTER => 0x4c,
+            KEYPAD_EQUAL => 0x51,
+            INTL_RO => 0x5e,
+            INTL_YEN => 0x5d,
+            KANA | CONVERT => 0x68,
+            NON_CONVERT | 0x19 => 0x66,
+            0x15 => 0x68,
+            0xe2 => 0x0a, // ISO section key
+            0xad => 0x4a, // mute
+            0xae => 0x49, // volume down
+            0xaf => 0x48, // volume up
             // Letters (ANSI layout)
             0x41 => 0x00, // A -> kVK_ANSI_A
             0x42 => 0x0B, // B -> kVK_ANSI_B
@@ -218,6 +230,7 @@ pub mod keymap {
             0x69 => 0x5C, // Keypad 9 -> kVK_ANSI_Keypad9
             0x6A => 0x43, // Multiply -> kVK_ANSI_KeypadMultiply
             0x6B => 0x45, // Add -> kVK_ANSI_KeypadPlus
+            0x6C => 0x5f, // JIS keypad comma
             0x6D => 0x4E, // Subtract -> kVK_ANSI_KeypadMinus
             0x6E => 0x41, // Decimal -> kVK_ANSI_KeypadDecimal
             0x6F => 0x4B, // Divide -> kVK_ANSI_KeypadDivide
@@ -266,7 +279,25 @@ pub mod keymap {
     /// The host layout and active group interpret these positions; never search
     /// for a US symbol in an arbitrary shift level of the host's map.
     pub fn vk_to_xkb_name(vk: u16) -> Option<[u8; 4]> {
+        use latch_proto::keyboard::*;
         Some(match vk {
+            KEYPAD_ENTER => *b"KPEN",
+            KEYPAD_EQUAL => *b"KPEQ",
+            INTL_RO => *b"AB11",
+            INTL_YEN => *b"AE13",
+            KANA => *b"HKTG",
+            CONVERT | 0x1c => *b"HENK",
+            NON_CONVERT | 0x1d => *b"MUHE",
+            0x15 => *b"HNGL",
+            0x19 => *b"HJCV",
+            0xe2 => *b"LSGT",
+            0xad => *b"MUTE",
+            0xae => *b"VOL-",
+            0xaf => *b"VOL+",
+            0xb0 => *b"I171", // evdev KEY_NEXTSONG + 8
+            0xb1 => *b"I173", // KEY_PREVIOUSSONG + 8
+            0xb2 => *b"I174", // KEY_STOPCD + 8
+            0xb3 => *b"I172", // KEY_PLAYPAUSE + 8
             0x08 => *b"BKSP",
             0x09 => *b"TAB\0",
             0x0C => *b"KP5\0",
@@ -293,7 +324,7 @@ pub mod keymap {
             0x5D => *b"MENU",
             0x6A => *b"KPMU",
             0x6B => *b"KPAD",
-            0x6C => *b"KPCO",
+            0x6C => *b"I129", // evdev keypad comma
             0x6D => *b"KPSU",
             0x6E => *b"KPDL",
             0x6F => *b"KPDV",
@@ -443,6 +474,26 @@ pub mod keymap {
         use std::collections::HashMap;
 
         #[test]
+        fn shared_physical_maps_cover_all_viewers_and_function_keys() {
+            for case in latch_proto::keyboard::CASES {
+                let name = vk_to_xkb_name(case.vk).unwrap();
+                assert_eq!(
+                    std::str::from_utf8(&name).unwrap().trim_end_matches('\0'),
+                    case.xkb
+                );
+                assert_eq!(vk_to_mac(case.vk), case.mac);
+            }
+            for vk in 0x7c..=0x87 {
+                assert!(vk_to_xkb_name(vk).is_some());
+                assert_eq!(vk_to_mac(vk).is_some(), vk <= 0x83);
+            }
+            for vk in 0x60..=0x6f {
+                assert!(vk_to_xkb_name(vk).is_some(), "{vk:#x}");
+                assert!(vk_to_mac(vk).is_some(), "{vk:#x}");
+            }
+        }
+
+        #[test]
         fn xkb_keys_use_physical_names_independent_of_symbols_or_group() {
             assert_eq!(vk_to_xkb_name(0x31), Some(*b"AE01"));
             assert_eq!(vk_to_xkb_name(0x41), Some(*b"AC01"));
@@ -503,6 +554,7 @@ pub mod keymap {
             // 2. (VK_CONTROL, VK_LCONTROL) -> kVK_Control (0x3B)
             // 3. (VK_MENU, VK_LMENU) -> kVK_Option (0x3A)
             // 4. (VK_INSERT, VK_HELP) -> kVK_Help (0x72)
+            // 5. Korean/JIS language controls use Mac Kana/Eisu positions.
             let mut mac_to_vks: HashMap<u16, Vec<u16>> = HashMap::new();
             for vk in 0..=512 {
                 if let Some(mac) = vk_to_mac(vk) {
@@ -517,6 +569,14 @@ pub mod keymap {
                         0x3B => vks == [0x11, 0xA2], // VK_CONTROL, VK_LCONTROL
                         0x3A => vks == [0x12, 0xA4], // VK_MENU, VK_LMENU
                         0x72 => vks == [0x2D, 0x2F], // VK_INSERT, VK_HELP
+                        0x68 => {
+                            vks == [
+                                0x15,
+                                latch_proto::keyboard::KANA,
+                                latch_proto::keyboard::CONVERT,
+                            ]
+                        }
+                        0x66 => vks == [0x19, latch_proto::keyboard::NON_CONVERT],
                         _ => false,
                     };
                     assert!(

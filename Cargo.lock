@@ -2029,6 +2029,7 @@ dependencies = [
  "wgpu",
  "windows 0.58.0",
  "windows-sys 0.61.2",
+ "x11-dl",
  "x11rb 0.14.0",
 ]
 

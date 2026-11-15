@@ -55,6 +55,7 @@ Content-Length: <n>
 | `audio_channels` | u32 | optional; most channels the viewer plays (6 for 5.1, 8 for 7.1). Absent, or below 3, means stereo |
 | `mic` | bool | optional, default false; the viewer offers its microphone (datagram kind 13) |
 | `probe_trains` | bool | optional, default false; the viewer times probe trains (datagram kind 16) and reports their rate |
+| `key_positions` | bool | optional, default false; offers additional physical keyboard positions in input kind 8 |
 | `relay` | bool | optional, default false; the viewer supports the two-lane authenticated relay extension |
 
 A request is taken within 64 to 16384 pixels a side, 1 to 500 fps and
@@ -113,6 +114,7 @@ uses the original ordered connection, regardless of its serialized size.
 | `audio_problem` | string | why there is no audio, when `audio` is null |
 | `cursor` | bool | optional, default false; host supports omitting pointer from video and sending shape updates |
 | `gamepads` | u8 | optional, default 0; gamepad slots the host emulates (0: none, so the viewer sends none) |
+| `key_positions` | bool | optional, default false; accepts input kind 8, only when offered in the request |
 | `gamepad_kinds` | [string] | optional; the pad kinds the host emulates as themselves, of `"xbox"`, `"playstation"`, `"generic"`; unknown names are skipped |
 | `gamepad_problem` | string | optional; why the host takes no gamepads although the viewer offered them |
 | `reference_invalidation` | bool | optional, default false; true only when the viewer asked and the session's encoder makes recovery frames |
@@ -268,6 +270,33 @@ Events, each `u8 kind` then a fixed payload:
 | 5 | scroll | `i16 vertical, i16 horizontal` (120 per notch; up and right positive) |
 | 6 | text | `u8 len` (1–64), UTF-8 bytes |
 | 7 | release everything held | none |
+| 8 | additional key position | `u16 usage` (USB HID keyboard page), `u8 down`, `u8 modifiers` with the same mask as kind 4. Negotiated with `key_positions`. |
+
+Keys name physical US positions, interpreted using the host layout. Kind 4
+preserves left/right modifiers with VK_LSHIFT/RSHIFT (`a0/a1`),
+VK_LCONTROL/RCONTROL (`a2/a3`), VK_LMENU/RMENU (`a4/a5`) and
+VK_LWIN/RWIN (`5b/5c`). Generic `10/11/12` from older viewers mean the
+left side. The modifier mask describes aggregate held state and carries
+no side information. UTF-8 text carries committed IME/dead-key characters.
+Viewers suppress the physical presses that composed a text commit.
+
+`StreamRequest.key_positions` and `Accept.key_positions` are optional
+booleans, default false and omitted when false. A host answers true only
+when the viewer offered true. Kind 8 is sent only after that acceptance.
+Supported keyboard-page usages are `58` (keypad Enter), `67` (keypad
+Equals), `87` (IntlRo), `88` (Kana), `89` (IntlYen), `8a` (Convert) and
+`8b` (NonConvert), all hexadecimal. Unknown positions are rejected.
+Other keys keep kind 4. Internally the Rust input type represents a kind-8
+position as `Event::Key.vk = 0x100 + usage`. Those internal values never
+appear as a kind-4 payload from the sender.
+
+A viewer connected to an older host uses the existing kind-4 fallback
+Return, main Equals, ISO extra, Kana/Hangul, backslash, Convert and
+NonConvert respectively. Fallbacks that share a destination release it
+only after both source positions are released. An older viewer sends its
+existing kind-4 keys to a new host. Neither peer sends new events to a
+6.0.0 peer. Input ordering, retransmission and InputAck cover kind 8 in the
+same sequence space as every other input event.
 
 Input is reliable without retransmission timers: the viewer numbers every
 event and keeps it until the host acknowledges it. Each `Input` datagram

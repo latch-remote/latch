@@ -1,6 +1,6 @@
 //! Input events and their reliability. See `docs/PROTOCOL.md`, "Input (4)".
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 pub const BUTTON_LEFT: u8 = 1;
@@ -96,8 +96,9 @@ impl Event {
                 down,
                 modifiers,
             } => {
-                out.push(4);
-                out.extend(vk.to_le_bytes());
+                let position = crate::keyboard::position(*vk);
+                out.push(if position.is_some() { 8 } else { 4 });
+                out.extend(position.unwrap_or(*vk).to_le_bytes());
                 out.extend([*down as u8, *modifiers]);
             }
             Event::Scroll {
@@ -181,6 +182,18 @@ impl Event {
                 )
             }
             7 => (Event::ReleaseAll, 1),
+            8 => {
+                let vk = u16at(1)?.checked_add(0x100)?;
+                crate::keyboard::position(vk)?;
+                (
+                    Event::Key {
+                        vk,
+                        down: boolean(3)?,
+                        modifiers: *bytes.get(4)?,
+                    },
+                    5,
+                )
+            }
             _ => return None,
         })
     }
@@ -189,6 +202,8 @@ impl Event {
 /// The viewer's side: numbers events and sends every unacknowledged one
 /// until the host acknowledges it.
 pub struct InputSender {
+    key_positions: bool,
+    legacy_held: BTreeSet<u16>,
     session: u32,
     next: u32,
     queue: VecDeque<(u32, Event, bool)>,
@@ -199,6 +214,8 @@ pub struct InputSender {
 impl InputSender {
     pub fn new(session: u32) -> Self {
         Self {
+            key_positions: false,
+            legacy_held: BTreeSet::new(),
             session,
             next: 0,
             queue: Default::default(),
@@ -207,12 +224,41 @@ impl InputSender {
         }
     }
 
+    /// Enable kind 8 only after the host accepted the viewer's offer.
+    pub fn with_key_positions(mut self, accepted: bool) -> Self {
+        self.key_positions = accepted;
+        self
+    }
+
     /// Queues an event. Text longer than [`MAX_TEXT`] is split at character
     /// boundaries. Adjacent unsent absolute positions are latest-wins.
     /// A relative move right after another not yet sent is merged into it
     /// if the sum fits. Sent payloads remain immutable, and coalescing never
     /// crosses another event, preserving click locations and input order.
-    pub fn push(&mut self, event: Event) {
+    pub fn push(&mut self, mut event: Event) {
+        if matches!(event, Event::ReleaseAll) {
+            self.legacy_held.clear();
+        }
+        if let Event::Key { vk, down, .. } = &mut event {
+            if !self.key_positions {
+                let Some(legacy) = crate::keyboard::legacy(*vk) else {
+                    return;
+                };
+                if *down {
+                    self.legacy_held.insert(*vk);
+                } else {
+                    self.legacy_held.remove(vk);
+                    if self
+                        .legacy_held
+                        .iter()
+                        .any(|&held| crate::keyboard::legacy(held) == Some(legacy))
+                    {
+                        return;
+                    }
+                }
+                *vk = legacy;
+            }
+        }
         if let Event::Text(text) = &event {
             if text.is_empty() {
                 return;

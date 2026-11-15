@@ -6,7 +6,7 @@ use latch_stream::input::{
     MOD_META, MOD_SHIFT,
 };
 use latch_stream::Input;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const VK_SHIFT: i16 = 0x10;
 pub const VK_CONTROL: i16 = 0x11;
@@ -249,9 +249,6 @@ impl Sink for Recorder {
 /// modifier mask sent with it.
 type KeyEvent = (i16, bool, u8);
 
-/// The modifier keys, in the order their mask bits are listed.
-const MODIFIERS: [i16; 4] = [VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN];
-
 fn send(out: &(impl Sink + ?Sized), events: &[KeyEvent]) {
     for &(vk, down, mask) in events {
         out.key(vk, down, mask);
@@ -283,40 +280,38 @@ fn chord_events(keys: &[i16], mask: u8) -> Vec<KeyEvent> {
 /// `mask` outside `keys` are released first, so ⌘ held as Ctrl does not
 /// turn Shift+Insert into Ctrl+Shift+Insert, and pressed again after.
 /// `press` is the part of `keys` to press: those not already held.
-fn alone_events(keys: &[i16], press: &[i16], mask: u8) -> Vec<KeyEvent> {
-    let others: Vec<i16> = MODIFIERS
-        .into_iter()
-        .filter(|&vk| mask & mask_of(&[vk]) != 0 && !keys.contains(&vk))
+fn alone_events(keys: &[i16], press: &[i16], held: &[i16]) -> Vec<KeyEvent> {
+    let others: Vec<i16> = held
+        .iter()
+        .copied()
+        .filter(|&vk| mask_of(&[vk]) != 0 && mask_of(keys) & mask_of(&[vk]) == 0)
         .collect();
-    let mut mask = mask;
+    let mut held = held.to_vec();
     let mut events = Vec::new();
     for &vk in &others {
-        mask &= !mask_of(&[vk]);
-        events.push((vk, false, mask));
+        held.retain(|&k| k != vk);
+        events.push((vk, false, mask_of(&held)));
     }
-    events.extend(chord_events(press, mask));
+    events.extend(chord_events(press, mask_of(&held)));
     for &vk in &others {
-        mask |= mask_of(&[vk]);
-        events.push((vk, true, mask));
+        held.push(vk);
+        events.push((vk, true, mask_of(&held)));
     }
     events
 }
 
 fn mask_of(keys: &[i16]) -> u8 {
-    let mut m: u8 = 0;
-    if keys.contains(&VK_SHIFT) {
-        m |= MOD_SHIFT;
+    keys.iter().fold(0, |mask, &vk| mask | modifier_mask(vk))
+}
+
+fn modifier_mask(vk: i16) -> u8 {
+    match vk {
+        VK_SHIFT | 0xa0 | 0xa1 => MOD_SHIFT,
+        VK_CONTROL | 0xa2 | 0xa3 => MOD_CTRL,
+        VK_MENU | 0xa4 | 0xa5 => MOD_ALT,
+        VK_LWIN | 0x5c => MOD_META,
+        _ => 0,
     }
-    if keys.contains(&VK_CONTROL) {
-        m |= MOD_CTRL;
-    }
-    if keys.contains(&VK_MENU) {
-        m |= MOD_ALT;
-    }
-    if keys.contains(&VK_LWIN) {
-        m |= MOD_META;
-    }
-    m
 }
 
 /// Which keys and buttons the PC currently believes are down, so they can all
@@ -324,11 +319,56 @@ fn mask_of(keys: &[i16]) -> u8 {
 #[derive(Default)]
 pub struct Held {
     keys: BTreeSet<i16>,
+    physical: BTreeMap<u16, i16>,
     buttons: BTreeSet<u8>,
 }
 
 impl Held {
+    /// Retain each source's destination until release. Two physical keys
+    /// mapped to one remote modifier keep it down until both are released.
+    pub fn physical_key(
+        &mut self,
+        out: &(impl Sink + ?Sized),
+        source: u16,
+        down: bool,
+        target: u16,
+    ) {
+        if down {
+            let target = *self.physical.entry(source).or_insert(target as i16);
+            self.key(out, target, true);
+        } else if let Some(target) = self.physical.remove(&source) {
+            if !self.physical.values().any(|&held| held == target) {
+                self.key(out, target, false);
+            }
+        }
+    }
+
+    pub fn physical_down(&self, source: u16) -> bool {
+        self.physical.contains_key(&source)
+    }
+
+    /// Committed text has its own characters. Temporarily release actual
+    /// sided modifiers so an IME/dead-key commit cannot become a shortcut.
+    /// The reliable input queue preserves releases, text, then restoration.
+    pub fn text(&mut self, out: &(impl Sink + ?Sized), text: &str) {
+        let modifiers: Vec<_> = self
+            .keys
+            .iter()
+            .copied()
+            .filter(|k| mask_of(&[*k]) != 0)
+            .collect();
+        for &vk in &modifiers {
+            self.key(out, vk, false);
+        }
+        out.text(text);
+        for vk in modifiers {
+            self.key(out, vk, true);
+        }
+    }
     pub fn key(&mut self, out: &(impl Sink + ?Sized), vk: i16, down: bool) {
+        if down && matches!(vk, 0x14 | 0x90 | 0x91) && self.keys.contains(&vk) {
+            return;
+        }
         if down {
             self.keys.insert(vk);
         } else {
@@ -349,6 +389,9 @@ impl Held {
     /// Turn modifier changes into key presses. Cmd maps to Ctrl or the
     /// Windows key.
     pub fn modifiers(&mut self, out: &(impl Sink + ?Sized), now: Modifiers, cmd_is_ctrl: bool) {
+        if crate::keyboard::available() {
+            return;
+        }
         for (vk, down) in self.modifier_changes(now, cmd_is_ctrl) {
             self.key(out, vk, down);
         }
@@ -370,18 +413,13 @@ impl Held {
 
     /// The modifier byte Latch wants alongside every key event.
     pub fn mask(&self) -> u8 {
-        [
-            (VK_SHIFT, MOD_SHIFT),
-            (VK_CONTROL, MOD_CTRL),
-            (VK_MENU, MOD_ALT),
-            (VK_LWIN, MOD_META),
-        ]
-        .into_iter()
-        .filter(|(vk, _)| self.keys.contains(vk))
-        .fold(0, |mask, (_, bit)| mask | bit)
+        self.keys
+            .iter()
+            .fold(0, |mask, &vk| mask | modifier_mask(vk))
     }
 
     pub fn release_all(&mut self, out: &(impl Sink + ?Sized)) {
+        self.physical.clear();
         for k in std::mem::take(&mut self.keys) {
             out.key(k, false, 0);
         }
@@ -408,14 +446,20 @@ impl Held {
     }
 
     fn chord_alone_events(&self, keys: &[i16]) -> Vec<KeyEvent> {
-        alone_events(keys, &self.chord_plan(keys), self.mask())
+        alone_events(
+            keys,
+            &self.chord_plan(keys),
+            &self.keys.iter().copied().collect::<Vec<_>>(),
+        )
     }
 
     /// The keys of `keys` a chord would have to press: those not held.
     pub fn chord_plan(&self, keys: &[i16]) -> Vec<i16> {
         keys.iter()
             .copied()
-            .filter(|k| !self.keys.contains(k))
+            .filter(|k| {
+                !self.keys.contains(k) && (mask_of(&[*k]) == 0 || self.mask() & mask_of(&[*k]) == 0)
+            })
             .collect()
     }
 
@@ -435,6 +479,16 @@ impl Held {
 pub struct SharedHeld(std::rc::Rc<std::cell::RefCell<Held>>);
 
 impl SharedHeld {
+    pub fn physical_down(&self, source: u16) -> bool {
+        self.0.borrow().physical_down(source)
+    }
+    pub fn physical_key(&self, out: &(impl Sink + ?Sized), source: u16, down: bool, target: u16) {
+        self.0.borrow_mut().physical_key(out, source, down, target);
+    }
+
+    pub fn text(&self, out: &(impl Sink + ?Sized), text: &str) {
+        self.0.borrow_mut().text(out, text);
+    }
     pub fn key(&self, out: &(impl Sink + ?Sized), vk: i16, down: bool) {
         self.0.borrow_mut().key(out, vk, down);
     }
@@ -481,6 +535,67 @@ impl SharedHeld {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_keys_toggle_once_per_physical_press() {
+        let out = Recorder::default();
+        out.connected.set(true);
+        for vk in [0x14, 0x90, 0x91] {
+            let mut held = Held::default();
+            for down in [true, true, false] {
+                held.physical_key(&out, vk, down, vk);
+            }
+            assert_eq!(out.keys(), [(vk as i16, true), (vk as i16, false)]);
+        }
+    }
+
+    #[test]
+    fn physical_sides_masks_shared_destinations_and_focus_release() {
+        let out = Recorder::default();
+        out.connected.set(true);
+        for case in latch_proto::keyboard::CASES {
+            let mut held = Held::default();
+            held.physical_key(&out, case.vk, true, case.vk);
+            assert_eq!(held.mask(), case.mask);
+            held.release_all(&out);
+            assert!(!held.any_down());
+            assert!(held.physical.is_empty());
+            assert!(out.take().contains(&Sent::Key(case.vk as i16, false, 0)));
+            held.physical_key(&out, case.vk, false, case.vk);
+            assert!(out.take().is_empty());
+        }
+        let mut held = Held::default();
+        held.physical_key(&out, 0x5b, true, 0xa2);
+        held.physical_key(&out, 0xa2, true, 0xa2);
+        held.physical_key(&out, 0x5b, false, 0x5b);
+        assert!(held.is_down(0xa2));
+        held.physical_key(&out, 0xa2, false, 0xa2);
+        assert!(!held.any_down());
+        out.connected.set(false);
+        held.release_all(&out);
+        assert!(!held.any_down());
+    }
+
+    #[test]
+    fn committed_text_is_ordered_between_modifier_release_and_restore() {
+        let out = Recorder::default();
+        out.connected.set(true);
+        let mut held = Held::default();
+        held.physical_key(&out, 0xa5, true, 0xa5);
+        out.take();
+        held.text(&out, "é한글");
+        assert_eq!(
+            out.take(),
+            [
+                Sent::Key(0xa5, false, 0),
+                Sent::Text("é한글".into()),
+                Sent::Key(0xa5, true, MOD_ALT)
+            ]
+        );
+        assert!(held.is_down(0xa5));
+        held.physical_key(&out, 0xa5, false, 0xa5);
+        assert!(!held.any_down());
+    }
 
     #[test]
     fn releasing_sends_key_ups_and_a_host_wide_release() {

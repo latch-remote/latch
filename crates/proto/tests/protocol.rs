@@ -765,6 +765,7 @@ fn test_5_wire_fuzz_random_and_mutations() {
 fn test_6_control_messages_roundtrip_and_errors() {
     let messages = vec![
         Message::Accept(Accept {
+            key_positions: false,
             relay: false,
             color: Default::default(),
             session: 0x12345678,
@@ -1118,6 +1119,7 @@ fn microphone_packets_are_kind_13_and_older_fields_stay_off_the_wire() {
         "{json}"
     );
     let surround = StreamRequest {
+        key_positions: false,
         audio_channels: 6,
         mic: true,
         ..request
@@ -1130,6 +1132,7 @@ fn microphone_packets_are_kind_13_and_older_fields_stay_off_the_wire() {
 fn av1_offer_is_additive_and_unknown_codecs_still_fall_through() {
     use latch_proto::control::StreamRequest;
     let mut request: serde_json::Value = serde_json::to_value(StreamRequest {
+        key_positions: false,
         relay: false,
         prefer_color: false,
         color: Default::default(),

@@ -213,6 +213,7 @@ impl Drop for ClientApp {
 impl ClientApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::early::install(&cc.egui_ctx);
+        crate::keyboard::install(cc);
         let discovery = Arc::new(Mutex::new(Discovery::default()));
         let stop = session::spawn_discovery(discovery.clone(), cc.egui_ctx.clone());
         let mut app =
@@ -2041,16 +2042,14 @@ impl ClientApp {
             ) {
                 self.dirty = true;
             }
-            if cfg!(target_os = "macos") {
-                ui::row_separator(ui);
-                if ui::toggle_row(
-                    ui,
-                    &mut self.cfg.cmd_is_ctrl,
-                    "Command acts as Ctrl",
-                    Some("So Command-C, V and Z copy, paste and undo on Windows and Linux. Off, Command is the Windows key. A Mac always gets Command."),
-                ) {
-                    self.dirty = true;
-                }
+            ui::row_separator(ui);
+            if ui::toggle_row(
+                ui,
+                &mut self.cfg.cmd_is_ctrl,
+                "Map Command ↔ Ctrl",
+                Some("Map Command from a Mac viewer to Ctrl on Windows/Linux, and Ctrl to Command in the reverse direction. Turn off to send physical modifiers as pressed."),
+            ) {
+                self.dirty = true;
             }
         });
         ui::section(ui, "Power", |ui| {

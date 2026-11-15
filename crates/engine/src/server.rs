@@ -526,6 +526,7 @@ impl Server {
         }
         let audio = prepared.audio.take();
         let accept = Accept {
+            key_positions: prepared.req.key_positions,
             relay: relay_enabled,
             color: info.color,
             session: id,

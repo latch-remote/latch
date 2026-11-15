@@ -17,6 +17,17 @@ struct Point {
     x: f64,
     y: f64,
 }
+
+#[repr(C)]
+struct NativeCGEvent {
+    _private: [u8; 0],
+}
+// SAFETY: CoreGraphics names this opaque object __CGEvent in Objective-C
+// method signatures. NSEvent.CGEvent returns a borrowed pointer to it.
+unsafe impl objc2::encode::RefEncode for NativeCGEvent {
+    const ENCODING_REF: objc2::encode::Encoding =
+        objc2::encode::Encoding::Pointer(&objc2::encode::Encoding::Struct("__CGEvent", &[]));
+}
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
@@ -39,19 +50,23 @@ extern "C" {
     fn CGEventSetIntegerValueField(event: Ref, field: u32, value: i64);
     fn CGEventKeyboardSetUnicodeString(event: Ref, length: usize, text: *const u16);
     fn CGEventPost(tap: u32, event: Ref);
+    fn CGEventSourceFlagsState(state: i32) -> u64;
     #[cfg(test)]
     fn CGEventGetType(event: Ref) -> u32;
     #[cfg(test)]
     fn CGEventGetFlags(event: Ref) -> u64;
     #[cfg(test)]
     fn CGEventGetIntegerValueField(event: Ref, field: u32) -> i64;
+    #[cfg(test)]
+    fn CGEventKeyboardGetUnicodeString(event: Ref, max: usize, actual: *mut usize, text: *mut u16);
 }
 pub fn open() -> Result<Box<dyn InputSink>> {
     // SAFETY: this only queries authorization and never shows an authorization prompt.
     ensure!(unsafe { AXIsProcessTrusted() }, "Latch needs Accessibility permission to control this Mac: System Settings → Privacy & Security → Accessibility");
     Ok(Box::new(Sink {
         held: Held::default(),
-        caps_lock: false,
+        // SAFETY: only reads the current session's lock state.
+        caps_lock: unsafe { CGEventSourceFlagsState(0) } & (1 << 16) != 0,
         posting: true,
         clicks: ClickCounter::new(),
         stream_size: None,
@@ -143,6 +158,20 @@ impl Sink {
         if self.caps_lock {
             flags |= 1 << 16;
         }
+        for (vk, bit) in [
+            (0xa0, 2),
+            (0xa1, 4),
+            (0xa2, 1),
+            (0xa3, 0x2000),
+            (0xa4, 0x20),
+            (0xa5, 0x40),
+            (0x5b, 8),
+            (0x5c, 0x10),
+        ] {
+            if self.held.keys.contains(&vk) {
+                flags |= bit;
+            }
+        }
         flags
     }
     fn build(&mut self, event: &Event, display: DisplayRect, current: Point) -> Result<Vec<Owned>> {
@@ -204,7 +233,12 @@ impl Sink {
                     }
                 }
                 Event::Key { vk, down, .. } => {
-                    if let Some(key) = crate::input::keymap::vk_to_mac(*vk) {
+                    if let Some(kind) = media_key(*vk) {
+                        let e = media_event(kind, *down, *down && self.held.keys.contains(vk))?;
+                        if self.held.note(event) {
+                            events.push(e);
+                        }
+                    } else if let Some(key) = crate::input::keymap::vk_to_mac(*vk) {
                         let e = Owned::new(CGEventCreateKeyboardEvent(ptr::null(), key, *down))?;
                         // kCGKeyboardEventAutorepeat: repeated down while already held.
                         CGEventSetIntegerValueField(
@@ -267,8 +301,13 @@ impl Sink {
                     unreachable!("release_all is handled before event construction")
                 }
             }
+            let mut flags = self.flags();
+            if matches!(event, Event::Key { vk, .. } if matches!(*vk, 0x60..=0x6f | 0x90 | latch_proto::keyboard::KEYPAD_ENTER | latch_proto::keyboard::KEYPAD_EQUAL))
+            {
+                flags |= 1 << 21; // kCGEventFlagMaskNumericPad
+            }
             for e in &events {
-                CGEventSetFlags(e.0, self.flags());
+                CGEventSetFlags(e.0, flags);
             }
         }
         Ok(events)
@@ -303,6 +342,40 @@ impl Sink {
             Ok(CGEventGetLocation(event.0))
         }
     }
+}
+
+fn media_key(vk: u16) -> Option<u16> {
+    Some(match vk {
+        0xad => 7,  // NX_KEYTYPE_MUTE
+        0xae => 1,  // SOUND_DOWN
+        0xaf => 0,  // SOUND_UP
+        0xb0 => 17, // NEXT
+        0xb1 => 18, // PREVIOUS
+        0xb3 => 16, // PLAY
+        _ => return None,
+    })
+}
+
+fn media_event(kind: u16, down: bool, repeat: bool) -> Result<Owned> {
+    objc2::rc::autoreleasepool(|_| {
+        // SAFETY: AppKit constructs an autoreleased system-defined event.
+        // Retain its CGEvent before the pool ends. No event is posted.
+        unsafe {
+            let data = ((kind as isize) << 16)
+                | (if down { 0x0a00 } else { 0x0b00 })
+                | isize::from(repeat);
+            let event: *mut objc2::runtime::AnyObject = objc2::msg_send![objc2::class!(NSEvent),
+                otherEventWithType: 14usize,
+                location: objc2_foundation::NSPoint::new(0., 0.),
+                modifierFlags: 0usize, timestamp: 0f64, windowNumber: 0isize,
+                context: ptr::null::<objc2::runtime::AnyObject>(), subtype: 8i16,
+                data1: data, data2: -1isize];
+            ensure!(!event.is_null(), "cannot construct media key");
+            let cg: *const NativeCGEvent = objc2::msg_send![event, CGEvent];
+            ensure!(!cg.is_null(), "media key has no CGEvent");
+            Ok(Owned::retain(cg.cast()))
+        }
+    })
 }
 impl InputSink for Sink {
     fn set_stream_size(&mut self, width: u32, height: u32) {
@@ -559,7 +632,7 @@ mod tests {
         assert_eq!(events.len(), 4);
         // SAFETY: inspection only; these events are never posted.
         unsafe {
-            assert_eq!(CGEventGetFlags(events[0].0), 0x1e0000);
+            assert_eq!(CGEventGetFlags(events[0].0), 0x1e002f);
         }
         sink.held.keys.remove(&0xa0);
         assert_ne!(sink.flags() & (1 << 17), 0);
@@ -569,5 +642,106 @@ mod tests {
             clamp(Point { x: -1e9, y: 1e9 }, display()),
             Point { x: -100., y: 119. }
         );
+    }
+    #[test]
+    fn every_viewer_builds_shared_key_codes_flags_and_releases() -> Result<()> {
+        for viewer in ["windows", "macos", "linux"] {
+            for case in latch_proto::keyboard::CASES {
+                let mut sink = sink();
+                for down in [true, false] {
+                    let records = sink.build(
+                        &Event::Key {
+                            vk: case.vk,
+                            down,
+                            modifiers: case.mask,
+                        },
+                        display(),
+                        Point::default(),
+                    )?;
+                    if media_key(case.vk).is_some() {
+                        assert_eq!(records.len(), 1);
+                        // SAFETY: inspection of an unposted system-defined event.
+                        assert_eq!(unsafe { CGEventGetType(records[0].0) }, 14);
+                    } else if let Some(key) = case.mac {
+                        assert_eq!(records.len(), 1, "{viewer} -> macos, {:#x}", case.vk);
+                        // SAFETY: inspecting locally constructed events only.
+                        unsafe {
+                            assert_eq!(
+                                CGEventGetIntegerValueField(records[0].0, 9),
+                                i64::from(key)
+                            );
+                            let generic = (CGEventGetFlags(records[0].0) >> 17) & 15;
+                            assert_eq!(generic, if down { u64::from(case.mask) } else { 0 });
+                            let keypad = matches!(
+                                case.vk,
+                                0x60..=0x6f
+                                    | 0x90
+                                    | latch_proto::keyboard::KEYPAD_ENTER
+                                    | latch_proto::keyboard::KEYPAD_EQUAL
+                            );
+                            assert_eq!(CGEventGetFlags(records[0].0) & (1 << 21) != 0, keypad);
+                        }
+                    } else {
+                        assert!(records.is_empty());
+                    }
+                }
+                assert!(sink.held.keys.is_empty());
+            }
+        }
+        for text in latch_proto::keyboard::TEXT_CASES {
+            let mut sink = sink();
+            let records = sink.build(&Event::Text((*text).into()), display(), Point::default())?;
+            let mut units = [0; 32];
+            let mut actual = 0;
+            // SAFETY: the output buffer has max elements. Only inspect an unposted event.
+            unsafe {
+                CGEventKeyboardGetUnicodeString(
+                    records[0].0,
+                    units.len(),
+                    &mut actual,
+                    units.as_mut_ptr(),
+                );
+            }
+            assert_eq!(String::from_utf16(&units[..actual]).unwrap(), *text);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn caps_lock_toggles_once_per_press_and_num_lock_is_keypad_clear() -> Result<()> {
+        let mut sink = sink();
+        for (down, caps) in [
+            (true, true),
+            (true, true),
+            (false, true),
+            (true, false),
+            (false, false),
+        ] {
+            sink.build(
+                &Event::Key {
+                    vk: 0x14,
+                    down,
+                    modifiers: 0,
+                },
+                display(),
+                Point::default(),
+            )?;
+            assert_eq!(sink.caps_lock, caps);
+        }
+        let records = sink.build(
+            &Event::Key {
+                vk: 0x90,
+                down: true,
+                modifiers: 0,
+            },
+            display(),
+            Point::default(),
+        )?;
+        // SAFETY: inspect a constructed keypad-clear event.
+        assert_eq!(
+            unsafe { CGEventGetIntegerValueField(records[0].0, 9) },
+            0x47
+        );
+        Ok(())
     }
 }

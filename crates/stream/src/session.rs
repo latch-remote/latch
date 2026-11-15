@@ -1786,6 +1786,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         })
         .collect();
     let request = StreamRequest {
+        key_positions: true,
         relay: inner.configured_relay.lock().is_some(),
         prefer_color: settings.prefer_color,
         color: settings.color,
@@ -1962,7 +1963,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
             udp: send_udp,
             host: media,
             relay: inner.relay.lock().clone(),
-            sender: InputSender::new(accept.session),
+            sender: InputSender::new(accept.session).with_key_positions(accept.key_positions),
             input_progress: None,
             input_failed: false,
             pads: PadSender::new(accept.session),

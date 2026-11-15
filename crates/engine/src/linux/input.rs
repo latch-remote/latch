@@ -125,7 +125,7 @@ impl X11Input {
             for ch in text.chars() {
                 let mut symbols = vec![0; per];
                 // Bind both shift levels to avoid changing text under held Shift.
-                symbols.fill(0x01000000 | u32::from(ch));
+                symbols.fill(unicode_keysym(ch));
                 self.conn
                     .change_keyboard_mapping(1, spare.0, per as u8, &symbols)?
                     .check()?;
@@ -154,6 +154,15 @@ impl X11Input {
         Ok(())
     }
 }
+fn unicode_keysym(ch: char) -> u32 {
+    let code = u32::from(ch);
+    match ch {
+        '\n' | '\r' => 0xff0d,
+        '\t' => 0xff09,
+        _ if code <= 0xff => code,
+        _ => 0x01000000 | code,
+    }
+}
 fn button_code(button: u8) -> anyhow::Result<u8> {
     match button {
         1..=3 => Ok(button),
@@ -168,6 +177,15 @@ fn notches(remainder: &mut i32, delta: i16) -> i32 {
     *remainder %= 120;
     count
 }
+
+fn keycode(first: u8, names: &[xkb::KeyName], vk: u16) -> anyhow::Result<u8> {
+    let name = crate::input::keymap::vk_to_xkb_name(vk).context("unmapped virtual key")?;
+    names
+        .iter()
+        .position(|key| key.name == name)
+        .and_then(|i| first.checked_add(u8::try_from(i).ok()?))
+        .context("physical key absent from XKB keyboard mapping")
+}
 impl InputSink for X11Input {
     fn apply(&mut self, event: &Event, display: DisplayRect) -> anyhow::Result<()> {
         self.refresh()?;
@@ -179,17 +197,15 @@ impl InputSink for X11Input {
                     if !down {
                         return Ok(());
                     }
-                    let name = crate::input::keymap::vk_to_xkb_name(*vk)
-                        .context("unmapped virtual key")?;
-                    self.key_names
-                        .value_list
-                        .key_names
-                        .as_ref()
-                        .context("XKB key names unavailable")?
-                        .iter()
-                        .position(|key| key.name == name)
-                        .map(|i| self.key_names.first_key + i as u8)
-                        .context("physical key absent from XKB keyboard mapping")?
+                    keycode(
+                        self.key_names.first_key,
+                        self.key_names
+                            .value_list
+                            .key_names
+                            .as_ref()
+                            .context("XKB key names unavailable")?,
+                        *vk,
+                    )?
                 };
                 self.fake(
                     if *down {
@@ -302,6 +318,111 @@ impl Drop for X11Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_keys_resolve_against_real_xkb_layouts_without_posting() {
+        use std::ffi::{c_char, c_int, c_void, CStr, CString};
+        #[repr(C)]
+        struct Names {
+            rules: *const c_char,
+            model: *const c_char,
+            layout: *const c_char,
+            variant: *const c_char,
+            options: *const c_char,
+        }
+        #[link(name = "xkbcommon")]
+        unsafe extern "C" {
+            fn xkb_context_new(flags: u32) -> *mut c_void;
+            fn xkb_context_unref(context: *mut c_void);
+            fn xkb_keymap_new_from_names(
+                context: *mut c_void,
+                names: *const Names,
+                flags: u32,
+            ) -> *mut c_void;
+            fn xkb_keymap_unref(keymap: *mut c_void);
+            fn xkb_keymap_key_get_name(keymap: *mut c_void, key: u32) -> *const c_char;
+            fn xkb_keymap_key_by_name(keymap: *mut c_void, name: *const c_char) -> u32;
+            fn xkb_keysym_to_utf32(keysym: u32) -> u32;
+            fn xkb_state_new(keymap: *mut c_void) -> *mut c_void;
+            fn xkb_state_unref(state: *mut c_void);
+            fn xkb_state_update_key(state: *mut c_void, key: u32, direction: u32) -> u32;
+            fn xkb_state_mod_name_is_active(
+                state: *mut c_void,
+                name: *const c_char,
+                components: u32,
+            ) -> c_int;
+        }
+        for layout in [c"us", c"gb", c"de", c"fr", c"kr", c"jp"] {
+            // SAFETY: all names are live C strings and the owned keymap and
+            // context are unreferenced after lookups. No server is opened.
+            unsafe {
+                let context = xkb_context_new(0);
+                assert!(!context.is_null());
+                let keymap = xkb_keymap_new_from_names(
+                    context,
+                    &Names {
+                        rules: c"evdev".as_ptr(),
+                        model: c"pc105".as_ptr(),
+                        layout: layout.as_ptr(),
+                        variant: c"".as_ptr(),
+                        options: c"".as_ptr(),
+                    },
+                    0,
+                );
+                assert!(!keymap.is_null(), "{layout:?}");
+                let names: Vec<_> = (8..=255)
+                    .map(|code| {
+                        let name = xkb_keymap_key_get_name(keymap, code);
+                        let mut bytes = [0; 4];
+                        if !name.is_null() {
+                            let name = CStr::from_ptr(name).to_bytes();
+                            let len = name.len().min(4);
+                            bytes[..len].copy_from_slice(&name[..len]);
+                        }
+                        xkb::KeyName { name: bytes }
+                    })
+                    .collect();
+                for viewer in ["windows", "macos", "linux"] {
+                    for case in latch_proto::keyboard::CASES {
+                        let name = CString::new(case.xkb).unwrap();
+                        let expected = xkb_keymap_key_by_name(keymap, name.as_ptr());
+                        assert_ne!(
+                            expected,
+                            u32::MAX,
+                            "{viewer} -> linux, {layout:?}, {}",
+                            case.xkb
+                        );
+                        assert_eq!(u32::from(keycode(8, &names, case.vk).unwrap()), expected);
+                        let state = xkb_state_new(keymap);
+                        assert!(!state.is_null());
+                        xkb_state_update_key(state, expected, 1);
+                        let active =
+                            |name: &CStr| xkb_state_mod_name_is_active(state, name.as_ptr(), 8) > 0;
+                        assert_eq!(active(c"Shift"), case.mask & 1 != 0);
+                        assert_eq!(active(c"Control"), case.mask & 2 != 0);
+                        assert_eq!(active(c"Mod1") || active(c"Mod5"), case.mask & 4 != 0);
+                        assert_eq!(active(c"Mod4"), case.mask & 8 != 0);
+                        xkb_state_update_key(state, expected, 0);
+                        assert!(
+                            !active(c"Shift")
+                                && !active(c"Control")
+                                && !active(c"Mod1")
+                                && !active(c"Mod4")
+                                && !active(c"Mod5")
+                        );
+                        xkb_state_unref(state);
+                    }
+                }
+                xkb_keymap_unref(keymap);
+                xkb_context_unref(context);
+                for text in latch_proto::keyboard::TEXT_CASES {
+                    for ch in text.chars() {
+                        assert_eq!(xkb_keysym_to_utf32(unicode_keysym(ch)), u32::from(ch));
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn scroll_remainders_and_buttons() {
         let mut r = 0;

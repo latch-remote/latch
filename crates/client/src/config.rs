@@ -339,7 +339,8 @@ pub struct ClientConfig {
     /// asleep, Tailscale is asleep too, and the Mac can only wake the PC
     /// from that PC's own network.
     pub sleep_prompt: bool,
-    /// The Mac's Command key acts as Ctrl on the PC (else as the Windows key).
+    /// Map Command to Ctrl from Mac to W/L, Ctrl to Command from W/L to
+    /// Mac. False preserves physical modifiers. Same-OS input is unchanged.
     pub cmd_is_ctrl: bool,
     /// A click on the picture captures the mouse: the cursor is hidden and
     /// raw movement goes to the PC, which is what games read. Off, the Mac

@@ -59,6 +59,7 @@ fn mouse(dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
 /// through the PC's own layout (French AZERTY turns A into scan 0x10, the
 /// US Q) would move every binding. Sunshine uses the same fixed table.
 fn us_scan(vk: u16) -> Option<u16> {
+    use latch_proto::keyboard::*;
     const LETTERS: [u16; 26] = [
         0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18,
         0x19, 0x10, 0x13, 0x1f, 0x14, 0x16, 0x2f, 0x11, 0x2d, 0x15, 0x2c,
@@ -68,6 +69,22 @@ fn us_scan(vk: u16) -> Option<u16> {
         0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x76,
     ];
     Some(match vk {
+        KEYPAD_ENTER => 0x1c,
+        KEYPAD_EQUAL => 0x59,
+        INTL_RO => 0x73,
+        INTL_YEN => 0x7d,
+        KANA => 0x70,
+        0x15 => 0x72,
+        0x19 => 0x71,
+        CONVERT | 0x1c => 0x79,
+        NON_CONVERT | 0x1d => 0x7b,
+        0xad => 0x20,
+        0xae => 0x2e,
+        0xaf => 0x30,
+        0xb0 => 0x19,
+        0xb1 => 0x10,
+        0xb2 => 0x24,
+        0xb3 => 0x22,
         0x41..=0x5a => LETTERS[usize::from(vk - 0x41)],
         0x31..=0x39 => vk - 0x31 + 0x02,
         0x30 => 0x0b,
@@ -103,6 +120,7 @@ fn us_scan(vk: u16) -> Option<u16> {
         0x5d => 0x5d,               // Menu
         0x6a => 0x37,               // numpad *
         0x6b => 0x4e,               // numpad +
+        0x6c => 0x7e,               // numpad comma (Brazilian ABNT/JIS)
         0x6d => 0x4a,               // numpad -
         0x6e => 0x53,               // numpad .
         0x6f => 0x35,               // numpad /
@@ -124,7 +142,7 @@ fn us_scan(vk: u16) -> Option<u16> {
     })
 }
 fn extended(vk: u16) -> bool {
-    matches!(vk, 0x21..=0x28 | 0x2c..=0x2e | 0x5b..=0x5d | 0x6f | 0x90 | 0xa3 | 0xa5)
+    matches!(vk, 0x21..=0x28 | 0x2c..=0x2e | 0x5b..=0x5d | 0x6f | 0x90 | 0xa3 | 0xa5 | 0xad..=0xb3 | latch_proto::keyboard::KEYPAD_ENTER)
 }
 // Target the middle of a pixel's 1/65536 interval, rather than its left edge.
 fn normalize(n: i32, start: i32, size: i32) -> i32 {
@@ -413,7 +431,45 @@ mod tests {
         ] {
             assert_eq!(us_scan(vk), Some(scan), "vk {vk:#x}");
         }
-        assert_eq!(us_scan(0x15), None, "Hangul keeps the PC's mapping");
+        assert_eq!(us_scan(0x15), Some(0x72));
+    }
+    #[test]
+    fn every_viewer_builds_the_shared_native_keyboard_cases() -> Result<()> {
+        for viewer in ["windows", "macos", "linux"] {
+            for case in latch_proto::keyboard::CASES {
+                for down in [true, false] {
+                    let records = construct(
+                        &Event::Key {
+                            vk: case.vk,
+                            down,
+                            modifiers: case.mask,
+                        },
+                        DisplayRect::default(),
+                    )?;
+                    // SAFETY: construct returns keyboard INPUT records for keys.
+                    let key = unsafe { records[0].Anonymous.ki };
+                    assert_eq!(key.wScan, case.scan, "{viewer} -> windows, {:#x}", case.vk);
+                    assert_eq!(key.wVk.0, 0);
+                    assert!(key.dwFlags.contains(KEYEVENTF_SCANCODE));
+                    assert_eq!(key.dwFlags.contains(KEYEVENTF_EXTENDEDKEY), case.extended);
+                    assert_eq!(key.dwFlags.contains(KEYEVENTF_KEYUP), !down);
+                }
+            }
+        }
+        for text in latch_proto::keyboard::TEXT_CASES {
+            let records = construct(&Event::Text((*text).into()), DisplayRect::default())?;
+            let units: Vec<_> = records
+                .iter()
+                .filter_map(|record| {
+                    // SAFETY: these records all have INPUT_KEYBOARD discriminators.
+                    let key = unsafe { record.Anonymous.ki };
+                    assert!(key.dwFlags.contains(KEYEVENTF_UNICODE));
+                    (!key.dwFlags.contains(KEYEVENTF_KEYUP)).then_some(key.wScan)
+                })
+                .collect();
+            assert_eq!(String::from_utf16(&units).unwrap(), *text);
+        }
+        Ok(())
     }
     #[test]
     fn constructs_without_posting() -> Result<()> {

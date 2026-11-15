@@ -6,9 +6,18 @@ GitHub release notes, so each version gets a heading of the form
 
 ## Unreleased
 
+### Input
+
 - Send viewer mouse and keyboard input directly from OS events on macOS,
   Windows and Linux, preserving input ordering, capture, focus and local
   shortcuts while avoiding the next UI frame for ordinary input.
+- Preserve sided native modifiers and focused Win/Super/Command input
+  between viewers and hosts. Add a Command/Ctrl mapping choice on every
+  viewer, toolbar actions for reserved shortcuts and native focus-loss
+  releases.
+- Preserve ISO, numpad and Japanese/Korean positions with a negotiated
+  key-position extension and 6.0.0 fallbacks. Expand native keyboard maps,
+  macOS media events and shared cross-platform event-construction tests.
 
 ### Packaging
 

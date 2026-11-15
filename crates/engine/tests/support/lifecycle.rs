@@ -194,6 +194,7 @@ fn a_viewer_that_does_not_read_cannot_block_the_control_writer() {
     }
     host.set_nonblocking(false).unwrap();
     let accept = Accept {
+        key_positions: false,
         relay: false,
         color: Default::default(),
         cursor: false,
@@ -675,6 +676,7 @@ fn audio_reports_failure_retries_with_backoff_clears_notice_and_fits_the_mtu() {
     };
     let (host, mut client) = sockets();
     let accept = Accept {
+        key_positions: false,
         relay: false,
         color: Default::default(),
         cursor: false,

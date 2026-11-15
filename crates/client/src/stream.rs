@@ -259,8 +259,7 @@ pub struct View {
     /// let go that the PC never saw pressed, with ⌘ seen and no paste.
     pasted_since_v_up: bool,
     cmd_since_v_up: bool,
-    /// The other machine is a Mac: ⌘ is Command there, whatever the
-    /// "Command acts as Ctrl" setting says for Windows and Linux.
+    /// Whether the host uses Command for its application shortcuts.
     host_mac: bool,
     /// Texture handle and shape serial for rendering host cursor locally.
     cursor_texture: Option<(u32, egui::TextureHandle)>,
@@ -298,6 +297,7 @@ struct PendingPaste {
 
 /// Input held back behind a paste.
 enum Queued {
+    Physical(crate::keyboard::Key),
     /// An event, with where it was going when it arrived.
     Event(Event, At),
     /// The modifiers held at the end of a frame: egui has no events for
@@ -437,6 +437,7 @@ impl View {
             self.held.release_all(out);
         }
         crate::macos::stream_owns_keys(false);
+        crate::keyboard::owns_keys(false);
         ctx.options_mut(|o| o.zoom_with_keyboard = true);
         self.set_captured(ctx, false);
         self.bar_shown = false;
@@ -1426,6 +1427,10 @@ impl View {
             ),
             ("Windows key", &[input::VK_LWIN][..]),
             ("Alt+Tab", &[input::VK_MENU, input::VK_TAB][..]),
+            ("Command+Tab", &[input::VK_LWIN, input::VK_TAB][..]),
+            ("Command+Q", &[input::VK_LWIN, 0x51][..]),
+            ("Command+Space", &[input::VK_LWIN, 0x20][..]),
+            ("Win+L", &[input::VK_LWIN, 0x4c][..]),
             ("Escape", &[input::VK_ESCAPE][..]),
             ("Print Screen", &[input::VK_SNAPSHOT][..]),
         ] {
@@ -1433,17 +1438,21 @@ impl View {
                 self.held.chord(input, keys);
             }
         }
-        if cfg!(target_os = "macos") {
-            ui::menu_separator(ui);
-            if self.host_mac {
-                ui::menu_note(ui, "Command is Command on another Mac.");
-            } else if ui::menu_choice(ui, "Command acts as Ctrl", cfg.cmd_is_ctrl)
-                .on_hover_text("On: Command-C, V and Z copy, paste and undo there. Off: Command is the Windows key. A Mac there always gets Command.")
-                .clicked()
+        ui::menu_separator(ui);
+        for (label, mapped) in [
+            ("Send keys as pressed", false),
+            ("Map Command ↔ Ctrl", true),
+        ] {
+            if ui::menu_choice(ui, label, cfg.cmd_is_ctrl == mapped).clicked()
+                && cfg.cmd_is_ctrl != mapped
             {
                 actions.push(Action::ToggleCmd);
             }
         }
+        ui::menu_note(
+            ui,
+            "Win/Super is Command on a Mac. Ctrl+Alt+Delete cannot open Windows secure attention.",
+        );
     }
 
     fn mouse_menu(
@@ -1716,6 +1725,7 @@ impl View {
             self.held.release_all(out);
             self.set_captured(ctx, false);
             crate::macos::stream_owns_keys(false);
+            crate::keyboard::owns_keys(false);
             return None;
         }
         let (events, modifiers, pointer, focused) = ctx.input(|i| {
@@ -1763,6 +1773,7 @@ impl View {
         // ⌘+, ⌘- and ⌘0: egui would zoom Latch's own window on them while
         // they zoomed the browser on the PC.
         crate::macos::stream_owns_keys(keys_to_pc);
+        crate::keyboard::owns_keys(keys_to_pc);
         if ctx.options(|o| o.zoom_with_keyboard) == keys_to_pc {
             ctx.options_mut(|o| o.zoom_with_keyboard = !keys_to_pc);
         }
@@ -1812,7 +1823,7 @@ impl View {
         // the toolbar opens (games and the Start menu react to one), nor a
         // lone Alt when Control is let go first (Windows opens the menu bar).
         // Before the stream connects it can still free a captured mouse.
-        let ctrl_alt = modifiers.ctrl && modifiers.alt;
+        let ctrl_alt = modifiers.ctrl && modifiers.alt && !crate::keyboard::alt_gr();
         if ctrl_alt || (self.capture_chord_held && (modifiers.ctrl || modifiers.alt)) {
             if ctrl_alt && !self.capture_chord_held && (connected || self.captured) {
                 self.capture_chord_held = true;
@@ -1938,12 +1949,14 @@ impl View {
             keys_to_pc,
             over_stream,
         };
+        let events = crate::keyboard::take()
+            .unwrap_or_else(|| events.into_iter().map(|e| (e, None, false)).collect());
         let physical_text = events.iter().any(
-            |ev| matches!(ev, Event::Key { key, pressed: true, .. } if input::vk(*key).is_some()),
+            |(ev, native, _)| matches!(ev, Event::Key { key, pressed: true, .. } if native.as_ref().map_or_else(|| input::vk(*key).is_some(), |k| crate::keyboard::text_position(k.vk))),
         );
         let commits: Vec<_> = events
             .iter()
-            .filter_map(|ev| match ev {
+            .filter_map(|(ev, _, _)| match ev {
                 Event::Ime(egui::ImeEvent::Commit(t)) => Some(t.clone()),
                 _ => None,
             })
@@ -1952,8 +1965,8 @@ impl View {
         // after it in the same frame are new typing and go to the PC.
         let last_commit = events
             .iter()
-            .rposition(|ev| matches!(ev, Event::Ime(egui::ImeEvent::Commit(_))));
-        for (i, ev) in events.into_iter().enumerate() {
+            .rposition(|(ev, _, _)| matches!(ev, Event::Ime(egui::ImeEvent::Commit(_))));
+        for (i, (ev, native, literal)) in events.into_iter().enumerate() {
             match &ev {
                 Event::Ime(egui::ImeEvent::Enabled | egui::ImeEvent::Preedit(_)) => {
                     self.composing = true
@@ -1967,14 +1980,32 @@ impl View {
                     ..
                 } if (self.composing || last_commit.is_some_and(|c| i < c))
                     && !modifiers.ctrl
-                    && !modifiers.command =>
+                    && !modifiers.command
+                    && native
+                        .as_ref()
+                        .is_none_or(|k| !matches!(k.vk, 0xa0..=0xa5 | 0x5b | 0x5c)) =>
                 {
                     continue
                 }
                 _ => {}
             }
-            if matches!(&ev, Event::Text(t) if self.composing || physical_text || commits.contains(t))
+            if !literal
+                && matches!(&ev, Event::Text(t) if self.composing || physical_text || commits.contains(t))
             {
+                continue;
+            }
+            if let Some(key) = native {
+                if self.early.claim(Ahead::Physical(key.vk, key.down)) {
+                    self.cmd_since_v_up |= key.down && matches!(key.vk, 0x5b | 0x5c | 0xa2 | 0xa3);
+                    if key.vk == input::VK_V as u16 && !key.down {
+                        self.pasted_since_v_up = false;
+                        self.cmd_since_v_up = false;
+                    }
+                    continue;
+                }
+                if keys_to_pc {
+                    self.dispatch(&link, Queued::Physical(key));
+                }
                 continue;
             }
             // Sent already, from the OS event.
@@ -2041,6 +2072,8 @@ impl View {
                     local_focus: !keys_belong_to_pc,
                     mouse,
                     cmd_is_ctrl: self.cmd_is_ctrl(cfg),
+                    host_mac: self.host_mac,
+                    map_shortcuts: cfg.cmd_is_ctrl,
                     motion_scale,
                     video,
                     pointer_region: if free_mouse {
@@ -2114,6 +2147,19 @@ impl View {
         let out = link.out;
         let cmd_is_ctrl = self.cmd_is_ctrl(link.cfg);
         let (ev, at) = match item {
+            Queued::Physical(key) => {
+                self.cmd_since_v_up |= key.down && matches!(key.vk, 0x5b | 0x5c | 0xa2 | 0xa3);
+                if key.vk == input::VK_V as u16 && !key.down {
+                    let pasted = std::mem::take(&mut self.pasted_since_v_up);
+                    let cmd = std::mem::take(&mut self.cmd_since_v_up);
+                    if swallowed_paste(self.held.is_down(input::VK_V), pasted, cmd) {
+                        self.paste(link, String::new());
+                    }
+                }
+                let target = crate::keyboard::mapped(key.vk, self.host_mac, link.cfg.cmd_is_ctrl);
+                self.held.physical_key(out, key.vk, key.down, target);
+                return;
+            }
             Queued::Modifiers(m) => {
                 self.cmd_since_v_up |= m.command;
                 self.held.modifiers(out, m, cmd_is_ctrl);
@@ -2136,7 +2182,7 @@ impl View {
             } if at.keys_to_pc && (pressed || !repeat) => {
                 // The host key never reaches the PC, even when it was
                 // pressed and let go inside one frame.
-                if m.ctrl && m.alt {
+                if m.ctrl && m.alt && !crate::keyboard::alt_gr() {
                     return;
                 }
                 // Each key goes with the modifiers held when it was pressed:
@@ -2178,12 +2224,12 @@ impl View {
             Event::Paste(text) if at.keys_to_pc => self.paste(link, text),
             Event::Text(text) if at.keys_to_pc => {
                 if !text.is_empty() {
-                    out.text(&text);
+                    self.held.text(out, &text);
                 }
             }
             Event::Ime(egui::ImeEvent::Commit(text)) if at.keys_to_pc => {
                 if !text.is_empty() {
-                    out.text(&text);
+                    self.held.text(out, &text);
                 }
             }
             Event::PointerButton {
@@ -2302,7 +2348,9 @@ impl View {
 
     /// What ⌘ stands for in a clipboard shortcut.
     fn clipboard_modifier(&self, cfg: &ClientConfig) -> i16 {
-        if self.host_mac || (cfg!(target_os = "macos") && !cfg.cmd_is_ctrl) {
+        if (cfg!(target_os = "macos") && (self.host_mac || !cfg.cmd_is_ctrl))
+            || (!cfg!(target_os = "macos") && self.host_mac && cfg.cmd_is_ctrl)
+        {
             input::VK_LWIN
         } else {
             input::VK_CONTROL
@@ -2312,7 +2360,12 @@ impl View {
     /// egui swallows Cmd/Ctrl+C/X/V into clipboard events; replay them as
     /// the key chord the PC expects.
     fn clipboard_chord<S: Sink + ?Sized>(&mut self, link: &Link<'_, S>, edit: Edit) {
-        let (keys, alone) = link.live.shortcuts.keys(
+        let shortcuts = if link.cfg.cmd_is_ctrl {
+            link.live.shortcuts
+        } else {
+            crate::clipboard::Shortcuts::Letters
+        };
+        let (keys, alone) = shortcuts.keys(
             edit,
             self.clipboard_modifier(link.cfg),
             link.live.clipboard.pastes_to_selection(),
@@ -2331,6 +2384,8 @@ struct EarlyGate {
     local_focus: bool,
     mouse: bool,
     cmd_is_ctrl: bool,
+    host_mac: bool,
+    map_shortcuts: bool,
     motion_scale: f32,
     video: Rect,
     pointer_region: Rect,
@@ -2348,6 +2403,8 @@ impl EarlyGate {
             local_focus: self.local_focus,
             mouse: self.mouse,
             cmd_is_ctrl: self.cmd_is_ctrl,
+            host_mac: self.host_mac,
+            map_shortcuts: self.map_shortcuts,
             motion_scale: self.motion_scale,
             video: self.video,
             pointer_region: self.pointer_region,
@@ -3720,11 +3777,7 @@ pub(crate) mod tests {
         // The separate menus exist from this width up; at the minimum
         // height they must fit too.
         let short = Vec2::new(OVERFLOW_BELOW, 420.0);
-        let last_key = if cfg!(target_os = "macos") {
-            "Command acts as Ctrl"
-        } else {
-            "Print Screen"
-        };
+        let last_key = "Map Command ↔ Ctrl";
         for (trigger, last) in [
             ("Keys", last_key),
             ("Mouse", "Free, for desktops (follows this cursor)"),
@@ -3817,11 +3870,7 @@ pub(crate) mod tests {
         use crate::app::snapshots::{file_name, save};
         let min = Vec2::new(640.0, 420.0);
         let short = Vec2::new(OVERFLOW_BELOW, 420.0);
-        let last_key = if cfg!(target_os = "macos") {
-            "Command acts as Ctrl"
-        } else {
-            "Print Screen"
-        };
+        let last_key = "Map Command ↔ Ctrl";
         for ppp in [1.0, 2.0] {
             for (name, size, trigger, last) in [
                 ("more-end", min, "More", LAST_POWER_ITEM),
@@ -4310,6 +4359,51 @@ pub(crate) mod tests {
             (Some(false), false)
         );
         assert_eq!(caps_tap(Some(false), Some(true), true), (Some(true), true));
+    }
+
+    #[test]
+    fn native_sided_keys_release_on_focus_loss_and_disconnect() {
+        for os in ["windows", "macos", "linux"] {
+            let (mut h, tap) = recording_on(View::default(), true, os);
+            for vk in [0xa1, 0xa3, 0xa5, 0x5c, latch_proto::keyboard::KEYPAD_ENTER] {
+                crate::keyboard::test_frame(vec![(
+                    key(Key::F35, true, Modifiers::NONE),
+                    Some(crate::keyboard::Key { vk, down: true }),
+                    false,
+                )]);
+                frame(&mut h, vec![], Modifiers::NONE);
+            }
+            assert!(h.state().view.held.any_down());
+            tap.take();
+            frame(&mut h, vec![Event::WindowFocused(false)], Modifiers::NONE);
+            assert!(!h.state().view.held.any_down());
+            assert!(tap.take().contains(&Sent::ReleaseAll), "{os}");
+            tap.connected.set(false);
+            frame(&mut h, vec![], Modifiers::NONE);
+            assert!(!h.state().view.held.any_down());
+        }
+    }
+
+    #[test]
+    fn native_dead_key_text_survives_another_physical_key_in_the_same_frame() {
+        let (mut h, tap) = recording(View::default(), true);
+        crate::keyboard::test_frame(vec![
+            (Event::Text("é".into()), None, true),
+            (
+                key(Key::A, true, Modifiers::NONE),
+                Some(crate::keyboard::Key {
+                    vk: 0x41,
+                    down: true,
+                }),
+                false,
+            ),
+            (Event::Text("a".into()), None, false),
+        ]);
+        frame(&mut h, vec![], Modifiers::NONE);
+        assert_eq!(
+            tap.take(),
+            [Sent::Text("é".into()), Sent::Key(0x41, true, 0)]
+        );
     }
 
     #[test]

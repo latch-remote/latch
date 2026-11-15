@@ -35,6 +35,69 @@ limits for every host/viewer direction.
    (or if the router forwards UDP 9). Settings can offer sleep after a
    session; that is off by default.
 
+## Keyboard between different operating systems
+
+The stream toolbar's **Keys** menu offers **Send keys as pressed** and
+**Map Command ↔ Ctrl**. The mapping option is the default and retains the
+existing `cmd_is_ctrl = true` setting in `client.toml`. A Mac viewer sends
+Command as Ctrl to Windows/Linux. A Windows/Linux viewer sends Ctrl as
+Command to a Mac. Same-platform modifiers keep their identity. Win/Super
+always sends Meta, which is Command on a Mac. Left and right sides are
+preserved, including right Alt/AltGr.
+
+This default keeps familiar copy, paste, undo and application shortcuts
+usable across platforms and preserves existing Mac-viewer preferences.
+Choose **Send keys as pressed** for game bindings or software that needs
+Control and Command independently. A held key keeps its destination until
+released, including when the setting changes.
+
+Keys use physical US scan positions, interpreted by the **host's** layout.
+For example, the Q position on a US or German viewer reaches the A position
+on a French AZERTY host. UK/German/French ISO extra keys, separate numpad
+keys and Japanese/Korean language keys retain their positions when the
+host has an equivalent. The viewer's IME composition and dead-key results
+use separate Unicode text events, so a committed `한글` or `é` arrives once.
+Preedit stays on the viewer. Committed text temporarily releases and then
+restores held sided modifiers in the reliable input sequence. Ordinary
+printable keys and AltGr combinations
+use the host layout. Configure that layout on the host for the intended
+physical-key output.
+
+Caps Lock toggles the host on each viewer change, with repeat presses
+ignored by the viewer. It starts from the host's existing state. Lock states
+are independent when connecting. Num Lock toggles on Windows/X11 and is
+keypad Clear on macOS. macOS maps Korean language positions to its JIS
+Kana/Eisu positions. Semantic Hangul/Hanja conversion depends on the host's
+input source. Viewer IME commits provide composed Korean text directly.
+macOS has Carbon positions through F20. F21–F24 and media Stop have no
+corresponding event in the current injector. Volume, mute, play/pause and
+next/previous use system-defined media events.
+
+New peers negotiate distinct keypad Enter/Equals and additional Japanese
+positions. With a 6.0.0 host, keypad Enter falls back to Return, Equals to
+the main equal key, IntlRo to ISO extra, IntlYen to backslash and language
+positions to their closest VK. Older hosts retain their native key-table limits. A 6.0.0 viewer retains
+its original capture limits. Focus loss, opening a local control, disconnect and stream teardown
+release remote held keys. Focus-loss release is queued directly from the
+native callback, including while a clipboard paste is waiting.
+
+### System shortcuts
+
+| Viewer | Captured while the stream owns focused keyboard input | Viewer-owned combinations and limits |
+| --- | --- | --- |
+| Windows | Sided Win keys, Alt+Tab/F4/Space through a low-level hook, plus ordinary focused keys | Ctrl+Alt+Delete is secure attention. Win+L remains OS-reserved and capture cannot be relied on. Hook installation failures are logged. |
+| macOS | Command, Option, Control, Shift and Command+Q/H through the existing app-menu override | Command+Tab and Command+Space are owned by macOS. |
+| Linux X11 | A focus-scoped keyboard grab keeps sided Super and Alt+Tab in the stream | Another client can prevent the grab. Latch logs a refusal and continues with delivered focused keys. |
+| Linux Wayland | Compositor-delivered focused keys and sided Super | The compositor owns global shortcuts. winit 0.30 exposes no shortcut-inhibit protocol API, so Latch cannot request inhibition in this stack. |
+
+Use **Keys** in the stream toolbar to send Alt+Tab, Command+Tab,
+Command+Q, Command+Space, Win+L, the Windows key or ordinary
+Ctrl+Alt+Delete directly to the host. These actions use host key identities
+and bypass the modifier-mapping setting. The toolbar is available after
+Ctrl+Alt releases the mouse. Windows secure attention cannot be synthesized
+by SendInput or the elevated helper. It requires local trusted input or
+another OS-supported administration mechanism.
+
 ## When the connection drops
 
 If a stream loses its connection, leave the window open. Latch tries again
