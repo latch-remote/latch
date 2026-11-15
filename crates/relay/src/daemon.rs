@@ -924,27 +924,28 @@ mod tests {
         // Time the wake from the write itself. A loaded machine can start the
         // writer late, and that delay says nothing about the readiness wait.
         // An interrupted poll or an expired housekeeping interval can return
-        // before the peer writes, so judge the first return after the write.
+        // with no ready socket, before or after the peer writes. Only a return
+        // with a ready socket ends the test, within the bound from the write.
+        // An omitted socket leaves the next housekeeping interval to end a
+        // wait, far outside that bound.
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut writing = None;
-        let (elapsed, timed_out) = loop {
-            let timeouts = wake.stats().timeouts;
+        loop {
             // A long injected housekeeping interval exposes omission from the
             // poll set. Production calls always use TICK.
             daemon.wait(&wake, Duration::from_secs(1)).unwrap();
             let woke = Instant::now();
-            let timed_out = wake.stats().timeouts != timeouts;
+            assert!(woke < deadline);
             writing = writing.or_else(|| announced.try_recv().ok());
             if let Some(writing) = writing.filter(|writing| woke >= *writing) {
-                break (woke.duration_since(writing), timed_out);
+                let elapsed = woke.duration_since(writing);
+                assert!(elapsed < Duration::from_millis(100), "{elapsed:?}");
+                if wake.last_wait_ready.load(Ordering::Relaxed) {
+                    break;
+                }
             }
-            assert!(Instant::now() < deadline);
-        };
+        }
         let peer = writer.join().unwrap();
-        // An omitted socket leaves only the housekeeping timeout to end the
-        // wait, however late the peer wrote.
-        assert!(!timed_out, "the housekeeping interval ended the wait");
-        assert!(elapsed < Duration::from_millis(100), "{elapsed:?}");
         drop(peer);
         drop(daemon);
         std::fs::remove_file(path).unwrap();
