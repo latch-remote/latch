@@ -208,7 +208,7 @@ impl RelayRoute {
     pub fn connection_info(&self) -> Option<latch_relay::ConnectionInfo> {
         self.state.lock().connection_info.clone()
     }
-    fn retry_after_sign_in(&self) {
+    fn retry_after_network_change(&self) {
         let mut state = self.state.lock();
         state.failures = 0;
         state.retry_at = Instant::now();
@@ -2397,9 +2397,11 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
             }
         }
         let status = inner.relay.lock().network_status();
-        if last_network_status.needs_sign_in && !status.needs_sign_in {
+        if (last_network_status.needs_sign_in && !status.needs_sign_in)
+            || (!last_network_status.proxy_available && status.proxy_available)
+        {
             accepted = Instant::now();
-            inner.relay.lock().retry_after_sign_in();
+            inner.relay.lock().retry_after_network_change();
         }
         if status != last_network_status {
             for message in &status.messages {

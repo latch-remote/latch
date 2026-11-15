@@ -138,6 +138,7 @@ pub fn proxy_selection(diagnosis: &NetworkDiagnosis) -> (Option<ProxyConfig>, bo
 pub struct NetworkStatus {
     pub messages: Vec<String>,
     pub needs_sign_in: bool,
+    pub proxy_available: bool,
     pub portal_url: Option<netenv::PortalUrl>,
 }
 
@@ -149,7 +150,10 @@ pub fn status(
     failure: Option<&Failure>,
     info: Option<&ConnectionInfo>,
 ) -> NetworkStatus {
-    let mut result = NetworkStatus::default();
+    let mut result = NetworkStatus {
+        proxy_available: proxy_selection(diagnosis).0.is_some(),
+        ..Default::default()
+    };
     if let CaptivePortal::Captive { portal_url } = &diagnosis.captive_portal {
         result.needs_sign_in = true;
         result.portal_url = portal_url.clone();

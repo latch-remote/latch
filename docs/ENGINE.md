@@ -935,7 +935,8 @@ Stable notices reach the viewer event stream and examples. The host sends its
 notices through the existing version-1 Notice message. The viewer renders a
 small shared diagnosis surface and opens a `PortalUrl` only after a button click.
 The first-picture watchdog waits while a captive portal is positively known,
-then receives a fresh deadline when the portal opens. Relay attempts continue
+then receives a fresh deadline when the portal opens or a delayed proxy result
+becomes available. Relay attempts continue
 with fresh grants and normal backoff. A successful carrier clears the earlier
 relay error. Unavailable checks and an old relay's missing HTTP probe stay silent.
 

@@ -788,8 +788,8 @@ partial large record, carried by private typed timeout payloads. Hints expire
 after 30 seconds and are shared by clones. DNS, connect, idle, ACK and
 session-lifetime timeouts leave the hint untouched. `reduce_mss_after_stall()`
 records an external path-MTU stall. `ConnectionInfo::reduced_mss_reason` emits
-`MssReason::{ExplicitStall, WriteStall, RecordStall}`. The `TlsHandshakeStall`
-variant remains available for source compatibility.
+`MssReason::{ExplicitStall, TlsHandshakeStall, WriteStall, RecordStall}`.
+`ConnectionInfo::reduced_mss_value` reports the applied MSS.
 Linux applies it before connect and macOS before TLS after connect.
 Windows uses its platform TCP behavior.
 The Linux server enables `net.ipv4.tcp_mtu_probing=2` through the deployment
