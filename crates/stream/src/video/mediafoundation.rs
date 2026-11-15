@@ -887,10 +887,11 @@ impl State {
             };
             let transform = create_transform(subtype)?;
             // MF_LOW_LATENCY and CODECAPI_AVLowLatencyMode share one GUID.
-            // The H.264 decoder exposes it as a UINT32 transform attribute,
-            // not the VT_BOOL encoder property on ICodecAPI. Set it before types.
-            // A transform without attributes answers E_NOTIMPL; low latency
-            // is a hint, so that decoder runs without it.
+            // Set the UINT32 transform attribute before types. The optional
+            // ICodecAPI interface takes VT_BOOL. Read both interfaces back
+            // after setup so diagnostics reflect the decoder actually in use.
+            // A transform without attributes answers E_NOTIMPL and runs with
+            // the bitstream's explicit reordering limits.
             match transform.GetAttributes() {
                 Ok(attributes) => {
                     attributes
