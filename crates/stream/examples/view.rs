@@ -179,6 +179,7 @@ fn main() -> anyhow::Result<()> {
             cursor: false,
             gamepads: pads > 0,
             mic: flag("--mic"),
+            display: None,
         },
         frames.clone(),
         tx,

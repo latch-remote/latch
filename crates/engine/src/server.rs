@@ -346,6 +346,7 @@ impl Server {
             fps: prepared.req.fps,
             bitrate_kbps: prepared.req.bitrate_kbps,
             codec,
+            display: prepared.req.display.clone(),
         };
         let mut opened = open(&config);
         // A codec whose only encoder will not open here gives way to the

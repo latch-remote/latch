@@ -3,9 +3,39 @@
 use latch_core::api::CodecCaps;
 use latch_engine::software::Ceiling;
 use latch_engine::video::{Codec, Limits};
+use latch_proto::control::HostDisplay;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How long a look at the displays stands before the next status looks again.
+const DISPLAYS_FOR: Duration = Duration::from_secs(3);
+
+/// The displays a viewer can choose from. While a viewer `streaming`, the
+/// list from before its session: a Windows session on the virtual display
+/// switches the other monitors off until it ends, and they are still
+/// there to choose.
+pub fn displays(streaming: bool) -> Vec<HostDisplay> {
+    static SEEN: Mutex<Option<(Instant, Vec<HostDisplay>)>> = Mutex::new(None);
+    if let Some((at, list)) = &*SEEN.lock() {
+        if streaming || at.elapsed() < DISPLAYS_FOR {
+            return list.clone();
+        }
+    }
+    match latch_engine::display::list() {
+        Ok(list) => {
+            *SEEN.lock() = Some((Instant::now(), list.clone()));
+            list
+        }
+        Err(error) => {
+            tracing::debug!("could not list the displays: {error:#}");
+            SEEN.lock()
+                .as_ref()
+                .map(|(_, list)| list.clone())
+                .unwrap_or_default()
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 pub fn capture_size() -> Option<[u32; 2]> {

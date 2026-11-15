@@ -247,6 +247,7 @@ pub(super) fn codec_available(codec: Codec) -> bool {
         fps: 60,
         bitrate_kbps: 10_000,
         codec,
+        display: None,
     };
     match probe_keyframe(&config, &gpu) {
         Ok(()) => {
@@ -938,6 +939,7 @@ mod tests {
             fps: 30,
             bitrate_kbps: 4000,
             codec: Codec::H264High,
+            display: None,
         };
         let mut encoder = match Encoder::software(&config) {
             Ok(e) => e,
@@ -996,6 +998,7 @@ mod hardware_tests {
                 fps: 60,
                 bitrate_kbps: 50_000,
                 codec,
+                display: None,
             };
             for (activation, name) in hardware(codec)? {
                 // SAFETY: the test owns a COM/MF runtime on this thread.

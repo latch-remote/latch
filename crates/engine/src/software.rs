@@ -459,6 +459,7 @@ pub fn measure_fps(width: u32, height: u32, budget: Duration) -> u32 {
         fps,
         bitrate_kbps: 20_000,
         codec: Codec::H264Baseline,
+        display: None,
     };
     let Ok(mut pipeline) = SoftwarePipeline::new(pattern, &config) else {
         return 0;
@@ -900,6 +901,7 @@ mod tests {
                 fps: 100,
                 bitrate_kbps: 1000,
                 codec: Codec::H264Baseline,
+                display: None,
             },
         )
         .unwrap()

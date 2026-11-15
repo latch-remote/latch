@@ -7,6 +7,7 @@ use crate::path::{self, Path};
 use anyhow::{anyhow, bail, Context, Result};
 use latch_core::api::{Ack, CodecCaps, NatReport, PowerAction, PowerRequest, Status};
 use latch_core::{http, tailscale, wake, CONTROL_PORT};
+use latch_proto::control::HostDisplay;
 use latch_stream::session::Server;
 use latch_stream::{Event, FrameSlot, Input, Session, Settings};
 use parking_lot::Mutex;
@@ -656,6 +657,8 @@ pub struct Live {
     pub shortcuts: clipboard::Shortcuts,
     /// This machine's gamepads, into the stream.
     pub pads: crate::gamepads::Link,
+    /// The display this stream asked the host for; `None` left it to the host.
+    pub display: Option<String>,
 }
 
 impl Drop for Live {
@@ -729,6 +732,19 @@ impl HostLimits {
         }
     }
 
+    /// [`of`](Self::of) for a stream of the display `chosen` (its id, as
+    /// the host listed it): a host whose capture size is fixed captures
+    /// that display at its own size, not the whole desktop's.
+    pub fn of_display(streamer: &latch_core::api::Streamer, chosen: Option<&str>) -> Self {
+        let mut limits = Self::of(streamer);
+        if limits.capture_size.is_some() {
+            if let Some(d) = HostDisplay::find(&streamer.displays, chosen) {
+                limits.capture_size = Some([d.width, d.height]);
+            }
+        }
+        limits
+    }
+
     /// The limits of the codec the PC will pick from `offer`: the first
     /// it encodes, as its server picks.
     fn codec(&self, offer: &[latch_stream::Codec]) -> Option<&CodecCaps> {
@@ -737,6 +753,36 @@ impl HostLimits {
             self.codecs.iter().find(|caps| name == caps.codec.as_str())
         })
     }
+}
+
+/// The display to ask a host for: the one `saved` names while the host
+/// still lists it. `None` (an older host, no choice, or a display that
+/// has gone) leaves it to the host.
+pub fn chosen_display(displays: &[HostDisplay], saved: Option<&str>) -> Option<String> {
+    HostDisplay::find(displays, saved).map(|d| d.id.clone())
+}
+
+/// What a viewer can choose between on a host with `displays`, as
+/// (choice, label): leaving it to the host first, then each display.
+/// Empty when there is nothing to choose: one display, or an older host
+/// that lists none.
+pub fn display_choices(displays: &[HostDisplay]) -> Vec<(Option<String>, String)> {
+    if displays.len() < 2 {
+        return Vec::new();
+    }
+    let automatic = match displays.iter().find(|d| d.default) {
+        Some(d) => format!("Automatic ({})", d.name),
+        None => "All displays".to_string(),
+    };
+    std::iter::once((None, automatic))
+        .chain(displays.iter().map(|d| {
+            let mut label = format!("{} · {} × {}", d.name, d.width, d.height);
+            if d.primary {
+                label.push_str(" · main");
+            }
+            (Some(d.id.clone()), label)
+        }))
+        .collect()
 }
 
 /// What a stream asks a PC for.
@@ -856,6 +902,8 @@ pub fn request_for_hz(
 pub struct Connect {
     pub target: Target,
     pub settings: StreamSettings,
+    /// The display chosen for this PC, if any (see [`chosen_display`]).
+    pub display: Option<String>,
     pub native: (u32, u32),
     pub display_hz: Option<u32>,
     pub progress: Arc<Mutex<Progress>>,
@@ -1065,7 +1113,9 @@ fn run(c: &Connect, generation: u64) -> Result<()> {
     let hz = c.display_hz.unwrap_or(60);
     let mut settings = path::effective_for(&c.settings, c.native, hz);
     let wanted = settings.resolution.pixels(c.native);
-    let planned = plan(&c.settings, c.native, hz, &HostLimits::of(&host.streamer));
+    let display = chosen_display(&host.streamer.displays, c.display.as_deref());
+    let limits = HostLimits::of_display(&host.streamer, display.as_deref());
+    let planned = plan(&c.settings, c.native, hz, &limits);
     let (w, h, fps) = (planned.width, planned.height, planned.fps);
     settings.fps = fps;
     settings.bitrate_kbps = planned.bitrate_kbps;
@@ -1112,6 +1162,7 @@ fn run(c: &Connect, generation: u64) -> Result<()> {
             cursor: true,
             gamepads: test.is_none(),
             mic: settings.mic && test.is_none(),
+            display: display.clone(),
         },
         frames.clone(),
         tx,
@@ -1144,12 +1195,13 @@ fn run(c: &Connect, generation: u64) -> Result<()> {
         started: Instant::now(),
         codec: "",
         requested: (w, h, fps),
-        desktop: fixed_desktop(host.streamer.capture_size).filter(|&d| d != (w, h)),
+        desktop: fixed_desktop(limits.capture_size).filter(|&d| d != (w, h)),
         settings,
         path,
         clipboard: clipboard::Sync::spawn(t.ip, c.ctx.clone()),
         shortcuts: clipboard::Shortcuts::for_os(if host.os.is_empty() { &t.os } else { &host.os }),
         pads,
+        display,
     });
     prog_guard.step = Step::Connecting;
     prog_guard.detail = "Connecting…".into();
@@ -1221,6 +1273,82 @@ pub fn wake_only(pc: &Pc) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn screens() -> Vec<HostDisplay> {
+        let d = |id: &str, name: &str, width, height, primary, default| HostDisplay {
+            id: id.into(),
+            name: name.into(),
+            width,
+            height,
+            primary,
+            default,
+            ..Default::default()
+        };
+        vec![
+            d("1", "Built-in display", 3024, 1964, true, true),
+            d("2", "External display", 2560, 1440, false, false),
+        ]
+    }
+
+    #[test]
+    fn a_saved_display_is_asked_for_only_while_the_host_lists_it() {
+        let listed = screens();
+        assert_eq!(chosen_display(&listed, Some("2")).as_deref(), Some("2"));
+        assert_eq!(chosen_display(&listed, Some("9")), None, "it has gone");
+        assert_eq!(chosen_display(&listed, None), None);
+        assert_eq!(chosen_display(&[], Some("2")), None, "an older host");
+    }
+
+    #[test]
+    fn the_choices_lead_with_the_hosts_own_and_need_two_displays() {
+        let listed = screens();
+        assert_eq!(
+            display_choices(&listed),
+            [
+                (None, "Automatic (Built-in display)".to_string()),
+                (
+                    Some("1".to_string()),
+                    "Built-in display · 3024 × 1964 · main".to_string()
+                ),
+                (
+                    Some("2".to_string()),
+                    "External display · 2560 × 1440".to_string()
+                ),
+            ]
+        );
+        assert!(display_choices(&listed[..1]).is_empty());
+        assert!(display_choices(&[]).is_empty());
+        // A Linux host has no default: no choice is the whole screen.
+        let mut linux = listed;
+        linux.iter_mut().for_each(|d| d.default = false);
+        assert_eq!(display_choices(&linux)[0].1, "All displays");
+    }
+
+    #[test]
+    fn a_fixed_desktop_is_the_chosen_displays_size() {
+        let streamer = latch_core::api::Streamer {
+            capture_size: Some([5584, 1964]),
+            displays: screens(),
+            ..Default::default()
+        };
+        assert_eq!(
+            HostLimits::of_display(&streamer, Some("2")).capture_size,
+            Some([2560, 1440])
+        );
+        assert_eq!(
+            HostLimits::of_display(&streamer, None).capture_size,
+            Some([5584, 1964])
+        );
+        // A host that sizes its desktop to the viewer stays unlimited.
+        let follows = latch_core::api::Streamer {
+            capture_size: None,
+            ..streamer
+        };
+        assert_eq!(
+            HostLimits::of_display(&follows, Some("2")).capture_size,
+            None
+        );
+    }
 
     #[test]
     fn old_hosts_get_a_push_or_specific_update_instructions() {
@@ -1514,6 +1642,7 @@ mod tests {
             progress: Arc::default(),
             live: Arc::default(),
             ctx: egui::Context::default(),
+            display: None,
         };
         let generation = 1;
         c.progress.lock().generation = generation;
@@ -1683,6 +1812,7 @@ mod tests {
                 progress: Arc::default(),
                 live: Arc::default(),
                 ctx: egui::Context::default(),
+                display: None,
             };
             let generation = NEXT_CONNECT.fetch_add(1, Ordering::Relaxed);
             c.progress.lock().generation = generation;

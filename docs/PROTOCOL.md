@@ -56,6 +56,7 @@ Content-Length: <n>
 | `mic` | bool | optional, default false; the viewer offers its microphone (datagram kind 13) |
 | `probe_trains` | bool | optional, default false; the viewer times probe trains (datagram kind 16) and reports their rate |
 | `relay` | bool | optional, default false; the viewer supports the two-lane authenticated relay extension |
+| `display` | string | optional; the host display to share, by an `id` from its status `streamer.displays` (see [Choosing a display](#choosing-a-display-additive)); absent leaves the choice to the host |
 
 A request is taken within 64 to 16384 pixels a side, 1 to 500 fps and
 500 kbps to 1 Gbps (`latch_proto::control::MAX_*`). The host then meets
@@ -464,6 +465,33 @@ version. A host that cannot speak the requested version answers 426 with
 an `Ack` naming the versions it speaks. `/v1/status` reports
 `streamer.protocol` (1 here; absent from Latch 4 hosts, which speak only
 GameStream).
+
+## Choosing a display (additive)
+
+`/v1/status` → `streamer.displays` lists the displays a stream can
+share. It is absent from older hosts, which share the display they pick,
+and a viewer then offers no choice.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | string | what `StreamRequest.display` names it by; opaque to the viewer: a CGDirectDisplayID on a Mac, the GDI name (`\\.\DISPLAY2`) on Windows, the RandR monitor name (`DP-1`) on Linux |
+| `name` | string | for people: `"Built-in display"`, a monitor's own name, `"Virtual display"` |
+| `x`, `y` | i32 | where it sits on the host's desktop |
+| `width`, `height` | u32 | its size in pixels |
+| `primary` | bool | the system's main display |
+| `default` | bool | optional, default false; what a request naming no display shares. None is on a Linux host, which then shares its whole X screen |
+
+A request naming a display the host does not have now (unplugged, or
+renumbered after a restart) is served as if it named none; it is never
+refused for that. A Windows host that would otherwise size its virtual
+display to the viewer and turn the other monitors off for the session
+does neither when another output is chosen; while a session runs its
+status keeps listing the displays it had before. A Linux host shares one
+RandR 1.5 monitor's rectangle of the X screen and does not resize it when
+several are connected; its `capture_size` stays the whole screen's, and a
+viewer that chose a monitor plans for that monitor's size instead.
+Switching displays mid-stream is a new session; there is no control
+message for it.
 
 ## Encoder limits (5.2, additive)
 

@@ -234,22 +234,112 @@ pub(super) fn sdr_white_level(name: &[u16; 32]) -> f32 {
 fn selection_rank(virtual_display: bool, primary: bool) -> (bool, bool) {
     (!virtual_display, !primary)
 }
+fn primary(output: &Output) -> bool {
+    output.desc.DesktopCoordinates.left == 0 && output.desc.DesktopCoordinates.top == 0
+}
+/// Which of `outputs` a session shares: the one named `wanted` while it is
+/// attached, else the virtual display, else the primary one.
+fn pick(outputs: &[(String, bool, bool)], wanted: Option<&str>) -> Option<usize> {
+    wanted
+        .and_then(|w| outputs.iter().position(|(name, _, _)| name == w))
+        .or_else(|| {
+            outputs
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, v, p))| selection_rank(*v, *p))
+                .map(|(i, _)| i)
+        })
+}
+fn keys(outputs: &[Output]) -> Vec<(String, bool, bool)> {
+    outputs
+        .iter()
+        .map(|o| (text(&o.desc.DeviceName), o.virtual_display, primary(o)))
+        .collect()
+}
 pub(super) fn select() -> Result<Output> {
+    select_named(None)
+}
+/// The output named `wanted` (its GDI name, `\\.\DISPLAY2`), or the one
+/// [`select`] takes when that is `None` or not attached now.
+pub(super) fn select_named(wanted: Option<&str>) -> Result<Output> {
     let mut outputs = outputs()?;
-    let index = outputs
+    let Some(index) = pick(&keys(&outputs), wanted) else {
+        bail!("no DXGI output attached to the desktop");
+    };
+    Ok(outputs.swap_remove(index))
+}
+/// The monitor names Windows shows in Settings, by GDI source name.
+fn friendly_names() -> Vec<([u16; 32], String)> {
+    let Ok((paths, _)) = topology() else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for path in paths {
+        let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                adapterId: path.sourceInfo.adapterId,
+                id: path.sourceInfo.id,
+            },
+            ..Default::default()
+        };
+        let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
+                adapterId: path.targetInfo.adapterId,
+                id: path.targetInfo.id,
+            },
+            ..Default::default()
+        };
+        // SAFETY: Both device-info packets have the SDK size and matching IDs.
+        unsafe {
+            if DisplayConfigGetDeviceInfo(&mut source.header) == 0
+                && DisplayConfigGetDeviceInfo(&mut target.header) == 0
+            {
+                let name = text(&target.monitorFriendlyDeviceName);
+                if !name.is_empty() {
+                    names.push((source.viewGdiDeviceName, name));
+                }
+            }
+        }
+    }
+    names
+}
+/// Every output attached to the desktop, for a viewer to choose from. The
+/// one [`select`] takes is the default.
+pub(super) fn list() -> Result<Vec<latch_proto::control::HostDisplay>> {
+    let outputs = outputs()?;
+    let default = pick(&keys(&outputs), None);
+    let friendly = friendly_names();
+    Ok(outputs
         .iter()
         .enumerate()
-        .min_by_key(|(_, o)| {
-            selection_rank(
-                o.virtual_display,
-                o.desc.DesktopCoordinates.left == 0 && o.desc.DesktopCoordinates.top == 0,
-            )
+        .map(|(i, o)| {
+            let id = text(&o.desc.DeviceName);
+            let r = o.desc.DesktopCoordinates;
+            let name = if o.virtual_display {
+                "Virtual display".to_string()
+            } else {
+                friendly
+                    .iter()
+                    .find(|(gdi, _)| *gdi == o.desc.DeviceName)
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_else(|| id.trim_start_matches(r"\\.\").to_string())
+            };
+            latch_proto::control::HostDisplay {
+                id,
+                name,
+                x: r.left,
+                y: r.top,
+                width: (r.right - r.left).max(0) as u32,
+                height: (r.bottom - r.top).max(0) as u32,
+                primary: primary(o),
+                default: Some(i) == default,
+            }
         })
-        .map_or(0, |(i, _)| i);
-    if outputs.is_empty() {
-        bail!("no DXGI output attached to the desktop");
-    }
-    Ok(outputs.swap_remove(index))
+        .collect())
 }
 
 fn current(output: &Output) -> Result<DEVMODEW> {
@@ -294,8 +384,15 @@ fn refresh_rank(hz: u32, requested: u32) -> (bool, u32) {
         if hz >= requested { hz } else { u32::MAX - hz },
     )
 }
-pub(super) fn prepare(width: u32, height: u32, fps: u32) -> Result<Option<Previous>> {
-    let output = select()?;
+pub(super) fn prepare(
+    width: u32,
+    height: u32,
+    fps: u32,
+    display: Option<&str>,
+) -> Result<Option<Previous>> {
+    // A viewer that chose a real monitor shares it as it is: the virtual
+    // display keeps its size and every monitor stays on.
+    let output = select_named(display)?;
     if !output.virtual_display {
         return Ok(None);
     }
@@ -447,6 +544,23 @@ mod tests {
             );
         }
         Ok(())
+    }
+    #[test]
+    fn a_chosen_output_wins_while_it_is_attached() {
+        let outputs = [
+            (r"\\.\DISPLAY1".to_string(), false, true),
+            (r"\\.\DISPLAY2".to_string(), true, false),
+            (r"\\.\DISPLAY3".to_string(), false, false),
+        ];
+        assert_eq!(super::pick(&outputs, None), Some(1), "virtual by default");
+        assert_eq!(super::pick(&outputs, Some(r"\\.\DISPLAY3")), Some(2));
+        assert_eq!(super::pick(&outputs, Some(r"\\.\DISPLAY1")), Some(0));
+        assert_eq!(
+            super::pick(&outputs, Some(r"\\.\DISPLAY9")),
+            Some(1),
+            "a display that has gone falls back to the default"
+        );
+        assert_eq!(super::pick(&[], Some("x")), None);
     }
     #[test]
     fn virtual_output_wins_over_primary() {

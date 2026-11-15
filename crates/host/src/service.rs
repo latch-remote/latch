@@ -184,6 +184,7 @@ impl Service {
             socket_send_bytes: status.socket_send_bytes,
             socket_receive_bytes: status.socket_receive_bytes,
             capture_size: streamer::capture_size(),
+            displays: streamer::displays(status.viewer.is_some()),
             viewer: status.viewer.is_some(),
             protocol: latch_proto::PROTOCOL,
         }

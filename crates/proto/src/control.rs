@@ -140,6 +140,44 @@ pub struct StreamRequest {
     /// their rate in `Report.probe_kbps`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub probe_trains: bool,
+    /// Which of the host's displays to share: the [`HostDisplay::id`] its
+    /// status listed. Absent, or naming a display that has gone, the host
+    /// shares the one it would anyway; an older host ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+}
+
+/// One display a host can share, as its status lists it
+/// (`streamer.displays`, `docs/PROTOCOL.md`, "Choosing a display").
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HostDisplay {
+    /// What a [`StreamRequest::display`] names it by. Opaque to a viewer:
+    /// a CGDirectDisplayID on a Mac, the GDI name (`\\.\DISPLAY2`) on
+    /// Windows, the RandR monitor name (`DP-1`) on Linux.
+    pub id: String,
+    /// For people: "Built-in display", "DELL U2720Q", "HDMI-1".
+    pub name: String,
+    /// Where it sits on the host's desktop, and its size, in the pixels
+    /// that host captures it in.
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    /// The system's main display.
+    pub primary: bool,
+    /// What a request naming no display shares. None is on a Linux host,
+    /// which then shares every monitor of its X screen together.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
+}
+
+impl HostDisplay {
+    /// The display in `displays` that `id` names, if it is still there.
+    pub fn find<'a>(displays: &'a [HostDisplay], id: Option<&str>) -> Option<&'a HostDisplay> {
+        let id = id?;
+        displays.iter().find(|d| d.id == id)
+    }
 }
 
 fn is_zero(n: &u32) -> bool {

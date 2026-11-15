@@ -118,6 +118,7 @@ impl Running {
                 cursor: true,
                 gamepads: true,
                 mic: false,
+                display: None,
             },
             frames.clone(),
             tx,

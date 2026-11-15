@@ -314,7 +314,7 @@ enum Pipeline {
 }
 impl Pipeline {
     fn new(config: &VideoConfig, mf: bool) -> Result<Self> {
-        let capture = Capture::new_color(config.color)?;
+        let capture = Capture::new_color(config.color, config.display.as_deref())?;
         let mut config = config.clone();
         if config.color.is_hdr() && !capture.hdr_output {
             config.color = latch_proto::color::ColorDescription {
@@ -683,8 +683,12 @@ pub fn prepare_display(
     width: u32,
     height: u32,
     fps: u32,
+    wanted: Option<&str>,
 ) -> Result<Option<crate::display::Previous>> {
-    display::prepare(width, height, fps)
+    display::prepare(width, height, fps, wanted)
+}
+pub fn displays() -> Result<Vec<latch_proto::control::HostDisplay>> {
+    display::list()
 }
 pub fn restore_display(previous: &crate::display::Previous) -> Result<()> {
     display::restore(previous)
@@ -745,6 +749,7 @@ mod tests {
             fps: 1000,
             bitrate_kbps: 50_000,
             codec: Codec::Hevc,
+            display: None,
         };
         let mut pipeline = Pipeline::new(&config, true)?;
         for i in 0..96 {
@@ -798,6 +803,7 @@ mod tests {
             fps: 30,
             bitrate_kbps: 4000,
             codec: Codec::H264Baseline,
+            display: None,
         };
         let mut encoder = match MfEncoder::software(&config) {
             Ok(e) => e,

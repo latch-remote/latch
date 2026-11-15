@@ -34,7 +34,8 @@ pub fn prepare(cfg: &HostConfig, req: &StreamRequest) -> Result<Undo> {
     if !cfg!(windows) && !crate::streamer::display_follows_viewer() {
         return Ok(None);
     }
-    let previous = latch_engine::display::prepare(size[0], size[1], size[2])?;
+    let previous =
+        latch_engine::display::prepare(size[0], size[1], size[2], req.display.as_deref())?;
     Ok(previous.map(|previous| {
         Box::new(move || {
             if let Err(e) = latch_engine::display::restore(&previous) {

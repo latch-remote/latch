@@ -22,9 +22,84 @@ const GEOMETRY_CHECK: Duration = Duration::from_millis(250);
 /// than one frame's encode time keeps its rate; more would only queue.
 const IN_FLIGHT: usize = 2;
 /// `LATCH_MAC_DISPLAY=<CGDirectDisplayID>` shares that display instead of
-/// the main one; the stream request does not name a display yet.
-fn wanted_display() -> Option<u32> {
+/// the main one when the viewer names none.
+fn owner_display() -> Option<u32> {
     std::env::var("LATCH_MAC_DISPLAY").ok()?.trim().parse().ok()
+}
+
+/// The display a session shares: the viewer's choice, else the owner's,
+/// else (in capture) the main one. A choice that is not a display ID, or
+/// names one that has gone, falls through.
+fn wanted_display(chosen: Option<&str>, owner: Option<u32>) -> Option<u32> {
+    chosen.and_then(|id| id.trim().parse().ok()).or(owner)
+}
+
+/// Every active display, named by its CGDirectDisplayID. The default is
+/// the owner's `LATCH_MAC_DISPLAY` while it is active, else the main one.
+pub fn displays() -> Vec<crate::display::HostDisplay> {
+    let mut ids = [0u32; 32];
+    let mut count = 0u32;
+    // SAFETY: the buffer holds `ids.len()` IDs and `count` is a valid out pointer.
+    let status =
+        unsafe { ffi::CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+    if status != 0 {
+        return Vec::new();
+    }
+    let ids = &ids[..(count as usize).min(ids.len())];
+    // SAFETY: reads the window server's display configuration only.
+    let main = unsafe { ffi::CGMainDisplayID() };
+    let default = owner_display()
+        .filter(|id| ids.contains(id))
+        .unwrap_or(main);
+    let mut external = 0;
+    let externals = ids
+        .iter()
+        // SAFETY: as above.
+        .filter(|&&id| unsafe { ffi::CGDisplayIsBuiltin(id) } == 0)
+        .count();
+    ids.iter()
+        .map(|&id| {
+            // SAFETY: CGDisplayBounds and the copied mode only read the
+            // display configuration; the mode is released after use.
+            let (bounds, pixels, builtin) = unsafe {
+                let bounds = ffi::CGDisplayBounds(id);
+                let mode = ffi::CGDisplayCopyDisplayMode(id);
+                let pixels = if mode.is_null() {
+                    None
+                } else {
+                    let size = (
+                        ffi::CGDisplayModeGetPixelWidth(mode) as u32,
+                        ffi::CGDisplayModeGetPixelHeight(mode) as u32,
+                    );
+                    ffi::CGDisplayModeRelease(mode);
+                    Some(size)
+                };
+                (bounds, pixels, ffi::CGDisplayIsBuiltin(id) != 0)
+            };
+            let (width, height) =
+                pixels.unwrap_or((bounds.size.width as u32, bounds.size.height as u32));
+            let name = if builtin {
+                "Built-in display".to_string()
+            } else {
+                external += 1;
+                if externals > 1 {
+                    format!("External display {external}")
+                } else {
+                    "External display".to_string()
+                }
+            };
+            crate::display::HostDisplay {
+                id: id.to_string(),
+                name,
+                x: bounds.origin.x as i32,
+                y: bounds.origin.y as i32,
+                width,
+                height,
+                primary: id == main,
+                default: id == default,
+            }
+        })
+        .collect()
 }
 
 pub fn open_video(config: &VideoConfig) -> Result<Box<dyn VideoPipeline>> {
@@ -54,7 +129,7 @@ fn open_video_color(config: &VideoConfig) -> Result<Box<dyn VideoPipeline>> {
         width: config.width,
         height: config.height,
         fps: config.fps,
-        display: wanted_display(),
+        display: wanted_display(config.display.as_deref(), owner_display()),
         pixel_format: depth.pixel_format(),
         hdr: config.color.is_hdr(),
     };
@@ -135,6 +210,7 @@ pub fn encodable() -> Vec<Codec> {
                     fps: 60,
                     bitrate_kbps: 10_000,
                     codec: *codec,
+                    display: None,
                 },
                 Depth::Eight,
             )
@@ -364,5 +440,35 @@ impl AudioCapture for Audio {
     }
     fn describe(&self) -> String {
         "ScreenCaptureKit system audio · 48 kHz stereo".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wanted_display;
+
+    #[test]
+    fn the_viewers_choice_comes_before_the_owners_override() {
+        assert_eq!(wanted_display(Some("69733382"), Some(1)), Some(69733382));
+        assert_eq!(wanted_display(None, Some(1)), Some(1));
+        assert_eq!(wanted_display(None, None), None, "the main display");
+        // Not a display ID (another platform's name): the owner's, or main.
+        assert_eq!(wanted_display(Some(r"\\.\DISPLAY2"), Some(1)), Some(1));
+        assert_eq!(wanted_display(Some(""), None), None);
+    }
+
+    #[test]
+    fn the_main_display_is_listed_as_primary() {
+        let displays = super::displays();
+        eprintln!("{displays:#?}");
+        // SAFETY: reads the window server's configuration only.
+        let main = unsafe { super::ffi::CGMainDisplayID() };
+        if displays.is_empty() {
+            return;
+        }
+        let primary: Vec<_> = displays.iter().filter(|d| d.primary).collect();
+        assert_eq!(primary.len(), 1);
+        assert_eq!(primary[0].id, main.to_string());
+        assert!(displays.iter().all(|d| d.width > 0 && d.height > 0));
     }
 }

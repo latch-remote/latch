@@ -105,6 +105,7 @@ fn connect_with(
             cursor,
             gamepads,
             mic: false,
+            display: None,
         },
         frames.clone(),
         tx,

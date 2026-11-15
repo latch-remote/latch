@@ -79,6 +79,7 @@ fn main() -> anyhow::Result<()> {
         fps,
         bitrate_kbps: kbps,
         codec: Codec::H264Baseline,
+        display: None,
     };
     let motion = match motion.as_str() {
         "still" => Some(Motion::Still),

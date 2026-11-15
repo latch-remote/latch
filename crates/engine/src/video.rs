@@ -15,6 +15,9 @@ pub struct VideoConfig {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub codec: Codec,
+    /// The display to capture, as [`crate::display::list`] names it; the
+    /// platform's usual one when `None` or no longer there.
+    pub display: Option<String>,
 }
 
 /// One encoded frame: an Annex B access unit (SPS/PPS, or VPS/SPS/PPS for

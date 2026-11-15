@@ -72,7 +72,11 @@ fn machine_noun(os: &str) -> &'static str {
 /// Whether the machine's menu has anything in it: power actions its owner
 /// allows, or an update for an old host.
 fn has_power_items(env: &Env<'_>) -> bool {
-    env.power_allowed || env.old_host.is_some()
+    env.power_allowed || env.old_host.is_some() || !display_choices(env).is_empty()
+}
+
+fn display_choices(env: &Env<'_>) -> Vec<(Option<String>, String)> {
+    crate::session::display_choices(&env.displays)
 }
 
 /// What a power action costs, said before it is sent to `pc`.
@@ -103,6 +107,8 @@ pub enum Action {
     ApplySettings(StreamSettings),
     /// Whether a click on the picture captures the mouse.
     MouseCapture(bool),
+    /// Share this display of the machine's (`None`: the one it picks).
+    ChooseDisplay(Option<String>),
 }
 
 /// An unexpected connection drop reconnection state machine.
@@ -200,6 +206,8 @@ pub struct Env<'a> {
     pub power_allowed: bool,
     /// Sleep is offered: something can wake the machine again.
     pub can_sleep: bool,
+    /// The machine's displays, as its status lists them.
+    pub displays: Vec<latch_proto::control::HostDisplay>,
 }
 
 struct Toast {
@@ -1139,7 +1147,7 @@ impl View {
                                     self.keys_menu(ui, live, cfg, actions);
                                     self.stats_button(ui);
                                     self.fullscreen_button(ui, env, actions);
-                                    self.power_menu(ui, env);
+                                    self.power_menu(ui, env, actions);
                                     if rect.width() >= 1100.0 {
                                         self.volume_controls(ui, live);
                                     } else {
@@ -1281,7 +1289,7 @@ impl View {
             self.key_items(ui, live, cfg, actions);
             if has_power_items(env) {
                 ui::menu_label(ui, machine_noun(&env.os));
-                self.power_items(ui, env);
+                self.power_items(ui, env, actions);
             }
         });
     }
@@ -1337,18 +1345,38 @@ impl View {
         }
     }
 
-    fn power_menu(&mut self, ui: &mut egui::Ui, env: &Env<'_>) {
+    fn power_menu(&mut self, ui: &mut egui::Ui, env: &Env<'_>, actions: &mut Vec<Action>) {
         if !has_power_items(env) {
             return;
         }
-        ui::menu_button(ui, machine_noun(&env.os), |ui| self.power_items(ui, env));
+        ui::menu_button(ui, machine_noun(&env.os), |ui| {
+            self.power_items(ui, env, actions)
+        });
     }
 
     /// Sleep, Restart and Shut down where the machine's owner allows them,
     /// each asked about first: a slip in this menu must not end the stream
     /// or put to sleep a machine that nothing here can wake. The stream
     /// stays up until the machine has agreed.
-    fn power_items(&mut self, ui: &mut egui::Ui, env: &Env<'_>) {
+    fn power_items(&mut self, ui: &mut egui::Ui, env: &Env<'_>, actions: &mut Vec<Action>) {
+        let displays = display_choices(env);
+        if !displays.is_empty() {
+            ui::menu_label(ui, "Display to share");
+            let streamed = env.live.display.as_deref();
+            let current = crate::session::chosen_display(&env.displays, streamed);
+            for (choice, label) in displays {
+                if ui::menu_choice(ui, &label, choice == current)
+                    .on_hover_text("The stream starts again on this display, in a second or two.")
+                    .clicked()
+                    && choice != current
+                {
+                    actions.push(Action::ChooseDisplay(choice));
+                }
+            }
+            if env.power_allowed || env.old_host.is_some() {
+                ui::menu_separator(ui);
+            }
+        }
         if env.power_allowed {
             if env.can_sleep && ui::menu_item(ui, "Sleep…").clicked() {
                 self.confirm = Some(PowerAction::Sleep);
@@ -2891,6 +2919,7 @@ pub(crate) mod tests {
                 cursor: true,
                 gamepads: false,
                 mic: false,
+                display: None,
             },
             frames.clone(),
             tx,
@@ -2917,6 +2946,7 @@ pub(crate) mod tests {
             clipboard: crate::clipboard::Sync::spawn(ip, ctx.clone()),
             shortcuts: Default::default(),
             pads,
+            display: None,
         }
     }
 
@@ -2948,6 +2978,7 @@ pub(crate) mod tests {
             video_help: extra.video_help.clone(),
             power_allowed: extra.power_allowed,
             can_sleep: extra.can_sleep,
+            displays: Vec::new(),
         };
         let actions = view.show(ctx, &env);
         if !actions.is_empty() {

@@ -17,6 +17,7 @@ fn config() -> VideoConfig {
         fps: 60,
         bitrate_kbps: 1000,
         codec: Codec::H264Baseline,
+        display: None,
     }
 }
 

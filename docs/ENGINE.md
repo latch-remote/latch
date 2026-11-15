@@ -402,7 +402,11 @@ refresh; GPU completion, compositor, panel response and scanout are unmeasured.
   viewer is resized by the engine (`xrandr` semantics through RandR) or by
   the owner's prep command; Windows sets the virtual display's mode; macOS
   captures the main display (or `LATCH_MAC_DISPLAY`) and lets
-  ScreenCaptureKit scale it. Linux's CPU pipeline also emits the negotiated
+  ScreenCaptureKit scale it. A viewer can name another display
+  (`display::list`, `StreamRequest.display`): Windows then duplicates that
+  output and leaves the virtual display and topology alone, macOS captures
+  it, and Linux captures that RandR monitor's rectangle of the root without
+  resizing. Linux's CPU pipeline also emits the negotiated
   output size when the display stays at its native size, for software, NVENC
   and VA-API alike. It aspect-fits with centred black bars, using the same
   content rectangle for pointer injection as Windows and macOS. Reductions

@@ -400,6 +400,7 @@ impl ClientApp {
         session::connect(Connect {
             target,
             settings: self.cfg.stream.clone(),
+            display: self.cfg.display(&pc.node_id).map(str::to_owned),
             native: Self::native_pixels(ctx),
             #[cfg(not(target_os = "linux"))]
             display_hz: crate::refresh::hz(),
@@ -1137,16 +1138,21 @@ impl eframe::App for ClientApp {
                     // Discovery's fresh word on it; without that, nothing.
                     power_allowed: pc_now.is_some_and(|p| p.power_allowed()),
                     can_sleep: pc_now.is_some_and(|p| p.can_sleep()),
+                    displays: pc_now
+                        .and_then(|p| p.host.as_ref())
+                        .map(|h| h.streamer.displays.clone())
+                        .unwrap_or_default(),
                 };
                 let actions = self.view.show(ctx, &env);
                 let (ip, name, input) = (l.ip, l.pc.clone(), l.input.clone());
+                let (node_id, streamed_display) = (l.node_id.clone(), l.display.clone());
                 // What a reconnect for a new display would ask for, beside
                 // what this stream asked for.
                 let display_request = (
                     l.requested,
                     pc_now
                         .and_then(|p| p.host.as_ref())
-                        .map(|h| HostLimits::of(&h.streamer)),
+                        .map(|h| HostLimits::of_display(&h.streamer, l.display.as_deref())),
                 );
                 drop(guard);
                 for a in actions {
@@ -1177,6 +1183,16 @@ impl eframe::App for ClientApp {
                             self.dirty = true;
                             self.disconnect();
                             self.reconnect = self.last_pc.clone();
+                        }
+                        Action::ChooseDisplay(display) => {
+                            self.cfg.choose_display(&node_id, display.clone());
+                            self.dirty = true;
+                            // Another display is another capture: the
+                            // stream starts again on it.
+                            if display != streamed_display {
+                                self.disconnect();
+                                self.reconnect = self.last_pc.clone();
+                            }
                         }
                         Action::TurnOffHdr => self.turn_off_hdr(ctx, ip),
                         Action::InstallHost => {
@@ -1681,7 +1697,15 @@ impl ClientApp {
         // Only a machine that is away: one that answers is re-learned
         // within seconds, and forgetting it would only forget its saved details.
         let forget = !pc.online && pc.known.is_some();
-        if !(wake || test_wake || power || forget || pc.ip.is_some()) {
+        let displays = if live && pc.online {
+            pc.host
+                .as_ref()
+                .map(|h| session::display_choices(&h.streamer.displays))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !(wake || test_wake || power || forget || pc.ip.is_some() || !displays.is_empty()) {
             return;
         }
         let ask = |action| Confirm {
@@ -1711,8 +1735,23 @@ impl ClientApp {
                 if test_wake && ui::menu_item(ui, "Test waking it from this network").clicked() {
                     self.test_wake(pc);
                 }
-                if power {
+                if !displays.is_empty() {
                     if wake || test_wake {
+                        ui::menu_separator(ui);
+                    }
+                    ui::menu_label(ui, "Display to share");
+                    let chosen = pc.host.as_ref().and_then(|h| {
+                        session::chosen_display(&h.streamer.displays, self.cfg.display(&pc.node_id))
+                    });
+                    for (choice, label) in &displays {
+                        if ui::menu_choice(ui, label, *choice == chosen).clicked() {
+                            self.cfg.choose_display(&pc.node_id, choice.clone());
+                            self.dirty = true;
+                        }
+                    }
+                }
+                if power {
+                    if wake || test_wake || !displays.is_empty() {
                         ui::menu_separator(ui);
                     }
                     // Only where something can wake it again: never a Linux
@@ -1730,7 +1769,7 @@ impl ClientApp {
                     }
                 }
                 if let Some(ip) = pc.ip {
-                    if wake || test_wake || power {
+                    if wake || test_wake || power || !displays.is_empty() {
                         ui::menu_separator(ui);
                     }
                     if ui::menu_item(ui, "Copy Tailscale address").clicked() {
@@ -1743,7 +1782,7 @@ impl ClientApp {
                     }
                 }
                 if forget {
-                    if wake || test_wake || power || pc.ip.is_some() {
+                    if wake || test_wake || power || pc.ip.is_some() || !displays.is_empty() {
                         ui::menu_separator(ui);
                     }
                     if ui::menu_item(ui, "Forget this machine…").clicked() {
