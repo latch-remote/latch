@@ -91,21 +91,42 @@ The deployed monthly combined ingress-plus-egress ceiling is explicitly
 500,000,000,000 bytes. Retain headroom against the remaining current-month
 provider allowance and other traffic.
 
+For a fresh certificate, issue through webroot from the start. Stop
+`certbot.timer` and finish any active renewal before binding port 80. Open the
+DNS/firewall paths described above and create the webroot, then run a temporary
+HTTP server until the daemon has its first certificate. Run these commands on
+the deployment host, with `RELAY_HOST` set to the certificate hostname.
+
+```sh
+sudo systemctl stop certbot.timer
+sudo install -d -m 0755 /var/www/latch-relay/.well-known/acme-challenge
+sudo python3 -m http.server 80 --bind :: --directory /var/www/latch-relay
+```
+
+In a second terminal, issue the first certificate with
+`sudo certbot certonly --webroot -w /var/www/latch-relay -d "$RELAY_HOST"`.
+Stop the temporary HTTP server, then install using
+`/etc/letsencrypt/live/$RELAY_HOST/fullchain.pem` and
+`/etc/letsencrypt/live/$RELAY_HOST/privkey.pem`. The saved renewal configuration
+already uses webroot. Keep the timer stopped through installation and the
+renewal dry-run, then enable it.
+
 ```sh
 sudo bash deploy/relay-tcp/install.sh \
   "$PWD/target/release/latch-relay" \
-  /root/relay-cert/fullchain.pem /root/relay-cert/privkey.pem \
+  "/etc/letsencrypt/live/$RELAY_HOST/fullchain.pem" \
+  "/etc/letsencrypt/live/$RELAY_HOST/privkey.pem" \
   500000000000 --initialize-quota
 sudo install -o root -g root -m 0750 deploy/relay-tcp/certbot-deploy.sh \
   /etc/letsencrypt/renewal-hooks/deploy/50-latch-relay
 sudo apt-get install ethtool
 sudo bash deploy/relay-tcp/network.sh
 sudo systemctl start latch-relay.service
-sudo systemctl enable --now certbot.timer
 sudo systemctl is-active latch-relay.service
 sudo journalctl -u latch-relay.service --since '5 minutes ago' --no-pager
 python3 deploy/relay-tcp/selftest.py --live relay.latch.rune.foo
-sudo certbot renew --dry-run --run-deploy-hooks --cert-name relay.latch.rune.foo
+sudo certbot renew --dry-run --run-deploy-hooks --cert-name "$RELAY_HOST"
+sudo systemctl enable --now certbot.timer
 ```
 
 The installer enables the service for boot and leaves the first public start
@@ -125,7 +146,9 @@ quota. Local `limits.json` changes survive reinstalling the kit.
 `network.sh` persists BBR/fq, 16-MiB TCP/UDP socket ceilings, always-on TCP
 packet-size probing (`net.ipv4.tcp_mtu_probing=2`, which Linux applies to IPv4
 and IPv6, so the daemon's sending path survives networks that drop ICMP Packet
-Too Big; client Unix retries can request 1200- then 512-byte MSS),
+Too Big; Linux clients advertise 1200- then 512-byte MSS before connect.
+macOS can apply MSS only after connect and Windows skips these recovery rungs,
+so both rely on relay TCP MTU probing for its certificate flight),
 128-KiB unsent low-water mark, idle-window preservation and a 131,072-entry
 conntrack ceiling. It installs a boot-time UDP GRO forwarding unit and daemon
 drop-ins with 65,536-file limits. Tailscaled receives 384/512-MiB memory
@@ -347,7 +370,9 @@ test overlap when interpreting global daemon counters.
 Perform this upgrade in an arranged maintenance window. Build the reviewed
 Linux `latch-relay` binary with four Cargo jobs. Copy the binary and this kit to
 the relay host through your normal deployment channel. Retain the current quota
-ledger, budget and operator limits.
+ledger, budget and operator limits. Stop `certbot.timer` with
+`sudo systemctl stop certbot.timer` before step 1 and let any running
+`certbot.service` finish before the daemon takes port 80.
 
 1. Stop `latch-relay.service`. Run `install.sh BINARY FULLCHAIN_PEM PRIVATE_KEY_PEM
    MONTHLY_BYTES` using the existing certificate paths and budget. Omit
@@ -362,19 +387,28 @@ ledger, budget and operator limits.
    Keep TCP 443 open. Confirm the hostname's A and AAAA records reach this host.
    Verify `curl -i http://RELAY_HOST/netenv/probe` returns an empty 204 with
    `Content-Length: 0` and `Cache-Control: no-store`.
-4. With the new listener running, run
+4. With the new listener running and Certbot 2.3 or later, run
    `sudo certbot reconfigure --cert-name RELAY_HOST --webroot -w /var/www/latch-relay`
    using the existing Certbot certificate name. Remove renewal pre/post hooks
    that stop/start the relay for standalone port ownership. Retain the existing
    `certbot-deploy.sh` deploy hook that installs renewed certificate/key files
    and restarts the relay. Inspect `certbot certificates` and the renewal
-   configuration to confirm the webroot authenticator and path.
+   configuration to confirm the webroot authenticator and path. For Certbot older
+   than 2.3, back up and edit `/etc/letsencrypt/renewal/RELAY_HOST.conf` instead.
+   Set `authenticator = webroot` and `webroot_path = /var/www/latch-relay,` under
+   `[renewalparams]`, remove standalone-only stop/start hooks, and set
+   `RELAY_HOST = /var/www/latch-relay` under `[[webroot_map]]`. Preserve the
+   account, server, key and certificate paths and the deploy hook.
 5. Run `sudo certbot renew --cert-name RELAY_HOST --dry-run`, then check
    `systemctl status latch-relay.service` and `journalctl -u latch-relay.service`.
    Run `python3 deploy/relay-tcp/selftest.py --binary PATH_TO_LOCAL_BINARY` on a
    disposable host to exercise both listeners without public test traffic.
+6. Re-enable and start renewal with `sudo systemctl enable --now certbot.timer`.
 
-The listener bounds request size/time, concurrent connections and global admission.
+The listener bounds request size/time, concurrent connections and per-source
+(IPv4 /32, IPv6 /64) plus global admission. Probe traffic has 120 global and
+30 per-source admissions per minute. Two connection slots and 16 ACME admissions
+per minute are reserved for challenge requests after probe credits are spent.
 It logs no request paths or addresses. It serves only the probe and bounded
 regular ACME challenge files. New clients still stream through the old relay.
 Portal discovery then relies on native OS signals or an actual intercepting

@@ -890,3 +890,15 @@ fn partial_proxy_result_is_usable_while_portal_check_continues() {
     cache.poll();
     assert!(cache.pending.is_none());
 }
+
+#[test]
+fn empty_proxy_observation_is_distinct_from_pending_discovery() {
+    let (tx, rx) = mpsc::channel();
+    tx.send(Observation::Proxy(ProxyDiscovery::default()))
+        .unwrap();
+    drop(tx);
+    let result = collect(rx, 1, Instant::now() + Duration::from_secs(1));
+    assert!(result.proxy_observed);
+    assert!(result.proxies.candidates.is_empty());
+    assert!(!NetworkDiagnosis::default().proxy_observed);
+}

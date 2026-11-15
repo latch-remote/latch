@@ -87,6 +87,8 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
+        #[cfg(test)]
+        std::env::set_var("LATCH_NETENV_PROBE", "0");
         Self {
             relay: latch_stream::session::relay_config(&control::RelaySettings::default()),
             prepare: None,
@@ -797,10 +799,6 @@ impl Server {
             if status != network_status {
                 for message in &status.messages {
                     self.log(message.clone());
-                    let _ = session.send_tcp(&Message::Notice(Notice {
-                        kind: "network".into(),
-                        message: message.clone(),
-                    }));
                 }
                 network_status = status;
             }

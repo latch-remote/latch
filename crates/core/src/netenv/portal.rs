@@ -93,7 +93,20 @@ fn read_probe(target: &ProbeTarget, reader: &mut impl BufRead) -> Option<Captive
     if matches!(status, 301 | 302 | 303 | 307 | 308 | 511) {
         let portal_url = header(&headers, "location")
             .and_then(|value| target.url.join(value).ok())
-            .filter(|url| matches!(url.scheme(), "http" | "https"))
+            .filter(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && match url.host() {
+                        Some(url::Host::Ipv4(ip)) => !ip.is_loopback(),
+                        Some(url::Host::Ipv6(ip)) => {
+                            !ip.is_loopback()
+                                && !ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+                        }
+                        Some(url::Host::Domain(host)) => {
+                            !host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+                        }
+                        None => false,
+                    }
+            })
             .map(|mut url| {
                 let _ = url.set_username("");
                 let _ = url.set_password(None);
@@ -204,5 +217,41 @@ pub(super) fn detect_with_native(
     match native() {
         state @ (CaptivePortal::OpenInternet | CaptivePortal::Captive { .. }) => state,
         _ => CaptivePortal::NoConnectivity,
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+    #[test]
+    fn portal_button_rejects_loopback_and_keeps_private_hosts() {
+        let target = ProbeTarget::new("http://relay.test/netenv/probe", 204, b"").unwrap();
+        for host in [
+            "127.0.0.1",
+            "127.42.1.2",
+            "[::1]",
+            "[::ffff:127.0.0.1]",
+            "localhost",
+            "LOCALHOST.",
+        ] {
+            let result = classify(
+                &target,
+                format!("HTTP/1.1 302 Found\r\nLocation: http://{host}:8000/action\r\n\r\n")
+                    .as_bytes(),
+            );
+            assert_eq!(result, CaptivePortal::Captive { portal_url: None });
+        }
+        for host in ["192.168.1.1", "10.0.0.1", "172.16.0.1", "[fd00::1]"] {
+            assert!(matches!(
+                classify(
+                    &target,
+                    format!("HTTP/1.1 302 Found\r\nLocation: http://{host}/signin\r\n\r\n")
+                        .as_bytes()
+                ),
+                CaptivePortal::Captive {
+                    portal_url: Some(_)
+                }
+            ));
+        }
     }
 }

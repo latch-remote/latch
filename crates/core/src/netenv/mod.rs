@@ -60,6 +60,8 @@ impl Options {
 #[derive(Debug, Clone)]
 pub struct NetworkDiagnosis {
     pub proxies: ProxyDiscovery,
+    /// Whether this snapshot includes the proxy observation, even if empty.
+    pub proxy_observed: bool,
     pub captive_portal: CaptivePortal,
     pub tailscale: TailscaleDiagnosis,
     pub ip: IpAvailability,
@@ -72,6 +74,7 @@ impl Default for NetworkDiagnosis {
     fn default() -> Self {
         Self {
             proxies: ProxyDiscovery::default(),
+            proxy_observed: false,
             captive_portal: CaptivePortal::Unknown,
             tailscale: TailscaleDiagnosis::unknown(),
             ip: IpAvailability::default(),
@@ -241,7 +244,10 @@ fn collect_progress(
     {
         received += 1;
         match observation {
-            Observation::Proxy(value) => result.proxies = value,
+            Observation::Proxy(value) => {
+                result.proxies = value;
+                result.proxy_observed = true;
+            }
             Observation::Portal(value) => result.captive_portal = value,
             Observation::Tailscale(value) => result.tailscale = value,
             Observation::Ip(value) => result.ip = value,

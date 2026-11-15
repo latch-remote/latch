@@ -116,6 +116,8 @@ impl Drop for ClipboardStream {
 
 impl Service {
     pub fn new() -> Self {
+        #[cfg(test)]
+        std::env::set_var("LATCH_NETENV_PROBE", "0");
         let cfg = HostConfig::load();
         if cfg.relay.enabled {
             latch_stream::network::diagnosis(&cfg.relay.host);

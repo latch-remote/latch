@@ -292,13 +292,16 @@ updates ignore the legacy GitHub token settings.
 Latch discovers this network's OS, PAC/WPAD and environment proxy settings in
 background. A cached result is used immediately. Slow discovery continues while
 the connection tries direct access. Changing networks or signing in to a portal
-is detected automatically, with a five-second refresh interval, shortened to one
-second while a portal is confirmed. An in-flight check can take up to six seconds
-and continues across the refresh interval.
+invalidates the cached result. Relay connection failures also refresh discovery.
+A confirmed portal retries after 2 seconds with exponential backoff up to 60
+seconds. Healthy sessions send no periodic HTTP probes. An in-flight check can
+take up to six seconds.
 
 - **This network needs a sign-in** appears when a portal redirects the anonymous
   connectivity check. Choose **Open network sign-in**, complete the browser's
   sign-in, and leave Latch open. The pending stream resumes automatically.
+  Portal waiting ends after three minutes with a sign-in timeout message. Media
+  arriving clears the banner and keeps the normal eight-second stall watchdog.
 - **This network inspects encrypted traffic** means the relay presented an
   untrusted certificate. Latch refuses the substituted certificate and shows its
   issuer when available. Ask the network administrator to permit the relay's
@@ -307,6 +310,16 @@ and continues across the refresh interval.
   **Proxy authentication required** means its supplied credentials are absent
   or were rejected. Sign in through your OS's proxy configuration or contact the
   network administrator. Latch never prompts for or guesses proxy credentials.
+- **Latch could not verify the relay's encrypted connection** means TLS
+  certificate verification failed. Check the machine's clock and the network's
+  certificate policy, then ask the administrator to allow the genuine relay
+  certificate or use another network.
+- **Automatic proxy settings could not be resolved** means OS PAC/WPAD settings
+  could not produce a usable proxy. Check the OS proxy configuration and ask the
+  network administrator for working automatic settings or a CONNECT proxy.
+- **Proxy refused the CONNECT tunnel** means the proxy explicitly denied access.
+  Ask the network administrator to allow CONNECT to the configured relay host
+  on port 443.
 - **Using the WebSocket carrier** means native relay TLS was blocked. The path
   indicator says **Latch WebSocket**, with **via proxy** when applicable.
 - **Tailscale is blocked** or **Tailscale is using DERP only** describes the
@@ -314,8 +327,11 @@ and continues across the refresh interval.
   allowed by this network. DERP adds latency.
 
 Healthy networks show no network warning. The relay can retry a stalled TCP
-path with 1200-byte and then 512-byte MSS on Unix. The retry hint expires after
-30 seconds. Windows retains its normal TCP segmentation behavior.
+path with 1200-byte and then 512-byte MSS on Linux, applied before connect to
+shrink the relay certificate flight. On macOS TCP_MAXSEG is accepted only after
+connect, so client hints affect outgoing data but cannot shrink that flight.
+macOS and Windows rely on the relay's Linux TCP MTU probing for its sending
+path. Windows skips client MSS recovery rungs. The hint expires after 30 seconds.
 
 The portal check sends an anonymous plain-HTTP `GET /netenv/probe` to the
 configured relay hostname on port 80. It includes Host, Connection and cache

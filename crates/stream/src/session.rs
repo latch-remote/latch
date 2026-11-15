@@ -518,6 +518,9 @@ impl RelayRoute {
                 tracing::warn!(role = ?self.role, ?kind, %message, "relay closed, falling back to UDP");
                 if let Some(transport) = &state.transport {
                     state.failure = transport.failure().map(|error| error.failure);
+                    if let Some(config) = &self.config {
+                        crate::network::relay_failed(config.endpoint.host());
+                    }
                 }
                 for message in crate::network::status(
                     &latch_core::netenv::NetworkDiagnosis::default(),
@@ -640,6 +643,9 @@ impl RelayRoute {
                     Err(error) => {
                         tracing::warn!(%error, "relay preparation failed");
                         state.failure = Some(latch_relay::ConnectError::from_io(&error).failure);
+                        if let Some(config) = &self.config {
+                            crate::network::relay_failed(config.endpoint.host());
+                        }
                         let number = state.number;
                         self.reset(&mut state);
                         if !send(&self.message(number, A::Abort)) {
@@ -1234,6 +1240,12 @@ impl VideoHealth {
     fn stalled(&self, now: Instant) -> bool {
         self.last_frame
             .is_some_and(|last| now.saturating_duration_since(last) >= MEDIA_STALL_TIMEOUT)
+    }
+
+    fn session_stalled(&self, network: &crate::network::NetworkStatus, now: Instant) -> bool {
+        // A portal can delay the first picture, but delivered media always keeps
+        // the normal stall deadline, even if cleartext HTTP remains redirected.
+        (!network.needs_sign_in || self.last_frame.is_some()) && self.stalled(now)
     }
 
     fn stall_message(&self) -> &'static str {
@@ -2224,7 +2236,8 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 }
             });
     }
-    let mut accepted = Instant::now();
+    let session_started = Instant::now();
+    let mut accepted = session_started;
     let mut last_report = Instant::now();
     let mut last_keepalive = Instant::now();
     let mut damage_since: Option<Instant> = None;
@@ -2402,12 +2415,20 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
             }
         }
         let mut status = inner.relay.lock().network_status();
+        let media_arrived = inner.video_health.lock().last_encoded.is_some();
+        status.media_arrived(media_arrived);
+        if media_arrived {
+            if let Some(config) = &inner.relay.lock().config {
+                crate::network::media_received(config.endpoint.host());
+            }
+        }
         if (last_network_status.needs_sign_in && !status.needs_sign_in)
             || (!last_network_status.proxy_available && status.proxy_available)
         {
             accepted = Instant::now();
             inner.relay.lock().retry_after_network_change();
             status = inner.relay.lock().network_status();
+            status.media_arrived(media_arrived);
         }
         if status != last_network_status {
             inner.emit(Event::Network(status.clone()));
@@ -2415,9 +2436,16 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
         }
         // Signing in can take longer than the first-picture watchdog. Keep the
         // authorized control session alive while the portal is confirmed captive.
-        let waiting_for_sign_in = status.needs_sign_in;
+        let waiting_for_sign_in = status.needs_sign_in && !media_arrived;
+        if status.sign_in_timed_out(session_started.elapsed()) {
+            return Outcome::Failed(
+                "network".into(),
+                "Network sign-in timed out. Complete sign-in in your browser, then reconnect."
+                    .into(),
+            );
+        }
         let health = inner.video_health.lock();
-        if !waiting_for_sign_in && health.stalled(now) {
+        if health.session_stalled(&status, now) {
             return Outcome::Ended(-1, health.stall_message().into());
         }
         drop(health);
@@ -3904,6 +3932,28 @@ mod tests {
             0,
             "oversized paste is rejected before splitting"
         );
+    }
+
+    #[test]
+    fn portal_with_flowing_media_keeps_normal_host_stall_deadline() {
+        let now = Instant::now();
+        let mut health = VideoHealth::default();
+        let mut status = crate::network::NetworkStatus {
+            needs_sign_in: true,
+            messages: vec!["This network needs a sign-in.".into()],
+            ..Default::default()
+        };
+        health.last_encoded = Some(now);
+        health.frame(now, false);
+        assert!(!health.session_stalled(
+            &status,
+            now + MEDIA_STALL_TIMEOUT - Duration::from_millis(1)
+        ));
+        assert!(health.session_stalled(&status, now + MEDIA_STALL_TIMEOUT));
+        status.media_arrived(health.last_encoded.is_some());
+        assert!(!status.needs_sign_in);
+        assert!(status.messages.is_empty());
+        assert!(health.session_stalled(&status, now + MEDIA_STALL_TIMEOUT));
     }
 
     #[test]

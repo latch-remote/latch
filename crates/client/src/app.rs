@@ -239,6 +239,8 @@ impl ClientApp {
         progress: Arc<Mutex<Progress>>,
         cfg: ClientConfig,
     ) -> Self {
+        #[cfg(test)]
+        std::env::set_var("LATCH_NETENV_PROBE", "0");
         ui::apply(&cc.egui_ctx);
         if cfg.stream.relay.enabled {
             latch_stream::network::diagnosis(&cfg.stream.relay.host);
@@ -321,6 +323,7 @@ impl ClientApp {
         progress: Progress,
         cfg: ClientConfig,
     ) -> Self {
+        std::env::set_var("LATCH_NETENV_PROBE", "0");
         Self::with_shared(
             cc,
             Arc::new(Mutex::new(discovery)),

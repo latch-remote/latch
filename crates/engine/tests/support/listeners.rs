@@ -15,7 +15,13 @@ pub fn proxy() -> (UdpSocket, TcpListener) {
 pub fn host() -> (Arc<Server>, TcpListener) {
     ports::retry_bind(|port| {
         let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
-        let server = Server::bind(tcp.local_addr()?.port(), Options::default())?;
+        let server = Server::bind(tcp.local_addr()?.port(), options())?;
         Ok((server, tcp))
     })
+}
+
+#[allow(dead_code)]
+pub fn options() -> Options {
+    std::env::set_var("LATCH_NETENV_PROBE", "0");
+    Options::default()
 }

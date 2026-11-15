@@ -1,7 +1,8 @@
 //! Anonymous HTTP probe and ACME webroot. No request or address logging.
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -10,16 +11,26 @@ const MAX_BODY: u64 = 4096;
 const TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECTIONS: usize = 8;
 const ACCEPTS_PER_MINUTE: u32 = 120;
+const PER_SOURCE: u32 = 30;
+const ACME_RESERVE: u32 = 16;
+const RESERVED_CONNECTIONS: usize = 2;
 
 struct Request {
     stream: TcpStream,
+    source: IpAddr,
+    acme_only: bool,
     deadline: Instant,
     input: Vec<u8>,
     output: Vec<u8>,
     written: usize,
 }
 impl Request {
-    fn step(&mut self, webroot: Option<&Path>, now: Instant) -> io::Result<bool> {
+    fn step(
+        &mut self,
+        webroot: Option<&Path>,
+        now: Instant,
+        acme_credit: &mut u32,
+    ) -> io::Result<bool> {
         if now >= self.deadline {
             return Ok(true);
         }
@@ -36,6 +47,12 @@ impl Request {
             }
             if !self.input.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
                 return Ok(false);
+            }
+            if self.acme_only {
+                if !is_acme_request(&self.input) || *acme_credit >= ACME_RESERVE {
+                    return Ok(true);
+                }
+                *acme_credit += 1;
             }
             self.output = response(&self.input, webroot);
         }
@@ -57,6 +74,10 @@ pub(crate) struct ProbeServer {
     requests: Vec<Request>,
     window: Instant,
     accepts: u32,
+    sources: HashMap<IpAddr, u32>,
+    acme_accepts: u32,
+    accept_retry_at: Option<Instant>,
+    accept_error_logged: bool,
 }
 impl ProbeServer {
     pub fn bind(address: SocketAddr, webroot: Option<&Path>) -> io::Result<Self> {
@@ -84,44 +105,102 @@ impl ProbeServer {
             requests: Vec::new(),
             window: Instant::now(),
             accepts: 0,
+            sources: HashMap::new(),
+            acme_accepts: 0,
+            accept_retry_at: None,
+            accept_error_logged: false,
         })
     }
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
     }
-    pub fn poll(&mut self) -> io::Result<()> {
+    pub fn poll(&mut self) {
         self.poll_at(Instant::now())
     }
-    fn poll_at(&mut self, now: Instant) -> io::Result<()> {
+    fn poll_at(&mut self, now: Instant) {
         if now.duration_since(self.window) >= Duration::from_secs(60) {
             self.window = now;
             self.accepts = 0;
+            self.sources.clear();
+            self.acme_accepts = 0;
         }
-        // Bound work per relay tick, even under a continuous connection flood.
-        for _ in 0..16 {
-            let stream = match self.listener.accept() {
-                Ok((stream, _)) => stream,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => return Err(error),
-            };
-            if self.accepts >= ACCEPTS_PER_MINUTE || self.requests.len() >= CONNECTIONS {
-                continue;
+        // Pending requests from one source cannot occupy every slot. The last
+        // two slots and separate ACME credits remain available after probe caps.
+        if self.accept_retry_at.is_none_or(|at| now >= at) {
+            for _ in 0..16 {
+                let (stream, address) = match self.listener.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => {
+                        self.accept_error(&error, now);
+                        break;
+                    }
+                };
+                self.accept_error_logged = false;
+                let source = crate::daemon::normalize_ip(address.ip());
+                if self.requests.len() >= CONNECTIONS
+                    || self.requests.iter().filter(|r| r.source == source).count() >= 2
+                {
+                    continue;
+                }
+                let acme_only = !self.admit_probe(source)
+                    || self.requests.len() >= CONNECTIONS - RESERVED_CONNECTIONS;
+                if stream.set_nonblocking(true).is_err() {
+                    continue;
+                }
+                self.requests.push(Request {
+                    stream,
+                    source,
+                    acme_only,
+                    deadline: now + TIMEOUT,
+                    input: Vec::new(),
+                    output: Vec::new(),
+                    written: 0,
+                });
             }
-            self.accepts += 1;
-            stream.set_nonblocking(true)?;
-            self.requests.push(Request {
-                stream,
-                deadline: now + TIMEOUT,
-                input: Vec::new(),
-                output: Vec::new(),
-                written: 0,
-            });
         }
         let webroot = self.webroot.as_deref();
-        self.requests
-            .retain_mut(|request| matches!(request.step(webroot, now), Ok(false)));
-        Ok(())
+        self.requests.retain_mut(|request| {
+            matches!(
+                request.step(webroot, now, &mut self.acme_accepts),
+                Ok(false)
+            )
+        });
     }
+    fn admit_probe(&mut self, source: IpAddr) -> bool {
+        if self.accepts >= ACCEPTS_PER_MINUTE
+            || self.sources.get(&source).copied().unwrap_or(0) >= PER_SOURCE
+        {
+            return false;
+        }
+        // At most 120 different normal admissions fit in a window.
+        *self.sources.entry(source).or_default() += 1;
+        self.accepts += 1;
+        true
+    }
+    fn accept_error(&mut self, error: &io::Error, now: Instant) {
+        if !self.accept_error_logged {
+            eprintln!("HTTP probe accept failed ({:?}), retrying", error.kind());
+            self.accept_error_logged = true;
+        }
+        self.accept_retry_at = Some(now + Duration::from_secs(1));
+    }
+}
+
+fn is_acme_request(request: &[u8]) -> bool {
+    let Some(line) = request.split(|byte| *byte == b'\n').next() else {
+        return false;
+    };
+    let Ok(line) = std::str::from_utf8(line) else {
+        return false;
+    };
+    let mut parts = line.trim_end_matches('\r').split(' ');
+    parts.next() == Some("GET")
+        && parts
+            .next()
+            .is_some_and(|path| path.starts_with("/.well-known/acme-challenge/"))
+        && matches!(parts.next(), Some("HTTP/1.0" | "HTTP/1.1"))
+        && parts.next().is_none()
 }
 
 fn response(request: &[u8], webroot: Option<&Path>) -> Vec<u8> {
@@ -219,13 +298,66 @@ mod tests {
         let now = Instant::now();
         let mut request = Request {
             stream,
+            source: "127.0.0.1".parse().unwrap(),
+            acme_only: false,
             deadline: now + TIMEOUT,
             input: vec![],
             output: vec![],
             written: 0,
         };
-        assert!(!request.step(None, now).unwrap());
-        assert!(request.step(None, now + TIMEOUT).unwrap());
+        assert!(!request.step(None, now, &mut 0).unwrap());
+        assert!(request.step(None, now + TIMEOUT, &mut 0).unwrap());
+    }
+    fn exchange(server: &mut ProbeServer, path: &str, now: Instant) -> String {
+        let mut peer = TcpStream::connect(server.local_addr().unwrap()).unwrap();
+        peer.write_all(format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes())
+            .unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + TIMEOUT;
+        let mut bytes = Vec::new();
+        loop {
+            server.poll_at(now);
+            let mut chunk = [0; 1024];
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(size) => bytes.extend_from_slice(&chunk[..size]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("{error}"),
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+    #[test]
+    fn flooding_source_preserves_other_sources_and_acme_reserve() {
+        let root = std::env::temp_dir().join(format!("latch-probe-flood-{}", std::process::id()));
+        fs::create_dir_all(root.join(".well-known/acme-challenge")).unwrap();
+        fs::write(root.join(".well-known/acme-challenge/token"), b"proof").unwrap();
+        let mut server = ProbeServer::bind("127.0.0.1:0".parse().unwrap(), Some(&root)).unwrap();
+        let flood = "192.0.2.1".parse().unwrap();
+        for _ in 0..PER_SOURCE {
+            assert!(server.admit_probe(flood));
+        }
+        for _ in 0..200 {
+            assert!(!server.admit_probe(flood));
+        }
+        assert_eq!(server.accepts, PER_SOURCE);
+        let now = Instant::now();
+        assert!(exchange(&mut server, "/netenv/probe", now).starts_with("HTTP/1.1 204"));
+        assert_eq!(server.accepts, PER_SOURCE + 1);
+        // Even a global probe flood cannot spend the challenge reserve.
+        server.accepts = ACCEPTS_PER_MINUTE;
+        assert!(exchange(&mut server, "/netenv/probe", now).is_empty());
+        assert_eq!(server.acme_accepts, 0);
+        let reply = exchange(&mut server, "/.well-known/acme-challenge/token", now);
+        assert!(reply.starts_with("HTTP/1.1 200"));
+        assert!(reply.ends_with("proof"));
+        assert_eq!(server.acme_accepts, 1);
+        server.poll_at(now + Duration::from_secs(61));
+        assert_eq!(server.accepts, 0);
+        assert!(server.sources.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn connection_and_rate_limits_recover_on_injected_clock() {
@@ -234,31 +366,52 @@ mod tests {
         let peers: Vec<_> = (0..CONNECTIONS + 1)
             .map(|_| TcpStream::connect(server.local_addr().unwrap()).unwrap())
             .collect();
-        server.poll_at(now).unwrap();
-        assert_eq!(server.requests.len(), CONNECTIONS);
-        server.poll_at(now + TIMEOUT).unwrap();
+        server.poll_at(now);
+        assert_eq!(server.requests.len(), 2, "one source has two pending slots");
+        server.poll_at(now + TIMEOUT);
         assert!(server.requests.is_empty());
         drop(peers);
         server.accepts = ACCEPTS_PER_MINUTE;
         let mut rejected = TcpStream::connect(server.local_addr().unwrap()).unwrap();
+        rejected
+            .write_all(b"GET /netenv/probe HTTP/1.1\r\n\r\n")
+            .unwrap();
         rejected.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut closed = false;
-        while !closed && Instant::now() < deadline {
-            server.poll_at(now + TIMEOUT).unwrap();
-            closed = matches!(rejected.read(&mut [0]), Ok(0));
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            server.poll_at(now + TIMEOUT);
+            if matches!(rejected.read(&mut [0]), Ok(0)) {
+                break;
+            }
+            assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
-        assert!(closed, "rate-limited connection was not closed");
         assert!(server.requests.is_empty());
-        drop(rejected);
+        assert_eq!(server.acme_accepts, 0);
         let _peer = TcpStream::connect(server.local_addr().unwrap()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + TIMEOUT;
         while server.requests.is_empty() && Instant::now() < deadline {
-            server.poll_at(now + Duration::from_secs(61)).unwrap();
+            server.poll_at(now + Duration::from_secs(61));
             std::thread::yield_now();
         }
         assert_eq!(server.requests.len(), 1);
         assert_eq!(server.accepts, 1);
+    }
+    #[test]
+    fn accept_error_backs_off_without_stopping_service() {
+        let mut server = ProbeServer::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let now = Instant::now();
+        server.accept_error(&io::Error::from(io::ErrorKind::Other), now);
+        assert_eq!(server.accept_retry_at, Some(now + Duration::from_secs(1)));
+        assert!(server.accept_error_logged);
+        let _peer = TcpStream::connect(server.local_addr().unwrap()).unwrap();
+        server.poll_at(now);
+        assert!(server.requests.is_empty());
+        let deadline = Instant::now() + TIMEOUT;
+        while server.requests.is_empty() && Instant::now() < deadline {
+            server.poll_at(now + Duration::from_secs(1));
+            std::thread::yield_now();
+        }
+        assert_eq!(server.requests.len(), 1);
     }
 }

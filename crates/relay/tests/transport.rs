@@ -1237,3 +1237,36 @@ fn fresh_connections_report_the_applied_mss_step_down() {
         );
     }
 }
+
+#[test]
+fn discovered_proxy_refusal_survives_direct_route_failure() {
+    // Let TCP connect and queue the ClientHello without replying, so both direct
+    // carrier handshakes time out without any external network traffic.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let direct_port = listener.local_addr().unwrap().port();
+    let gateway = Gateway::start_for_endpoint(
+        0,
+        GatewayMode::Connect {
+            auth: false,
+            status: 403,
+            intercept: false,
+            http_only: false,
+        },
+        direct_port,
+    );
+    let mut config = proxy_config(&gateway, false);
+    config.endpoint = latch_relay::Endpoint::new("localhost", direct_port).unwrap();
+    let proxy = config.proxy.clone();
+    config.set_proxy_discovery(move || (proxy.clone(), false));
+    let error = latch_relay::create_grant_with_info(&config, &Cancel::new()).unwrap_err();
+    let typed = latch_relay::ConnectError::from_io(&error);
+    assert_eq!(
+        typed.failure,
+        latch_relay::Failure::ProxyRefused { status: 403 }
+    );
+    assert!(typed
+        .attempts
+        .iter()
+        .any(|attempt| !attempt.via_proxy
+            && attempt.failure == latch_relay::Failure::ConnectionBlocked));
+}

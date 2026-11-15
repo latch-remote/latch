@@ -295,7 +295,7 @@ impl Daemon {
         while !cancel.is_cancelled() {
             let before = self.metrics.network_bytes.load(Ordering::Relaxed);
             if let Some(probe) = &mut self.probe {
-                probe.poll()?;
+                probe.poll();
             }
             self.accept()?;
             for index in 0..self.connections.len() {
