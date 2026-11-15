@@ -11,6 +11,7 @@ need() {
   fi
 }
 need "$ROOT/Dockerfile" "latch-host"
+need "$ROOT/Dockerfile" "LATCH_CONTAINER_INSTALL=1"
 need "$ROOT/Dockerfile" "ubuntu:24.04"
 need "$ROOT/Dockerfile" "EXPOSE 47850/tcp 47850/udp"
 need "$ROOT/entrypoint.sh" "latch-host --background"

@@ -1,16 +1,18 @@
 //! Public release manifests and verified downloads for both apps' updaters.
 //! Source lives separately in a private repository. Consumer requests carry
-//! no credentials, and each receiving Windows host resolves its own manifest.
+//! no credentials, and each receiving host resolves its own manifest.
 
 use anyhow::{anyhow, bail, Context, Result};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::{BufReader, Read, Write};
-use std::net::TcpStream;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(target_os = "linux")]
+pub mod linux;
 
 pub const REPO: &str = "latch-remote/latch-releases";
 pub const LATEST_MANIFEST: &str =
@@ -109,15 +111,25 @@ fn manifest(url: &str) -> Result<Release> {
 
 /// Authenticate uploaded bytes against the independently resolved public manifest.
 pub fn verify_host(release: &Release, claimed: &Version, bytes: &[u8]) -> Result<()> {
+    verify_host_asset(release, claimed, bytes, HOST_EXE)
+}
+
+/// Authenticate a platform artifact using the receiver's public manifest.
+pub fn verify_host_asset(
+    release: &Release,
+    claimed: &Version,
+    bytes: &[u8],
+    name: &str,
+) -> Result<()> {
     if release.tag != format!("v{claimed}")
         || release.version != *claimed
         || !release.is_newer_than(&current())
     {
         bail!("release tag must match the claimed version and be newer than this host");
     }
-    let asset = release.asset(HOST_EXE).ok_or_else(|| {
+    let asset = release.asset(name).ok_or_else(|| {
         anyhow!(
-            "release {} has no published {HOST_EXE}; update the PC once by hand",
+            "release {} has no published {name}; update the installation once by hand",
             release.tag
         )
     })?;
@@ -128,7 +140,7 @@ pub fn verify_host(release: &Release, claimed: &Version, bytes: &[u8]) -> Result
             .as_ref()
             .is_some_and(|h| h.eq_ignore_ascii_case(&sha256_hex(bytes)))
     {
-        bail!("the executable does not match the manifest's published {HOST_EXE} SHA-256");
+        bail!("the artifact does not match the manifest's published {name} SHA-256");
     }
     Ok(())
 }
@@ -272,10 +284,14 @@ fn download_with(
     let serial = NEXT_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dest.with_extension(format!("part-{}-{serial}", std::process::id()));
     let result = (|| -> Result<()> {
-        let mut file = std::fs::File::options()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut options = std::fs::File::options();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
         let mut sink = Hashing {
             inner: &mut file,
             sha: Sha256::new(),
@@ -459,7 +475,14 @@ fn split_url(url: &str) -> Result<(String, String)> {
     Ok((host.to_string(), path.to_string()))
 }
 
-fn connect(host: &str) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
+fn connect(host: &str) -> Result<impl Read + Write> {
+    connect_with(host, |tcp| tcp)
+}
+
+fn connect_with<S: Read + Write>(
+    host: &str,
+    wrap: impl FnOnce(std::net::TcpStream) -> S,
+) -> Result<rustls::StreamOwned<rustls::ClientConnection, S>> {
     let config = tls_config()?;
     let tcp = crate::http::connect((host, 443u16), TIMEOUT)
         .with_context(|| format!("connect to {host}"))?;
@@ -469,7 +492,7 @@ fn connect(host: &str) -> Result<rustls::StreamOwned<rustls::ClientConnection, T
         .map_err(crate::http::io_err)?;
     let name = rustls::pki_types::ServerName::try_from(host.to_string())?;
     let conn = rustls::ClientConnection::new(config, name)?;
-    Ok(rustls::StreamOwned::new(conn, tcp))
+    Ok(rustls::StreamOwned::new(conn, wrap(tcp)))
 }
 
 // Matches Graviola 0.4.2's mandatory features before it can assert/abort.

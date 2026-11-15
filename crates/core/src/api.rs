@@ -10,7 +10,7 @@
 //! | POST   | /v1/stream  | stream request | TCP upgrade |
 //! | POST   | /v1/power   | [`PowerRequest`]| [`Ack`]      |
 //! | POST   | /v1/quit    |                 | [`Ack`] (loopback only) |
-//! | POST   | /v1/update  | `latch-host.exe` bytes | [`Ack`]     |
+//! | POST   | /v1/update  | platform release artifact | [`Ack`]     |
 //! | GET    | /v1/clipboard |               | [`Clipboard`] |
 //! | POST   | /v1/clipboard | [`Clipboard`] | [`Ack`]      |
 //! | GET    | /v1/display |                 | display report (JSON) |
@@ -20,7 +20,7 @@
 //! (a tagged server answers its tailnet's members); see the host's
 //! `service` module.
 //!
-//! `/v1/update` carries the new executable itself, with its version in
+//! `/v1/update` carries the Windows executable or Linux architecture tarball, with its version in
 //! [`UPDATE_VERSION_HEADER`] and its SHA-256 in [`UPDATE_SHA256_HEADER`]. A
 //! tailnet peer that may sleep the PC may also update it; the host verifies
 //! the digest, swaps the file in and restarts. See [`crate::update`].

@@ -20,7 +20,7 @@ if-addrs = "0.15"
 rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12"] }
 rustls-graviola = "0.4.0"
 webpki-roots = "1"
-semver = "1"
+semver = { version = "1", features = ["serde"] }
 sha2 = "0.10"
 socket2 = "0.6"
 url = "2.5"
@@ -30,6 +30,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_IO", "Win32_Networking_WinSock"] }
