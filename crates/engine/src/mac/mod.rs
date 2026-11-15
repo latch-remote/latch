@@ -28,20 +28,23 @@ fn owner_display() -> Option<u32> {
 }
 
 /// The display a session shares: the viewer's choice, else the owner's,
-/// else (in capture) the main one. A choice that is not a display ID, or
-/// names one that has gone, falls through.
-fn wanted_display(chosen: Option<&str>, owner: Option<u32>) -> Option<u32> {
-    chosen.and_then(|id| id.trim().parse().ok()).or(owner)
+/// else (in capture) the main one. A choice naming a display that has
+/// gone falls through.
+fn wanted_display(chosen: Option<u32>, owner: Option<u32>, available: &[u32]) -> Option<u32> {
+    chosen
+        .filter(|id| available.contains(id))
+        .or_else(|| owner.filter(|id| available.contains(id)))
 }
 
-/// Every active display, named by its CGDirectDisplayID. The default is
-/// the owner's `LATCH_MAC_DISPLAY` while it is active, else the main one.
+/// Every online display, including sleeping ones, named by its
+/// CGDirectDisplayID. The default is the owner's `LATCH_MAC_DISPLAY`
+/// while it is online, else the main one.
 pub fn displays() -> Vec<crate::display::HostDisplay> {
     let mut ids = [0u32; 32];
     let mut count = 0u32;
     // SAFETY: the buffer holds `ids.len()` IDs and `count` is a valid out pointer.
     let status =
-        unsafe { ffi::CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+        unsafe { ffi::CGGetOnlineDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
     if status != 0 {
         return Vec::new();
     }
@@ -129,7 +132,10 @@ fn open_video_color(config: &VideoConfig) -> Result<Box<dyn VideoPipeline>> {
         width: config.width,
         height: config.height,
         fps: config.fps,
-        display: wanted_display(config.display.as_deref(), owner_display()),
+        display: config
+            .display
+            .as_deref()
+            .and_then(|id| id.trim().parse().ok()),
         pixel_format: depth.pixel_format(),
         hdr: config.color.is_hdr(),
     };
@@ -449,12 +455,21 @@ mod tests {
 
     #[test]
     fn the_viewers_choice_comes_before_the_owners_override() {
-        assert_eq!(wanted_display(Some("69733382"), Some(1)), Some(69733382));
-        assert_eq!(wanted_display(None, Some(1)), Some(1));
-        assert_eq!(wanted_display(None, None), None, "the main display");
-        // Not a display ID (another platform's name): the owner's, or main.
-        assert_eq!(wanted_display(Some(r"\\.\DISPLAY2"), Some(1)), Some(1));
-        assert_eq!(wanted_display(Some(""), None), None);
+        let available = [1, 2, 69733382];
+        assert_eq!(
+            wanted_display(Some(69733382), Some(1), &available),
+            Some(69733382)
+        );
+        assert_eq!(wanted_display(None, Some(1), &available), Some(1));
+        assert_eq!(
+            wanted_display(None, None, &available),
+            None,
+            "the main display"
+        );
+        // A disconnected choice falls back to the owner's override first.
+        assert_eq!(wanted_display(Some(9), Some(2), &available), Some(2));
+        assert_eq!(wanted_display(Some(9), Some(8), &available), None);
+        assert_eq!(wanted_display(Some(1), Some(2), &[]), None);
     }
 
     #[test]
@@ -463,6 +478,11 @@ mod tests {
         eprintln!("{displays:#?}");
         // SAFETY: reads the window server's configuration only.
         let main = unsafe { super::ffi::CGMainDisplayID() };
+        // A sleeping main display remains online and must remain selectable.
+        // SAFETY: reads the window server's configuration only.
+        if unsafe { super::ffi::CGDisplayIsOnline(main) } != 0 {
+            assert!(displays.iter().any(|d| d.id == main.to_string()));
+        }
         if displays.is_empty() {
             return;
         }

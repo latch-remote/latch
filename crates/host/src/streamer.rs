@@ -11,14 +11,14 @@ use std::time::{Duration, Instant};
 /// How long a look at the displays stands before the next status looks again.
 const DISPLAYS_FOR: Duration = Duration::from_secs(3);
 
-/// The displays a viewer can choose from. While a viewer `streaming`, the
-/// list from before its session: a Windows session on the virtual display
+/// The displays a viewer can choose from. On Windows while `streaming`,
+/// keep the list from before the session: a session on the virtual display
 /// switches the other monitors off until it ends, and they are still
 /// there to choose.
 pub fn displays(streaming: bool) -> Vec<HostDisplay> {
     static SEEN: Mutex<Option<(Instant, Vec<HostDisplay>)>> = Mutex::new(None);
     if let Some((at, list)) = &*SEEN.lock() {
-        if streaming || at.elapsed() < DISPLAYS_FOR {
+        if (cfg!(windows) && streaming) || at.elapsed() < DISPLAYS_FOR {
             return list.clone();
         }
     }

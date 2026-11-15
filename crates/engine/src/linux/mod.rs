@@ -166,7 +166,10 @@ pub fn prepare_display(
 ) -> anyhow::Result<Option<crate::display::Previous>> {
     // One monitor of several is shared at its own size: resizing would
     // change a monitor that may not be the chosen one.
-    if wanted.is_some() && displays().is_ok_and(|d| d.len() > 1) {
+    if wanted.is_some()
+        && displays()
+            .is_ok_and(|d| d.len() > 1 && crate::display::HostDisplay::find(&d, wanted).is_some())
+    {
         return Ok(None);
     }
     display::prepare(width, height, fps)

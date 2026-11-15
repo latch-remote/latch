@@ -1368,7 +1368,8 @@ impl View {
                 if ui::menu_choice(ui, &label, choice == current)
                     .on_hover_text("The stream starts again on this display, in a second or two.")
                     .clicked()
-                    && choice != current
+                    && (choice != current
+                        || choice.as_deref() != env.cfg.display(&env.live.node_id))
                 {
                     actions.push(Action::ChooseDisplay(choice));
                 }
@@ -2855,6 +2856,7 @@ pub(crate) mod tests {
         pub video_help: Option<crate::display::Help>,
         pub power_allowed: bool,
         pub can_sleep: bool,
+        pub displays: Vec<latch_proto::control::HostDisplay>,
     }
 
     pub(crate) struct Fixture {
@@ -2978,7 +2980,7 @@ pub(crate) mod tests {
             video_help: extra.video_help.clone(),
             power_allowed: extra.power_allowed,
             can_sleep: extra.can_sleep,
-            displays: Vec::new(),
+            displays: extra.displays.clone(),
         };
         let actions = view.show(ctx, &env);
         if !actions.is_empty() {
@@ -3039,6 +3041,75 @@ pub(crate) mod tests {
                 },
             ),
         )
+    }
+
+    #[test]
+    fn the_stream_menu_can_switch_displays_without_power_permission() {
+        use latch_proto::control::HostDisplay;
+        let displays = vec![
+            HostDisplay {
+                id: "1".into(),
+                name: "Built-in display".into(),
+                width: 3024,
+                height: 1964,
+                default: true,
+                ..Default::default()
+            },
+            HostDisplay {
+                id: "2".into(),
+                name: "External display".into(),
+                width: 2560,
+                height: 1440,
+                ..Default::default()
+            },
+        ];
+        let mut h = harness_with(
+            Vec2::new(1280.0, 800.0),
+            1.0,
+            false,
+            fixture(
+                view_with_bar(),
+                Extra {
+                    os: "macOS".into(),
+                    displays,
+                    ..Default::default()
+                },
+            ),
+        );
+        let external = "External display · 2560 × 1440";
+        h.get_by_label("Mac").simulate_click();
+        h.run_steps(2);
+        h.get_by_label(external).simulate_click();
+        h.run_steps(2);
+        assert_eq!(h.state().actions, [Action::ChooseDisplay(Some("2".into()))]);
+
+        // Once reconnected, choosing the same display leaves the stream up.
+        h.state_mut().live.as_mut().unwrap().display = Some("2".into());
+        h.state_mut().cfg.choose_display("n1", Some("2".into()));
+        h.state_mut().actions.clear();
+        h.get_by_label("Mac").simulate_click();
+        h.run_steps(2);
+        h.get_by_label(external).simulate_click();
+        h.run_steps(2);
+        assert!(h.state().actions.is_empty());
+
+        h.get_by_label("Mac").simulate_click();
+        h.run_steps(2);
+        h.get_by_label("Automatic (Built-in display)")
+            .simulate_click();
+        h.run_steps(2);
+        assert_eq!(h.state().actions, [Action::ChooseDisplay(None)]);
+
+        // A stream that fell back after a display disappeared can still
+        // forget the saved choice by choosing Automatic.
+        h.state_mut().live.as_mut().unwrap().display = None;
+        h.state_mut().actions.clear();
+        h.get_by_label("Mac").simulate_click();
+        h.run_steps(2);
+        h.get_by_label("Automatic (Built-in display)")
+            .simulate_click();
+        h.run_steps(2);
+        assert_eq!(h.state().actions, [Action::ChooseDisplay(None)]);
     }
 
     fn bar_control_rects(h: &egui_kittest::Harness<'_, Fixture>) -> Vec<(String, Rect)> {

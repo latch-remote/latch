@@ -117,7 +117,7 @@ pub struct Request {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-    /// A CGDirectDisplayID; the main display when `None` or gone.
+    /// A CGDirectDisplayID; the owner's override or main display when `None` or gone.
     pub display: Option<u32>,
     /// NV12 or P010 (see `encoder::Depth`).
     pub pixel_format: u32,
@@ -172,7 +172,11 @@ impl Capture {
                                     .map(|i| displays.objectAtIndex(i))
                                     .find(|d| d.displayID() == id)
                             };
-                            wanted
+                            let available: Vec<_> = (0..displays.count())
+                                .map(|i| displays.objectAtIndex(i).displayID())
+                                .collect();
+                            let owner = if audio { None } else { super::owner_display() };
+                            super::wanted_display(wanted, owner, &available)
                                 .and_then(find)
                                 .or_else(|| find(CGMainDisplayID()))
                                 .or_else(|| {

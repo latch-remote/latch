@@ -476,7 +476,7 @@ and a viewer then offers no choice.
 | --- | --- | --- |
 | `id` | string | what `StreamRequest.display` names it by; opaque to the viewer: a CGDirectDisplayID on a Mac, the GDI name (`\\.\DISPLAY2`) on Windows, the RandR monitor name (`DP-1`) on Linux |
 | `name` | string | for people: `"Built-in display"`, a monitor's own name, `"Virtual display"` |
-| `x`, `y` | i32 | where it sits on the host's desktop |
+| `x`, `y` | i32 | where it sits on the host's desktop, in the platform's desktop coordinates (points on macOS, pixels on Windows and X11) |
 | `width`, `height` | u32 | its size in pixels |
 | `primary` | bool | the system's main display |
 | `default` | bool | optional, default false; what a request naming no display shares. None is on a Linux host, which then shares its whole X screen |
