@@ -1,9 +1,14 @@
 //! ScreenCaptureKit retains IOSurfaces through VideoToolbox encoding. Sound has its own stream.
 
 mod capture;
+mod cursor;
+pub use cursor::system_cursor;
 mod encoder;
 mod ffi;
+pub mod gamepad;
 mod input;
+mod run_loop;
+pub use run_loop::with_main_queue;
 pub(crate) mod synthetic;
 
 #[cfg(test)]
@@ -153,6 +158,7 @@ fn open_video_color(config: &VideoConfig) -> Result<Box<dyn VideoPipeline>> {
         pacer: Pacer::new(config.fps),
         pending: None,
         checked: Instant::now(),
+        cursor: cursor::Plane::default(),
     };
     video.wake();
     // Some virtual Macs advertise hardware that fails only on the first encode.
@@ -237,6 +243,7 @@ struct Video {
     pacer: Pacer,
     pending: Option<EncodedVideo>,
     checked: Instant,
+    cursor: cursor::Plane,
 }
 impl Video {
     /// A frame coming out of the encoder wakes `next` as a new picture does.
@@ -250,6 +257,10 @@ impl Video {
     }
     fn restart_capture(&mut self) -> Result<()> {
         self.capture = Capture::video(self.request)?;
+        self.cursor.reset();
+        self.cursor
+            .sample(self.capture.display, self.config.width, self.config.height);
+        self.capture.set_cursor_drawn(self.cursor.drawn())?;
         self.wake();
         self.generation = 0;
         self.encoder.request_keyframe();
@@ -319,7 +330,10 @@ impl VideoPipeline for Video {
             if let Some((.., frame)) = self.encoder.collect(Duration::ZERO) {
                 drop(state);
                 match frame {
-                    Some(Ok(frame)) => return Ok(frame),
+                    Some(Ok(frame)) => {
+                        self.cursor.encoded(frame.captured);
+                        return Ok(frame);
+                    }
                     Some(Err(error)) => self.recover(error)?,
                     // A real-time encoder may drop under load; the next
                     // picture carries any keyframe that one was.
@@ -407,6 +421,38 @@ impl VideoPipeline for Video {
             };
             self.capture.shared.ready.wait_for(&mut state, wait);
         }
+    }
+    fn set_cursor_drawn(&mut self, drawn: bool) -> bool {
+        self.cursor.request_drawn(drawn);
+        if !drawn {
+            self.cursor
+                .sample(self.capture.display, self.config.width, self.config.height);
+        }
+        let now = Instant::now();
+        if !self.cursor.can_configure(now) {
+            return true;
+        }
+        let drawn = self.cursor.configuration_drawn();
+        match self.capture.set_cursor_drawn(drawn) {
+            Ok(changed) => {
+                if changed {
+                    self.cursor
+                        .configured(self.capture.cursor_drawn(), Instant::now());
+                    self.pending = None;
+                    self.encoder.request_keyframe();
+                }
+                // Cursor controls remain supported during a composited fallback.
+                true
+            }
+            Err(error) => {
+                self.cursor.configuration_failed(Instant::now());
+                tracing::warn!(%error, "could not change ScreenCaptureKit cursor composition");
+                true
+            }
+        }
+    }
+    fn take_cursor(&mut self) -> Option<crate::video::CursorUpdate> {
+        self.cursor.update_for_frame()
     }
     fn recovers(&self) -> bool {
         self.encoder.recovers()
