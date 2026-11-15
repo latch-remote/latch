@@ -842,3 +842,18 @@ fn warning_codes_are_stable_and_messages_are_credential_free() {
     );
     assert_eq!(W::ChecksTimedOut.severity(), WarningSeverity::Actionable);
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn desktop_commands_prefer_the_system_executable() {
+    assert_eq!(
+        command_program("true"),
+        std::path::Path::new("/usr/bin/true")
+    );
+    let missing = "latch-netenv-missing-executable";
+    assert_eq!(command_program(missing), std::path::Path::new(missing));
+    assert_eq!(
+        command_program("/usr/sbin/scutil"),
+        std::path::Path::new("/usr/sbin/scutil")
+    );
+}

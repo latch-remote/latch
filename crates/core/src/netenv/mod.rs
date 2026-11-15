@@ -333,14 +333,22 @@ fn command(program: &str, args: &[&str], deadline: Instant) -> Option<String> {
     if remaining.is_zero() {
         return None;
     }
+    crate::tailscale::run_limited(
+        std::process::Command::new(command_program(program)).args(args),
+        remaining,
+    )
+    .ok()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn command_program(program: &str) -> std::path::PathBuf {
     // Prefer the system executable over desktop/session PATH entries.
     let system = std::path::Path::new("/usr/bin").join(program);
-    let program = if system.is_file() {
-        system.as_os_str()
+    if system.is_file() {
+        system
     } else {
-        std::ffi::OsStr::new(program)
-    };
-    crate::tailscale::run_limited(std::process::Command::new(program).args(args), remaining).ok()
+        program.into()
+    }
 }
 
 #[cfg(test)]
