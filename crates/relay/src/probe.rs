@@ -240,11 +240,24 @@ mod tests {
         assert!(server.requests.is_empty());
         drop(peers);
         server.accepts = ACCEPTS_PER_MINUTE;
-        let _peer = TcpStream::connect(server.local_addr().unwrap()).unwrap();
-        server.poll_at(now + TIMEOUT).unwrap();
+        let mut rejected = TcpStream::connect(server.local_addr().unwrap()).unwrap();
+        rejected.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut closed = false;
+        while !closed && Instant::now() < deadline {
+            server.poll_at(now + TIMEOUT).unwrap();
+            closed = matches!(rejected.read(&mut [0]), Ok(0));
+            std::thread::yield_now();
+        }
+        assert!(closed, "rate-limited connection was not closed");
         assert!(server.requests.is_empty());
+        drop(rejected);
         let _peer = TcpStream::connect(server.local_addr().unwrap()).unwrap();
-        server.poll_at(now + Duration::from_secs(61)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.requests.is_empty() && Instant::now() < deadline {
+            server.poll_at(now + Duration::from_secs(61)).unwrap();
+            std::thread::yield_now();
+        }
         assert_eq!(server.requests.len(), 1);
         assert_eq!(server.accepts, 1);
     }
