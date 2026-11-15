@@ -357,6 +357,17 @@ fn local_cursor_negotiated_and_host_omits_pointer_when_asked() {
     assert_eq!(shape.hot_x, 0);
     assert_eq!(shape.hot_y, 0);
 
+    // Keep the cursor and its comparison window inside a flat, static colour
+    // bar. At the display centre, lossy H.264 reconstruction of the bar edges
+    // can differ after toggling the cursor even with identical source pixels.
+    let cursor_x = 100;
+    let cursor_y = 100;
+    session
+        .input()
+        .mouse_position(cursor_x, cursor_y, W as i16, H as i16);
+    let cursor_x = cursor_x as usize;
+    let cursor_y = cursor_y as usize;
+
     // 3. Since cursor: true, host starts with draw_cursor: false.
     // Receive a frame with cursor omitted.
     let (seq1, frame_omitted) = next_frame(&frames, 0, Duration::from_secs(5))
@@ -367,9 +378,6 @@ fn local_cursor_negotiated_and_host_omits_pointer_when_asked() {
     // 4. Request host to draw cursor
     session.draw_cursor(true);
 
-    // Startup places input in the middle of the captured display.
-    let cursor_x = W as usize / 2;
-    let cursor_y = H as usize / 2;
     // Wait for a frame with the cursor drawn at that position.
     let mut seq = seq1;
     let start = Instant::now();
@@ -377,7 +385,7 @@ fn local_cursor_negotiated_and_host_omits_pointer_when_asked() {
     while start.elapsed() < Duration::from_secs(3) {
         if let Some((s, f)) = next_frame(&frames, seq, Duration::from_millis(100)) {
             seq = s;
-            // Compare around the centered synthetic arrow.
+            // Compare around the synthetic arrow.
             let mut diff = 0u64;
             for y in cursor_y - 5..cursor_y + 25 {
                 for x in cursor_x - 5..cursor_x + 25 {
@@ -406,28 +414,20 @@ fn local_cursor_negotiated_and_host_omits_pointer_when_asked() {
     let start = Instant::now();
     let mut cursor_omitted_again = false;
     let mut least_diff = u64::MAX;
-    let mut closest_rows = Vec::new();
     while start.elapsed() < Duration::from_secs(3) {
         if let Some((s, f)) = next_frame(&frames, seq, Duration::from_millis(100)) {
             seq = s;
             let mut diff = 0u64;
-            let mut rows = Vec::new();
             for y in cursor_y - 5..cursor_y + 25 {
-                let mut row_diff = 0u64;
                 for x in cursor_x - 5..cursor_x + 25 {
                     let idx = y * f.y_stride + x;
                     if idx < f.y.len() && idx < luma_omitted.len() {
                         let d = f.y[idx].abs_diff(luma_omitted[idx]);
                         diff += d as u64;
-                        row_diff += d as u64;
                     }
                 }
-                rows.push(row_diff);
             }
-            if diff < least_diff {
-                least_diff = diff;
-                closest_rows = rows;
-            }
+            least_diff = least_diff.min(diff);
             frames.recycle(f);
             if diff < 50 {
                 cursor_omitted_again = true;
@@ -437,7 +437,7 @@ fn local_cursor_negotiated_and_host_omits_pointer_when_asked() {
     }
     assert!(
         cursor_omitted_again,
-        "host did not omit cursor when draw_cursor(false): least luma difference {least_diff}, rows {closest_rows:?}"
+        "host did not omit cursor when draw_cursor(false): least luma difference {least_diff}"
     );
 
     session.stop();
