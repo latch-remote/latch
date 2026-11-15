@@ -20,6 +20,18 @@ pub struct VideoConfig {
     pub display: Option<String>,
 }
 
+/// Capture permission or its producer ended. Retrying must require a new session.
+#[derive(Debug)]
+pub struct CaptureEnded(pub String);
+
+impl std::fmt::Display for CaptureEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for CaptureEnded {}
+
 /// One encoded frame: an Annex B access unit (SPS/PPS, or VPS/SPS/PPS for
 /// HEVC, in band before every keyframe).
 #[derive(Debug, Clone)]

@@ -1512,8 +1512,8 @@ impl Drop for RelayRoute {
     }
 }
 
-/// Includes takeover (up to 30 s), this viewer's prep (15 s), and capture open.
-const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// Includes takeover, preparation, and up to 90 seconds of portal approval.
+const START_TIMEOUT: Duration = Duration::from_secs(180);
 /// After the host accepts, its first decoded picture must arrive within this.
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(8);
 /// Still desktops produce idle frames every 100 ms. Give loss recovery and
@@ -2010,6 +2010,7 @@ struct Inner {
     done: Mutex<bool>,
     done_cv: Condvar,
     cursor_supported: AtomicBool,
+    key_positions: AtomicBool,
     cursor_state: Mutex<Option<CursorState>>,
     control_writer: Mutex<Option<TcpStream>>,
     /// Gamepad slots the host takes; 0 until it accepts, or if it takes none.
@@ -2098,6 +2099,7 @@ impl Inner {
             done: Mutex::new(false),
             done_cv: Condvar::new(),
             cursor_supported: AtomicBool::new(false),
+            key_positions: AtomicBool::new(false),
             cursor_state: Mutex::new(None),
             control_writer: Mutex::new(None),
             pad_slots: AtomicU32::new(0),
@@ -2319,6 +2321,10 @@ impl Session {
     }
 
     /// Whether the host agreed to stream cursor shapes and omit the host pointer.
+    pub fn key_positions(&self) -> bool {
+        self.inner.key_positions.load(Ordering::Acquire)
+    }
+
     pub fn cursor_supported(&self) -> bool {
         self.inner.cursor_supported.load(Ordering::Acquire)
     }
@@ -2508,6 +2514,8 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
     let color = video::decoder_color(settings.color, settings.width, settings.height);
     let request = StreamRequest {
         media_path_policy: true,
+        key_positions: true,
+        startup_timeout_secs: START_TIMEOUT.as_secs() as u32,
         relay: inner.configured_relay.lock().is_some(),
         prefer_color: settings.prefer_color,
         color,
@@ -2580,7 +2588,16 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
     }
     let accept = match control::read_message(&mut tcp) {
         Ok(Message::Accept(a)) => a,
-        Ok(Message::End(e)) => return fail("starting", e.message),
+        Ok(Message::End(e)) => {
+            return fail(
+                if e.code == control::end::TRANSPORT_FAILED {
+                    "connecting"
+                } else {
+                    "starting"
+                },
+                e.message,
+            )
+        }
         Ok(other) => return fail("starting", format!("the host said {other:?} first")),
         Err(e) => {
             return fail(
@@ -2667,6 +2684,9 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
             };
         }
     }
+    inner
+        .key_positions
+        .store(accept.key_positions, Ordering::Release);
     let player = accept.audio.as_ref().and_then(|a| {
         match Player::with_gain(
             a.rate,
@@ -2691,7 +2711,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
             udp: send_udp,
             host: media,
             relay: inner.relay.lock().clone(),
-            sender: InputSender::new(accept.session),
+            sender: InputSender::new(accept.session).with_key_positions(accept.key_positions),
             input_progress: None,
             input_failed: false,
             pads: PadSender::new(accept.session),
@@ -5063,6 +5083,82 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         drop(server_sock);
+    }
+
+    #[test]
+    fn transient_pre_accept_end_keeps_automatic_reconnect() {
+        for (code, stage) in [
+            (control::end::TRANSPORT_FAILED, "connecting"),
+            (control::end::CAPTURE_FAILED, "starting"),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let host = std::thread::spawn(move || {
+                use std::io::Read;
+                let (mut tcp, _) = listener.accept().unwrap();
+                tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    tcp.read_exact(&mut byte).unwrap();
+                    head.push(byte[0]);
+                }
+                // Consume the request body before closing, preserving the End on Windows.
+                let head = String::from_utf8(head).unwrap();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                tcp.read_exact(&mut vec![0; length]).unwrap();
+                tcp.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: {}\r\n\r\n", control::UPGRADE).as_bytes()).unwrap();
+                control::write_message(
+                    &mut tcp,
+                    &Message::End(control::End {
+                        code,
+                        message: "preparation refused".into(),
+                    }),
+                )
+                .unwrap();
+            });
+            let (tx, events) = mpsc::channel();
+            let session = Session::start_with_relay(
+                Server {
+                    address: address.ip(),
+                    port: address.port(),
+                },
+                Settings {
+                    prefer_color: false,
+                    color: Default::default(),
+                    cursor: false,
+                    gamepads: false,
+                    mic: false,
+                    width: 64,
+                    height: 64,
+                    fps: 30,
+                    bitrate_kbps: 1000,
+                    hevc: false,
+                    av1: false,
+                    audio: false,
+                    name: "test".into(),
+                    display: None,
+                },
+                Arc::new(FrameSlot::default()),
+                tx,
+                || {},
+                None,
+            );
+            let failed = events
+                .iter()
+                .find(|event| matches!(event, Event::Failed { .. }))
+                .unwrap();
+            host.join().unwrap();
+            session.stop();
+            assert!(matches!(failed, Event::Failed { stage: actual, .. } if actual == stage));
+        }
     }
 
     #[test]

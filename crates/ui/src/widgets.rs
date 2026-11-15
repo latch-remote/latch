@@ -1310,7 +1310,7 @@ fn menu_row(ui: &mut Ui, label: &str, checked: Option<bool>, enabled: bool) -> R
                 ui.painter(),
                 Pos2::new(rect.left() + 12.0, rect.top() + h.min(28.0) / 2.0),
                 Icon::Check,
-                P.text,
+                if enabled { P.text } else { P.text_disabled },
             );
         }
         ui.painter().galley(
@@ -1341,6 +1341,11 @@ pub fn menu_item_enabled(ui: &mut Ui, enabled: bool, label: &str) -> Response {
 /// A menu item with a check mark when chosen.
 pub fn menu_choice(ui: &mut Ui, label: &str, chosen: bool) -> Response {
     menu_row(ui, label, Some(chosen), true)
+}
+
+/// A checked menu item that can be greyed out.
+pub fn menu_choice_enabled(ui: &mut Ui, enabled: bool, label: &str, chosen: bool) -> Response {
+    menu_row(ui, label, Some(chosen), enabled)
 }
 
 /// A heading inside a menu.

@@ -8,12 +8,19 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 pub fn run(p: &Plan<'_>) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let mut approval_note = None::<String>;
+    #[cfg(not(target_os = "linux"))]
+    let approval_note = None::<String>;
     let result = (|| {
         crate::prep::migrate()?;
         #[cfg(target_os = "macos")]
         request_permissions();
         #[cfg(target_os = "linux")]
-        retire_engine()?;
+        {
+            approval_note = latch_engine::linux::approve_wayland()?;
+            retire_engine()?;
+        }
         set_autostart(true, p.exe)?;
         #[cfg(target_os = "macos")]
         if firewall_blocks(p.exe) {
@@ -27,6 +34,10 @@ pub fn run(p: &Plan<'_>) -> Result<()> {
                 "Sharing setup finished. Permission changes may need an app restart.".to_string()
             }
             Err(e) => format!("Sharing setup failed: {e:#}"),
+        };
+        let text = match approval_note {
+            Some(note) => format!("{text}\n{note}"),
+            None => text,
         };
         let text = match linger() {
             Some(note) => format!("{text}\n{note}"),
