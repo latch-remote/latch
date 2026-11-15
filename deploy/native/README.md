@@ -123,10 +123,22 @@ Wayland sessions are not supported, even if Xwayland is present.
 
 ## Updates and old installations
 
-Linux has no in-app binary updater. Download and verify the next release,
-then repeat the headless installer, or replace the binary and restart
-Latch in your existing X11 session. The installer restarts the headless
-host, ending any active stream.
+This kit installs a root-owned binary at `/usr/local/bin/latch-host`. Latch
+shows an installation-owner update notice for that path. Download and verify
+the next release, then repeat the headless installer. The installer restarts
+the headless host, ending any active stream, so arrange that after disconnecting.
+
+A release binary installed in a user-owned writable directory, such as
+`~/.local/bin`, can update from the Latch window or with `latch-host --self-update`
+while its local service runs. The updater waits for streams to end, verifies
+the matching public manifest/archive, replaces the resolved binary atomically
+and restarts its service with health-check rollback. A registered user unit
+uses a separate transient systemd user supervisor. Reopen the window after
+installation. AUR/Nix and container installs use their deployment tools.
+See [Linux update ownership and recovery](../../docs/USING.md#linux-installation-ownership-and-recovery).
+
+Updater tests use Docker locally and native x64/arm64 Linux CI. No Linux machine outside CI and containers is available for this work. A real systemd user session and
+installed desktop update remain unverified.
 
 `migrate-legacy.sh` is only for upgrades from pre-4.1 BroLink unit names or
 Latch 4's separate engine service. Install the runtime prerequisites and

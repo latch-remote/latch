@@ -449,6 +449,9 @@ impl Service {
     /// version did not change. Restart into the new program once nobody
     /// watches. (Windows swaps its executable through `update`.)
     fn follow_reinstall(self: &Arc<Self>) {
+        if self.update_running.load(Ordering::Acquire) {
+            return;
+        }
         let Some(stamp) = started_from().filter(|s| s.replaced()) else {
             return;
         };
@@ -869,6 +872,14 @@ impl Service {
     /// A newer `latch-host.exe` from the Mac: stage it, answer, then swap
     /// it in and hand over. See [`crate::update`].
     fn update(&self, from: IpAddr, req: &Request) -> Response {
+        #[cfg(target_os = "linux")]
+        return self.update_linux(from, req);
+        #[cfg(not(target_os = "linux"))]
+        self.update_windows(from, req)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn update_windows(&self, from: IpAddr, req: &Request) -> Response {
         if !cfg!(windows) {
             // A Mac replaces its own app from GitHub and a container is
             // rebuilt; swapping a Windows executable in here would only
@@ -951,6 +962,55 @@ impl Service {
                 self.update_running.store(false, Ordering::Release);
                 self.log(format!("update from {from} refused: {}", r.message()));
                 Response::json(r.status(), &Ack::err(r.message()))
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn update_linux(&self, from: IpAddr, req: &Request) -> Response {
+        if !self.cfg.lock().accept_updates {
+            return Response::json(403, &Ack::err("the owner has turned pushed updates off"));
+        }
+        let _admission = self.admission.lock();
+        if self.update_running.swap(true, Ordering::AcqRel) {
+            return Response::json(409, &Ack::err("an update is already being installed"));
+        }
+        let result = (|| -> Result<()> {
+            let engine_running = self.server.lock().is_some();
+            anyhow::ensure!(
+                !update::refuse_self_update(engine_running, self.someone_watching()),
+                "a stream is running; the update is retried after it ends"
+            );
+            let exe = std::env::current_exe()?;
+            let version = update::linux::authenticate(req, &exe)?;
+            let mut helper = update::linux::start(&exe, &version)?;
+            let running = self.update_running.clone();
+            let log = self.log.clone();
+            self.log(format!(
+                "installing Linux Latch {version}, requested by {from}"
+            ));
+            std::thread::spawn(move || {
+                // Success normally restarts this process. An early failure
+                // releases admission so a failed download cannot block streams.
+                let result = helper.wait();
+                push_log(
+                    &log,
+                    format!("Linux update supervisor finished: {result:?}"),
+                );
+                running.store(false, Ordering::Release);
+            });
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Response::json(200, &Ack::ok()),
+            Err(e) => {
+                self.update_running.store(false, Ordering::Release);
+                let status = if e.to_string().contains("a stream is running") {
+                    409
+                } else {
+                    400
+                };
+                Response::json(status, &Ack::err(format!("{e:#}")))
             }
         }
     }
@@ -1974,7 +2034,7 @@ mod tests {
         let svc = Service::new();
         let req = Request::default();
         svc.update_running.store(true, Ordering::Release);
-        if cfg!(windows) {
+        if cfg!(any(windows, target_os = "linux")) {
             assert_eq!(svc.update(LOOPBACK, &req).status, 409);
         } else {
             // Not a Windows PC: refused before the slot is even looked at.
@@ -1992,7 +2052,7 @@ mod tests {
         let svc = Service::new();
         svc.cfg.lock().accept_updates = false;
         let r = svc.update(LOOPBACK, &Request::default());
-        if cfg!(windows) {
+        if cfg!(any(windows, target_os = "linux")) {
             assert_eq!(r.status, 403, "{}", r.body);
             assert!(r.body.contains("turned pushed updates off"), "{}", r.body);
         } else {

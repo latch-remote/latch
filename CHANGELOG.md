@@ -84,6 +84,12 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Packaging
 
+- Add verified Linux self-updates for user-owned release binaries, with
+  architecture selection, private same-filesystem staging, atomic replacement,
+  service restart and post-update health rollback. Keep package-manager,
+  Nix, protected and container installs on their deployment update paths.
+  Add native x64/arm64 CI fixture updates and a headless `--self-update` request.
+
 - Add a Scoop manifest, AUR packages (`latch-remote-bin` from the release
   binaries, `latch-remote` from the source archive) and a Nix flake that
   builds Latch from source or packages the release binary. A CI workflow

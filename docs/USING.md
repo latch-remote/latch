@@ -195,9 +195,14 @@ switch and a **Check now** button.
   version-specific public manifest and installs the file only if its exact
   version, URL, size and SHA-256 match. A PC that cannot reach GitHub refuses
   the update.
-- **Linux.** Latch says a newer version exists and links to it. Install the
-  tarball as in [deploy/native/README.md](../deploy/native/README.md), or
-  rebuild the Docker node.
+- **Linux.** A release binary owned by your user in a writable directory
+  downloads the matching x64 or arm64 tarball when the window is open. It
+  waits for viewing and hosting streams to end, then asks the local service
+  to install it. Reopen the window after the service restarts. A headless
+  user-owned install can request the same update with `latch-host --self-update`
+  while its local service is running. Settings' automatic-update switch
+  controls window checks. The CLI is an explicit update request and refuses
+  installation during a hosted stream. Run it again after disconnecting.
 
 Version 6 downloads and update checks need no GitHub login. Legacy
 `github_token` and `LATCH_GITHUB_TOKEN` settings are ignored by this public
@@ -208,6 +213,59 @@ SSH installation of a current release: a Latch 5 viewer cannot stream the
 retired protocol to upgrade them. Mac builds are ad-hoc signed, so macOS may
 ask for Screen Recording and Accessibility again after an update
 ([why](ROADMAP.md#signing-and-notarization)).
+
+### Linux installation ownership and recovery
+
+The updater resolves installation symlinks and replaces their target. It
+leaves the symlink in place. These installations show a notice with the
+appropriate update instructions.
+
+- Pacman-owned files, including AUR packages, and paths under `/usr/bin` or
+  `/usr/lib` use the package manager. Pacman ownership is queried with `pacman -Qo`.
+- Resolved paths under `/nix/store` use the Nix package or flake rebuild.
+- Docker/Podman markers (`/.dockerenv`, `/run/.containerenv`), `container` or
+  `LATCH_CONTAINER_INSTALL` environment markers, and OverlayFS, squashfs or
+  EROFS filesystems use an image rebuild and container recreation. The
+  headless container kit sets `LATCH_CONTAINER_INSTALL=1`.
+- Read-only mounts use the installation's deployment tool.
+- Root-owned installs, files or parent directories owned by another user,
+  unwritable files/directories, group/world-writable install directories or
+  files, privileged executables and unsafe ancestor directories require the
+  installation owner to replace the binary. Ancestors must belong to root
+  or the user and prevent other users from renaming entries, allowing sticky
+  directories such as `/tmp`. Running as root also selects this notice.
+
+For a user-owned release, the service authenticates the archive using its
+own version-specific public manifest and the shared version, size and SHA-256
+checks. Its separate supervisor resolves that manifest and downloads again
+into a private `0700` sibling directory. Only the selected binary member is
+written, initially `0600`. After digest and ELF architecture verification,
+it becomes `0755` and must report the exact release version with `--version`.
+The updater holds an exclusive file lock, hard-links the old executable for
+recovery and atomically renames the new executable over the install path.
+
+When the service runs in `latch.service`, a transient systemd user unit keeps
+the supervisor alive across `systemctl --user restart latch.service`. An
+unsupervised service is stopped through a pinned process handle and started
+again. The new service must report the expected version continuously for 15
+seconds within 60 seconds. A restart or health-check failure restores the old
+binary atomically and restarts it. Failure details are in `update.log`. If
+restoring the file itself fails, the private staging directory and recovery
+binary remain for the installation owner. Downloads, disk-full errors and
+concurrent updater attempts leave the installed binary in place.
+
+The authenticated `/v1/update` endpoint accepts a Linux host's matching
+release tarball with the existing version and digest headers. Automatic
+cross-machine Linux pushes await an architecture capability in discovery.
+Current hosts advertise their OS, so automatic Mac pushes continue to select
+Windows executables. No streaming protocol or manifest format changes are
+required for local Linux updates.
+
+Linux updater validation uses local HTTP manifest/artifact fixtures and
+compiled ELF programs on native x64 and arm64 CI. Local development uses
+Docker with Ubuntu 24.04/glibc 2.39. No Linux machine outside CI and containers is available for
+this work. Desktop relaunch, a real systemd user session and hardware
+stream continuity remain unverified there.
 
 ### Moving from 5.x to 6.0.0
 

@@ -369,9 +369,9 @@ fn prune_updates(root: &std::path::Path, keep: &str) {
     }
 }
 
-fn desktop_offer(rel: &Release, windows: bool) -> Option<String> {
+fn desktop_offer(rel: &Release, can_update: bool) -> Option<String> {
     rel.is_newer_than(&update::current()).then(|| {
-        if windows {
+        if can_update {
             format!(
                 "Latch {} is available; installs when no stream is running.",
                 rel.version
@@ -387,7 +387,32 @@ fn desktop_offer(rel: &Release, windows: bool) -> Option<String> {
     })
 }
 
-/// Windows pulls the bare release asset; Linux only advertises manual updates.
+fn desktop_can_update() -> bool {
+    #[cfg(target_os = "linux")]
+    return std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| update::linux::owned(&exe).is_ok());
+    #[cfg(not(target_os = "linux"))]
+    cfg!(windows)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_manual_offer(rel: &Release) -> String {
+    let why = std::env::current_exe()
+        .ok()
+        .and_then(|exe| update::linux::installation(&exe).ok())
+        .and_then(Result::err)
+        .map(|reason| reason.to_string())
+        .unwrap_or_else(|| "replace this installation through its deployment tool".into());
+    format!(
+        "Latch {} is available; {why}. https://github.com/{}/releases/tag/{}",
+        rel.version,
+        update::REPO,
+        rel.tag
+    )
+}
+
+/// Desktop pulls use the local service to serialize installation with streams.
 fn spawn_desktop(
     state: Arc<Mutex<State>>,
     live: Arc<Mutex<Option<Live>>>,
@@ -409,14 +434,20 @@ fn spawn_desktop(
                     Ok(rel) => {
                         next = Instant::now() + CHECK_EVERY;
                         let newer = rel.is_newer_than(&update::current());
+                        let can_update = desktop_can_update();
                         let mut st = state.lock();
                         st.checked = Some(Instant::now());
                         st.latest = Some(rel.version.clone());
                         st.release = Some(rel.clone());
-                        st.message = desktop_offer(&rel, cfg!(windows))
+                        st.message = desktop_offer(&rel, can_update)
                             .unwrap_or_else(|| format!("Up to date (v{}).", update::current()));
                         st.notice = newer.then(|| (Tone::Info, st.message.clone()));
-                        pending = (newer && cfg!(windows)).then_some(rel);
+                        #[cfg(target_os = "linux")]
+                        if newer && !can_update {
+                            st.message = linux_manual_offer(&rel);
+                            st.notice = Some((Tone::Info, st.message.clone()));
+                        }
+                        pending = (newer && can_update).then_some(rel);
                     }
                     Err(e) => {
                         next = Instant::now() + RETRY_AFTER;
@@ -443,9 +474,15 @@ fn spawn_desktop(
                     continue;
                 }
                 let result = (|| -> Result<()> {
-                    let path = fetch_asset(rel, HOST_EXE)?;
-                    let bytes = std::fs::read(path)?;
-                    update::verify_host(rel, &rel.version, &bytes)?;
+                    #[cfg(target_os = "linux")]
+                    let bytes = update::linux::download_release(rel)?;
+                    #[cfg(not(target_os = "linux"))]
+                    let bytes = {
+                        let path = fetch_asset(rel, HOST_EXE)?;
+                        let bytes = std::fs::read(path)?;
+                        update::verify_host(rel, &rel.version, &bytes)?;
+                        bytes
+                    };
                     // The service independently authenticates the same bytes and serializes
                     // installation with incoming streams and peer pushes.
                     send_host(
@@ -462,6 +499,11 @@ fn spawn_desktop(
                             "Installing Latch {}. Reopen Latch after the service restarts.",
                             rel.version
                         );
+                        #[cfg(target_os = "linux")]
+                        {
+                            let mut st = state.lock();
+                            st.notice = Some((Tone::Info, st.message.clone()));
+                        }
                         #[cfg(windows)]
                         if runs_at_least(
                             SocketAddr::from((Ipv4Addr::LOCALHOST, CONTROL_PORT)),
@@ -839,8 +881,8 @@ pub fn old_host_message(name: &str, version: &Version) -> String {
 }
 
 /// What to say about a host this Mac cannot update when a newer release is
-/// out: a Linux machine or a container, whose Latch Host is installed by
-/// hand. `None` for a Windows PC (it is sent the update), a Mac (its own
+/// out. Linux copies use their local updater or deployment tool.
+/// `None` for a Windows PC (it is sent the update), a Mac (its own
 /// app updates it) and a host already on the release.
 pub fn manual_update_message(
     name: &str,
@@ -853,7 +895,7 @@ pub fn manual_update_message(
     }
     rel.is_newer_than(running).then(|| {
         format!(
-            "{name} runs Latch Host {running}, and {} is out. This Mac sends updates to Windows PCs only: install the new Latch Host on {name} by hand, the way it was set up (a Linux machine: the release's latch-host-linux tarball).",
+            "{name} runs Latch Host {running}, and {} is out. This Mac sends updates to Windows PCs only. On {name}, open Latch to update a user-owned Linux release, or update through its package manager or deployment kit.",
             rel.version
         )
     })

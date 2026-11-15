@@ -230,6 +230,8 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --locked --workspace --all-targets
+      - name: Linux updater local-manifest fixture and rollback
+        run: cargo test --locked -p latch-core -j 4 linux_release_fixture_updates_and_rolls_back -- --nocapture
       - name: release host
         run: cargo build --locked --release -p latch-host
       - name: native TCP relay deployment checks
