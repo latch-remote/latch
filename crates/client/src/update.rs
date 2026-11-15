@@ -462,6 +462,7 @@ impl LinuxRetry {
                 version: Some(version.clone()),
                 ..Self::default()
             };
+            self.persist();
         }
     }
 
@@ -612,7 +613,6 @@ fn spawn_desktop(
                         #[cfg(target_os = "linux")]
                         {
                             retry.offer(&rel.version, explicit);
-                            retry.persist();
                             let remaining = retry.remaining(std::time::SystemTime::now());
                             offered_at = Instant::now() + remaining;
                             if !remaining.is_zero() {
@@ -1739,8 +1739,17 @@ mod tests {
         let mut legacy: LinuxRetry =
             toml::from_str("version = '999.0.0'\nattempts = 8\nretry_at = 1086400\n").unwrap();
         assert!(!legacy.remaining(now).is_zero());
+        legacy.persist();
         legacy.offer(&version, false);
         assert_eq!(legacy.remaining(now), Duration::ZERO);
+        let persisted: LinuxRetry = latch_core::config::try_load(LINUX_RETRY_FILE).unwrap();
+        assert_eq!(persisted.backoff_version, 1);
+        assert_eq!(persisted.remaining(now), Duration::ZERO);
+        legacy.after_attempt(now);
+        legacy.persist();
+        let mut reloaded: LinuxRetry = latch_core::config::try_load(LINUX_RETRY_FILE).unwrap();
+        reloaded.offer(&version, false);
+        assert_eq!(reloaded.remaining(now), RETRY_AFTER);
         let offline_until = now + Duration::from_secs(24 * 3600);
         while now < offline_until {
             now += policy.manifest_failed(now);

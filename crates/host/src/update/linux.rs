@@ -252,7 +252,10 @@ pub fn reconcile() -> Result<Option<linux::UpdateState>> {
         {
             return Ok(Some(state));
         }
-        let needs_restart = state.phase == linux::Phase::Restoring;
+        let needs_restart = matches!(
+            state.phase,
+            linux::Phase::Swapping | linux::Phase::Restoring
+        );
         let restored = match state.recover(&path) {
             Ok(restored) => restored,
             Err(e) if e.to_string().contains("another updater is already running") => {
@@ -404,7 +407,13 @@ fn watch_replacement(exe: &Path, version: &Version, systemd: bool) -> Result<()>
     super::watch_checked(
         || {
             if systemd {
-                if let Some(reason) = service_failure().ok().flatten() {
+                if let Some(reason) = service_failure()
+                    .inspect_err(|error| {
+                        tracing::debug!("could not read latch.service failure state: {error:#}")
+                    })
+                    .ok()
+                    .flatten()
+                {
                     if failed_since
                         .get_or_insert_with(std::time::Instant::now)
                         .elapsed()

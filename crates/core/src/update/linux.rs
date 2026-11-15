@@ -6,7 +6,7 @@ use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -318,7 +318,7 @@ struct JournalLock {
 impl JournalLock {
     fn acquire(path: &Path) -> Result<Self> {
         let parent = path.parent().context("journal directory")?;
-        fs::create_dir_all(parent)?;
+        create_lock_directory(parent)?;
         let file = open_lock(&path.with_extension("json.lock"))?;
         ensure!(
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0,
@@ -663,6 +663,12 @@ impl UpdateState {
                 && self.original.is_some()
                 && fs::symlink_metadata(&self.exe).is_ok_and(|meta| {
                     meta.is_file() && Some((meta.dev(), meta.ino())) == self.original
+                })
+                && self.stage.as_ref().is_some_and(|stage| {
+                    validate_stage(stage, &self.exe).is_ok()
+                        && fs::symlink_metadata(stage.join("previous")).is_ok_and(|meta| {
+                            meta.is_file() && Some((meta.dev(), meta.ino())) == self.original
+                        })
                 });
         let result = (|| -> Result<bool> {
             let _lock = lock?;
@@ -672,7 +678,9 @@ impl UpdateState {
                 "installation changed to a symlink during recovery"
             );
             let inode = (installed.dev(), installed.ino());
-            if self.phase == Phase::Swapping && Some(inode) == self.replacement {
+            if matches!(self.phase, Phase::Swapping | Phase::Restoring)
+                && Some(inode) == self.replacement
+            {
                 let stage = self.stage.as_ref().context("missing recovery directory")?;
                 validate_stage(stage, &self.exe)?;
                 let previous = stage.join("previous");
@@ -681,6 +689,10 @@ impl UpdateState {
                     meta.is_file() && Some((meta.dev(), meta.ino())) == self.original,
                     "recovery inode changed"
                 );
+                // Recovery can itself be interrupted between the restore and
+                // its service restart. Persist the intent before moving bytes.
+                self.phase = Phase::Restoring;
+                self.write_unlocked(path)?;
                 fs::rename(previous, &self.exe)?;
                 File::open(self.exe.parent().context("installation directory")?)?.sync_all()?;
                 return Ok(true);
@@ -880,8 +892,16 @@ pub fn automatic_update_due(
 
 fn lock_path(exe: &Path) -> Result<PathBuf> {
     let dir = crate::config::data_dir()?.join("update-locks");
-    fs::create_dir_all(&dir)?;
+    create_lock_directory(&dir)?;
     Ok(dir.join(super::sha256_hex(exe.as_os_str().as_encoded_bytes())))
+}
+
+fn create_lock_directory(path: &Path) -> Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
+    Ok(())
 }
 
 /// Resolve directory aliases, then pin each directory before opening the next component.
@@ -895,7 +915,8 @@ fn open_lock_for_uid(path: &Path, uid: u32) -> Result<File> {
     let result = (|| -> Result<File> {
         let parent = path.parent().context("lock directory")?.canonicalize()?;
         let mut directory = File::open("/")?;
-        for component in parent.components().skip(1) {
+        let components: Vec<_> = parent.components().skip(1).collect();
+        for (index, component) in components.iter().enumerate() {
             let std::path::Component::Normal(name) = component else {
                 bail!("unsafe lock directory component");
             };
@@ -913,16 +934,30 @@ fn open_lock_for_uid(path: &Path, uid: u32) -> Result<File> {
             directory = unsafe { File::from_raw_fd(fd) };
             let meta = directory.metadata()?;
             ensure!(
-                (meta.uid() == 0 || meta.uid() == uid)
-                    && (meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0),
-                "unsafe lock ancestor"
+                meta.uid() == 0 || meta.uid() == uid,
+                "foreign-owned lock ancestor"
             );
+            if index + 1 < components.len() {
+                // Group access on user-owned ancestors follows the owner's
+                // filesystem policy, including Ubuntu's private-user groups.
+                ensure!(
+                    (meta.mode() & 0o002 == 0 || meta.mode() & 0o1000 != 0)
+                        && (meta.uid() == uid
+                            || meta.mode() & 0o020 == 0
+                            || meta.mode() & 0o1000 != 0),
+                    "unsafe lock ancestor"
+                );
+            }
         }
         let meta = directory.metadata()?;
         ensure!(
-            meta.uid() == uid && meta.mode() & 0o022 == 0,
-            "unsafe lock directory"
+            meta.is_dir() && meta.uid() == uid,
+            "unsafe lock directory owner or type"
         );
+        if meta.mode() & 0o7777 != 0o700 {
+            directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+            directory.sync_all()?;
+        }
         let name = std::ffi::CString::new(
             path.file_name()
                 .context("lock filename")?
@@ -959,7 +994,7 @@ fn open_lock_for_uid(path: &Path, uid: u32) -> Result<File> {
         format!(
             "unsafe Linux update lock {}. Stop Latch and any update supervisor, then have \
              the installation owner replace it with a regular, user-owned 0600 file in a \
-             user-owned directory without group/world write access",
+             user-owned directory. Owned lock directories are repaired to 0700 automatically. Foreign-owned ancestors and non-sticky world-writable ancestors require repair",
             path.display()
         )
     })
@@ -1148,7 +1183,11 @@ impl Transaction {
             state.save(path)?;
         }
         before_rename()?;
+        #[cfg(test)]
+        crash_at("before-swap-rename");
         fs::rename(self.stage.path().join("new"), &self.exe)?;
+        #[cfg(test)]
+        crash_at("after-swap-rename");
         self.swapped = true;
         File::open(self.exe.parent().unwrap())?.sync_all()?;
         Ok(())
@@ -1161,16 +1200,20 @@ impl Transaction {
                 meta.is_file() && Some((meta.dev(), meta.ino())) == self.replacement,
                 "installation changed during probation; recovery copy was preserved"
             );
-            fs::rename(self.stage.path().join("previous"), &self.exe)
-                .context("restore the previous binary")?;
-            File::open(self.exe.parent().unwrap())?.sync_all()?;
-            self.swapped = false;
             if let Some(path) = &self.journal {
                 let mut state = UpdateState::load(path)?.context("missing rollback journal")?;
                 state.phase = Phase::Restoring;
                 state.reason = "Restarting the previous Linux release after rollback".into();
                 state.save(path)?;
             }
+            #[cfg(test)]
+            crash_at("restoring-before-rename");
+            fs::rename(self.stage.path().join("previous"), &self.exe)
+                .context("restore the previous binary")?;
+            #[cfg(test)]
+            crash_at("restored-before-completion");
+            File::open(self.exe.parent().unwrap())?.sync_all()?;
+            self.swapped = false;
         }
         Ok(())
     }
@@ -1184,6 +1227,8 @@ impl Transaction {
     ) -> Result<()> {
         self.swap()?;
         if let Err(why) = restart().and_then(|()| health()) {
+            #[cfg(test)]
+            crash_at("probation-failed-before-restoring");
             self.rollback()?;
             restart().context("restart the previous binary after rollback")?;
             let result = Err(why.context("the previous Linux release was restored and restarted"));
@@ -1205,6 +1250,14 @@ impl Transaction {
         self.swapped = false;
         fs::remove_dir_all(self.stage.path())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+fn crash_at(point: &str) {
+    if std::env::var("LATCH_UPDATE_CRASH_POINT").as_deref() == Ok(point) {
+        // Simulate SIGKILL by exiting without running transaction destructors.
+        std::process::exit(0);
     }
 }
 
@@ -2022,10 +2075,23 @@ mod tests {
             assert_eq!(fs::metadata(&path).unwrap().uid(), 65534);
             assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
             assert_eq!(unsafe { libc::chown(cpath.as_ptr(), 0, 0) }, 0);
+            let foreign = dir.path().join("foreign");
+            create_lock_directory(&foreign.join("private")).unwrap();
+            let cforeign = std::ffi::CString::new(foreign.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(cforeign.as_ptr(), 65534, 65534) }, 0);
+            assert!(open_lock(&foreign.join("private/lock")).is_err());
+            assert_eq!(fs::metadata(&foreign).unwrap().uid(), 65534);
+            assert_eq!(unsafe { libc::chown(cforeign.as_ptr(), 0, 0) }, 0);
+            fs::set_permissions(&foreign, fs::Permissions::from_mode(0o775)).unwrap();
+            let error = open_lock_for_uid(&foreign.join("private/lock"), 1).unwrap_err();
+            assert!(format!("{error:#}").contains("unsafe lock ancestor"));
         }
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let nested = dir.path().join("nested");
+        create_lock_directory(&nested).unwrap();
+        fs::write(nested.join("lock"), []).unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(open_lock(&path).is_err());
+        assert!(open_lock(&nested.join("lock")).is_err());
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
         assert_eq!(fs::metadata(&target).unwrap().mode() & 0o777, 0o644);
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -2036,6 +2102,214 @@ mod tests {
         drop(open_lock(&alias.join("lock")).unwrap());
         assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn lock_directories_are_private_under_both_supported_umasks() {
+        for mask in ["002", "022"] {
+            let root = tempfile::tempdir().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "update::linux::tests::lock_umask_fixture",
+                    "--nocapture",
+                ])
+                .env("LATCH_LOCK_UMASK", mask)
+                .env("LATCH_DATA_DIR", root.path().join("ancestor/data"))
+                .env("LATCH_LOCK_ROOT", root.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "umask {mask}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn lock_umask_fixture() {
+        let Ok(mask) = std::env::var("LATCH_LOCK_UMASK") else {
+            return;
+        };
+        struct RestoreUmask(libc::mode_t);
+        impl Drop for RestoreUmask {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::umask(self.0);
+                }
+            }
+        }
+        let _umask = RestoreUmask(unsafe { libc::umask(u32::from_str_radix(&mask, 8).unwrap()) });
+        let root = PathBuf::from(std::env::var_os("LATCH_LOCK_ROOT").unwrap());
+        let ancestor = root.join("ancestor");
+        fs::create_dir(&ancestor).unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o775)).unwrap();
+        let journal = ancestor.join("journals/linux-update.json");
+        drop(JournalLock::acquire(&journal).unwrap());
+        let directory = journal.parent().unwrap();
+        assert_eq!(fs::metadata(directory).unwrap().mode() & 0o777, 0o700);
+        let inode = fs::metadata(directory).unwrap().ino();
+        for mode in [0o775, 0o777] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(mode)).unwrap();
+            drop(JournalLock::acquire(&journal).unwrap());
+            assert_eq!(fs::metadata(directory).unwrap().mode() & 0o777, 0o700);
+            assert_eq!(fs::metadata(directory).unwrap().ino(), inode);
+        }
+        let exe = ancestor.join("latch-host");
+        fs::write(&exe, b"old").unwrap();
+        let lock = lock_path(&exe).unwrap();
+        let directory = lock.parent().unwrap();
+        assert_eq!(fs::metadata(directory).unwrap().mode() & 0o777, 0o700);
+        let inode = fs::metadata(directory).unwrap().ino();
+        for mode in [0o775, 0o777] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(mode)).unwrap();
+            drop(Transaction::begin_resolved(&exe).unwrap());
+            assert_eq!(fs::metadata(directory).unwrap().mode() & 0o777, 0o700);
+            assert_eq!(fs::metadata(directory).unwrap().ino(), inode);
+            assert_eq!(fs::metadata(&lock).unwrap().mode() & 0o777, 0o600);
+        }
+        assert_eq!(fs::metadata(&ancestor).unwrap().mode() & 0o777, 0o775);
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(JournalLock::acquire(&journal).is_err());
+        assert!(open_lock(&lock).is_err());
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o1777)).unwrap();
+        drop(JournalLock::acquire(&journal).unwrap());
+    }
+
+    #[test]
+    fn crashes_across_forward_and_rollback_renames_preserve_the_failure_kind() {
+        for point in [
+            "before-swap-rename",
+            "after-swap-rename",
+            "probation-failed-before-restoring",
+            "restoring-before-rename",
+            "restored-before-completion",
+        ] {
+            let (dir, exe) = install();
+            let path = dir.path().join("linux-update.json");
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "update::linux::tests::transaction_crash_fixture",
+                    "--nocapture",
+                ])
+                .env("LATCH_UPDATE_CRASH_POINT", point)
+                .env("LATCH_CRASH_ROOT", dir.path())
+                .env("LATCH_DATA_DIR", dir.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{point}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut state = UpdateState::load(&path).unwrap().unwrap();
+            let before_swap = point == "before-swap-rename";
+            let after_restore = point == "restored-before-completion";
+            assert_eq!(
+                fs::read(&exe).unwrap(),
+                if before_swap || after_restore {
+                    b"old"
+                } else {
+                    b"new"
+                },
+                "{point}"
+            );
+            assert_eq!(
+                state.phase,
+                if matches!(
+                    point,
+                    "restoring-before-rename" | "restored-before-completion"
+                ) {
+                    Phase::Restoring
+                } else {
+                    Phase::Swapping
+                },
+                "{point}"
+            );
+            let stage = state.stage.clone().unwrap();
+            assert_eq!(stage.join("previous").exists(), !after_restore, "{point}");
+            let restarted = fs::read_to_string(dir.path().join("restarts")).unwrap_or_default();
+            assert_eq!(
+                restarted,
+                if matches!(point, "before-swap-rename" | "after-swap-rename") {
+                    ""
+                } else {
+                    "new\n"
+                },
+                "{point}"
+            );
+            assert_eq!(
+                state.recover(&path).unwrap(),
+                !before_swap && !after_restore,
+                "{point}"
+            );
+            assert_eq!(fs::read(&exe).unwrap(), b"old", "{point}");
+            assert_eq!(state.phase, Phase::Failed);
+            assert_eq!(
+                state.failure,
+                if before_swap {
+                    FailureKind::Transient
+                } else {
+                    FailureKind::Recovery
+                },
+                "{point}"
+            );
+            let now = Instant::now();
+            assert_eq!(
+                automatic_update_due(
+                    &state.version,
+                    &semver::Version::new(1, 0, 0),
+                    Some(&state),
+                    false,
+                    now,
+                    now
+                ),
+                before_swap,
+                "{point}"
+            );
+            assert!(automatic_update_due(
+                &state.version,
+                &semver::Version::new(1, 0, 0),
+                Some(&state),
+                true,
+                now,
+                now
+            ));
+            assert!(!stage.exists(), "{point}");
+        }
+    }
+
+    #[test]
+    fn transaction_crash_fixture() {
+        let Some(root) = std::env::var_os("LATCH_CRASH_ROOT").map(PathBuf::from) else {
+            return;
+        };
+        let exe = root.join("latch-host");
+        let path = root.join("linux-update.json");
+        let mut state =
+            UpdateState::request(&exe, &semver::Version::new(999, 0, 0), b"archive", &path)
+                .unwrap();
+        let mut tx = Transaction::begin_resolved(&exe).unwrap();
+        tx.record(&path, &mut state).unwrap();
+        stage(&tx, b"new");
+        let _ = tx.install(
+            || {
+                let mut log = OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .mode(0o600)
+                    .open(root.join("restarts"))?;
+                log.write_all(&fs::read(&exe)?)?;
+                log.write_all(b"\n")?;
+                Ok(())
+            },
+            || bail!("fixture replacement failed probation"),
+        );
+        panic!("the requested crash point was not reached");
     }
 
     #[test]

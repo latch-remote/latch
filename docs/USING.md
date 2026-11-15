@@ -427,20 +427,34 @@ listening control socket are checked on both sides of each health request.
 A restart or health failure restores the previous binary and restarts it. A
 failed systemd unit with no MainPID and no queued job triggers rollback after
 one second of stable failure, including start-limit-hit. Activating units and
-automatic restart cycles continue through the health window.
+automatic restart cycles continue through the health window. A systemctl error
+during the failure check is logged at debug level while probation continues.
 The fsynced `linux-update.json` journal records progress, inode identities,
 staging location and outcome. On startup, a service detects an unfinished
 update whose supervisor died and restores the previous inode deterministically.
-A running service also monitors for this failure. CI covers recovery both at
-the next service start and while the service keeps running. If restoration
-itself fails, the update becomes terminal Failed with the recovery copy retained
+A running service also monitors for this failure. Rollback fsyncs the Restoring
+journal entry and its directory before moving the old binary back. Recovery
+handles Restoring with either executable inode and queues a service restart for
+interrupted Swapping and Restoring states. An old Swapping journal whose restore
+already consumed the previous link is treated as recovery failure and suppressed.
+The original inode and its verified previous link prove a pre-rename
+interruption is eligible for retry. CI covers recovery both at the next service
+start and while the service keeps running. If restoration itself fails, the update becomes terminal Failed with the recovery copy retained
 and its path reported. The next update can proceed. A journal flock and phase
 compare-and-set serialize writers. Unsafe or unparsable journals are moved aside
 with at most three diagnostic copies, pruning the oldest modification times.
 Owned regular lock files restored with incorrect modes are repaired to `0600`
-using pinned directory and file descriptors. Lock symlinks, foreign owners, hard links
-and unsafe directories are refused with repair instructions. A journal read I/O
-error retains the journal for a later retry. Unknown fields and missing fields are
+using pinned directory and file descriptors. Journal and transaction lock
+directories are created explicitly as `0700` under either umask `002` or `022`.
+Existing user-owned lock directories are repaired to `0700` through their open
+descriptors after ownership and type checks. Every resolved ancestor must belong
+to root or the user. Group write on user-owned ancestors follows the owner's
+group-access policy, including Ubuntu private-user groups. Group members with
+that access are trusted for those ancestors. Root-owned ancestors require group
+write to be disabled or the sticky bit to be set. Every world-writable ancestor
+requires the sticky bit. The rule uses descriptor UID and mode checks. Lock
+symlinks, foreign owners, hard links and unsafe ancestors are refused with repair instructions. A journal read I/O error retains the
+journal for a later retry. Unknown fields and missing fields are
 tolerated, and unknown phases become terminal failures. Maintenance failures
 appear in service setup/status and logs while the service continues starting.
 
@@ -455,8 +469,9 @@ installation, a newly offered release and **Check now** reset the delay. Manifes
 failures have their own counter and never advance archive or installation delays.
 A verified download resets archive failures while installation retries retain
 their own counter. The first successful manifest check after migrating older
-shared retry state clears that legacy delay once. The window rechecks manifests
-at least every six hours while archive retries wait.
+shared retry state clears that legacy delay once and persists the reset
+immediately. The window rechecks manifests at least every six hours while
+archive retries wait.
 Verified cached archives are rechecked and reused. Transient errors keep the
 release eligible. **Check now** or `latch-host --self-update`
 explicitly retries it. The window, service status and CLI report the outcome.
@@ -499,7 +514,10 @@ journals and fixture history. Unit environments are excluded from diagnostics.
 The follow-up adds a crash-case assertion that rollback completes within 15
 seconds and a production `latch-host --background` systemd startup/status smoke
 check with isolated settings. These changed real-systemd cases await CI
-verification.
+verification. The first follow-up jobs at `4beb891` failed on lock-directory
+permissions under umask `002`. Revised local Linux tests exercise both `002` and
+`022`, plus subprocess exits at five forward/rollback boundaries and fake-systemd
+restart requests. A real user-manager run of this revision still requires CI.
 The test is ignored during ordinary test runs and requires explicit opt-in
 through the dedicated script, which refuses an existing `latch.service`.
 The fixture bypasses supervisor argv parsing, self-pinning, installation ownership

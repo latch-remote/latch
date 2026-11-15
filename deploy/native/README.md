@@ -137,8 +137,14 @@ uses a separate transient systemd user supervisor. A definitive systemd failure
 rolls back promptly. A supervisor lost before the swap retries with bounded
 back-off. Manifest outages have a separate retry counter, and verified downloads
 reset archive failures. Owned regular updater locks restored with incorrect
-modes are repaired to `0600` through verified descriptors. Reopen the window after
-installation. AUR/Nix and container installs use their deployment tools.
+modes are repaired to `0600` through verified descriptors. Lock directories are
+created and descriptor-repaired to `0700`, including under umask `002`.
+User-owned ancestors allow owner-authorized group write. Ancestors must belong
+to root or the user, and world-writable ancestors require the sticky bit.
+Root-owned ancestors also require group write to be disabled or sticky-bit
+protection. Rollback records and fsyncs Restoring before moving the old binary
+back, and recovery queues a restart across interrupted swap/restore boundaries.
+Reopen the window after installation. AUR/Nix and container installs use their deployment tools.
 See [Linux update ownership and recovery](../../docs/USING.md#linux-installation-ownership-and-recovery).
 
 Updater tests use Docker locally and native x64/arm64 Linux CI. No Linux machine outside CI and containers is available for this work. CI covers systemd user-session restart, rollback and killed-supervisor recovery with a fixture service; an installed desktop update remains unverified.
@@ -147,8 +153,11 @@ recovery while the service keeps running. The fixture bypasses supervisor argv p
 ownership checks and real GitHub manifest fetching. The follow-up adds bounded
 assertion diagnostics, an assertion requiring rollback within 15 seconds and a real
 `latch-host --background` startup/status smoke check under systemd with isolated
-settings. The changed systemd cases await CI verification. A full verified update
-of the production executable under systemd remains untested. Real GUI reopening
+settings. Both initial follow-up systemd jobs failed at `4beb891` because of
+umask `002` lock-directory modes. Revised tests cover both umasks and five crash
+boundaries locally in Docker. The changed systemd cases require fresh CI
+verification. A full verified update of the production executable under systemd
+is untested. Real GUI reopening
 and stream continuity remain untested.
 
 `migrate-legacy.sh` is only for upgrades from pre-4.1 BroLink unit names or

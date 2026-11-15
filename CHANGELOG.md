@@ -240,7 +240,13 @@ GitHub release notes, so each version gets a heading of the form
   launch errors and share transfer-rate accounting across redirects.
   Add bounded diagnostics for fixture assertions, a 15-second rollback assertion
   and a real `latch-host` systemd startup/status smoke check. The changed real
-  systemd cases await CI verification.
+  systemd cases await CI verification. Create lock directories explicitly as
+  `0700` and repair their modes through verified descriptors under umasks `002`
+  and `022`. Accept owner-authorized group access on user-owned ancestors while
+  refusing foreign owners and non-sticky world-writable ancestors. Persist
+  rollback intent before restoring the binary, recover interrupted restore
+  renames and queue service restarts for interrupted swaps. Persist legacy retry
+  resets immediately and debug-log systemctl failure-check errors.
 
 - Add verified Linux self-updates for user-owned release binaries, with
   architecture selection, private same-filesystem staging, atomic replacement,

@@ -1062,7 +1062,7 @@ fn a_definitively_failed_fake_systemd_unit_aborts_probation_promptly() {
     let script = dir.path().join("systemctl");
     fs::write(
         &script,
-        "#!/bin/sh\ncat \"$LATCH_FAILED_PROBATION_ROOT/state\"\n",
+        "#!/bin/sh\nif [ -f \"$LATCH_FAILED_PROBATION_ROOT/error\" ]; then /bin/rm \"$LATCH_FAILED_PROBATION_ROOT/error\"; exit 1; fi\ncat \"$LATCH_FAILED_PROBATION_ROOT/state\"\n",
     )
     .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1071,6 +1071,8 @@ fn a_definitively_failed_fake_systemd_unit_aborts_probation_promptly() {
         .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
         .output()
         .unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("could not read latch.service failure state"));
     assert!(
         output.status.success(),
         "{}\n{}",
@@ -1084,6 +1086,10 @@ fn failed_probation_fixture_entry() {
     let Some(root) = std::env::var_os("LATCH_FAILED_PROBATION_ROOT").map(PathBuf::from) else {
         return;
     };
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(std::io::stderr)
+        .init();
     for result in ["exit-code", "start-limit-hit"] {
         fs::write(
             root.join("state"),
@@ -1095,6 +1101,15 @@ fn failed_probation_fixture_entry() {
         assert!(verdict.unwrap_err().to_string().contains(result));
         assert!(start.elapsed() < Duration::from_secs(2));
     }
+    fs::write(root.join("error"), []).unwrap();
+    let start = Instant::now();
+    assert!(
+        watch_replacement(Path::new("/unused"), &Version::new(999, 0, 0), true)
+            .unwrap_err()
+            .to_string()
+            .contains("start-limit-hit")
+    );
+    assert!(start.elapsed() < Duration::from_secs(3));
     for state in [
         "ActiveState=activating\nSubState=auto-restart\nMainPID=0\nJob=\nResult=exit-code\n",
         "ActiveState=failed\nSubState=failed\nMainPID=0\nJob=10 /job/10\nResult=exit-code\n",
@@ -1112,4 +1127,105 @@ fn failed_probation_fixture_entry() {
         )
         .unwrap();
     }
+}
+
+#[test]
+fn each_interrupted_swap_and_restore_queues_a_service_restart() {
+    use std::os::unix::fs::PermissionsExt;
+    for point in [
+        "before-swap-rename",
+        "after-swap-rename",
+        "probation-failed-before-restoring",
+        "restoring-before-rename",
+        "restored-before-completion",
+        "legacy-restored-before-journal",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let systemctl = dir.path().join("systemctl");
+        fs::write(
+            &systemctl,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$LATCH_DATA_DIR/systemctl-calls\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o700)).unwrap();
+        let output = helper("interrupted_recovery_fixture_entry")
+            .env("LATCH_RECOVERY_POINT", point)
+            .env("LATCH_DATA_DIR", dir.path())
+            .env("PATH", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{point}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn interrupted_recovery_fixture_entry() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(point) = std::env::var("LATCH_RECOVERY_POINT") else {
+        return;
+    };
+    let root = latch_core::config::data_dir().unwrap();
+    let path = linux::state_path().unwrap();
+    let exe = root.join("latch-host");
+    let new = root.join("replacement");
+    fs::write(&exe, b"old").unwrap();
+    fs::write(&new, b"new").unwrap();
+    let original = fs::metadata(&exe).unwrap();
+    let replacement = fs::metadata(&new).unwrap();
+    let stage = root.join(".latch-update-recovery-test");
+    fs::create_dir(&stage).unwrap();
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(stage.join("owner"), exe.as_os_str().as_encoded_bytes()).unwrap();
+    fs::hard_link(&exe, stage.join("previous")).unwrap();
+    if point != "before-swap-rename" {
+        fs::rename(&new, &exe).unwrap();
+    }
+    if matches!(
+        point.as_str(),
+        "restored-before-completion" | "legacy-restored-before-journal"
+    ) {
+        fs::rename(stage.join("previous"), &exe).unwrap();
+    }
+    let mut state =
+        linux::UpdateState::request(&exe, &Version::new(999, 0, 0), &[], &path).unwrap();
+    state.phase = if matches!(
+        point.as_str(),
+        "restoring-before-rename" | "restored-before-completion"
+    ) {
+        linux::Phase::Restoring
+    } else {
+        linux::Phase::Swapping
+    };
+    state.systemd = true;
+    state.supervisor = u32::MAX;
+    state.supervisor_start = Some("dead".into());
+    state.stage = Some(stage);
+    state.original = Some((original.dev(), original.ino()));
+    state.replacement = Some((replacement.dev(), replacement.ino()));
+    state.save(&path).unwrap();
+    let recovered = reconcile().unwrap().unwrap();
+    assert_eq!(fs::read(&exe).unwrap(), b"old");
+    assert_eq!(recovered.phase, linux::Phase::Failed);
+    assert_eq!(
+        recovered.failure,
+        if point == "before-swap-rename" {
+            linux::FailureKind::Transient
+        } else {
+            linux::FailureKind::Recovery
+        }
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("systemctl-calls")).unwrap(),
+        "--user --no-block restart latch.service\n"
+    );
+    reconcile().unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("systemctl-calls")).unwrap(),
+        "--user --no-block restart latch.service\n"
+    );
 }
