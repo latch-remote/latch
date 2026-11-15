@@ -323,6 +323,7 @@ impl ClientApp {
         progress: Progress,
         cfg: ClientConfig,
     ) -> Self {
+        #[cfg(test)]
         std::env::set_var("LATCH_NETENV_PROBE", "0");
         Self::with_shared(
             cc,
@@ -1073,6 +1074,14 @@ fn spawn_tailscale_probe(ok: Arc<AtomicBool>, ctx: egui::Context, stop: Arc<Atom
 
 impl eframe::App for ClientApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::WindowFocused(true)))
+        }) {
+            latch_stream::network::recheck_portals();
+        }
         crate::video::begin_frame(_frame);
         // A test host stands in for a PC: connect to it once, at start.
         static TEST_SERVE: std::sync::Once = std::sync::Once::new();

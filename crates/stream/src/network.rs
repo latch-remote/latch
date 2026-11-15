@@ -28,6 +28,49 @@ impl Entry {
             && (self.retry_requested
                 || matches!(self.latest.captive_portal, CaptivePortal::Captive { .. }))
     }
+    fn observe(&mut self, mut latest: NetworkDiagnosis, now: Instant) {
+        merge_observations(&mut latest, &self.latest, self.media_usable);
+        if matches!(latest.captive_portal, CaptivePortal::Captive { .. })
+            && !matches!(self.latest.captive_portal, CaptivePortal::Captive { .. })
+        {
+            self.refresh_at = now + self.portal_backoff;
+        }
+        if !matches!(latest.captive_portal, CaptivePortal::Captive { .. }) {
+            self.portal_backoff = Duration::from_secs(1);
+        }
+        self.latest = latest;
+    }
+
+    fn request_retry(&mut self, now: Instant, urgent: bool) {
+        self.retry_requested = true;
+        if urgent {
+            self.portal_backoff = Duration::from_secs(1);
+        }
+        self.refresh_at = self.refresh_at.min(
+            now + if urgent {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(2)
+            },
+        );
+    }
+
+    fn refresh(&mut self, now: Instant, pending: bool) {
+        if !self.should_refresh(now, pending) {
+            return;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let interval = if matches!(self.latest.captive_portal, CaptivePortal::Captive { .. }) {
+            let interval = self.portal_backoff;
+            self.portal_backoff = (self.portal_backoff * 2).min(Duration::from_secs(4));
+            interval
+        } else {
+            self.portal_backoff = Duration::from_secs(1);
+            Duration::from_secs(2)
+        };
+        self.retry_requested = false;
+        self.refresh_at = now + interval;
+    }
 }
 
 static CACHE: OnceLock<Mutex<Vec<Entry>>> = OnceLock::new();
@@ -42,8 +85,20 @@ pub fn relay_failed(host: &str) {
             .iter_mut()
             .find(|entry| entry.host == host)
         {
-            entry.retry_requested = true;
+            entry.request_retry(Instant::now(), false);
             entry.media_usable = false;
+        }
+    }
+}
+
+/// Recheck promptly after opening sign-in or returning to the app. Only a
+/// confirmed portal is invalidated, so healthy sessions still remain idle.
+pub fn recheck_portals() {
+    if let Some(cache) = CACHE.get() {
+        for entry in cache.lock().unwrap().iter_mut() {
+            if matches!(entry.latest.captive_portal, CaptivePortal::Captive { .. }) {
+                entry.request_retry(Instant::now(), true);
+            }
         }
     }
 }
@@ -70,7 +125,15 @@ fn merge_observations(latest: &mut NetworkDiagnosis, previous: &NetworkDiagnosis
     } else if latest.captive_portal == CaptivePortal::Unknown {
         latest.captive_portal = previous.captive_portal.clone();
     }
-    if !latest.proxy_observed {
+    let incomplete_proxy = latest.proxies.candidates.is_empty()
+        && (latest.proxies.warnings.iter().any(|warning| {
+            !matches!(
+                warning,
+                netenv::NetworkWarning::WindowsServiceSettings
+                    | netenv::NetworkWarning::MacStaticFallback
+            )
+        }) || !latest.warnings.is_empty());
+    if !latest.proxy_observed || incomplete_proxy {
         latest.proxies = previous.proxies.clone();
     }
 }
@@ -131,7 +194,7 @@ pub fn diagnosis(host: &str) -> NetworkDiagnosis {
             network_key,
             generation: 0,
             refresh_at: now + Duration::from_secs(5),
-            portal_backoff: Duration::from_secs(2),
+            portal_backoff: Duration::from_secs(1),
             retry_requested: false,
             media_usable: false,
         });
@@ -143,28 +206,17 @@ pub fn diagnosis(host: &str) -> NetworkDiagnosis {
         entry.network_key = network_key;
         entry.generation = entry.generation.wrapping_add(1);
         entry.refresh_at = now + Duration::from_secs(5);
-        entry.portal_backoff = Duration::from_secs(2);
+        entry.portal_backoff = Duration::from_secs(1);
         entry.retry_requested = false;
         entry.latest = NetworkDiagnosis::default();
         entry.media_usable = false;
     } else {
-        if let Some(mut latest) = entry.environment.get(entry.generation, &options).cloned() {
-            merge_observations(&mut latest, &entry.latest, entry.media_usable);
-            if matches!(latest.captive_portal, CaptivePortal::Captive { .. })
-                && !matches!(entry.latest.captive_portal, CaptivePortal::Captive { .. })
-            {
-                entry.refresh_at = now + entry.portal_backoff;
-            }
-            entry.latest = latest;
+        if let Some(latest) = entry.environment.get(entry.generation, &options).cloned() {
+            entry.observe(latest, now);
         }
         // Never discard a slow PAC result just because its refresh interval
         // elapsed. Consume the completed snapshot before starting a refresh.
-        if entry.should_refresh(now, entry.environment.is_pending()) {
-            entry.generation = entry.generation.wrapping_add(1);
-            entry.retry_requested = false;
-            entry.portal_backoff = (entry.portal_backoff * 2).min(Duration::from_secs(60));
-            entry.refresh_at = now + entry.portal_backoff;
-        }
+        entry.refresh(now, entry.environment.is_pending());
     }
     entry.environment.request(entry.generation, options);
     entry.latest.clone()
@@ -208,8 +260,17 @@ pub struct NetworkStatus {
 }
 
 impl NetworkStatus {
-    pub(crate) fn sign_in_timed_out(&self, elapsed: Duration) -> bool {
-        self.needs_sign_in && elapsed >= Duration::from_secs(180)
+    pub(crate) fn recovered_from(&self, previous: &Self) -> bool {
+        (previous.needs_sign_in && !self.needs_sign_in)
+            || (!previous.proxy_available && self.proxy_available)
+    }
+
+    pub(crate) fn sign_in_timed_out(&self, since: &mut Option<Instant>, now: Instant) -> bool {
+        if !self.needs_sign_in {
+            *since = None;
+            return false;
+        }
+        now.saturating_duration_since(*since.get_or_insert(now)) >= Duration::from_secs(180)
     }
 
     pub(crate) fn media_arrived(&mut self, arrived: bool) {
@@ -246,7 +307,7 @@ pub fn status(
         match failure {
             Some(Failure::TlsInterception { issuer }) => result.messages.push(format!("This network inspects encrypted traffic. Latch refuses the substituted certificate (issuer {issuer:.128}).")),
             Some(Failure::TlsRejected) => result.messages.push("Latch could not verify the relay's encrypted connection. Check this network's certificate policy.".into()),
-            Some(Failure::CaptivePortal) if result.messages.is_empty() => {
+            Some(Failure::CaptivePortal) if result.messages.is_empty() && diagnosis.captive_portal != CaptivePortal::OpenInternet => {
                 result.needs_sign_in = true;
                 result.messages.push("This network needs a sign-in. Open this network's sign-in page.".into());
             },
@@ -285,6 +346,24 @@ pub fn status(
     result
 }
 
+/// Version-1 Notice text for the remote viewer. Host-local URLs, issuer names
+/// and credentials stay in the host log. Existing viewers display plain text.
+pub fn host_notice(
+    status: &NetworkStatus,
+    failure: Option<&Failure>,
+) -> Option<latch_proto::control::Notice> {
+    let message = match failure {
+        Some(Failure::TlsInterception { .. }) => "The host's network is intercepting the relay's encrypted connection. Ask the host's network administrator to allow the relay's genuine certificate.",
+        Some(Failure::ProxyRefused { .. }) => "The host's network proxy refused the relay connection. Ask the host's network administrator to allow CONNECT to the relay on port 443.",
+        _ if status.needs_sign_in => "The host's network needs a sign-in. Complete network sign-in on the host, then reconnect.",
+        _ => return None,
+    };
+    Some(latch_proto::control::Notice {
+        kind: "network".into(),
+        message: message.into(),
+    })
+}
+
 pub fn carrier_label(info: &ConnectionInfo) -> String {
     let carrier = match info.carrier {
         Carrier::Native => "native",
@@ -300,6 +379,69 @@ pub fn carrier_label(info: &ConnectionInfo) -> String {
 mod tests {
     use super::*;
     use latch_core::netenv::{ProxyCandidate, ProxySource};
+    struct LocalRelay {
+        config: latch_relay::ClientConfig,
+        cancel: latch_relay::Cancel,
+        worker: Option<std::thread::JoinHandle<()>>,
+        quota: std::path::PathBuf,
+    }
+    impl LocalRelay {
+        fn new() -> Self {
+            use latch_relay::daemon::{Daemon, DaemonConfig};
+            use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+            let quota = std::env::temp_dir().join(format!(
+                "latch-discovery-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            let mut daemon_config = DaemonConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                vec![CertificateDer::from_pem_slice(include_bytes!(
+                    "../../relay/tests/certs/server.pem"
+                ))
+                .unwrap()],
+                PrivateKeyDer::from_pem_slice(include_bytes!(
+                    "../../relay/tests/certs/server-key.pem"
+                ))
+                .unwrap(),
+                quota.clone(),
+                32 * 1024 * 1024,
+            )
+            .unwrap();
+            daemon_config.initialize_quota = true;
+            let daemon = Daemon::bind(daemon_config).unwrap();
+            let endpoint =
+                latch_relay::Endpoint::new("localhost", daemon.local_addr().unwrap().port())
+                    .unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots
+                .add(
+                    CertificateDer::from_pem_slice(include_bytes!(
+                        "../../relay/tests/certs/ca.pem"
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+            let config = latch_relay::ClientConfig::with_roots(endpoint, roots).unwrap();
+            let cancel = latch_relay::Cancel::new();
+            let run_cancel = cancel.clone();
+            let worker = std::thread::spawn(move || daemon.run(&run_cancel).unwrap());
+            Self {
+                config,
+                cancel,
+                worker: Some(worker),
+                quota,
+            }
+        }
+    }
+    impl Drop for LocalRelay {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+            self.worker.take().unwrap().join().unwrap();
+            std::fs::remove_file(&self.quota).unwrap();
+        }
+    }
+
     #[test]
     fn proxy_order_and_supplied_credentials() {
         let mut diagnosis = NetworkDiagnosis::default();
@@ -367,10 +509,18 @@ mod tests {
             needs_sign_in: true,
             ..Default::default()
         };
-        assert!(!status.sign_in_timed_out(Duration::from_secs(179)));
-        assert!(status.sign_in_timed_out(Duration::from_secs(180)));
+        let started = Instant::now();
+        let detected = started + Duration::from_secs(200);
+        let mut since = None;
+        assert!(!status.sign_in_timed_out(&mut since, detected));
+        assert_eq!(since, Some(detected));
+        assert!(!status.sign_in_timed_out(&mut since, detected + Duration::from_secs(179)));
+        assert!(status.sign_in_timed_out(&mut since, detected + Duration::from_secs(180)));
         status.media_arrived(true);
-        assert!(!status.sign_in_timed_out(Duration::from_secs(180)));
+        assert!(!status.sign_in_timed_out(&mut since, detected + Duration::from_secs(180)));
+        assert!(since.is_none());
+        status.needs_sign_in = true;
+        assert!(!status.sign_in_timed_out(&mut since, detected + Duration::from_secs(400)));
     }
     #[test]
     fn relay_portal_failure_waits_and_dead_proxy_does_not_claim_progress() {
@@ -407,7 +557,7 @@ mod tests {
             network_key: 0,
             generation: 1,
             refresh_at: now,
-            portal_backoff: Duration::from_secs(2),
+            portal_backoff: Duration::from_secs(1),
             retry_requested: false,
             media_usable: false,
         };
@@ -439,6 +589,270 @@ mod tests {
         assert!(complete.proxies.candidates.is_empty());
         assert!(proxy_selection(&complete).1);
     }
+    #[test]
+    fn failed_pac_and_incomplete_observations_keep_the_previous_proxy() {
+        let mut previous = NetworkDiagnosis::default();
+        previous.proxies.candidates.push(ProxyCandidate {
+            proxy: Proxy::parse("http://proxy.test:3128").unwrap(),
+            source: ProxySource::MacPac,
+        });
+        for warning in [
+            netenv::NetworkWarning::PacFailed,
+            netenv::NetworkWarning::WpadFailed,
+            netenv::NetworkWarning::ChecksPending,
+            netenv::NetworkWarning::ChecksTimedOut,
+            netenv::NetworkWarning::LinuxPacUnavailable,
+            netenv::NetworkWarning::IncompleteSystemProxy,
+            netenv::NetworkWarning::PacEvaluatorUnavailable,
+            netenv::NetworkWarning::MacSettingsUnavailable,
+        ] {
+            let mut latest = NetworkDiagnosis {
+                proxy_observed: true,
+                ..Default::default()
+            };
+            latest.proxies.warnings.push(warning);
+            merge_observations(&mut latest, &previous, false);
+            assert!(proxy_selection(&latest).0.is_some(), "{warning:?}");
+            assert!(!proxy_selection(&latest).1);
+        }
+        let mut latest = NetworkDiagnosis {
+            proxy_observed: true,
+            ..Default::default()
+        };
+        latest.warnings.push(netenv::NetworkWarning::ChecksTimedOut);
+        merge_observations(&mut latest, &previous, false);
+        assert!(proxy_selection(&latest).0.is_some());
+    }
+
+    #[test]
+    fn relay_failure_refresh_stays_short_and_portal_return_is_immediate() {
+        let now = Instant::now();
+        let mut entry = Entry {
+            host: "relay.test".into(),
+            environment: NetworkEnvironment::default(),
+            latest: NetworkDiagnosis::default(),
+            checked: now,
+            network_key: 0,
+            generation: 0,
+            refresh_at: now + Duration::from_secs(60),
+            portal_backoff: Duration::from_secs(60),
+            retry_requested: false,
+            media_usable: false,
+        };
+        entry.request_retry(now, false);
+        assert!(!entry.should_refresh(now + Duration::from_secs(1), false));
+        for second in (2..20).step_by(2) {
+            let at = now + Duration::from_secs(second);
+            entry.refresh(at, false);
+            assert_eq!(entry.portal_backoff, Duration::from_secs(1));
+            assert_eq!(entry.refresh_at, at + Duration::from_secs(2));
+            entry.request_retry(at, false);
+        }
+        entry.latest.captive_portal = CaptivePortal::Captive { portal_url: None };
+        entry.retry_requested = false;
+        entry.refresh(entry.refresh_at, false);
+        assert_eq!(entry.portal_backoff, Duration::from_secs(2));
+        entry.request_retry(now + Duration::from_secs(21), true);
+        assert!(entry.should_refresh(now + Duration::from_secs(21), false));
+        entry.refresh(now + Duration::from_secs(21), false);
+        assert_eq!(entry.portal_backoff, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn an_open_portal_probe_clears_an_earlier_relay_portal_failure() {
+        let diagnosis = NetworkDiagnosis {
+            captive_portal: CaptivePortal::OpenInternet,
+            ..Default::default()
+        };
+        assert!(!status(&diagnosis, Some(&Failure::CaptivePortal), None).needs_sign_in);
+    }
+
+    #[test]
+    fn host_notices_are_labelled_and_have_only_fixed_text() {
+        let status = NetworkStatus {
+            needs_sign_in: true,
+            ..Default::default()
+        };
+        for failure in [
+            None,
+            Some(Failure::ProxyRefused { status: 403 }),
+            Some(Failure::TlsInterception {
+                issuer: "http://private.portal/token".into(),
+            }),
+        ] {
+            let notice = host_notice(&status, failure.as_ref()).unwrap();
+            assert_eq!(notice.kind, "network");
+            assert!(notice.message.starts_with("The host's network"));
+            assert!(!notice.message.contains("http"));
+            let mut bytes = Vec::new();
+            latch_proto::control::write_message(
+                &mut bytes,
+                &latch_proto::control::Message::Notice(notice.clone()),
+            )
+            .unwrap();
+            assert!(
+                matches!(latch_proto::control::read_message(&mut bytes.as_slice()).unwrap(), latch_proto::control::Message::Notice(decoded) if decoded == notice)
+            );
+        }
+        assert!(host_notice(&NetworkStatus::default(), None).is_none());
+    }
+
+    #[test]
+    fn pac_failure_reconnects_through_the_retained_proxy() {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        let relay = LocalRelay::new();
+        let relay_address = ("127.0.0.1", relay.config.endpoint.port());
+        let cancel = relay.cancel.clone();
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        proxy.set_nonblocking(true).unwrap();
+        let tunnel_cancel = cancel.clone();
+        let tunnel = std::thread::spawn(move || {
+            let (mut client, _) = loop {
+                match proxy.accept() {
+                    Ok(pair) => break pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if tunnel_cancel.is_cancelled() {
+                            return false;
+                        }
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            client.set_nonblocking(false).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(4)))
+                .unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                client.read_exact(&mut byte).unwrap();
+                header.extend(byte);
+                assert!(header.len() <= 4096);
+            }
+            assert!(header.starts_with(b"CONNECT localhost:443 HTTP/1.1\r\n"));
+            let mut upstream = TcpStream::connect(relay_address).unwrap();
+            client
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .unwrap();
+            let mut upload_client = client.try_clone().unwrap();
+            let mut upload_server = upstream.try_clone().unwrap();
+            let upload = std::thread::spawn(move || {
+                let _ = std::io::copy(&mut upload_client, &mut upload_server);
+                let _ = upload_server.shutdown(Shutdown::Write);
+            });
+            let _ = std::io::copy(&mut upstream, &mut client);
+            let _ = client.shutdown(Shutdown::Both);
+            upload.join().unwrap();
+            true
+        });
+        let mut previous = NetworkDiagnosis::default();
+        previous.proxies.candidates.push(ProxyCandidate {
+            proxy: Proxy::parse(&format!("http://127.0.0.1:{proxy_port}")).unwrap(),
+            source: ProxySource::MacPac,
+        });
+        let mut latest = NetworkDiagnosis {
+            proxy_observed: true,
+            ..Default::default()
+        };
+        latest
+            .proxies
+            .warnings
+            .push(netenv::NetworkWarning::PacFailed);
+        merge_observations(&mut latest, &previous, false);
+        let mut config = relay.config.clone();
+        config.endpoint = latch_relay::Endpoint::new("localhost", 443).unwrap();
+        let selection = proxy_selection(&latest);
+        config.set_proxy_discovery(move || selection.clone());
+        let result = latch_relay::create_grant_with_info(&config, &cancel);
+        cancel.cancel();
+        assert!(
+            tunnel.join().unwrap(),
+            "reconnect never reached the retained proxy"
+        );
+        let (_, info) = result.unwrap();
+        assert!(info.via_proxy);
+        assert!(info.earlier_failures.is_empty());
+    }
+
+    #[test]
+    fn portal_opens_and_session_connects_within_the_bound_on_injected_clock() {
+        let relay = LocalRelay::new();
+        let start = Instant::now();
+        let mut entry = Entry {
+            host: "localhost".into(),
+            environment: NetworkEnvironment::default(),
+            latest: NetworkDiagnosis::default(),
+            checked: start,
+            network_key: 0,
+            generation: 0,
+            refresh_at: start,
+            portal_backoff: Duration::from_secs(1),
+            retry_requested: false,
+            media_usable: false,
+        };
+        entry.observe(
+            NetworkDiagnosis {
+                captive_portal: CaptivePortal::Captive { portal_url: None },
+                ..Default::default()
+            },
+            start,
+        );
+        let failure = Failure::CaptivePortal;
+        let mut previous = status(&entry.latest, Some(&failure), None);
+        assert!(previous.needs_sign_in);
+        let mut connected_at = None;
+        for tick in 1..=56 {
+            let now = start + Duration::from_millis(tick * 250);
+            if entry.should_refresh(now, false) {
+                entry.refresh(now, false);
+                let portal = if now.duration_since(start) >= Duration::from_secs(10) {
+                    CaptivePortal::OpenInternet
+                } else {
+                    CaptivePortal::Captive { portal_url: None }
+                };
+                entry.observe(
+                    NetworkDiagnosis {
+                        captive_portal: portal,
+                        ..Default::default()
+                    },
+                    now,
+                );
+            }
+            let current = status(&entry.latest, Some(&failure), None);
+            if current.recovered_from(&previous) {
+                let connecting = Instant::now();
+                let grant = latch_relay::create_grant(&relay.config, &relay.cancel).unwrap();
+                let keys = latch_relay::SessionKeys::generate().unwrap();
+                let host =
+                    latch_relay::Transport::connect(relay.config.clone(), grant.host, keys.clone())
+                        .unwrap();
+                let viewer =
+                    latch_relay::Transport::connect(relay.config.clone(), grant.viewer, keys)
+                        .unwrap();
+                for peer in [&host, &viewer] {
+                    assert!(matches!(
+                        peer.recv_timeout(Duration::from_secs(2)),
+                        Some(latch_relay::Event::Ready)
+                    ));
+                }
+                connected_at = Some(now.duration_since(start) + connecting.elapsed());
+                host.shutdown();
+                viewer.shutdown();
+                break;
+            }
+            previous = current;
+        }
+        assert!(
+            connected_at
+                .is_some_and(|elapsed| elapsed >= Duration::from_secs(10)
+                    && elapsed <= Duration::from_secs(14)),
+            "session did not connect within 14 seconds: {connected_at:?}"
+        );
+    }
+
     #[test]
     fn invalid_relay_host_cannot_supply_a_probe_path_or_credentials() {
         for host in [

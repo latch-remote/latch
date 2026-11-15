@@ -1270,3 +1270,37 @@ fn discovered_proxy_refusal_survives_direct_route_failure() {
         .any(|attempt| !attempt.via_proxy
             && attempt.failure == latch_relay::Failure::ConnectionBlocked));
 }
+
+#[test]
+fn proxy_refusal_cannot_hide_direct_tls_interception() {
+    let direct = Gateway::start(0, GatewayMode::TlsHttp { status: 200 });
+    let proxy = Gateway::start_for_endpoint(
+        0,
+        GatewayMode::Connect {
+            auth: false,
+            status: 403,
+            intercept: false,
+            http_only: false,
+        },
+        direct.port,
+    );
+    let mut config = proxy_config(&proxy, false);
+    config.endpoint = Endpoint::new("localhost", direct.port).unwrap();
+    config = config
+        .with_tls_roots(rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        })
+        .unwrap();
+    let discovered = config.proxy.clone();
+    config.set_proxy_discovery(move || (discovered.clone(), false));
+    let error = latch_relay::create_grant_with_info(&config, &Cancel::new()).unwrap_err();
+    let typed = latch_relay::ConnectError::from_io(&error);
+    assert!(matches!(
+        typed.failure,
+        latch_relay::Failure::TlsInterception { .. }
+    ));
+    assert!(typed.attempts.iter().any(|attempt| matches!(
+        attempt.failure,
+        latch_relay::Failure::ProxyRefused { status: 403 }
+    )));
+}

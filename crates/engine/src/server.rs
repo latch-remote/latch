@@ -800,6 +800,11 @@ impl Server {
                 for message in &status.messages {
                     self.log(message.clone());
                 }
+                if let Some(notice) =
+                    latch_stream::network::host_notice(&status, session.relay.failure().as_ref())
+                {
+                    let _ = session.send_tcp(&Message::Notice(notice));
+                }
                 network_status = status;
             }
             if route_revision != session.relay.revision() {

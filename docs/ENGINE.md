@@ -984,18 +984,23 @@ recovery attempts. Netenv publishes partial observations so an environment
 proxy can be used while other checks continue. OS discovery has a six-second
 deadline. The eight-host cache samples local routes/environment settings at most
 four times a second. Discovery refreshes on network changes and relay connection
-failures. Confirmed portals use exponential backoff from 2 to 60 seconds. Healthy
+failures. A relay failure requests a refresh within two seconds and retains the
+previous proxy when PAC/WPAD discovery is incomplete. Only confirmed portals
+double their retry backoff from 1 to 4 seconds. Returning to the app or opening
+sign-in requests an immediate portal recheck. Healthy
 sessions send no periodic HTTP probes. No session/UI
 thread waits for PAC/WPAD, DNS or an HTTP probe.
 
 `RelayRoute` retains typed terminal failures and the selected lane's
 `ConnectionInfo`. `Session::network_status` combines them with local netenv facts.
 `Event::Network` carries changing local facts and an empty message list clears
-an earlier diagnosis. The viewer and examples use these events. Host-local network
-facts stay in the host log. The viewer renders a
+an earlier diagnosis. The viewer and examples use these events. Host-local details
+stay in the host log. Fixed host-labelled portal, CONNECT-refusal and TLS-
+interception notices use the existing version-1 Notice and contain no URL or
+browser action. The viewer renders a
 small shared diagnosis surface and opens a `PortalUrl` only after a button click.
-The first-picture watchdog waits for at most three minutes while a captive portal
-is positively known. Delivered media clears the portal banner and retains the
+The first-picture watchdog waits for at most three minutes from the first
+positive portal observation, resetting that timer after the portal clears. Delivered media clears the portal banner and retains the
 normal eight-second mid-stream watchdog. The first-picture watchdog restarts
 when the portal opens or a delayed proxy result becomes available. Relay
 attempts continue with fresh grants and normal backoff. A successful carrier clears the earlier

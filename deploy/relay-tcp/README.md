@@ -124,7 +124,7 @@ sudo bash deploy/relay-tcp/network.sh
 sudo systemctl start latch-relay.service
 sudo systemctl is-active latch-relay.service
 sudo journalctl -u latch-relay.service --since '5 minutes ago' --no-pager
-python3 deploy/relay-tcp/selftest.py --live relay.latch.rune.foo
+python3 deploy/relay-tcp/selftest.py --live "$RELAY_HOST"
 sudo certbot renew --dry-run --run-deploy-hooks --cert-name "$RELAY_HOST"
 sudo systemctl enable --now certbot.timer
 ```
@@ -367,51 +367,223 @@ test overlap when interpreting global daemon counters.
 
 ## Enable the anonymous probe and switch Certbot to webroot
 
-Perform this upgrade in an arranged maintenance window. Build the reviewed
-Linux `latch-relay` binary with four Cargo jobs. Copy the binary and this kit to
-the relay host through your normal deployment channel. Retain the current quota
-ledger, budget and operator limits. Stop `certbot.timer` with
-`sudo systemctl stop certbot.timer` before step 1 and let any running
-`certbot.service` finish before the daemon takes port 80.
+Arrange a brief interruption and tell connected users before stopping the relay.
+On the live host, inspect recent metrics and active TCP connections. Metrics are
+printed every 30 seconds. Pick a quiet moment with `sessions=0` and no active
+stream connections, then confirm the latest sample immediately before proceeding.
+If sessions remain active, arrange their interruption with the users.
 
-1. Stop `latch-relay.service`. Run `install.sh BINARY FULLCHAIN_PEM PRIVATE_KEY_PEM
-   MONTHLY_BYTES` using the existing certificate paths and budget. Omit
-   `--initialize-quota` on upgrades. The installer creates the root-owned,
-   relay-readable `/var/www/latch-relay/.well-known/acme-challenge` webroot.
-2. Install the updated unit with `--http-listen [::]:80 --acme-webroot
-   /var/www/latch-relay`. `systemctl daemon-reload` and
-   `systemctl start latch-relay.service` activate it. The existing
-   `AmbientCapabilities=CAP_NET_BIND_SERVICE` and capability bounding set cover
-   both 80 and 443 under the `latch-relay` account.
-3. Allow inbound TCP 80 in both the provider firewall and host IPv4/IPv6 firewall.
-   Keep TCP 443 open. Confirm the hostname's A and AAAA records reach this host.
-   Verify `curl -i http://RELAY_HOST/netenv/probe` returns an empty 204 with
-   `Content-Length: 0` and `Cache-Control: no-store`.
-4. With the new listener running and Certbot 2.3 or later, run
-   `sudo certbot reconfigure --cert-name RELAY_HOST --webroot -w /var/www/latch-relay`
-   using the existing Certbot certificate name. Remove renewal pre/post hooks
-   that stop/start the relay for standalone port ownership. Retain the existing
-   `certbot-deploy.sh` deploy hook that installs renewed certificate/key files
-   and restarts the relay. Inspect `certbot certificates` and the renewal
-   configuration to confirm the webroot authenticator and path. For Certbot older
-   than 2.3, back up and edit `/etc/letsencrypt/renewal/RELAY_HOST.conf` instead.
-   Set `authenticator = webroot` and `webroot_path = /var/www/latch-relay,` under
-   `[renewalparams]`, remove standalone-only stop/start hooks, and set
-   `RELAY_HOST = /var/www/latch-relay` under `[[webroot_map]]`. Preserve the
-   account, server, key and certificate paths and the deploy hook.
-5. Run `sudo certbot renew --cert-name RELAY_HOST --dry-run`, then check
-   `systemctl status latch-relay.service` and `journalctl -u latch-relay.service`.
-   Run `python3 deploy/relay-tcp/selftest.py --binary PATH_TO_LOCAL_BINARY` on a
-   disposable host to exercise both listeners without public test traffic.
-6. Re-enable and start renewal with `sudo systemctl enable --now certbot.timer`.
+```sh
+sudo journalctl -u latch-relay.service --since '2 minutes ago' --no-pager | tail -20
+sudo ss -tnp '( sport = :443 )'
+sudo systemctl is-active certbot.service
+```
 
-The listener bounds request size/time, concurrent connections and per-source
-(IPv4 /32, IPv6 /64) plus global admission. Probe traffic has 120 global and
-30 per-source admissions per minute. Two connection slots and 16 ACME admissions
-per minute are reserved for challenge requests after probe credits are spent.
-It logs no request paths or addresses. It serves only the probe and bounded
-regular ACME challenge files. New clients still stream through the old relay.
-Portal discovery then relies on native OS signals or an actual intercepting
-redirect. A missing probe does not warn. The new unit requires the new binary,
-and leaving Certbot's standalone authenticator in place causes renewal to fail
-because the daemon owns port 80.
+Set the hostname, existing Certbot certificate name, reviewed Linux binary path
+and retained monthly budget. The commands below run on the deployment host.
+The installer installs the binary and unit together. The root-only backup covers
+the executable, unit and drop-ins, environment/configuration including the TLS
+identity, renewal configuration, and a consistent stopped quota ledger. Keep an
+off-host copy with private keys excluded as described in the general upgrade
+instructions above. Rollback retains the current ledger, including reservations
+spent after the backup.
+
+```sh
+export RELAY_HOST='your-relay-hostname'
+export RELAY_CERT_NAME="$RELAY_HOST"
+export RELAY_BINARY='/absolute/path/to/reviewed/latch-relay'
+export MONTHLY_BYTES='500000000000'
+```
+
+Run the following block from the checkout containing this kit. Every exit after
+the timer is stopped attempts to re-enable it and verifies that it is active.
+Certbot 2.3 or later uses `reconfigure`. Older versions use the renewal-file
+webroot settings in the fallback branch. A failure after stopping the relay
+restores the prior executable, unit, config
+and renewal settings, restarts it, and checks both carriers. Retain the printed
+backup directory for a later rollback. An unsuccessful rollback or timer restart
+exits with an error and needs operator attention.
+
+```bash
+sudo env RELAY_HOST="$RELAY_HOST" RELAY_CERT_NAME="$RELAY_CERT_NAME" \
+  RELAY_BINARY="$RELAY_BINARY" MONTHLY_BYTES="$MONTHLY_BYTES" \
+  RELAY_KIT="$PWD/deploy/relay-tcp" bash <<'BASH'
+set -euo pipefail
+umask 077
+renewal="/etc/letsencrypt/renewal/$RELAY_CERT_NAME.conf"
+backup=$(mktemp -d /root/latch-relay-upgrade.XXXXXX)
+printf 'Backup directory %s\n' "$backup"
+service_stopped=0
+rollback() {
+    systemctl stop latch-relay.service || return 1
+    cp -a /var/lib/latch-relay/quota "$backup/quota.at-rollback" || return 1
+    sha256sum --check "$backup/SHA256SUMS" || return 1
+    install -m 0755 "$backup/latch-relay" /usr/local/bin/latch-relay || return 1
+    cp -a "$backup/latch-relay.service" /etc/systemd/system/latch-relay.service || return 1
+    cp -a "$backup/config/." /etc/latch-relay/ || return 1
+    cp -a "$backup/renewal.conf" "$renewal" || return 1
+    rm -rf /etc/systemd/system/latch-relay.service.d || return 1
+    if [[ -d "$backup/drop-ins" ]]; then
+        cp -a "$backup/drop-ins" /etc/systemd/system/latch-relay.service.d || return 1
+    fi
+    systemctl daemon-reload || return 1
+    systemctl start latch-relay.service || return 1
+    systemctl is-active --quiet latch-relay.service || return 1
+    python3 "$RELAY_KIT/selftest.py" --live "$RELAY_HOST" || return 1
+}
+finish() {
+    result=$?
+    trap - EXIT HUP INT TERM
+    if (( result != 0 && service_stopped )); then
+        rollback || { echo 'Rollback failed. Use the retained backup to repair the service.' >&2; result=1; }
+    fi
+    systemctl enable --now certbot.timer || result=1
+    systemctl is-active --quiet certbot.timer || { echo 'Certbot timer is inactive. Restore renewal scheduling now.' >&2; result=1; }
+    exit "$result"
+}
+trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' HUP TERM
+systemctl stop certbot.timer
+certbot_state=$(systemctl is-active certbot.service || true)
+case "$certbot_state" in
+    inactive|failed) ;;
+    *) echo 'A Certbot job is still running. Let it finish and rerun this block.' >&2; exit 1 ;;
+esac
+cp -a /usr/local/bin/latch-relay "$backup/latch-relay"
+cp -a /etc/systemd/system/latch-relay.service "$backup/latch-relay.service"
+cp -a /etc/latch-relay "$backup/config"
+cp -a "$renewal" "$backup/renewal.conf"
+if [[ -d /etc/systemd/system/latch-relay.service.d ]]; then
+    cp -a /etc/systemd/system/latch-relay.service.d "$backup/drop-ins"
+fi
+sha256sum "$backup/latch-relay" "$backup/latch-relay.service" "$backup/renewal.conf" > "$backup/SHA256SUMS"
+journalctl -u latch-relay.service --since '1 minute ago' --no-pager | tail -10
+service_stopped=1
+systemctl stop latch-relay.service
+cp -a /var/lib/latch-relay/quota "$backup/quota.before"
+bash "$RELAY_KIT/install.sh" "$RELAY_BINARY" \
+  "/etc/letsencrypt/live/$RELAY_CERT_NAME/fullchain.pem" \
+  "/etc/letsencrypt/live/$RELAY_CERT_NAME/privkey.pem" "$MONTHLY_BYTES"
+grep -F -- '--http-listen [::]:80 --acme-webroot /var/www/latch-relay' /etc/systemd/system/latch-relay.service
+systemctl start latch-relay.service
+systemctl is-active --quiet latch-relay.service
+python3 "$RELAY_KIT/selftest.py" --live "$RELAY_HOST"
+for family in 4 6; do
+    [[ $(curl "-$family" --noproxy '*' -fsS --max-time 10 -o /dev/null \
+        -w '%{http_code}' "http://$RELAY_HOST/netenv/probe") == 204 ]]
+done
+# Remove this certificate's obsolete standalone pre/post hooks before any dry-run.
+# The deploy hook is retained. Confirm that global pre/post hook directories
+# likewise contain no standalone hook that stops this relay.
+python3 - "$renewal" <<'PY'
+import configparser
+import io
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+config = configparser.RawConfigParser()
+config.optionxform = str
+config.read_string("[DEFAULT]\n" + path.read_text())
+config.remove_option('renewalparams', 'pre_hook')
+config.remove_option('renewalparams', 'post_hook')
+output = io.StringIO()
+config.write(output)
+path.write_text(output.getvalue().removeprefix('[DEFAULT]\n'))
+PY
+certbot_version=$(certbot --version | awk '{print $2}')
+if dpkg --compare-versions "$certbot_version" ge 2.3; then
+    certbot reconfigure --cert-name "$RELAY_CERT_NAME" --webroot -w /var/www/latch-relay
+else
+    python3 - "$renewal" "$RELAY_HOST" <<'PY'
+import configparser
+import io
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+config = configparser.RawConfigParser()
+config.optionxform = str
+config.read_string("[DEFAULT]\n" + path.read_text())
+config['renewalparams']['authenticator'] = 'webroot'
+config['renewalparams']['webroot_path'] = '/var/www/latch-relay,'
+config['[webroot_map]'] = {sys.argv[2]: '/var/www/latch-relay'}
+output = io.StringIO()
+config.write(output)
+path.write_text(output.getvalue().removeprefix('[DEFAULT]\n'))
+PY
+fi
+certbot renew --cert-name "$RELAY_CERT_NAME" --dry-run
+systemctl is-active --quiet latch-relay.service
+journalctl -u latch-relay.service --since '2 minutes ago' --no-pager
+# The EXIT handler re-enables and verifies certbot.timer on success too.
+BASH
+```
+
+### Roll back later
+
+For an immediate failure, the block above runs rollback automatically. For a later
+rollback, set `RELAY_HOST`, `RELAY_CERT_NAME` and `backup` to the saved values,
+then run these restore commands as root during another arranged interruption.
+The current quota stays at its live path. The saved ledger is for audit and
+recovery of damaged storage, and must never overwrite accumulated usage.
+
+```bash
+set -euo pipefail
+RELAY_KIT="$PWD/deploy/relay-tcp"
+renewal="/etc/letsencrypt/renewal/$RELAY_CERT_NAME.conf"
+restore_timer() {
+    result=$?
+    trap - EXIT HUP INT TERM
+    systemctl enable --now certbot.timer || result=1
+    systemctl is-active --quiet certbot.timer || result=1
+    exit "$result"
+}
+trap restore_timer EXIT
+trap 'exit 130' INT
+trap 'exit 143' HUP TERM
+systemctl stop certbot.timer
+certbot_state=$(systemctl is-active certbot.service || true)
+case "$certbot_state" in inactive|failed) ;; *) echo 'Certbot is running' >&2; exit 1 ;; esac
+systemctl stop latch-relay.service
+cp -a /var/lib/latch-relay/quota "$backup/quota.at-rollback"
+sha256sum --check "$backup/SHA256SUMS"
+install -m 0755 "$backup/latch-relay" /usr/local/bin/latch-relay
+cp -a "$backup/latch-relay.service" /etc/systemd/system/latch-relay.service
+cp -a "$backup/config/." /etc/latch-relay/
+cp -a "$backup/renewal.conf" "$renewal"
+rm -rf /etc/systemd/system/latch-relay.service.d
+if [[ -d "$backup/drop-ins" ]]; then
+    cp -a "$backup/drop-ins" /etc/systemd/system/latch-relay.service.d
+fi
+systemctl daemon-reload
+systemctl start latch-relay.service
+systemctl is-active --quiet latch-relay.service
+python3 "$RELAY_KIT/selftest.py" --live "$RELAY_HOST"
+```
+
+### Renewal and expiry checks
+
+The deployed certificate registration has no expiry e-mail address. Check renewal
+failures and remaining validity explicitly. The expiry command exits nonzero
+when fewer than 30 days remain. Run it daily through the operator's monitoring
+or scheduler and alert on a nonzero result.
+
+```sh
+sudo systemctl --failed certbot.service
+sudo journalctl -u certbot.service --since '7 days ago' --no-pager
+sudo openssl x509 -in "/etc/letsencrypt/live/$RELAY_CERT_NAME/fullchain.pem" -noout -enddate
+sudo openssl x509 -in "/etc/letsencrypt/live/$RELAY_CERT_NAME/fullchain.pem" -noout -checkend 2592000
+sudo systemctl is-active certbot.timer
+```
+
+The HTTP listener bounds request size/time, concurrent connections and per-source
+(IPv4 /32, IPv6 /64) plus global admission. Normal traffic has 120 global and
+30 per-source admissions per minute. Two slots and 16 admissions per minute
+reserve capacity for existing challenge files during ordinary traffic. Headers
+have a 250-ms deadline and each source can hold one idle connection. Idle
+requests cannot occupy the reserved slots. This reduces ordinary-traffic
+starvation. A bounded unauthenticated listener remains susceptible to deliberate
+resource exhaustion, so renewal failures and certificate expiry need monitoring.
+The listener logs no request paths or addresses. A missing probe on an older
+relay remains silent. The new unit requires the new binary, and its port-80
+ownership requires the webroot renewal configuration.

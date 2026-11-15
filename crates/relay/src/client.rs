@@ -252,15 +252,17 @@ fn handshake_stall(error: &io::Error) -> Option<&HandshakeStall> {
     error.get_ref()?.downcast_ref()
 }
 
-// Prefer actionable policy evidence over ambiguous reachability failures. Proxy
-// credentials can be corrected first, then CONNECT policy, then certificate
-// trust. A block carries more evidence than a deadline. Cancellation and CPU
+// Expose certificate substitution before proxy policy refusals because it is
+// security evidence the user must see. Prefer actionable policy evidence over
+// ambiguous reachability failures. Proxy credentials can be corrected first,
+// then CONNECT policy, then certificate trust. A block carries more evidence than a deadline. Cancellation and CPU
 // support remain terminal, as do security failures that prohibit another route.
 fn failure_priority(failure: &Failure) -> u8 {
     match failure {
         Failure::ProxyAuthenticationRequired => 6,
         Failure::ProxyRefused { .. } => 5,
-        Failure::TlsInterception { .. } | Failure::TlsRejected => 4,
+        Failure::TlsInterception { .. } => 7,
+        Failure::TlsRejected => 4,
         Failure::CaptivePortal => 3,
         Failure::Timeout => 0,
         Failure::ConnectionBlocked | Failure::ClosedBeforeHandshake => 1,
@@ -2477,11 +2479,10 @@ mod tests {
         for pair in failures.windows(2) {
             assert!(failure_priority(&pair[0]) < failure_priority(&pair[1]));
         }
-        assert_eq!(
-            failure_priority(&Failure::TlsRejected),
+        assert!(
             failure_priority(&Failure::TlsInterception {
                 issuer: "Test CA".into()
-            })
+            }) > failure_priority(&Failure::ProxyRefused { status: 403 })
         );
     }
     #[test]

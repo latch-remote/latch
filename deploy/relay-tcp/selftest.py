@@ -59,7 +59,89 @@ def check_kit():
         network,
     )
     check_network(network)
+    check_upgrade_runbook()
     print("PASS kit syntax, operator limits, privilege and persistent-ledger contract")
+
+
+def check_upgrade_runbook():
+    text = (KIT / "README.md").read_text()
+    upgrade = text.split("## Enable the anonymous probe and switch Certbot to webroot", 1)[1]
+    blocks = re.findall(r"```bash\n(.*?)\n```", upgrade, re.S)
+    assert len(blocks) == 2
+    for block in blocks:
+        subprocess.run(["bash", "-n"], input=block, text=True, check=True)
+    script = blocks[0].split("bash <<'BASH'\n", 1)[1].rsplit("\nBASH", 1)[0]
+    ordered = ["trap finish EXIT", "systemctl stop certbot.timer", "certbot_state=",
+               'cp -a /usr/local/bin/latch-relay "$backup/latch-relay"',
+               'cp -a "$renewal" "$backup/renewal.conf"', "service_stopped=1",
+               'cp -a /var/lib/latch-relay/quota "$backup/quota.before"',
+               'bash "$RELAY_KIT/install.sh"', 'grep -F --',
+               'systemctl start latch-relay.service',
+               'python3 "$RELAY_KIT/selftest.py" --live "$RELAY_HOST"',
+               'for family in 4 6', 'python3 - "$renewal"', 'certbot reconfigure',
+               'certbot renew --cert-name "$RELAY_CERT_NAME" --dry-run']
+    # Examine the execution sequence after function definitions.
+    main = script[script.index("trap finish EXIT"):]
+    positions = [main.index(command) for command in ordered]
+    assert positions == sorted(positions), "upgrade command order changed"
+    for block in blocks:
+        assert 'systemctl enable --now certbot.timer' in block
+        assert 'systemctl is-active --quiet certbot.timer' in block
+        assert 'cp -a "$backup/renewal.conf" "$renewal"' in block
+        assert 'cp -a "$backup/latch-relay.service"' in block
+        assert 'install -m 0755 "$backup/latch-relay"' in block
+        assert 'cp -a "$backup/config/."' in block
+        assert 'cp -a "$backup/quota.before" /var/lib/latch-relay/quota' not in block
+    assert 'no expiry e-mail' in upgrade
+    assert '-checkend 2592000' in upgrade
+    assert '--live relay.' not in text
+    finish = "finish() {\n" + script.split("finish() {\n", 1)[1].split("\n}\ntrap finish EXIT", 1)[0] + "\n}\n"
+    with tempfile.TemporaryDirectory(prefix="latch-upgrade-exit-test-") as directory:
+        trace = Path(directory) / "calls"
+        for stopped, failed, rollback_failed, timer_failed in (
+                (0, 0, 0, 0), (0, 1, 0, 0), (1, 1, 0, 0),
+                (1, 1, 1, 0), (1, 0, 0, 1), (1, 1, 1, 1)):
+            trace.write_text("")
+            stub = r'''systemctl() {
+    printf '%s\n' "$*" >> "$TRACE"
+    if (( TIMER_FAILED )); then return 1; fi
+}
+rollback() {
+    printf 'rollback\n' >> "$TRACE"
+    return "$ROLLBACK_FAILED"
+}
+'''
+            env = os.environ | {"TRACE": str(trace), "TIMER_FAILED": str(timer_failed),
+                                "ROLLBACK_FAILED": str(rollback_failed)}
+            result = subprocess.run(["bash", "-c", stub + finish
+                + f"service_stopped={stopped}\ntrap finish EXIT\nexit {failed}\n"],
+                env=env, capture_output=True, text=True)
+            calls = trace.read_text().splitlines()
+            assert calls[-2:] == ["enable --now certbot.timer", "is-active --quiet certbot.timer"], calls
+            assert ("rollback" in calls) == bool(stopped and failed), calls
+            assert result.returncode == int(bool(failed or timer_failed)), result.stderr
+    snippets = re.findall(r"python3 - \"\$renewal\".*?<<'PY'\n(.*?)\nPY", script, re.S)
+    assert len(snippets) == 2
+    with tempfile.TemporaryDirectory(prefix="latch-renewal-test-") as directory:
+        path = Path(directory) / "renewal.conf"
+        original = ("cert = /certificate/path\nprivkey = /key/path\n"
+                    "[renewalparams]\naccount = retained-account\nserver = retained-server\n"
+                    "authenticator = standalone\npre_hook = systemctl stop latch-relay\n"
+                    "post_hook = systemctl start latch-relay\ndeploy_hook = retained-deploy-hook\n")
+        path.write_text(original)
+        subprocess.run(["python3", "-", str(path)], input=snippets[0], text=True, check=True)
+        hooks_removed = path.read_text()
+        assert "pre_hook" not in hooks_removed and "post_hook" not in hooks_removed
+        assert "retained-deploy-hook" in hooks_removed
+        subprocess.run(["python3", "-", str(path), "relay.test"], input=snippets[1], text=True, check=True)
+        rewritten = path.read_text()
+        for retained in ("retained-account", "retained-server", "retained-deploy-hook", "/certificate/path", "/key/path"):
+            assert retained in rewritten
+        assert "authenticator = webroot" in rewritten
+        assert "webroot_path = /var/www/latch-relay," in rewritten
+        assert "[[webroot_map]]" in rewritten
+        assert "relay.test = /var/www/latch-relay" in rewritten
+    print("PASS upgrade/rollback syntax, timer traps, command order and renewal configuration migration")
 
 
 def check_network(network):
@@ -166,6 +248,31 @@ def probe(host, port, context):
         with context.wrap_socket(raw, server_hostname=host) as connection:
             assert connection.selected_alpn_protocol() == "latch-relay/1"
             assert connection.version() in ("TLSv1.2", "TLSv1.3")
+
+
+def probe_websocket(host, port, context):
+    context.set_alpn_protocols(["http/1.1"])
+    with socket.create_connection((host, port), timeout=5) as raw:
+        with context.wrap_socket(raw, server_hostname=host) as connection:
+            key = base64.b64encode(os.urandom(16))
+            connection.sendall(
+                f"GET /relay HTTP/1.1\r\nHost: {host}:{port}\r\n".encode()
+                + b"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: "
+                + key + b"\r\n\r\n")
+            response = b""
+            while not response.endswith(b"\r\n\r\n"):
+                chunk = connection.recv(1)
+                assert chunk, "WebSocket upgrade closed before its headers"
+                response += chunk
+                assert len(response) <= 8192, "oversized WebSocket upgrade"
+            expected = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+            assert response.startswith(b"HTTP/1.1 101 "), response
+            assert b"Sec-WebSocket-Accept: " + expected + b"\r\n" in response
+
+
+def probe_carriers(host, port, certificate=None):
+    probe(host, port, tls_context(certificate))
+    probe_websocket(host, port, tls_context(certificate))
 
 
 def check_binary(binary):
@@ -278,6 +385,7 @@ def check_binary(binary):
             match = re.search(r"listening on \[::\]:(\d+)", line)
             assert match, line
             port = int(match[1])
+            probe_carriers("localhost", port, certificate)
             for address in ("127.0.0.1", "::1"):
                 with socket.create_connection((address, port), timeout=3) as raw:
                     with tls_context(certificate).wrap_socket(raw, server_hostname="localhost") as tls:
@@ -404,8 +512,8 @@ def main():
     if args.binary:
         check_binary(args.binary)
     if args.live:
-        probe(args.live, args.port, tls_context())
-        print("PASS live hostname, certificate chain and latch-relay/1 ALPN")
+        probe_carriers(args.live, args.port)
+        print("PASS live hostname, certificate chain, native TLS and WebSocket upgrade")
 
 
 if __name__ == "__main__":

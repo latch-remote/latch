@@ -43,6 +43,12 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Relay connectivity
 
+- Retain working PAC proxies across incomplete discovery, promptly recheck after
+  sign-in, and measure portal waiting from detection. Report host-labelled
+  network failures and preserve TLS interception evidence across routes.
+- Protect HTTP challenge capacity from missing-token requests and idle headers.
+  Document and test backup, rollback and renewal-timer handling for relay upgrades.
+
 - Discover OS and environment CONNECT proxies without delaying session start.
   Explain proxy authentication, captive portals, TLS interception, HTTPS-only
   fallback and restricted Tailscale paths in the viewer and examples. Open

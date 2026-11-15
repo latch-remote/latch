@@ -292,15 +292,19 @@ updates ignore the legacy GitHub token settings.
 Latch discovers this network's OS, PAC/WPAD and environment proxy settings in
 background. A cached result is used immediately. Slow discovery continues while
 the connection tries direct access. Changing networks or signing in to a portal
-invalidates the cached result. Relay connection failures also refresh discovery.
-A confirmed portal retries after 2 seconds with exponential backoff up to 60
-seconds. Healthy sessions send no periodic HTTP probes. An in-flight check can
+invalidates the cached result. Relay connection failures refresh discovery within
+two seconds. A failed PAC/WPAD lookup retains a previously working proxy until
+successful discovery replaces it.
+A confirmed portal retries after 1 second with exponential backoff up to 4
+seconds. Opening sign-in or returning to Latch rechecks promptly. Healthy
+sessions send no periodic HTTP probes. An in-flight check can
 take up to six seconds.
 
 - **This network needs a sign-in** appears when a portal redirects the anonymous
   connectivity check. Choose **Open network sign-in**, complete the browser's
   sign-in, and leave Latch open. The pending stream resumes automatically.
-  Portal waiting ends after three minutes with a sign-in timeout message. Media
+  Portal waiting ends three minutes after detection with a reachability message
+  that also covers a completed sign-in. Media
   arriving clears the banner and keeps the normal eight-second stall watchdog.
 - **This network inspects encrypted traffic** means the relay presented an
   untrusted certificate. Latch refuses the substituted certificate and shows its
@@ -325,6 +329,10 @@ take up to six seconds.
 - **Tailscale is blocked** or **Tailscale is using DERP only** describes the
   network evidence reported by Tailscale. Check that Tailscale is signed in and
   allowed by this network. DERP adds latency.
+
+A notice starting **The host's network** describes a problem on the sharing
+machine. Complete sign-in or check the proxy/certificate policy on that machine.
+These notices have fixed text and carry no sign-in URL or button.
 
 Healthy networks show no network warning. The relay can retry a stalled TCP
 path with 1200-byte and then 512-byte MSS on Linux, applied before connect to

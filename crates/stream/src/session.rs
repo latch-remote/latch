@@ -1242,12 +1242,6 @@ impl VideoHealth {
             .is_some_and(|last| now.saturating_duration_since(last) >= MEDIA_STALL_TIMEOUT)
     }
 
-    fn session_stalled(&self, network: &crate::network::NetworkStatus, now: Instant) -> bool {
-        // A portal can delay the first picture, but delivered media always keeps
-        // the normal stall deadline, even if cleartext HTTP remains redirected.
-        (!network.needs_sign_in || self.last_frame.is_some()) && self.stalled(now)
-    }
-
     fn stall_message(&self) -> &'static str {
         if self.last_encoded > self.last_frame {
             "Video is arriving, but decoding stopped producing pictures. Reconnecting…"
@@ -2236,8 +2230,8 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 }
             });
     }
-    let session_started = Instant::now();
-    let mut accepted = session_started;
+    let mut accepted = Instant::now();
+    let mut portal_since = None;
     let mut last_report = Instant::now();
     let mut last_keepalive = Instant::now();
     let mut damage_since: Option<Instant> = None;
@@ -2415,6 +2409,7 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
             }
         }
         let mut status = inner.relay.lock().network_status();
+        let portal_reported = status.needs_sign_in;
         let media_arrived = inner.video_health.lock().last_encoded.is_some();
         status.media_arrived(media_arrived);
         if media_arrived {
@@ -2422,9 +2417,7 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                 crate::network::media_received(config.endpoint.host());
             }
         }
-        if (last_network_status.needs_sign_in && !status.needs_sign_in)
-            || (!last_network_status.proxy_available && status.proxy_available)
-        {
+        if status.recovered_from(&last_network_status) {
             accepted = Instant::now();
             inner.relay.lock().retry_after_network_change();
             status = inner.relay.lock().network_status();
@@ -2436,16 +2429,16 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
         }
         // Signing in can take longer than the first-picture watchdog. Keep the
         // authorized control session alive while the portal is confirmed captive.
-        let waiting_for_sign_in = status.needs_sign_in && !media_arrived;
-        if status.sign_in_timed_out(session_started.elapsed()) {
+        let waiting_for_sign_in = portal_reported && !media_arrived;
+        if status.sign_in_timed_out(&mut portal_since, now) {
             return Outcome::Failed(
                 "network".into(),
-                "Network sign-in timed out. Complete sign-in in your browser, then reconnect."
+                "Latch still cannot reach the relay after network sign-in. Check that sign-in completed and ask the network administrator to allow the relay on port 443, then reconnect."
                     .into(),
             );
         }
         let health = inner.video_health.lock();
-        if health.session_stalled(&status, now) {
+        if health.stalled(now) {
             return Outcome::Ended(-1, health.stall_message().into());
         }
         drop(health);
@@ -3945,15 +3938,65 @@ mod tests {
         };
         health.last_encoded = Some(now);
         health.frame(now, false);
-        assert!(!health.session_stalled(
-            &status,
-            now + MEDIA_STALL_TIMEOUT - Duration::from_millis(1)
-        ));
-        assert!(health.session_stalled(&status, now + MEDIA_STALL_TIMEOUT));
+        assert!(!health.stalled(now + MEDIA_STALL_TIMEOUT - Duration::from_millis(1)));
+        assert!(health.stalled(now + MEDIA_STALL_TIMEOUT));
         status.media_arrived(health.last_encoded.is_some());
         assert!(!status.needs_sign_in);
         assert!(status.messages.is_empty());
-        assert!(health.session_stalled(&status, now + MEDIA_STALL_TIMEOUT));
+        assert!(health.stalled(now + MEDIA_STALL_TIMEOUT));
+    }
+
+    #[test]
+    fn control_loop_reports_stall_after_media_despite_a_portal_and_receives_host_notice() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let (events, received) = mpsc::channel();
+        let inner = Arc::new(Inner::new(
+            events,
+            Arc::new(FrameSlot::default()),
+            Box::new(|| {}),
+        ));
+        *inner.control_writer.lock() = Some(tcp.try_clone().unwrap());
+        inner.connected.store(true, Ordering::Release);
+        inner.relay.lock().state.lock().failure = Some(latch_relay::Failure::CaptivePortal);
+        let last_frame = Instant::now() - MEDIA_STALL_TIMEOUT;
+        inner.video_health.lock().last_encoded = Some(last_frame);
+        inner.video_health.lock().frame(last_frame, false);
+        let notice = crate::network::host_notice(
+            &crate::network::NetworkStatus {
+                needs_sign_in: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        control::write_message(&mut peer, &Message::Notice(notice.clone())).unwrap();
+        let accept: Accept = serde_json::from_value(serde_json::json!({
+            "session": 7, "token": "00000000000000000000000000000000",
+            "codec": "h264-baseline", "width": 64, "height": 64, "fps": 30,
+            "bitrate_kbps": 2000, "encoder": "test", "audio": null, "relay": false
+        }))
+        .unwrap();
+        let (done, timeout) = mpsc::channel();
+        let stop_inner = inner.clone();
+        let watchdog = std::thread::spawn(move || {
+            if timeout.recv_timeout(Duration::from_secs(1)).is_err() {
+                stop_inner.stop.store(true, Ordering::Release);
+            }
+        });
+        let outcome = control_loop(&inner, &mut tcp, &accept);
+        let _ = done.send(());
+        watchdog.join().unwrap();
+        let _ = tcp.shutdown(Shutdown::Both);
+        assert!(
+            matches!(outcome, Outcome::Ended(-1, ref message) if message.contains("Video stopped arriving"))
+        );
+        let events: Vec<_> = received.try_iter().collect();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, Event::Notice(message) if message == &notice.message)));
+        assert!(events.iter().all(|event| !matches!(event, Event::Network(status) if status.needs_sign_in || status.portal_url.is_some())));
     }
 
     #[test]

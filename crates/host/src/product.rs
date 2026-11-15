@@ -58,6 +58,8 @@ impl NodeApp {
         shared: Shared,
         os: Os,
     ) -> Self {
+        #[cfg(test)]
+        std::env::set_var("LATCH_NETENV_PROBE", "0");
         let client = ClientApp::headless(
             cc,
             discovery,

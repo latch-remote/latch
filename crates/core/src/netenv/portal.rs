@@ -96,13 +96,17 @@ fn read_probe(target: &ProbeTarget, reader: &mut impl BufRead) -> Option<Captive
             .filter(|url| {
                 matches!(url.scheme(), "http" | "https")
                     && match url.host() {
-                        Some(url::Host::Ipv4(ip)) => !ip.is_loopback(),
+                        Some(url::Host::Ipv4(ip)) => !ip.is_loopback() && !ip.is_unspecified(),
                         Some(url::Host::Ipv6(ip)) => {
                             !ip.is_loopback()
-                                && !ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+                                && !ip.is_unspecified()
+                                && !ip
+                                    .to_ipv4_mapped()
+                                    .is_some_and(|ip| ip.is_loopback() || ip.is_unspecified())
                         }
                         Some(url::Host::Domain(host)) => {
-                            !host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+                            let host = host.trim_end_matches('.').to_ascii_lowercase();
+                            host != "localhost" && !host.ends_with(".localhost")
                         }
                         None => false,
                     }
@@ -233,6 +237,10 @@ mod url_tests {
             "[::ffff:127.0.0.1]",
             "localhost",
             "LOCALHOST.",
+            "0.0.0.0",
+            "[::]",
+            "app.localhost",
+            "nested.APP.localhost.",
         ] {
             let result = classify(
                 &target,

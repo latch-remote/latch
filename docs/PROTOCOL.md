@@ -87,7 +87,7 @@ type byte and the payload and is at most 65 536. Payloads are JSON objects.
 | 1 | `Accept` | host → viewer | see below; always the first message |
 | 2 | `End` | either | `{"code": u32, "message": string}`; the sender closes after it (a host half-closes and reads for up to 100 ms first, so a report in flight cannot reset the connection before the viewer reads the End) |
 | 3 | `Keepalive` | either | `{}` |
-| 4 | `Notice` | host → viewer | `{"kind": "audio" \| "video" \| "input", "message": string}`; `message` empty clears it |
+| 4 | `Notice` | host → viewer | `{"kind": "audio" \| "video" \| "input" \| "network", "message": string}`; `message` empty clears it |
 | 5 | `Report` | either | `{"fps", "loss_pct", "decode_ms", "rtt_ms"}`, every 50 ms (older viewers: 250 ms or once a second), for bitrate and FEC feedback |
 | 6 | `Cursor` | host → viewer | `{"visible": bool, "shape": null \| {"serial": u32, "width": u32, "height": u32, "hot_x": u32, "hot_y": u32, "rgba": "<base64>"}}`; only after an `Accept` with `cursor` true; sent when visibility or shape changes (`shape` null: unchanged); straight-alpha sRGB RGBA, at most 96×96 |
 | 7 | `DrawCursor` | viewer → host | `{"draw": bool}`; tells host whether to composite pointer into video |
@@ -987,10 +987,13 @@ It follows no redirects. A redirect provides a browser sign-in action. A 404,
 timeout or unavailable probe from an older relay produces no warning by itself.
 This endpoint is independent of the TLS relay framing and version-1 peer protocol.
 Healthy sessions reuse discovery until the network key changes or a relay
-connection fails. Confirmed portals retry with 2-to-60-second exponential
-backoff. Delivered media clears the portal banner. Waiting before media ends
-after three minutes, and the normal media-stall deadline remains active once
-pictures flow. Browser sign-in actions reject loopback IPs and localhost while
+connection fails. Confirmed portals retry with 1-to-4-second exponential
+backoff. Relay failures refresh within two seconds and incomplete PAC/WPAD
+results retain the prior proxy. Opening sign-in or returning to the app rechecks
+promptly. Delivered media clears the portal banner. Waiting before media ends
+three minutes after portal detection, and the normal media-stall deadline remains active once
+pictures flow. Browser sign-in actions reject loopback and unspecified IPs,
+localhost and its subdomains while
 allowing private portal addresses.
 
 `GET /.well-known/acme-challenge/<token>` serves a bounded regular file from
@@ -1000,8 +1003,12 @@ get an empty 404. The listener permits eight concurrent requests, 4096 request
 bytes and two seconds per connection. Normal admissions have global 120/minute
 and per-source 30/minute caps, using the port-443 IPv4 /32 and IPv6 /64 keys.
 Two request slots and 16 challenge admissions per minute form an ACME-only
-reserve after probe admission is exhausted. One source holds at most two
-pending requests. Accept errors log once and back off for one second while
+reserve for existing challenge files under ordinary traffic. Missing files use
+ordinary credit. Headers expire after 250 ms. A source holds at most one idle
+request and two total pending requests. Idle requests cannot occupy the reserved
+slots. These bounds reduce ordinary-traffic starvation and cannot guarantee
+availability under deliberate resource exhaustion. Monitor renewal failures and
+certificate expiry. Accept errors log once and back off for one second while
 port 443 continues.
 It records no request addresses or paths.
 
@@ -1026,3 +1033,12 @@ proxy authorization. Relay grants and attachment capabilities are written only
 inside hostname-verified TLS after a successful CONNECT. Plain HTTP forwarding
 is unsupported. No stream/control fields change, so 6.0.0 peers and the deployed
 relay remain compatible.
+
+Host-local portal, CONNECT-refusal and TLS-interception diagnoses use existing
+version-1 `Notice { kind: "network", message }` frames. Their fixed text begins
+"The host's network" and contains no portal URL, issuer details or browser
+action. Full details stay in the host log. Version 6.0.0 viewers already accept
+arbitrary Notice kinds and display their plain text. This adds no wire field or
+negotiated capability. Viewer-local portal URLs stay in the local `Event::Network`
+diagnosis surface. Certificate substitution takes diagnostic priority over a
+CONNECT refusal encountered on an earlier route.

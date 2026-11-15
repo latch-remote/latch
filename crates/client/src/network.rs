@@ -8,6 +8,7 @@ pub fn show(ui: &mut egui::Ui, status: &NetworkStatus) {
     }
     if let Some(url) = &status.portal_url {
         if ui.button("Open network sign-in").clicked() {
+            latch_stream::network::recheck_portals();
             ui.ctx().open_url(egui::OpenUrl::new_tab(url.as_str()));
         }
     }
