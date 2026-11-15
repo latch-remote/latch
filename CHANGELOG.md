@@ -22,6 +22,12 @@ GitHub release notes, so each version gets a heading of the form
 - Upgrade objc2 and AppKit bindings together, x11rb and libloading, preserving
   macOS integration and Linux X11 abstract-socket connections.
 
+### Documentation
+
+- Document host and viewer support on Windows, macOS and Linux, with code
+  evidence, verification scope, all six streaming directions and in-flight
+  work. Correct platform and cursor claims.
+
 ## 6.0.0 (2026-11-14)
 
 ### Streaming and recovery

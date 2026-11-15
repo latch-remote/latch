@@ -31,10 +31,12 @@ written in Rust.
 Install Latch on your computers, sign them in to the same Tailscale
 account, and click **Connect**. The other machine's desktop appears full
 screen with its sound, your keyboard, mouse and gamepads, and the
-clipboard. Every install can both share and view.
+text clipboard. Every install includes sharing and viewing, with
+[platform-specific limits](docs/PLATFORMS.md).
 
-- **Fast.** Hardware HEVC, AV1 and H.264, HDR10, surround sound, at this
-  display's own size and refresh rate. [What was measured](docs/PERFORMANCE.md).
+- **Fast.** Hardware HEVC, AV1 and H.264 where supported, HEVC HDR10 on Mac
+  and Windows, and stereo or surround sound. Sessions fit the negotiated
+  encoder and display limits. [What was measured](docs/PERFORMANCE.md).
 - **Your Tailscale identity.** No Latch account or pairing PIN. Tailscale
   authorizes control and protects the normal UDP stream. Relay media has
   additional end-to-end encryption.
@@ -42,8 +44,8 @@ clipboard. Every install can both share and view.
   packets, and the bitrate follows the connection. Version 6 can attempt a
   public TCP/TLS relay when UDP video is missing, persistently damaged, or
   limited far below the requested rate during motion.
-- **Made for games.** Raw mouse input, Xbox and DualShock pads with rumble,
-  a latency overlay, and competitive and cinematic profiles.
+- **Made for games.** Relative mouse input, gamepad forwarding to Windows
+  and Linux hosts, a latency overlay, and competitive and cinematic profiles.
 - **Reaches a sleeping PC.** Wake-on-LAN, remote sleep and restart, a
   self-hosted relay kit, and updates that install themselves on Mac and
   Windows.
@@ -161,9 +163,13 @@ performance and remaining field limits are recorded in the
 
 | | Shares its desktop | Views |
 |---|---|---|
-| **Windows** | HEVC or H.264 on the GPU, AV1 where it has an encoder (not yet run on one); HDR10; virtual gamepads | hardware AV1, HEVC and H.264; HDR |
-| **macOS** | HEVC or H.264 on VideoToolbox; HDR10 | hardware AV1 (M3 and later), HEVC and H.264; HDR |
-| **Linux** | software H.264; NVENC and VA-API (not yet run on a GPU); virtual gamepads | software H.264 |
+| **Windows** | GPU H.264/HEVC, software H.264 fallback, AV1 host untested, HEVC HDR10, ViGEm gamepads | probed GPU H.264/HEVC/AV1, software Baseline fallback, HEVC HDR |
+| **macOS** | VideoToolbox H.264/HEVC, HDR capture on Apple Silicon/macOS 15+, gamepad injection missing | probed VideoToolbox H.264/HEVC/AV1 (supported chips), software Baseline fallback, HEVC HDR |
+| **Linux** | X11 software H.264, untested NVENC H.264/HEVC/AV1 and VA-API H.264/HEVC, uinput gamepads, SDR8 | software Constrained Baseline H.264, SDR8 |
+
+The [support matrix](docs/PLATFORMS.md) gives code evidence, verification
+scope, in-flight work and the status of all six host-to-viewer directions.
+Full feature coverage in every direction remains unverified.
 
 Latch is young. HDR has been checked by reading pixels back, not yet by
 eye on an HDR panel. Viewers are desktop apps only: for a phone, a TV or a
@@ -210,6 +216,7 @@ cargo test --workspace                   # the tests
 ## Documentation
 
 - [Using Latch](docs/USING.md), on [Windows](docs/WINDOWS.md) and [macOS](docs/MACOS.md)
+- [Platform support and six-direction audit](docs/PLATFORMS.md)
 - [How the engine works](docs/ENGINE.md) and the [wire protocol](docs/PROTOCOL.md)
 - [Security model](SECURITY.md), and how to report a problem privately
 - [Changelog](CHANGELOG.md)
