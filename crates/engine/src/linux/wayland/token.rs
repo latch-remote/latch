@@ -169,26 +169,27 @@ mod tests {
 
     #[test]
     fn the_file_follows_xdg_state_home_or_the_override() {
-        let p = |s: &str| Some(PathBuf::from(s));
+        let root = std::env::temp_dir();
+        let p = |s: &str| Some(root.join(s));
         assert_eq!(
-            path_from(None, p("/state"), p("/home/a")),
-            p("/state/latch/wayland-portal.json")
+            path_from(None, p("state"), p("home/a")),
+            p("state/latch/wayland-portal.json")
         );
         assert_eq!(
-            path_from(None, None, p("/home/a")),
-            p("/home/a/.local/state/latch/wayland-portal.json")
+            path_from(None, None, p("home/a")),
+            p("home/a/.local/state/latch/wayland-portal.json")
         );
         assert_eq!(
-            path_from(None, p("relative"), p("/home/a")),
-            p("/home/a/.local/state/latch/wayland-portal.json"),
+            path_from(None, Some("relative".into()), p("home/a")),
+            p("home/a/.local/state/latch/wayland-portal.json"),
             "a relative XDG_STATE_HOME is ignored"
         );
-        assert_eq!(
-            path_from(p("/tmp/t.json"), p("/state"), None),
-            p("/tmp/t.json")
-        );
+        assert_eq!(path_from(p("t.json"), p("state"), None), p("t.json"));
         assert_eq!(path_from(None, None, None), None);
-        assert_eq!(path_from(p(""), None, p("relative")), None);
+        assert_eq!(
+            path_from(Some(PathBuf::new()), None, Some("relative".into())),
+            None
+        );
     }
 
     #[test]

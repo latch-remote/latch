@@ -26,10 +26,22 @@ cleanup() {
     for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
     for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
     if (( result != 0 )); then cat "$fixture"/*.log; fi
+    if mountpoint -q "$XDG_RUNTIME_DIR/doc"; then fusermount3 -u "$XDG_RUNTIME_DIR/doc"; fi
     rm -rf "$fixture"
     exit "$result"
 }
 trap cleanup EXIT
+wait_for() {
+    local pid=$1 i
+    shift
+    for ((i=0; i<100; i++)); do
+        kill -0 "$pid" || return 1
+        if timeout 1 "$@" >> "$fixture/readiness.log" 2>&1; then return 0; fi
+        sleep 0.1
+    done
+    echo "timed out waiting for $*" >&2
+    return 1
+}
 cat > "$fixture/sway.conf" <<'CONFIG'
 output HEADLESS-1 mode 640x360
 output HEADLESS-1 bg #345678 solid_color
@@ -62,14 +74,15 @@ test -s "$fixture/ready.ppm"
 dbus-update-activation-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME
 pipewire > "$fixture/pipewire.log" 2>&1 &
 pids+=("$!")
+# xdpw exits if PipeWire is still starting. The frontend would then
+# D-Bus-activate the system xdpw, losing the SHM fixture patch.
+wait_for "$!" pw-cli info 0
 wireplumber > "$fixture/wireplumber.log" 2>&1 &
 pids+=("$!")
 "${LATCH_TEST_PORTAL_WLR:-/usr/libexec/xdg-desktop-portal-wlr}" -l DEBUG > "$fixture/portal-wlr.log" 2>&1 &
 pids+=("$!")
+wait_for "$!" busctl --user --auto-start=no get-property org.freedesktop.impl.portal.desktop.wlr /org/freedesktop/portal/desktop org.freedesktop.impl.portal.ScreenCast version
 /usr/libexec/xdg-desktop-portal -v > "$fixture/portal.log" 2>&1 &
 pids+=("$!")
-for ((i=0; i<100; i++)); do
-    if dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.freedesktop.portal.Desktop | grep -q "boolean true"; then break; fi
-    sleep 0.1
-done
+wait_for "$!" busctl --user --auto-start=no get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.ScreenCast version
 timeout 45 "$binary"
