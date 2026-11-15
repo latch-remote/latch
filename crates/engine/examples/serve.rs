@@ -4,11 +4,16 @@
 //!
 //!     serve [--bind 100.x.y.z] [--port 47860] [--telemetry]
 //!
+//! `--relay-host HOST --relay-port PORT --relay-ca PEM` selects private test PKI.
+//!
 //! `LATCH_TEST_PATTERN=still|sweep|noise` streams the synthetic desktop;
 //! `LATCH_TEST_GAMEPADS=system` then still plugs viewers' gamepads into the
 //! platform (ViGEmBus, uinput) rather than test pads.
 //! A viewer's microphone plays into `LATCH_MIC_DEVICE` (or the first
 //! virtual cable) on Windows and macOS, as the host does.
+
+#[path = "../../stream/examples/support/relay.rs"]
+mod measurement_relay;
 
 use latch_core::http::{self, Response};
 use latch_engine::server::{Options, Server};
@@ -39,6 +44,7 @@ fn main() -> anyhow::Result<()> {
     let server = Server::bind(
         port,
         Options {
+            relay: measurement_relay::relay(&args)?,
             prepare: args.iter().any(|a| a == "--prepare-display").then(|| {
                 Box::new(|req: &StreamRequest| {
                     let previous = latch_engine::display::prepare(
@@ -58,7 +64,6 @@ fn main() -> anyhow::Result<()> {
             }),
             log: Box::new(|line| eprintln!("{line}")),
             mic: mic_opener(),
-            ..Options::default()
         },
     )?;
     eprintln!("serving on {bind}:{port} (TCP and UDP)");

@@ -5,14 +5,16 @@
 //! how long a key press takes to show up in a decoded frame, and that
 //! gamepads plug in, follow the viewer, rumble back and unplug.
 
+#[path = "support/listeners.rs"]
+mod listeners;
+
 use latch_core::http::{self, Response};
 use latch_engine::pattern::{Motion, Pattern};
-use latch_engine::server::{Options, Server};
 use latch_engine::software::{Bgra, CpuCapture};
 use latch_proto::control::{self, StreamRequest};
 use latch_stream::{Event, Frame, FrameSlot, Session, Settings};
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -23,56 +25,39 @@ const FPS: u32 = 60;
 /// A host on 127.0.0.1: an HTTP listener that upgrades `/v1/stream` into
 /// the engine's server, both on the same port number.
 fn host() -> u16 {
-    for _ in 0..50 {
-        // The OS's next free UDP port, then TCP on the same number. Taking
-        // TCP's next port first failed 50 times running on Windows CI: its
-        // TCP ports come in sequence and can sit inside a block reserved
-        // (by Hyper-V) against UDP.
-        let port = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-            .and_then(|u| u.local_addr())
-            .unwrap()
-            .port();
-        let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)) else {
-            continue;
-        };
-        let Ok(server) = Server::bind(port, Options::default()) else {
-            continue;
-        };
-        std::thread::spawn(move || {
-            http::serve_with_peer_check(
-                listener,
-                |_| true,
-                move |peer, req| {
-                    if req.path != control::PATH {
-                        return Response::json(404, &serde_json::json!({ "ok": false }));
+    let (server, listener) = listeners::host();
+    let port = server.port();
+    std::thread::spawn(move || {
+        http::serve_with_peer_check(
+            listener,
+            |_| true,
+            move |peer, req| {
+                if req.path != control::PATH {
+                    return Response::json(404, &serde_json::json!({ "ok": false }));
+                }
+                let request: StreamRequest = match req.json() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return Response::json(
+                            400,
+                            &serde_json::json!({ "ok": false, "error": e.to_string() }),
+                        )
                     }
-                    let request: StreamRequest = match req.json() {
-                        Ok(r) => r,
-                        Err(e) => {
-                            return Response::json(
-                                400,
-                                &serde_json::json!({ "ok": false, "error": e.to_string() }),
-                            )
-                        }
-                    };
-                    match server.prepare(request, peer) {
-                        Ok(prepared) => {
-                            let server = server.clone();
-                            Response::switching(control::UPGRADE, move |tcp| {
-                                server.run(prepared, tcp)
-                            })
-                        }
-                        Err(r) => Response::json(
-                            r.status,
-                            &serde_json::json!({ "ok": false, "error": r.message }),
-                        ),
+                };
+                match server.prepare(request, peer) {
+                    Ok(prepared) => {
+                        let server = server.clone();
+                        Response::switching(control::UPGRADE, move |tcp| server.run(prepared, tcp))
                     }
-                },
-            )
-        });
-        return port;
-    }
-    panic!("no free port");
+                    Err(r) => Response::json(
+                        r.status,
+                        &serde_json::json!({ "ok": false, "error": r.message }),
+                    ),
+                }
+            },
+        )
+    });
+    port
 }
 
 fn connect(port: u16, cursor: bool) -> (Session, Arc<FrameSlot>, mpsc::Receiver<Event>) {

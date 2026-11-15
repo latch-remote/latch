@@ -1,4 +1,4 @@
-# Native TCP/TLS relay
+# TCP/TLS and HTTPS WebSocket relay
 
 This kit installs the `latch-relay` crate on a dedicated Linux machine with
 systemd. The public endpoint is `relay.latch.rune.foo:443` on the dedicated
@@ -25,7 +25,8 @@ python3 deploy/relay-tcp/selftest.py --binary target/release/latch-relay
 
 The binary selftest creates temporary loopback-only TLS identities and ledgers.
 It checks the shipped limits JSON, TLS/ALPN, ledger permissions and exclusive
-locking, missing/corrupt ledger rejection, preserved reservations on restart,
+locking, dual-stack IPv4/IPv6 acceptance, ordinary HTTP and WebSocket upgrade,
+missing/corrupt ledger rejection, preserved reservations on restart,
 initialization refusing an existing ledger, and budget exhaustion across restart.
 The crate tests exercise authenticated two-lane transport and whole frames.
 `python3 deploy/relay-tcp/selftest.py` checks the kit without starting a daemon.
@@ -39,14 +40,32 @@ crypto compatibility or sustainable throughput.
 ## TLS and network access
 
 Create the DNS A record after reserving and attaching the instance's static IP.
-The service binds IPv4 TCP 443. Publish an AAAA record only after explicitly
-configuring and testing an IPv6 listener and its firewall rules.
+The supplied service binds `[::]:443` with `IPV6_V6ONLY` disabled, accepting
+IPv4 and IPv6 on one listener. Publish an AAAA record after enabling the
+instance's public IPv6 route and its TCP 443 firewall rules. DNS64/NAT64 clients
+can also use the public A record. Mapped IPv4 and well-known NAT64 /96 addresses
+share the corresponding IPv4 admission key. Network-specific translation
+normally reaches the daemon through a translator's IPv4 source. Native IPv6
+and unrecognized translated IPv6 sources share a /64 admission key.
 
 Use a public WebPKI certificate whose SAN includes `relay.latch.rune.foo`.
 The deployed certificate uses Certbot standalone HTTP-01, with public TCP 80
 reserved for ACME. The enabled `certbot.timer` handles renewal. This daemon
-serves native TLS with ALPN `latch-relay/1`. It does not
-serve HTTP or terminate WebSockets. Networks must permit that TLS protocol.
+serves native TLS with ALPN `latch-relay/1` and HTTP/1.1 with `http/1.1` or
+absent ALPN on the same port. `GET /relay` supports RFC 6455 WebSocket upgrade.
+Root GET/HEAD requests receive 200, unknown paths 404, unsupported methods 405,
+malformed requests 400, incomplete `/relay` upgrades 426 with WebSocket version
+13, and excessive headers 431. Both
+carriers share admission limits, persistent transfer quota and deadlines.
+Cold clients try native TLS then WebSocket in a two-second connection ladder.
+Cloned configurations cache the winning carrier/address for 30 seconds. Stable
+warm attach opens use at most 1.25 s. With 200 ms RTT, cold grant plus concurrent
+attach opens, grant/attach/key confirmation and a control hop total 4.05 s.
+Fresh host lanes share fallback selection before upgrade completion, bounding
+cold grant plus cold attach and those exchanges to 4.8 s at 200 ms RTT.
+An explicit HTTP CONNECT proxy carries both rungs when supplied by the caller.
+Production clients verify public WebPKI roots and report untrusted issuer,
+portal, proxy and upgrade failures to the caller.
 
 Keep certificate automation state root-only. `certbot-deploy.sh` validates the
 new hostname, expiry and matching key before stopping the relay, copies the
@@ -56,7 +75,8 @@ The `/etc/latch-relay` directory is `root:latch-relay` mode `0750`. The restart
 ends current relay sessions, which need a fresh grant and fresh session keys
 through the authenticated control channel.
 
-Expose TCP 443 publicly on the new dedicated instance. Restrict SSH TCP 22 to
+Expose TCP 443 publicly for both enabled address families on the dedicated
+instance. Restrict SSH TCP 22 to
 the operator's current `/32` or a verified private management route. Retain
 key-based SSH, disable password/root login, and verify a second login before
 closing the original session. Apply the same port policy in any enabled host
@@ -100,7 +120,10 @@ Linux machine under the intended stream count before selecting a smaller bundle.
 An OOM kill ends current sessions and systemd restarts the service with the same
 quota. Local `limits.json` changes survive reinstalling the kit.
 
-`network.sh` persists BBR/fq, 16-MiB TCP/UDP socket ceilings, PMTU probing,
+`network.sh` persists BBR/fq, 16-MiB TCP/UDP socket ceilings, always-on TCP
+packet-size probing (`net.ipv4.tcp_mtu_probing=2`, which Linux applies to IPv4
+and IPv6, so the daemon's sending path survives networks that drop ICMP Packet
+Too Big; client Unix retries can also request a 1200-byte MSS),
 128-KiB unsent low-water mark, idle-window preservation and a 131,072-entry
 conntrack ceiling. It installs a boot-time UDP GRO forwarding unit and daemon
 drop-ins with 65,536-file limits. Tailscaled receives 384/512-MiB memory
@@ -124,9 +147,9 @@ transfer cap for the authorized dedicated deployment.
 
 | Limit | Value |
 | --- | --- |
-| Concurrent TCP connections | 24 globally, 8 per source IP |
-| Concurrent sessions | 4 globally, 2 per source IP |
-| Connection accepts per minute | 120 globally, 30 per source IP |
+| Concurrent TCP connections | 24 globally, 8 per source key |
+| Concurrent sessions | 4 globally, 2 per source key |
+| Connection accepts per minute | 120 globally, 30 per source key |
 | Source-rate entries | 256 |
 | Grant lifetime | 60 seconds |
 | Session lifetime | 3,600 seconds |
@@ -134,7 +157,15 @@ transfer cap for the authorized dedicated deployment.
 | Handshake/request deadline | 10 seconds |
 | Send stall / idle deadline | 750 ms / 30 seconds |
 
-A session uses four TCP connections, two lanes per peer. The per-IP limits
+Source keys cover one IPv4 address or IPv6 /64. Mapped IPv4 and well-known
+NAT64 /96 use the corresponding IPv4 key. The bounded rate table evicts its
+oldest window to admit new sources. Per-source rate refusals preserve global
+accept credit. Early TLS closes report "blocked or relay busy" because the
+client cannot distinguish exhausted admission from a network close. Request
+rejections send `[0]` when existing quota credit can deliver it. Decoy responses
+increment `http_responses` in periodic metrics and consume no diagnostic lines.
+
+A session uses four TCP connections, two lanes per peer. The per-source limits
 permit one complete session whose peers share a public NAT. Admission is bounded
 and anonymous. An unauthenticated client can spend quota or occupy limited slots.
 The monthly budget remains the economic admission boundary for this pilot.
