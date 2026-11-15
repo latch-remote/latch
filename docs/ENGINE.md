@@ -1088,11 +1088,27 @@ proxy can be used while other checks continue. OS discovery has a six-second
 deadline. The eight-host cache samples local routes/environment settings at most
 four times a second. Discovery refreshes on network changes and relay connection
 failures. A relay failure requests a refresh within two seconds and retains the
-previous proxy when PAC/WPAD discovery is incomplete. Only confirmed portals
-double their retry backoff from 1 to 4 seconds. Returning to the app or opening
-sign-in requests an immediate portal recheck. Healthy
-sessions send no periodic HTTP probes. No session/UI
-thread waits for PAC/WPAD, DNS or an HTTP probe.
+previous proxy on incomplete PAC/WPAD results. A retained proxy's preference
+starts with the first incomplete result and expires after 60 seconds without a
+successful verified connection through it. The shared relay `open` path then
+forces direct-first ordering ahead of cached proxy winners, with the retained
+proxy available as fallback. Success through
+the proxy renews the timer for grants, renewals and both attachment lanes.
+Successful discovery replaces the candidates and clears retention state. This
+uses monotonic `Instant` time. Platforms differ in whether suspend counts
+toward elapsed time, so waking can change ordering while retaining both paths.
+
+Confirmed portals double their retry backoff from 1 to 4 seconds. The first
+portal observation is immediate. A first open observation from a fresh
+discovery generation clears the portal immediately. Once open has been seen
+on the current network key, re-entry needs two consecutive redirect observations
+from separate generations. Cached reads and partial unknown snapshots cannot
+supply confirmation. An open or other observed non-redirect result breaks the
+redirect sequence. The existing backoff survives recovery and flapping, and
+schedules the extra confirmation round for a returning portal. Network-key
+changes reset this history. Returning to the app or opening sign-in requests
+an immediate portal recheck. Healthy sessions send no periodic HTTP probes.
+No session/UI thread waits for PAC/WPAD, DNS or an HTTP probe.
 
 `RelayRoute` retains typed terminal failures and the selected lane's
 `ConnectionInfo`. `Session::network_status` combines them with local netenv facts.
@@ -1100,7 +1116,11 @@ thread waits for PAC/WPAD, DNS or an HTTP probe.
 an earlier diagnosis. The viewer and examples use these events. Host-local details
 stay in the host log. Fixed host-labelled portal, CONNECT-refusal and TLS-
 interception notices use the existing version-1 Notice and contain no URL or
-browser action. The viewer renders a
+browser action. Each control session tracks the last emitted wire notice and
+sends a new notice only when its kind or text changes. A later viewer starts
+with empty history and receives the active notice once. Clearing the condition
+rearms the notice locally. The existing type-4 JSON frame remains compatible
+with 6.0.0 viewers. The viewer renders a
 small shared diagnosis surface and opens a `PortalUrl` only after a button click.
 The first-picture watchdog waits for at most three minutes from the first
 positive portal observation, resetting that timer after the portal clears. Delivered media clears the portal banner and retains the

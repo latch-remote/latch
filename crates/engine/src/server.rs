@@ -808,6 +808,7 @@ impl Server {
         let mut route_revision = session.relay.revision();
         let mut relay_messages = VecDeque::new();
         let mut network_status = latch_stream::network::NetworkStatus::default();
+        let mut network_notice = None;
         let reason = loop {
             let ended = session.ended.lock().clone();
             if let Some(e) = ended {
@@ -868,12 +869,14 @@ impl Server {
                 for message in &status.messages {
                     self.log(message.clone());
                 }
-                if let Some(notice) =
-                    latch_stream::network::host_notice(&status, session.relay.failure().as_ref())
-                {
-                    let _ = session.send_tcp(&Message::Notice(notice));
-                }
-                network_status = status;
+                network_status = status.clone();
+            }
+            if let Some(notice) = latch_stream::network::changed_host_notice(
+                &mut network_notice,
+                &status,
+                session.relay.failure().as_ref(),
+            ) {
+                let _ = session.send_tcp(&Message::Notice(notice));
             }
             if route_revision != session.relay.revision() {
                 route_revision = session.relay.revision();
