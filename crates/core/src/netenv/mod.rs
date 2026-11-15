@@ -1,4 +1,4 @@
-//! Local network facts for future transport selection and troubleshooting.
+//! Local network facts for transport selection and troubleshooting.
 //!
 //! [`discover`] blocks only its caller, for at most [`Options::timeout`]
 //! (clamped to 100 ms–15 s). Use [`NetworkEnvironment`] from a UI. It runs
@@ -60,6 +60,8 @@ impl Options {
 #[derive(Debug, Clone)]
 pub struct NetworkDiagnosis {
     pub proxies: ProxyDiscovery,
+    /// Whether this snapshot includes the proxy observation, even if empty.
+    pub proxy_observed: bool,
     pub captive_portal: CaptivePortal,
     pub tailscale: TailscaleDiagnosis,
     pub ip: IpAvailability,
@@ -72,6 +74,7 @@ impl Default for NetworkDiagnosis {
     fn default() -> Self {
         Self {
             proxies: ProxyDiscovery::default(),
+            proxy_observed: false,
             captive_portal: CaptivePortal::Unknown,
             tailscale: TailscaleDiagnosis::unknown(),
             ip: IpAvailability::default(),
@@ -186,6 +189,13 @@ fn slots() -> &'static [Arc<JobSlot>; 4] {
 /// No connection is made to the HTTPS destination during proxy discovery,
 /// apart from OS PAC/WPAD evaluation. See the module docs for probe privacy.
 pub fn discover(options: &Options) -> NetworkDiagnosis {
+    discover_progress(options, None)
+}
+
+fn discover_progress(
+    options: &Options,
+    progress: Option<&mpsc::Sender<NetworkDiagnosis>>,
+) -> NetworkDiagnosis {
     let deadline = Instant::now()
         + options
             .timeout
@@ -214,20 +224,36 @@ pub fn discover(options: &Options) -> NetworkDiagnosis {
         }
     }
     drop(tx);
-    collect(rx, started, deadline)
+    collect_progress(rx, started, deadline, progress)
 }
 
+#[cfg(test)]
 fn collect(rx: Receiver<Observation>, started: usize, deadline: Instant) -> NetworkDiagnosis {
+    collect_progress(rx, started, deadline, None)
+}
+
+fn collect_progress(
+    rx: Receiver<Observation>,
+    started: usize,
+    deadline: Instant,
+    progress: Option<&mpsc::Sender<NetworkDiagnosis>>,
+) -> NetworkDiagnosis {
     let mut result = NetworkDiagnosis::default();
     let mut received = 0;
     while let Ok(observation) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
     {
         received += 1;
         match observation {
-            Observation::Proxy(value) => result.proxies = value,
+            Observation::Proxy(value) => {
+                result.proxies = value;
+                result.proxy_observed = true;
+            }
             Observation::Portal(value) => result.captive_portal = value,
             Observation::Tailscale(value) => result.tailscale = value,
             Observation::Ip(value) => result.ip = value,
+        }
+        if let Some(progress) = progress {
+            let _ = progress.send(result.clone());
         }
     }
     if received != 4 {
@@ -287,7 +313,8 @@ impl NetworkEnvironment {
         if std::thread::Builder::new()
             .name("latch-network-diagnosis".into())
             .spawn(move || {
-                let _ = tx.send(discover(&worker_options));
+                let result = discover_progress(&worker_options, Some(&tx));
+                let _ = tx.send(result);
             })
             .is_err()
         {
@@ -298,16 +325,15 @@ impl NetworkEnvironment {
     }
 
     pub fn poll(&mut self) {
-        if let Some((_, _, rx)) = &self.pending {
-            match rx.try_recv() {
-                Ok(result) => {
-                    if let Some((key, options, _)) = self.pending.take() {
-                        self.cached = Some((key, options, result));
-                    }
+        if let Some((key, options, rx)) = &self.pending {
+            loop {
+                match rx.try_recv() {
+                    Ok(result) => self.cached = Some((*key, options.clone(), result)),
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(mpsc::TryRecvError::Empty) => return,
                 }
-                Err(mpsc::TryRecvError::Disconnected) => self.pending = None,
-                Err(mpsc::TryRecvError::Empty) => return,
             }
+            self.pending = None;
         }
         if let Some((key, options)) = self.queued.take() {
             if self.get(key, &options).is_none()
@@ -316,6 +342,11 @@ impl NetworkEnvironment {
                 self.queued = Some((key, options));
             }
         }
+    }
+
+    /// Partial observations remain usable while the remaining checks run.
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some() || self.queued.is_some()
     }
 
     /// Only returns a result for these exact inputs, never a stale network.

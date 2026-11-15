@@ -23,7 +23,7 @@ ssh -F /Users/daniel/.ssh/latch6-lightsail.conf latch6-relay
 | Inbound port | Scope and purpose |
 | --- | --- |
 | TCP 22 | Operator IPv4 /32 and current IPv6 /128, pinned key-only SSH |
-| TCP 80 | Public IPv4/IPv6, Certbot standalone HTTP-01 |
+| TCP 80 | Public IPv4/IPv6, HTTP probe and ACME webroot after the README upgrade |
 | TCP 443 | Public IPv4/IPv6, native ALPN and HTTPS WebSocket |
 | UDP 443 | Public IPv4/IPv6, Tailscale peer relay |
 | UDP 41641 | Public IPv4/IPv6, tailscaled transport and discovery |

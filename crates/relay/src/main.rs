@@ -15,7 +15,8 @@ use std::{
 
 const HELP: &str = "latch-relay --cert certificate-chain.pem --key private-key.pem --quota-file persistent-ledger\n\
   [--listen 127.0.0.1:8443] [--monthly-bytes 10737418240]\n\
-  [--limits-json pilot-limits.json] [--initialize-quota]\n\n\
+  [--limits-json pilot-limits.json] [--initialize-quota]\n\
+  [--http-listen [::]:80] [--acme-webroot /var/www/latch-relay]\n\n\
 Explicitly select --listen [::]:443 only after TLS, persistent budget storage\n\
 and operator limits are configured. Initialize the ledger once. Later starts\n\
 require the same retained file. Counters are emitted to stdout every 30 seconds.";
@@ -47,7 +48,14 @@ fn run() -> io::Result<()> {
         }
         if !matches!(
             arg.as_str(),
-            "--cert" | "--key" | "--quota-file" | "--listen" | "--monthly-bytes" | "--limits-json"
+            "--cert"
+                | "--key"
+                | "--quota-file"
+                | "--listen"
+                | "--monthly-bytes"
+                | "--limits-json"
+                | "--http-listen"
+                | "--acme-webroot"
         ) {
             return Err(invalid("unknown relay option, use --help"));
         }
@@ -90,6 +98,18 @@ fn run() -> io::Result<()> {
         monthly,
     )?;
     config.initialize_quota = initialize;
+    config.http_listen = values
+        .get("--http-listen")
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| invalid("invalid HTTP listener address"))
+        })
+        .transpose()?;
+    config.acme_webroot = values.get("--acme-webroot").map(PathBuf::from);
+    if config.acme_webroot.is_some() && config.http_listen.is_none() {
+        return Err(invalid("--acme-webroot requires --http-listen"));
+    }
     if let Some(path) = values.get("--limits-json") {
         let limits: PilotLimits =
             serde_json::from_slice(&bounded_read(Path::new(path), 16 * 1024)?)
@@ -98,6 +118,9 @@ fn run() -> io::Result<()> {
     }
     let daemon = Daemon::bind(config)?;
     let metrics = daemon.metrics();
+    if let Some(address) = daemon.http_addr()? {
+        eprintln!("latch-relay HTTP probe on {address}");
+    }
     eprintln!("latch-relay listening on {}", daemon.local_addr()?);
     let (stop, stopped) = mpsc::channel();
     let logger = thread::spawn(move || {

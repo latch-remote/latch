@@ -180,16 +180,18 @@ IPv6 by /64 and normalizes mapped IPv4 and well-known NAT64 /96 to IPv4.
 Translators normally present a gateway IPv4. Other translated IPv6 sources share
 a /64 bucket.
 
-A silent drop after ClientHello is classified as blocked. Automatic 1200-byte
-MSS hints require small-record receive progress followed by a stalled large
-write or partial large record. Typed private timeout payloads carry this
-evidence. Hints expire after 30 seconds and are shared by cloned configurations.
-DNS, connect, handshake-only, idle, ACK and session-lifetime timeouts leave the
-hint untouched. `reduce_mss_after_stall()` records an externally detected
-path-MTU stall. Linux applies the clamp before connect and macOS before TLS
-after connect. `ConnectionInfo::reduced_mss` and `reduced_mss_reason` report
-application and cause. Windows uses OS TCP behavior. Server TCP MTU probing
-covers its sending direction.
+A silent drop after ClientHello is classified as blocked. Two blocked carrier
+handshakes allow fresh 1200- then 512-byte MSS probes within an extra 500 ms.
+A working WebSocket after a blocked native handshake retains its normal MSS.
+Later typed stalls with small-record progress and a stalled large write or
+partial large record step the shared hint down from 1200 to 512 bytes. Hints
+expire after 30 seconds. DNS, connect, idle, ACK and session-lifetime timeouts
+leave the hint untouched. `reduce_mss_after_stall()` records an external
+path-MTU stall. `ConnectionInfo` reports the value actually applied and its cause.
+All route/carrier opens share a four-second deadline within the caller's setup
+budget. Product proxy discovery and the anonymous HTTP probe are described in
+[the protocol](../../docs/PROTOCOL.md#network-environment-and-anonymous-http-probe).
+
 
 WebSocket binary messages contain one existing length-prefixed record, at most
 16 KiB plus four bytes, including fragments. Masking, ping/pong and close follow
