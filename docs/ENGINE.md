@@ -931,7 +931,8 @@ thread waits for PAC/WPAD, DNS or an HTTP probe.
 
 `RelayRoute` retains typed terminal failures and the selected lane's
 `ConnectionInfo`. `Session::network_status` combines them with local netenv facts.
-Stable notices reach the viewer event stream and examples. The host sends its
+`Event::Network` carries changing local facts and an empty message list clears
+an earlier diagnosis. The viewer and examples use these events. The host sends its
 notices through the existing version-1 Notice message. The viewer renders a
 small shared diagnosis surface and opens a `PortalUrl` only after a button click.
 The first-picture watchdog waits while a captive portal is positively known,

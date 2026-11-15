@@ -964,6 +964,8 @@ pub enum Event {
     /// Something the host wants the person to know (it cannot inject
     /// input, say).
     Notice(String),
+    /// Current local network diagnosis. An empty message list clears earlier facts.
+    Network(crate::network::NetworkStatus),
 }
 
 /// Where the host is.
@@ -2404,9 +2406,7 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
             inner.relay.lock().retry_after_network_change();
         }
         if status != last_network_status {
-            for message in &status.messages {
-                inner.emit(Event::Notice(message.clone()));
-            }
+            inner.emit(Event::Network(status.clone()));
             last_network_status = status.clone();
         }
         // Signing in can take longer than the first-picture watchdog. Keep the

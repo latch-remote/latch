@@ -30,11 +30,14 @@ pub fn run(
     while start.elapsed() < Duration::from_secs(seconds) {
         let elapsed_ms = start.elapsed().as_millis();
         for event in events.try_iter() {
+            if matches!(&event, Event::Network(status) if status.messages.is_empty()) {
+                continue;
+            }
             let kind = match &event {
                 Event::Connected => "stream_ready",
                 Event::Terminated { .. } => "terminated",
                 Event::Failed { .. } => "failed",
-                Event::Notice(_) => "notice",
+                Event::Notice(_) | Event::Network(_) => "notice",
                 Event::NoAudio(_) => "audio_error",
                 _ => "event",
             };

@@ -776,6 +776,9 @@ impl ClientApp {
                         };
                     }
                     Event::Notice(text) => self.view.toast(Tone::Warning, text),
+                    // The persistent network surface reads current facts and clears
+                    // immediately on recovery, including after a backgrounded window.
+                    Event::Network(_) => {}
                     Event::Poor(p) => self.view.set_poor(p),
                     Event::NoAudio(e) => self
                         .view
