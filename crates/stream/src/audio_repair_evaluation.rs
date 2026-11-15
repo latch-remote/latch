@@ -54,10 +54,26 @@ fn tape(scenario: Scenario) -> Vec<(u64, Vec<u8>)> {
     tape_for(scenario, 25, 1_000_000..25_000_000)
 }
 
+#[derive(Clone, Copy)]
+struct CapturePath {
+    callback_samples: u32,
+    host_ppm: f64,
+    heavy_tail: bool,
+}
+
 fn tape_for(
     scenario: Scenario,
     seconds: u32,
     loss_window: std::ops::Range<u64>,
+) -> Vec<(u64, Vec<u8>)> {
+    tape_on_path(scenario, seconds, loss_window, None)
+}
+
+fn tape_on_path(
+    scenario: Scenario,
+    seconds: u32,
+    loss_window: std::ops::Range<u64>,
+    path: Option<CapturePath>,
 ) -> Vec<(u64, Vec<u8>)> {
     let mut rng = 0x9e37_79b9_7f4a_7c15;
     let mut jitter_rng = 0x1234_5678_9abc_def0;
@@ -68,13 +84,22 @@ fn tape_for(
     let mut last_capture = 0;
     let mut jitter = 0;
     for seq in 0..seconds * 200 {
-        let capture = if scenario.burst {
+        let capture = if let Some(path) = path {
+            let callback = ((seq + 1) * 240).div_ceil(path.callback_samples);
+            (f64::from(callback) * f64::from(path.callback_samples) * 1_000_000.0
+                / 48_000.0
+                / (1.0 + path.host_ppm * 1e-6))
+                .round() as u64
+        } else if scenario.burst {
             (u64::from((seq + 1) * 240 - 1) / 1024 + 1) * 21_333
         } else {
             u64::from(seq + 1) * 5000
         };
         if capture != last_capture {
             jitter = (random(&mut jitter_rng) * 1000.0) as u64;
+            if path.is_some_and(|p| p.heavy_tail) && random(&mut jitter_rng) < 0.02 {
+                jitter += 10_000 + (random(&mut jitter_rng) * 20_000.0) as u64;
+            }
             last_capture = capture;
         }
         packetizer.packetize(seq * 5000, &coded, |bytes| {
@@ -96,6 +121,7 @@ struct Second {
     cushion_ms: f64,
     margin_ms: f64,
     pulls: u32,
+    silence_ms: f64,
 }
 
 #[derive(Debug, Default)]
@@ -124,6 +150,7 @@ fn evaluate(
     old: bool,
     window: std::ops::Range<u64>,
     fixed: Option<usize>,
+    pull_us: u64,
 ) -> Measurement {
     let mut p = player();
     let mut mixer = Mixer::new(
@@ -166,7 +193,7 @@ fn evaluate(
         })
         .collect();
     let mut events = events.iter().peekable();
-    let mut out = [0.0; 240];
+    let mut out = vec![0.0; (pull_us * 96 / 1000) as usize];
     let mut result = Measurement {
         seconds: (0..window.end.div_ceil(1_000_000))
             .map(|_| Second::default())
@@ -216,7 +243,7 @@ fn evaluate(
             initial_delivered = p.link.delivered.lock().len();
             initial_discarded = p.link.discarded_samples.load(Ordering::Relaxed);
         }
-        if us % 2500 == 0 {
+        if us % pull_us == 0 {
             let before = p.queue.lock().len();
             if old {
                 original_mixer.fill_at(&mut out, now);
@@ -226,13 +253,18 @@ fn evaluate(
             if us >= window.start {
                 result.silence_ms += out.iter().filter(|&&s| s == 0.0).count() as f64 / 96.0;
                 let (cushion, margin) = if old {
-                    (original_mixer.cushion(242), original_mixer.margin_ms)
+                    (
+                        original_mixer.cushion(out.len() + 2),
+                        original_mixer.margin_ms,
+                    )
                 } else {
-                    (mixer.cushion(242), mixer.margin_ms)
+                    (mixer.cushion(out.len() + 2), mixer.margin_ms)
                 };
                 let cushion = cushion as f64 / 96.0;
-                let queued = (before + p.queue.lock().len()) as f64 / 2.0 / 96.0 + 2.5;
+                let queued =
+                    (before + p.queue.lock().len()) as f64 / 2.0 / 96.0 + pull_us as f64 / 1000.0;
                 let second = &mut result.seconds[(us / 1_000_000) as usize];
+                second.silence_ms += out.iter().filter(|&&s| s == 0.0).count() as f64 / 96.0;
                 second.queued_ms += queued;
                 second.cushion_ms += cushion;
                 second.margin_ms += margin;
@@ -284,8 +316,8 @@ fn seeded_loss_replays_real_receiver_and_playback_for_twenty_three_seconds() {
                 burst_loss: loss == 0.0,
             };
             let events = tape(scenario);
-            let old = evaluate(&events, true, 1_000_000..24_000_000, None);
-            let new = evaluate(&events, false, 1_000_000..24_000_000, None);
+            let old = evaluate(&events, true, 1_000_000..24_000_000, None, 2500);
+            let new = evaluate(&events, false, 1_000_000..24_000_000, None, 2500);
             println!("{} {} | repaired {} -> {} | concealed {} -> {} | silence {:.2} -> {:.2} | discarded {:.2} -> {:.2} | cushion mean {:.2} -> {:.2}, max {:.2} -> {:.2} | queued mean {:.2} -> {:.2}, max {:.2} -> {:.2} | damage {:.2} -> {:.2}",
                 scenario.name, if scenario.burst_loss { "bursty loss".to_string() } else { format!("{:.0}%", loss * 100.0) },
                 old.repaired, new.repaired, old.concealed, new.concealed,
@@ -351,8 +383,8 @@ fn pause_then_each_loss_with_thirteen_ms_cushion_never_adds_audible_damage() {
                     })
                     .collect();
                 let start = if group == 200 { 1_900_000 } else { 2_900_000 };
-                let old = evaluate(&events, true, start..4_500_000, Some(13 * 96));
-                let new = evaluate(&events, false, start..4_500_000, Some(13 * 96));
+                let old = evaluate(&events, true, start..4_500_000, Some(13 * 96), 2500);
+                let new = evaluate(&events, false, start..4_500_000, Some(13 * 96), 2500);
                 assert!(
                     new.damage_ms() <= old.damage_ms(),
                     "position {} parity lost={} {old:?} -> {new:?}",
@@ -435,30 +467,36 @@ fn network_arrival_clock_ignores_duplicates_and_receiver_release_time() {
 
 #[test]
 fn loss_free_receiver_and_playback_add_no_hold_or_cushion() {
-    for burst in [false, true] {
-        let events = tape(Scenario {
-            name: "loss free",
-            burst,
-            loss: 0.0,
-            burst_loss: false,
-        });
-        let old = evaluate(&events, true, 1_000_000..24_000_000, None);
-        let new = evaluate(&events, false, 1_000_000..24_000_000, None);
-        assert_eq!(new.concealed, 0);
-        assert_eq!(new.repaired, 0);
-        assert_eq!(new.silence_ms, 0.0);
-        assert_eq!(new.discarded_ms, 0.0);
-        assert!(
-            new.mean_cushion_ms <= old.mean_cushion_ms,
-            "{burst} {old:?} -> {new:?}"
-        );
-        assert!(
-            new.mean_queued_ms <= old.mean_queued_ms,
-            "{burst} {old:?} -> {new:?}"
-        );
+    let mut failures = Vec::new();
+    for pull_us in [2500, 5000, 10_000, 20_000] {
+        for burst in [false, true] {
+            let events = tape(Scenario {
+                name: "loss free",
+                burst,
+                loss: 0.0,
+                burst_loss: false,
+            });
+            let old = evaluate(&events, true, 1_000_000..24_000_000, None, pull_us);
+            let new = evaluate(&events, false, 1_000_000..24_000_000, None, pull_us);
+            println!("LOSS_FREE pull={pull_us} burst={burst} queue {:.3} -> {:.3}, damage {:.3} -> {:.3}", old.mean_queued_ms, new.mean_queued_ms, old.damage_ms(), new.damage_ms());
+            assert_eq!(new.concealed, 0);
+            assert_eq!(new.repaired, 0);
+            assert_eq!(new.silence_ms, 0.0);
+            assert_eq!(new.discarded_ms, 0.0);
+            if new.mean_cushion_ms > old.mean_cushion_ms || new.mean_queued_ms > old.mean_queued_ms
+            {
+                failures.push(format!(
+                    "pull={pull_us} burst={burst} queue {:.3}->{:.3}, cushion {:.3}->{:.3}",
+                    old.mean_queued_ms,
+                    new.mean_queued_ms,
+                    old.mean_cushion_ms,
+                    new.mean_cushion_ms
+                ));
+            }
+        }
     }
+    assert!(failures.is_empty(), "loss-free latency bounds {failures:?}");
 }
-
 #[test]
 fn reordered_originals_measure_network_lateness_once() {
     let mut p = player();
@@ -529,8 +567,8 @@ fn loss_stops_at_twelve_seconds_and_latency_recovers_within_ten_seconds() {
             burst_loss: false,
         };
         let events = tape_for(clean, 97, 1_000_000..12_000_000);
-        let baseline = evaluate(&events, false, 1_000_000..96_000_000, None);
-        let old_baseline = evaluate(&events, true, 1_000_000..96_000_000, None);
+        let baseline = evaluate(&events, false, 1_000_000..96_000_000, None, 2500);
+        let old_baseline = evaluate(&events, true, 1_000_000..96_000_000, None, 2500);
         println!(
             "BASELINE {cadence} queued {:.3} -> {:.3}, margin {:.3} -> {:.3}",
             old_baseline.mean_queued_ms,
@@ -556,8 +594,8 @@ fn loss_stops_at_twelve_seconds_and_latency_recovers_within_ten_seconds() {
                 ..clean
             };
             let events = tape_for(scenario, 97, 1_000_000..12_000_000);
-            let old = evaluate(&events, true, 1_000_000..96_000_000, None);
-            let new = evaluate(&events, false, 1_000_000..96_000_000, None);
+            let old = evaluate(&events, true, 1_000_000..96_000_000, None, 2500);
+            let new = evaluate(&events, false, 1_000_000..96_000_000, None, 2500);
             let name = format!(
                 "{cadence} {}",
                 if scenario.burst_loss {
@@ -590,61 +628,55 @@ fn loss_stops_at_twelve_seconds_and_latency_recovers_within_ten_seconds() {
 
 #[test]
 fn isolated_loss_at_each_position_prioritizes_latency_with_bounded_damage() {
-    for (burst, name) in [(false, "steady"), (true, "21.333ms")] {
-        let clean = tape(Scenario {
-            name,
-            burst,
-            loss: 0.0,
-            burst_loss: false,
-        });
-        for position in 0..4 {
-            for lose_parity in [false, true] {
-                let mut losses = 0;
-                let events: Vec<_> = clean
-                    .iter()
-                    .filter(|(_, bytes)| {
-                        let Datagram::Audio { packet, .. } = wire::parse(bytes).unwrap() else {
-                            panic!()
-                        };
-                        let group = packet.seq / 4;
-                        let selected = group > 50 && group < 1200 && group.is_multiple_of(10);
-                        let lost = selected
-                            && ((!packet.parity && packet.seq % 4 == position)
-                                || (packet.parity && lose_parity));
-                        if lost && !packet.parity {
-                            losses += 1;
-                        }
-                        !lost
-                    })
-                    .cloned()
-                    .collect();
-                assert_eq!(losses, 114);
-                let old = evaluate(&events, true, 1_000_000..24_000_000, None);
-                let new = evaluate(&events, false, 1_000_000..24_000_000, None);
-                println!("ISOLATED {name} pos={} parity_lost={lose_parity} damage {:.3} -> {:.3}, queued {:.3} -> {:.3}, repaired {} -> {}, concealed {} -> {}",
+    let mut failures = Vec::new();
+    for pull_us in [2500, 5000, 10_000, 20_000] {
+        for (burst, name) in [(false, "steady"), (true, "21.333ms")] {
+            let clean = tape(Scenario {
+                name,
+                burst,
+                loss: 0.0,
+                burst_loss: false,
+            });
+            for position in 0..4 {
+                for lose_parity in [false, true] {
+                    let mut losses = 0;
+                    let events: Vec<_> = clean
+                        .iter()
+                        .filter(|(_, bytes)| {
+                            let Datagram::Audio { packet, .. } = wire::parse(bytes).unwrap() else {
+                                panic!()
+                            };
+                            let group = packet.seq / 4;
+                            let selected = group > 50 && group < 1200 && group.is_multiple_of(10);
+                            let lost = selected
+                                && ((!packet.parity && packet.seq % 4 == position)
+                                    || (packet.parity && lose_parity));
+                            if lost && !packet.parity {
+                                losses += 1;
+                            }
+                            !lost
+                        })
+                        .cloned()
+                        .collect();
+                    assert_eq!(losses, 114);
+                    let old = evaluate(&events, true, 1_000_000..24_000_000, None, pull_us);
+                    let new = evaluate(&events, false, 1_000_000..24_000_000, None, pull_us);
+                    println!("ISOLATED pull={pull_us} {name} pos={} parity_lost={lose_parity} damage {:.3} -> {:.3}, queued {:.3} -> {:.3}, repaired {} -> {}, concealed {} -> {}",
                     position+1, old.damage_ms(), new.damage_ms(), old.mean_queued_ms, new.mean_queued_ms,
                     old.repaired, new.repaired, old.concealed, new.concealed);
-                assert!(
-                    new.mean_queued_ms <= old.mean_queued_ms,
-                    "{name} pos={} parity_lost={lose_parity} latency {:.3} -> {:.3}",
-                    position + 1,
-                    old.mean_queued_ms,
-                    new.mean_queued_ms
-                );
-                assert!(
-                    new.damage_ms() <= old.damage_ms() + 20.0,
-                    "{name} pos={} parity_lost={lose_parity} damage {:.3} -> {:.3}",
-                    position + 1,
-                    old.damage_ms(),
-                    new.damage_ms()
-                );
-                assert_eq!(new.cap_hits, 0);
-                assert_eq!(old.cap_hits, 0);
+                    if new.mean_queued_ms > old.mean_queued_ms
+                        || new.damage_ms() > old.damage_ms() + 20.0
+                    {
+                        failures.push(format!("pull={pull_us} {name} pos={} parity_lost={lose_parity} queue {:.3}->{:.3} damage {:.3}->{:.3}", position+1, old.mean_queued_ms, new.mean_queued_ms, old.damage_ms(), new.damage_ms()));
+                    }
+                    assert_eq!(new.cap_hits, 0);
+                    assert_eq!(old.cap_hits, 0);
+                }
             }
         }
     }
+    assert!(failures.is_empty(), "isolated-loss bounds {failures:?}");
 }
-
 #[test]
 fn one_loss_followed_by_an_eighty_ms_network_stall_recovers() {
     for (burst, name) in [(false, "steady"), (true, "21.333ms")] {
@@ -658,7 +690,7 @@ fn one_loss_followed_by_an_eighty_ms_network_stall_recovers() {
             97,
             0..0,
         );
-        let baseline = evaluate(&clean, false, 1_000_000..96_000_000, None);
+        let baseline = evaluate(&clean, false, 1_000_000..96_000_000, None, 2500);
         let mut events: Vec<_> = clean
             .iter()
             .filter_map(|(at, bytes)| {
@@ -680,8 +712,8 @@ fn one_loss_followed_by_an_eighty_ms_network_stall_recovers() {
             })
             .collect();
         events.sort_by_key(|(at, _)| *at);
-        let old = evaluate(&events, true, 1_000_000..96_000_000, None);
-        let new = evaluate(&events, false, 1_000_000..96_000_000, None);
+        let old = evaluate(&events, true, 1_000_000..96_000_000, None, 2500);
+        let new = evaluate(&events, false, 1_000_000..96_000_000, None, 2500);
         for (label, range) in [
             ("stall", 1..7),
             ("+10s", 16..17),
@@ -750,8 +782,8 @@ fn exact_1024_sample_callbacks_reproduce_main_growth_and_the_controller_fix() {
         let callback = (*at - 5000) / 21_333;
         *at += callback * 1024 * 1_000_000 / 48_000 - callback * 21_333;
     }
-    let old = evaluate(&events, true, 1_000_000..96_000_000, None);
-    let new = evaluate(&events, false, 1_000_000..96_000_000, None);
+    let old = evaluate(&events, true, 1_000_000..96_000_000, None, 2500);
+    let new = evaluate(&events, false, 1_000_000..96_000_000, None, 2500);
     for second in [1, 12, 22, 32, 44, 72, 92] {
         println!(
             "EXACT_CALLBACK {second}s {:?} -> {:?}",
@@ -776,7 +808,7 @@ fn a_stall_starting_during_a_real_receiver_wait_does_not_keep_the_backlog() {
         97,
         0..0,
     );
-    let baseline = evaluate(&clean, false, 1_000_000..96_000_000, None);
+    let baseline = evaluate(&clean, false, 1_000_000..96_000_000, None, 2500);
     let mut events: Vec<_> = clean
         .iter()
         .filter_map(|(at, bytes)| {
@@ -797,12 +829,109 @@ fn a_stall_starting_during_a_real_receiver_wait_does_not_keep_the_backlog() {
         })
         .collect();
     events.sort_by_key(|(at, _)| *at);
-    let old = evaluate(&events, true, 1_000_000..96_000_000, None);
-    let new = evaluate(&events, false, 1_000_000..96_000_000, None);
+    let old = evaluate(&events, true, 1_000_000..96_000_000, None, 2500);
+    let new = evaluate(&events, false, 1_000_000..96_000_000, None, 2500);
     println!(
         "PENDING_STALL 12s {:?} -> {:?}",
         mean_latency(&old, 12..13),
         mean_latency(&new, 12..13)
     );
     assert_recovers(&new, &baseline, 12, "pending repair then stall");
+}
+
+#[test]
+fn an_old_low_point_never_slows_a_queue_above_plan() {
+    let p = player();
+    p.link.jitter_us.store(10_000, Ordering::Relaxed);
+    p.link.burst_us.store(5000, Ordering::Relaxed);
+    let mut mixer = Mixer::new(
+        48_000,
+        2,
+        48_000,
+        2,
+        p.queue.clone(),
+        p.pulled.clone(),
+        None,
+        p.gain.clone(),
+    )
+    .linked(p.link.clone());
+    let now = Instant::now();
+    mixer.started = true;
+    mixer.low = 0.0;
+    // The smoothed level still reflects the earlier dip while a fresh
+    // arrival puts current slack above the plan and below the cushion.
+    mixer.level = 0.0;
+    p.queue.lock().extend([0.5; 96 * 10]);
+    let mut out = [0.0; 240];
+    mixer.fill_at(&mut out, now);
+    assert_eq!(mixer.pos, 1.0);
+    assert_eq!(p.queue.lock().len(), 96 * 10 - 240);
+}
+
+#[test]
+fn ten_loss_free_minutes_with_capture_clock_drift_add_no_underrun_windows() {
+    let started = Instant::now();
+    let mut failures = Vec::new();
+    for callback_samples in [480, 1024] {
+        for host_ppm in [15.625, 50.0, 100.0, -50.0, -100.0] {
+            let events = tape_on_path(
+                Scenario {
+                    name: "clock drift",
+                    burst: true,
+                    loss: 0.0,
+                    burst_loss: false,
+                },
+                602,
+                0..0,
+                Some(CapturePath {
+                    callback_samples,
+                    host_ppm,
+                    heavy_tail: false,
+                }),
+            );
+            let old = evaluate(&events, true, 1_000_000..600_000_000, None, 2500);
+            let new = evaluate(&events, false, 1_000_000..600_000_000, None, 2500);
+            let old_windows = old.seconds.iter().filter(|s| s.silence_ms > 0.0).count();
+            let new_windows = new.seconds.iter().filter(|s| s.silence_ms > 0.0).count();
+            println!("DRIFT samples={callback_samples} ppm={host_ppm} windows {old_windows} -> {new_windows}, silence {:.3} -> {:.3}, queue {:.3} -> {:.3}", old.silence_ms, new.silence_ms, old.mean_queued_ms, new.mean_queued_ms);
+            if new_windows > old_windows {
+                failures.push((callback_samples, host_ppm, old_windows, new_windows));
+            }
+            assert_eq!(new.cap_hits, 0);
+        }
+    }
+    println!("DRIFT_RUNTIME {:.3}s", started.elapsed().as_secs_f64());
+    assert!(
+        failures.is_empty(),
+        "loss-free underrun regressions {failures:?}"
+    );
+}
+
+#[test]
+fn additional_capture_drift_and_heavy_tail_paths_report_real_playback() {
+    for host_ppm in [-100.0, 100.0] {
+        for heavy_tail in [false, true] {
+            for loss in [0.0, 0.05] {
+                let events = tape_on_path(
+                    Scenario {
+                        name: "10ms capture",
+                        burst: true,
+                        loss,
+                        burst_loss: false,
+                    },
+                    25,
+                    1_000_000..25_000_000,
+                    Some(CapturePath {
+                        callback_samples: 480,
+                        host_ppm,
+                        heavy_tail,
+                    }),
+                );
+                let old = evaluate(&events, true, 1_000_000..24_000_000, None, 10_000);
+                let new = evaluate(&events, false, 1_000_000..24_000_000, None, 10_000);
+                println!("PATH ppm={host_ppm} tail={heavy_tail} loss={loss} damage {:.3} -> {:.3}, queue {:.3} -> {:.3}, cushion {:.3} -> {:.3}, silence {:.3} -> {:.3}, discard {:.3} -> {:.3}", old.damage_ms(), new.damage_ms(), old.mean_queued_ms, new.mean_queued_ms, old.mean_cushion_ms, new.mean_cushion_ms, old.silence_ms, new.silence_ms, old.discarded_ms, new.discarded_ms);
+                assert_eq!(new.cap_hits, 0);
+            }
+        }
+    }
 }

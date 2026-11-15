@@ -444,7 +444,8 @@ lets tests check audio bit for bit. Opus is gone.
   1%, 5% and 15% loss includes parity. Burst loss drops 16 ms every 400 ms.
   The original 23-second matrix has lower damage
   (`silence + intact discard + 5 ms * concealments`), controller cushion
-  and actual mean queued audio in every scenario. Extended traces lose
+  and measured actual mean queued audio in every scenario at 2.5 ms pulls.
+  The actual-queue assertion allows up to main plus 5 ms. Extended traces lose
   packets from 1–12 s and continue clean until 96 s. During loss, mean
   queued audio is below main in all eight traces. Within 10 s after loss
   stops, every one-second queue and margin average is within 2 ms of its

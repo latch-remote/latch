@@ -116,7 +116,7 @@ pub struct AudioReceiver {
     packet_us: u32,
     next: Option<u32>,
     frames: std::collections::HashMap<u32, (u32, Vec<u8>)>,
-    parity: std::collections::HashMap<u32, (Instant, Vec<u8>)>,
+    parity: std::collections::HashMap<u32, Vec<u8>>,
     latest: Option<u32>,
     last_arrival: Option<Instant>,
     spacing: [(u32, Duration); SPACING_GROUPS],
@@ -177,7 +177,7 @@ impl AudioReceiver {
         if packet.parity {
             self.parity
                 .entry(packet.seq)
-                .or_insert_with(|| (now, packet.payload.to_vec()));
+                .or_insert_with(|| packet.payload.to_vec());
         } else {
             if crate::video::before(packet.seq, next) || packet.seq.wrapping_sub(next) > 64 {
                 return;
@@ -245,7 +245,7 @@ impl AudioReceiver {
     }
 
     fn rebuild(&mut self, group: u32) {
-        let Some((_, parity)) = self.parity.get(&group) else {
+        let Some(parity) = self.parity.get(&group) else {
             return;
         };
         let missing: Vec<_> = (0..GROUP)
