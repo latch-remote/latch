@@ -4,6 +4,11 @@ The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
 `## X.Y.Z (date)`.
 
+## Unreleased
+
+- Upgrade objc2 and AppKit bindings together, x11rb and libloading, preserving
+  macOS integration and Linux X11 abstract-socket connections.
+
 ## 6.0.0 (2026-11-14)
 
 ### Streaming and recovery
