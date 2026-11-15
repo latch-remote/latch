@@ -9,54 +9,37 @@
 #[path = "support/relay.rs"]
 mod relay;
 
+#[path = "support/listeners.rs"]
+mod listeners;
+
 use latch_core::http::{self, Response};
-use latch_engine::server::{Options, Server};
 use latch_proto::control::{self, StreamRequest};
 use latch_proto::sim::Impairment;
 use latch_stream::{Event, Frame, FrameSlot, Session, Settings};
-use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 fn host() -> u16 {
-    for _ in 0..50 {
-        // The OS's next free UDP port, then TCP on the same number. Taking
-        // TCP's next port first failed 50 times running on Windows CI: its
-        // TCP ports come in sequence and can sit inside a block reserved
-        // (by Hyper-V) against UDP.
-        let port = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-            .and_then(|u| u.local_addr())
-            .unwrap()
-            .port();
-        let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)) else {
-            continue;
-        };
-        let Ok(server) = Server::bind(port, Options::default()) else {
-            continue;
-        };
-        std::thread::spawn(move || {
-            http::serve_with_peer_check(
-                listener,
-                |_| true,
-                move |peer, req| {
-                    let request: StreamRequest = req.json().unwrap();
-                    match server.prepare(request, peer) {
-                        Ok(prepared) => {
-                            let server = server.clone();
-                            Response::switching(control::UPGRADE, move |tcp| {
-                                server.run(prepared, tcp)
-                            })
-                        }
-                        Err(r) => {
-                            Response::json(r.status, &serde_json::json!({ "error": r.message }))
-                        }
+    let (server, listener) = listeners::host();
+    let port = server.port();
+    std::thread::spawn(move || {
+        http::serve_with_peer_check(
+            listener,
+            |_| true,
+            move |peer, req| {
+                let request: StreamRequest = req.json().unwrap();
+                match server.prepare(request, peer) {
+                    Ok(prepared) => {
+                        let server = server.clone();
+                        Response::switching(control::UPGRADE, move |tcp| server.run(prepared, tcp))
                     }
-                },
-            )
-        });
-        return port;
-    }
-    panic!("no free port");
+                    Err(r) => Response::json(r.status, &serde_json::json!({ "error": r.message })),
+                }
+            },
+        )
+    });
+    port
 }
 
 fn square_is_white(f: &Frame) -> bool {

@@ -1,9 +1,13 @@
 """Regression checks for the verdicts that gate CI."""
+import json
+from pathlib import Path
 import struct
+import tempfile
 import unittest
+from unittest.mock import patch
 
 from middlebox import alpns
-from netlab import classify, evaluate
+from netlab import classify, evaluate, main, run_scenario
 
 
 def healthy_events():
@@ -48,6 +52,24 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(classify(result, expected), "FAIL")
         result["errors"] = [{"message": "no picture arrived"}]
         self.assertEqual(classify(result, expected), "EXPECTED-FAILURE")
+
+    def test_setup_error_and_unexpected_pass_fail_the_job(self):
+        expected = {"i": {"failures": ["first_frame_deadline"]}}
+        with tempfile.TemporaryDirectory() as directory, patch("netlab.Lab") as lab:
+            lab.return_value.execute.side_effect = RuntimeError("private PulseAudio sink unavailable")
+            result = run_scenario("i", Path(directory), expected)
+            self.assertEqual(result["status"], "ERROR")
+            lab.return_value.close.assert_called_once()
+            for status in ("ERROR", "UNEXPECTED-PASS"):
+                with self.subTest(status=status), patch("netlab.run_scenario", return_value={
+                        "scenario": "i", "name": "proxy", "status": status}), \
+                        patch("netlab.os.geteuid", return_value=0), \
+                        patch("netlab.sys.platform", "linux"), \
+                        patch("netlab.command", return_value="test revision"), \
+                        patch("netlab.sys.argv", ["netlab", "--scenarios", "i", "--output", directory]):
+                    self.assertEqual(main(), 1)
+                    saved = json.loads((Path(directory) / "results.json").read_text())
+                    self.assertEqual(saved["results"][0]["status"], status)
 
     def test_security_requires_user_facing_error_and_no_frames(self):
         events = healthy_events()

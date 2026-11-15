@@ -8,8 +8,10 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 
@@ -161,7 +163,7 @@ class Lab:
         self.log = (output / "commands.log").open("w")
         self.started = None
         self.actions = []
-        self.pulse = None
+        self.audio_directory = None
 
     def run(self, *args, input=None, check=True):
         self.log.write(" ".join(map(str, args)) + "\n")
@@ -208,7 +210,7 @@ class Lab:
             directory = Path("/etc/netns") / name
             directory.mkdir(parents=True)
             self.etc.append(directory)
-            (directory / "hosts").write_text("127.0.0.1 localhost\n198.18.0.1 relay.netlab.test\n")
+            (directory / "hosts").write_text(f"127.0.0.1 localhost {socket.gethostname()}\n198.18.0.1 relay.netlab.test\n")
         for left, right, subnet, leftdev, rightdev in [
             ("h", "c", 1, "tail", "host"), ("c", "v", 2, "viewer", "tail"),
             ("h", "i", 3, "wan", "host"), ("c", "i", 4, "wan", "campus"),
@@ -391,16 +393,23 @@ add rule inet lab impairment iifname "viewer" drop''')
         # Count only the measured endpoints, excluding preflight handshakes.
         self.ns("i", "nft", "reset", "counter", "inet", "lab", "relay_dials")
         # ALSA's PulseAudio plugin connects through this private Unix socket.
-        pulse = Path(f"/tmp/latch-netlab-{self.names['v']}-{time.monotonic_ns()}.sock")
-        self.pulse = pulse
-        self.spawn("v", "pulse", ["pulseaudio", "--system", "-n", "--use-pid-file=no", "--disallow-exit", "--exit-idle-time=-1",
+        # System mode shares /run/pulse and changes UID. Give each daemon its
+        # own root-owned runtime/state, independent of the runner's user session.
+        self.audio_directory = tempfile.TemporaryDirectory(prefix="latch-netlab-audio-")
+        audio = Path(self.audio_directory.name)
+        pulse = audio / "native"
+        pulse_process = self.spawn("v", "pulse", ["pulseaudio", "--system=false", "--daemonize=no", "-n", "--use-pid-file=no", "--disallow-exit", "--exit-idle-time=-1",
             "--load=module-native-protocol-unix socket=" + str(pulse) + " auth-anonymous=1",
-            "--load=module-null-sink sink_name=netlab", "--log-target=stderr"])
+            "--load=module-null-sink sink_name=netlab", "--log-target=stderr"],
+            {"XDG_RUNTIME_DIR": str(audio), "PULSE_RUNTIME_PATH": str(audio), "PULSE_STATE_PATH": str(audio / "state")})
         deadline = time.monotonic() + 5
-        while not pulse.exists() and time.monotonic() < deadline:
+        while not pulse.exists() and pulse_process.poll() is None and time.monotonic() < deadline:
             time.sleep(0.05)
         if not pulse.exists():
-            raise RuntimeError("private PulseAudio sink unavailable")
+            raise RuntimeError("private PulseAudio sink unavailable\n" + (self.output / "pulse.log").read_text())
+        sinks = self.ns("v", "pactl", "--server", f"unix:{pulse}", "list", "short", "sinks")
+        if not any(line.split()[1:2] == ["netlab"] for line in sinks.splitlines()):
+            raise RuntimeError(f"private PulseAudio null sink missing: {sinks}")
         alsa = self.output / "asound.conf"
         alsa.write_text(f'pcm.!default {{ type pulse server "unix:{pulse}" }}\nctl.!default {{ type pulse server "unix:{pulse}" }}\n')
         common = ["--relay-host", "relay.netlab.test", "--relay-ca", self.output / "relay-ca.pem"]
@@ -464,8 +473,8 @@ add rule inet lab impairment iifname "viewer" drop''')
             self.stop_process(process)
         for file in self.files:
             file.close()
-        if self.pulse is not None:
-            self.pulse.unlink(missing_ok=True)
+        if self.audio_directory is not None:
+            self.audio_directory.cleanup()
         for name in reversed(self.created):
             self.run("ip", "netns", "del", name, check=False)
         for directory in self.etc:

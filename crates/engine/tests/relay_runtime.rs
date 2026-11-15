@@ -1,5 +1,8 @@
 //! Authorized engine/viewer sessions over a real, explicitly trusted TLS relay.
 //! A datagram forwarder blackholes both directions independently of TCP control.
+#[path = "support/listeners.rs"]
+mod listeners;
+
 use latch_core::http;
 use latch_engine::server::{Options, Server};
 use latch_proto::control::{self, Codec, Message, RelayAction, RelayControl, StreamRequest};
@@ -7,7 +10,7 @@ use latch_relay::{Cancel, ClientConfig, Endpoint};
 use latch_stream::{Event, Frame, FrameSlot, Session, Settings};
 use std::{
     io::Write,
-    net::{Ipv4Addr, TcpListener, UdpSocket},
+    net::{Ipv4Addr, TcpListener},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc,
@@ -39,9 +42,8 @@ impl Running {
     }
     fn with_pattern(config: ClientConfig, blackhole: bool, pattern: &str) -> Self {
         std::env::set_var("LATCH_TEST_PATTERN", pattern);
-        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = udp.local_addr().unwrap().port();
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let (udp, listener) = listeners::proxy();
+        let port = listener.local_addr().unwrap().port();
         let server = Server::bind(
             0,
             Options {

@@ -68,7 +68,10 @@ outside the Rust build cache. Choose a fresh `--output PATH` for each invocation
 
 The workflow has a 15-minute timeout and runs two scenarios concurrently
 inside the runner, with unique namespace names, interfaces, ports,
-certificates, quota ledgers and audio sockets. Scenario c runs for 85
+certificates, quota ledgers and audio sockets. Each PulseAudio daemon runs
+in foreground user mode with its own root-owned runtime/state directory, so
+it requires no login session or D-Bus service. A `pactl` preflight checks the
+private null sink before starting the real viewer. Scenario c runs for 85
 seconds to cover main's 60-second UDP reassessment dwell. The remaining
 scenarios run for 16–32 seconds each. A warm two-worker run takes about
 four minutes. Scenario m already passes on native TLS through DNS64/NAT64
@@ -122,8 +125,10 @@ scenario result. Each scenario also saves `result.json`, the viewer's
 firewall counters, and independent preflight results. JSON includes
 connection (accepted control negotiation) and first-frame times, decoded fps over time, media paths and
 switches, session terminations, input round trips, audio samples, errors,
-and each assertion verdict. Private keys are deleted before artifact
-upload. `summary.md` is copied into the GitHub job summary.
+and each assertion verdict. Private keys are deleted during cleanup. Artifact
+upload explicitly selects only logs, JSON/JSONL results and Markdown summaries,
+excluding private keys and the daemon’s mode-0600 quota ledger even when setup
+or cleanup fails. `summary.md` is copied into the GitHub job summary.
 
 Before measurement, probes validate real TLS/ALPN, CONNECT tunneling,
 interceptor certificate rejection, the portal redirect, and DNS64/NAT64
@@ -183,7 +188,7 @@ through DNS64 and tayga NAT64, so it is enabled in CI.
 
 ## Test hooks
 
-The only Rust changes are in measurement examples. `serve` and `view`
+The runtime measurement hooks are confined to examples. `serve` and `view`
 share an example-only helper accepting `--relay-host`, `--relay-port`,
 and `--relay-ca`. It calls the existing `ClientConfig::with_roots` API.
 Production root selection and public-address enforcement stay in

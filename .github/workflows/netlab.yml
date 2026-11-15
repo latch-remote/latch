@@ -42,7 +42,9 @@ jobs:
         with:
           name: netlab-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/netlab/
-            !${{ runner.temp }}/netlab/**/*-key.pem
+            ${{ runner.temp }}/netlab/**/*.log
+            ${{ runner.temp }}/netlab/**/*.json
+            ${{ runner.temp }}/netlab/**/*.jsonl
+            ${{ runner.temp }}/netlab/**/*.md
           if-no-files-found: error
           retention-days: 7
