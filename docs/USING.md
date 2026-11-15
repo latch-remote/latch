@@ -252,8 +252,8 @@ The supervisor starts in its own transient systemd user unit, without a
 fsynced supervisor-start acknowledgement before accepting the request. The
 unit has a 240-second runtime limit. A working user manager and Linux 5.3+
 (`pidfd_open`) are checked before offering or downloading an update. An
-unsupervised service uses a pinned process handle for its handover, with the
-supervisor still running in its own user unit.
+unsupervised service uses a separate supervisor process and a pinned process
+handle for its handover, preserving the service's session environment.
 
 The new service must report the expected version continuously for 15 seconds
 within 60 seconds. Its systemd MainPID, executable inode and ownership of the

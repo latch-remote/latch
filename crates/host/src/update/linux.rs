@@ -115,46 +115,62 @@ pub fn start(exe: &Path, version: &Version, body: &[u8]) -> Result<()> {
 }
 
 fn launch(command: &mut Command, state: &linux::UpdateState, path: &Path) -> Result<()> {
-    // systemd-run exits once the unit has started. No --wait client remains in
-    // latch.service's control group when that service is restarted.
-    let mut environment = std::ffi::OsString::from("--setenv=LATCH_DATA_DIR=");
-    environment.push(
-        path.parent()
-            .context("update data directory")?
-            .canonicalize()?,
-    );
-    let mut launcher = Command::new("systemd-run");
-    launcher
-        .args([
-            "--user",
-            "--collect",
-            "--quiet",
-            "--service-type=exec",
-            "--property=RuntimeMaxSec=240",
-            "--property=TimeoutStopSec=10",
-        ])
-        .arg(format!("--unit={}", state.unit))
-        .arg(environment);
-    for (key, value) in command.get_envs() {
-        if let Some(value) = value {
-            let mut setting = std::ffi::OsString::from("--setenv=");
-            setting.push(key);
-            setting.push("=");
-            setting.push(value);
-            launcher.arg(setting);
+    if state.systemd {
+        // systemd-run exits once the unit has started. No --wait client remains in
+        // latch.service's control group when that service is restarted.
+        let mut environment = std::ffi::OsString::from("--setenv=LATCH_DATA_DIR=");
+        environment.push(
+            path.parent()
+                .context("update data directory")?
+                .canonicalize()?,
+        );
+        let mut launcher = Command::new("systemd-run");
+        launcher
+            .args([
+                "--user",
+                "--collect",
+                "--quiet",
+                "--service-type=exec",
+                "--property=RuntimeMaxSec=240",
+                "--property=TimeoutStopSec=10",
+            ])
+            .arg(format!("--unit={}", state.unit))
+            .arg(environment);
+        for (key, value) in command.get_envs() {
+            if let Some(value) = value {
+                let mut setting = std::ffi::OsString::from("--setenv=");
+                setting.push(key);
+                setting.push("=");
+                setting.push(value);
+                launcher.arg(setting);
+            }
         }
+        let output = launcher
+            .arg(command.get_program())
+            .args(command.get_args())
+            .stdin(Stdio::null())
+            .output()
+            .context("start the Linux update unit")?;
+        ensure!(
+            output.status.success(),
+            "Linux update unit failed to start: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    } else {
+        // Preserve the existing unsupervised service's session environment.
+        // Its replacement must also outlive the supervisor process.
+        use std::os::unix::process::CommandExt;
+        let mut child = command
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("start the independent Linux update process")?;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
     }
-    let output = launcher
-        .arg(command.get_program())
-        .args(command.get_args())
-        .stdin(Stdio::null())
-        .output()
-        .context("start the Linux update unit")?;
-    ensure!(
-        output.status.success(),
-        "Linux update unit failed to start: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let current = linux::UpdateState::load(path)?.context("missing supervisor state")?;
@@ -165,7 +181,7 @@ fn launch(command: &mut Command, state: &linux::UpdateState, path: &Path) -> Res
             return Ok(());
         }
         ensure!(
-            unit_active(&state.unit)?,
+            !state.systemd || unit_active(&state.unit)?,
             "Linux update unit stopped before supervisor startup"
         );
         ensure!(
@@ -208,7 +224,9 @@ pub fn reconcile() -> Result<Option<linux::UpdateState>> {
             .modified()?
             .elapsed()
             .is_ok_and(|age| age < Duration::from_secs(15));
-        if state.supervisor == 0 && (starting || unit_active(&state.unit).unwrap_or(false)) {
+        if state.supervisor == 0
+            && (starting || state.systemd && unit_active(&state.unit).unwrap_or(false))
+        {
             return Ok(Some(state));
         }
         let needs_restart = matches!(

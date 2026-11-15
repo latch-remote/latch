@@ -184,7 +184,12 @@ fn systemd_fixture_session() {
         .status()
         .unwrap()
         .success());
-    restart().unwrap();
+    // A fresh fixture unit has no loaded failed state to reset yet.
+    assert!(Command::new("systemctl")
+        .args(["--user", "start", "latch.service"])
+        .status()
+        .unwrap()
+        .success());
     wait_for("original listener", || {
         main_pid()
             .is_ok_and(|pid| linux::owns_listener(pid, &exe, latch_core::CONTROL_PORT).is_ok())
@@ -319,4 +324,51 @@ fn monitor_failure_fixture_entry() {
         .unwrap()
         .reason
         .contains("verification failed"));
+}
+
+#[test]
+fn a_direct_supervisor_keeps_the_unsupervised_services_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(helper("direct_launch_fixture_entry")
+        .env("LATCH_DIRECT_FIXTURE", "1")
+        .env("LATCH_DATA_DIR", dir.path())
+        .env("LATCH_FIXTURE_SESSION", "preserved")
+        .status()
+        .unwrap()
+        .success());
+}
+
+#[test]
+fn direct_launch_fixture_entry() {
+    if std::env::var_os("LATCH_DIRECT_FIXTURE").is_none() {
+        return;
+    }
+    let path = linux::state_path().unwrap();
+    let state =
+        linux::UpdateState::request(Path::new("/unused"), &Version::new(999, 0, 0), &[], &path)
+            .unwrap();
+    assert!(!state.systemd);
+    launch(
+        &mut helper("direct_supervisor_fixture_entry"),
+        &state,
+        &path,
+    )
+    .unwrap();
+    let outcome = linux::UpdateState::load(&path).unwrap().unwrap();
+    assert_eq!(outcome.reason, "preserved");
+    assert_eq!(outcome.phase, linux::Phase::Succeeded);
+}
+
+#[test]
+fn direct_supervisor_fixture_entry() {
+    if std::env::var_os("LATCH_DIRECT_FIXTURE").is_none() {
+        return;
+    }
+    let path = linux::state_path().unwrap();
+    let mut state = linux::UpdateState::load(&path).unwrap().unwrap();
+    state.supervisor = std::process::id();
+    state.supervisor_start = linux::process_start(state.supervisor);
+    state.phase = linux::Phase::Succeeded;
+    state.reason = std::env::var("LATCH_FIXTURE_SESSION").unwrap();
+    state.save(&path).unwrap();
 }

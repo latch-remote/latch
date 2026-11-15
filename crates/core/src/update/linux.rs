@@ -42,9 +42,9 @@ impl std::fmt::Display for Managed {
             Self::Snap => "update through Snap (snap refresh)",
             Self::AppImage => "replace the AppImage and reopen Latch",
             Self::NativeKit => "rerun the installer for the native installation",
-            Self::Kernel => "update manually; Linux 5.3+ with pidfd_open is required",
+            Self::Kernel => "update manually because Linux 5.3+ with pidfd_open is required",
             Self::UserManager => {
-                "update manually; systemd-run and a reachable systemd user manager are required"
+                "update manually because systemd-run and a reachable systemd user manager are required"
             }
             Self::Permissions => "have the installation owner replace the release binary",
         })
@@ -412,7 +412,7 @@ impl UpdateState {
             );
         }
         self.finish(path, &Err(anyhow::anyhow!(
-            "Linux update supervisor stopped before completion; previous release restored or retained"
+            "Linux update supervisor stopped before completion. Recovery restored or retained the previous release."
         )))?;
         if let Some(stage) = &self.stage {
             if stage.exists() {
@@ -1136,15 +1136,24 @@ mod tests {
         let unrelated = dir.path().join(".latch-update-unrelated");
         fs::create_dir(&unrelated).unwrap();
         fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o700)).unwrap();
+        let recovery = dir.path().join(".latch-update-recovery");
+        fs::create_dir(&recovery).unwrap();
+        fs::set_permissions(&recovery, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(recovery.join("owner"), exe.as_os_str().as_encoded_bytes()).unwrap();
+        fs::write(recovery.join("previous"), b"recovery copy").unwrap();
+        let legacy_lock = dir.path().join(".latch-host.update.lock");
+        fs::write(&legacy_lock, []).unwrap();
+        fs::set_permissions(&legacy_lock, fs::Permissions::from_mode(0o600)).unwrap();
         cleanup(&exe, std::time::SystemTime::now()).unwrap();
-        assert!(old.exists() && unrelated.exists());
+        assert!(old.exists() && unrelated.exists() && legacy_lock.exists());
         cleanup(
             &exe,
             std::time::SystemTime::now() + Duration::from_secs(48 * 3600),
         )
         .unwrap();
         assert!(!old.exists());
-        assert!(unrelated.exists());
+        assert!(unrelated.exists() && recovery.exists());
+        assert!(!legacy_lock.exists());
     }
 
     #[test]
