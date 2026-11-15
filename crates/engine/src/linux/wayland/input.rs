@@ -13,7 +13,7 @@ use super::portal::{self, Session};
 use crate::input::{keymap, DisplayRect, Event, Held, InputSink};
 use anyhow::{bail, ensure, Context};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 use std::time::{Duration, Instant};
 
 const RELEASE_BUDGET: Duration = Duration::from_millis(250);
@@ -75,6 +75,7 @@ struct Pressed {
 
 /// One way into the compositor.
 pub(super) trait Device: Send {
+    fn set_stopping(&mut self, _stopping: Arc<AtomicBool>) {}
     fn key(&mut self, code: u16, down: bool) -> anyhow::Result<()>;
     fn button(&mut self, code: u16, down: bool) -> anyhow::Result<()>;
     fn absolute(&mut self, x: i32, y: i32, display: DisplayRect) -> anyhow::Result<()>;
@@ -120,6 +121,10 @@ impl Sink {
 }
 
 impl<D: ?Sized + Device> InputSink for WaylandInput<D> {
+    fn set_stopping(&mut self, stopping: Arc<AtomicBool>) {
+        self.device.set_stopping(stopping);
+    }
+
     fn apply(&mut self, event: &Event, display: DisplayRect) -> anyhow::Result<()> {
         self.release_on_drop = true;
         if let Some(session) = &self.session {
@@ -234,6 +239,7 @@ impl<D: ?Sized + Device> Drop for WaylandInput<D> {
 /// The RemoteDesktop portal's `Notify*` methods.
 struct Portal {
     session: Arc<Session>,
+    stopping: Arc<AtomicBool>,
     /// The screencast stream absolute positions are relative to.
     stream: u32,
 }
@@ -249,7 +255,11 @@ impl Portal {
             .first()
             .map(|s| s.node)
             .context("the remote desktop session has no screen")?;
-        Ok(Self { session, stream })
+        Ok(Self {
+            session,
+            stopping: Arc::new(AtomicBool::new(false)),
+            stream,
+        })
     }
 
     fn state(down: bool) -> u32 {
@@ -258,6 +268,10 @@ impl Portal {
 }
 
 impl Device for Portal {
+    fn set_stopping(&mut self, stopping: Arc<AtomicBool>) {
+        self.stopping = stopping;
+    }
+
     fn release(&mut self, code: u16, button: bool, limit: Duration) -> anyhow::Result<()> {
         let method = if button {
             "NotifyPointerButton"
@@ -273,18 +287,20 @@ impl Device for Portal {
             self.session.devices & portal::KEYBOARD != 0,
             "the keyboard was not shared on this machine"
         );
-        self.session.notify("NotifyKeyboardKeycode", |h| {
-            (h, portal::no_options(), i32::from(code), Self::state(down))
-        })
+        self.session
+            .notify("NotifyKeyboardKeycode", &self.stopping, |h| {
+                (h, portal::no_options(), i32::from(code), Self::state(down))
+            })
     }
     fn button(&mut self, code: u16, down: bool) -> anyhow::Result<()> {
         ensure!(
             self.session.devices & portal::POINTER != 0,
             "the pointer was not shared on this machine"
         );
-        self.session.notify("NotifyPointerButton", |h| {
-            (h, portal::no_options(), i32::from(code), Self::state(down))
-        })
+        self.session
+            .notify("NotifyPointerButton", &self.stopping, |h| {
+                (h, portal::no_options(), i32::from(code), Self::state(down))
+            })
     }
     fn absolute(&mut self, x: i32, y: i32, _display: DisplayRect) -> anyhow::Result<()> {
         ensure!(
@@ -292,18 +308,20 @@ impl Device for Portal {
             "the pointer was not shared on this machine"
         );
         let stream = self.stream;
-        self.session.notify("NotifyPointerMotionAbsolute", |h| {
-            (h, portal::no_options(), stream, f64::from(x), f64::from(y))
-        })
+        self.session
+            .notify("NotifyPointerMotionAbsolute", &self.stopping, |h| {
+                (h, portal::no_options(), stream, f64::from(x), f64::from(y))
+            })
     }
     fn relative(&mut self, dx: i16, dy: i16) -> anyhow::Result<()> {
         ensure!(
             self.session.devices & portal::POINTER != 0,
             "the pointer was not shared on this machine"
         );
-        self.session.notify("NotifyPointerMotion", |h| {
-            (h, portal::no_options(), f64::from(dx), f64::from(dy))
-        })
+        self.session
+            .notify("NotifyPointerMotion", &self.stopping, |h| {
+                (h, portal::no_options(), f64::from(dx), f64::from(dy))
+            })
     }
     fn scroll(&mut self, vertical: i32, horizontal: i32) -> anyhow::Result<()> {
         ensure!(
@@ -312,9 +330,10 @@ impl Device for Portal {
         );
         for (axis, steps) in [(0u32, vertical), (1u32, horizontal)] {
             if steps != 0 {
-                self.session.notify("NotifyPointerAxisDiscrete", |h| {
-                    (h, portal::no_options(), axis, steps)
-                })?;
+                self.session
+                    .notify("NotifyPointerAxisDiscrete", &self.stopping, |h| {
+                        (h, portal::no_options(), axis, steps)
+                    })?;
             }
         }
         Ok(())
@@ -327,9 +346,10 @@ impl Device for Portal {
         for ch in text.chars() {
             let sym = keysym(ch) as i32;
             for down in [true, false] {
-                self.session.notify("NotifyKeyboardKeysym", |h| {
-                    (h, portal::no_options(), sym, Self::state(down))
-                })?;
+                self.session
+                    .notify("NotifyKeyboardKeysym", &self.stopping, |h| {
+                        (h, portal::no_options(), sym, Self::state(down))
+                    })?;
             }
         }
         Ok(())

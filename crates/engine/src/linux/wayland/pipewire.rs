@@ -663,6 +663,7 @@ impl Consumer {
     /// Connects to `node` through the portal's PipeWire `remote`, and
     /// waits up to `first` for its first picture.
     pub fn connect(remote: OwnedFd, node: u32, fps: u32, first: Duration) -> anyhow::Result<Self> {
+        super::portal::check_startup()?;
         let api = api()?;
         let name = CString::new("latch-screencast")?;
         let props = CString::new("media.type=Video media.category=Capture media.role=Screen")?;
@@ -754,12 +755,14 @@ impl Consumer {
                 ptrs.len() as u32,
             );
             (api.pw_thread_loop_unlock)(thread);
+            super::portal::check_startup()?;
             if connected < 0 {
                 bail!("could not connect to screencast node {node} ({connected})");
             }
             let deadline = Instant::now() + first;
             let mut s = shared.state.lock();
             while s.frames == 0 && s.error.is_none() {
+                super::portal::check_startup()?;
                 // Request a graph cycle after the driver has been assigned.
                 // An idle xdpw producer may have queued its sole initial frame
                 // before PipeWire's implicit trigger could drive the graph.
@@ -773,6 +776,7 @@ impl Consumer {
                 }
                 let wake = deadline.min(Instant::now() + Duration::from_millis(100));
                 shared.changed.wait_until(&mut s, wake);
+                super::portal::check_startup()?;
                 if Instant::now() >= deadline && s.frames == 0 {
                     bail!(
                         "the screencast sent no picture within {first:?}{}",
@@ -784,6 +788,7 @@ impl Consumer {
                     );
                 }
             }
+            super::portal::check_startup()?;
             if let Some(e) = s.error.clone() {
                 bail!(e);
             }
@@ -850,6 +855,39 @@ impl Drop for Consumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_stop_cancels_pipewire_without_waiting_for_the_first_picture_deadline() {
+        use std::net::{TcpListener, TcpStream};
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (tcp, _) = listener.accept().unwrap();
+        let (remote, _stalled_pipewire) = UnixStream::pair().unwrap();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let cancel = stopping.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            cancel.store(true, Ordering::Release);
+        });
+        let now = Instant::now();
+        let result =
+            super::super::portal::during_startup(&tcp, Duration::from_secs(90), stopping, || {
+                Consumer::connect(remote.into(), 1, 30, Duration::from_secs(10))
+            })
+            .unwrap();
+        worker.join().unwrap();
+        let error = result
+            .err()
+            .expect("stalled PipeWire unexpectedly connected");
+        assert!(format!("{error:#}").contains("host stopped"), "{error:#}");
+        assert!(
+            now.elapsed() < Duration::from_secs(1),
+            "shutdown took {:?}",
+            now.elapsed()
+        );
+    }
 
     #[test]
     fn shared_memory_offsets_wrap_within_the_advertised_buffer() {

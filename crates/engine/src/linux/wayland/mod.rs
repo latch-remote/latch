@@ -60,6 +60,7 @@ pub struct WaylandCapture {
 
 impl WaylandCapture {
     pub fn new(fps: u32) -> anyhow::Result<Self> {
+        portal::check_startup()?;
         let session = session().context("start the screen-sharing portal session")?;
         let stream = session.streams[0].clone();
         let mut current = CONSUMER.lock();
@@ -80,6 +81,7 @@ impl WaylandCapture {
             }
         };
         drop(current);
+        portal::check_startup()?;
         let (w, h) = consumer.lock().size();
         *LAST_SIZE.lock() = Some([w, h]);
         tracing::info!(

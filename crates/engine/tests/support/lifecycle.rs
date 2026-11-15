@@ -48,7 +48,7 @@ fn session(addr: SocketAddr) -> Arc<Session> {
         addr: Mutex::new(Some(addr)),
         ended: Mutex::new(None),
         audio_notice: Mutex::new(None),
-        stop: AtomicBool::new(false),
+        stop: Arc::new(AtomicBool::new(false)),
         finished: Mutex::new(false),
         finished_cv: Condvar::new(),
         keyframe: AtomicBool::new(false),
@@ -430,6 +430,115 @@ fn ending_revokes_and_releases_input_immediately() {
     assert_eq!(releases.load(Ordering::Relaxed), 1);
     session.end(end::ENDED, "again");
     assert_eq!(releases.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn viewer_stop_and_host_end_do_not_wait_for_in_flight_input() {
+    struct BlockedInput(mpsc::Sender<()>, mpsc::Receiver<()>, Arc<AtomicUsize>);
+    impl InputSink for BlockedInput {
+        fn apply(&mut self, _: &input::Event, _: DisplayRect) -> anyhow::Result<()> {
+            self.0.send(()).unwrap();
+            self.1.recv_timeout(Duration::from_secs(3)).unwrap();
+            Ok(())
+        }
+        fn release_all(&mut self) {
+            self.2.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    for viewer_stop in [true, false] {
+        let server = Server::bind(0, Options::default()).unwrap();
+        let session = session("127.0.0.1:9".parse().unwrap());
+        let (entered, in_flight) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let releases = Arc::new(AtomicUsize::new(0));
+        session.input.lock().sink =
+            Some(Box::new(BlockedInput(entered, blocked, releases.clone())));
+        let (host, mut peer) = sockets();
+        peer.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let accept: Accept = serde_json::from_value(serde_json::json!({
+            "session": 7, "token": "00000000000000000000000000000000",
+            "codec": "h264-baseline", "width": 64, "height": 64, "fps": 30,
+            "bitrate_kbps": 1000, "encoder": "test", "audio": null
+        }))
+        .unwrap();
+        let held = Arc::new(AtomicBool::new(true));
+        let controlling = {
+            let server = server.clone();
+            let session = session.clone();
+            let held = held.clone();
+            std::thread::spawn(move || {
+                server.control(&session, host, accept, None, || {
+                    let session = session.clone();
+                    let video = std::thread::spawn(move || {
+                        while !session.stopping() {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        held.store(false, Ordering::Release);
+                    });
+                    (Some(video), None)
+                })
+            })
+        };
+        assert!(matches!(
+            control::read_message(&mut peer).unwrap(),
+            Message::Accept(_)
+        ));
+        let applying = {
+            let server = server.clone();
+            let session = session.clone();
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                wire::write_input(
+                    &mut bytes,
+                    session.id,
+                    0,
+                    &[input::Event::Text("abc".into())],
+                );
+                dispatch_datagram(&server, &session, &bytes, session.announced, false);
+            })
+        };
+        in_flight.recv_timeout(Duration::from_secs(1)).unwrap();
+        let ending = if viewer_stop {
+            control::write_message(
+                &mut peer,
+                &Message::End(End {
+                    code: end::ENDED,
+                    message: "viewer Stop".into(),
+                }),
+            )
+            .unwrap();
+            None
+        } else {
+            let session = session.clone();
+            Some(std::thread::spawn(move || {
+                session.end(end::HOST_STOPPING, "host Stop")
+            }))
+        };
+        let ended = control::read_message(&mut peer);
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while held.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let capture_stopped = !held.load(Ordering::Acquire);
+        let end_returned = ending.as_ref().is_none_or(|worker| worker.is_finished());
+        release.send(()).unwrap();
+        applying.join().unwrap();
+        if let Some(ending) = ending {
+            ending.join().unwrap();
+        }
+        let _ = peer.shutdown(Shutdown::Both);
+        controlling.join().unwrap();
+        let expected = if viewer_stop {
+            end::ENDED
+        } else {
+            end::HOST_STOPPING
+        };
+        assert!(matches!(ended, Ok(Message::End(e)) if e.code == expected));
+        assert!(capture_stopped);
+        assert!(end_returned, "host end waited for in-flight input");
+        assert_eq!(releases.load(Ordering::Relaxed), 1);
+    }
 }
 
 #[test]

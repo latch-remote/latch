@@ -58,6 +58,9 @@ impl DisplayRect {
 }
 
 pub trait InputSink: Send {
+    /// Interrupt platform I/O when the stream is stopping.
+    fn set_stopping(&mut self, _stopping: std::sync::Arc<std::sync::atomic::AtomicBool>) {}
+
     /// An explicit monitor choice can fill one X screen on a multi-screen host.
     fn set_display_selected(&mut self, _selected: bool) {}
 

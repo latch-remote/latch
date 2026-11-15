@@ -68,17 +68,15 @@ fn viewer_gone() -> bool {
     })
 }
 
-async fn wait_for_viewer() -> anyhow::Result<()> {
-    loop {
-        ensure!(
-            !viewer_gone(),
-            "the viewer disconnected or the host stopped while waiting for screen-sharing approval"
-        );
-        async_io::Timer::after(Duration::from_millis(100)).await;
-    }
+pub(super) fn check_startup() -> anyhow::Result<()> {
+    ensure!(
+        !viewer_gone(),
+        "the viewer disconnected or the host stopped while starting screen sharing"
+    );
+    Ok(())
 }
 
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 const DESTINATION: &str = "org.freedesktop.portal.Desktop";
 const PATH: &str = "/org/freedesktop/portal/desktop";
@@ -95,8 +93,9 @@ pub fn approval_budget(viewer_seconds: u32) -> Duration {
     ))
 }
 
-/// How long any other portal request may take.
+/// How long a startup D-Bus call may take.
 const REPLY: Duration = Duration::from_secs(10);
+const INPUT_REPLY: Duration = Duration::from_millis(250);
 const CLOSE: Duration = Duration::from_millis(250);
 
 /// `SelectDevices` device types.
@@ -144,7 +143,33 @@ fn run<T>(future: impl std::future::Future<Output = anyhow::Result<T>>) -> anyho
     zbus::block_on(future)
 }
 
+async fn cancellable<T>(
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+    check: impl Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<T> {
+    futures::pin_mut!(future);
+    loop {
+        check()?;
+        let tick = async_io::Timer::after(Duration::from_millis(25));
+        futures::pin_mut!(tick);
+        if let futures::future::Either::Left((result, _)) =
+            futures::future::select(future.as_mut(), tick).await
+        {
+            check()?;
+            return result;
+        }
+    }
+}
+
 async fn timeout<T>(
+    limit: Duration,
+    what: &str,
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    cancellable(bounded(limit, what, future), check_startup).await
+}
+
+async fn bounded<T>(
     limit: Duration,
     what: &str,
     future: impl std::future::Future<Output = anyhow::Result<T>>,
@@ -332,25 +357,9 @@ where
         "/org/freedesktop/portal/desktop/request/{}/{token}",
         sender_path(&unique)
     );
-    // Listen before asking: the answer can come before the call returns.
-    let request = zbus::Proxy::new(
-        conn,
-        DESTINATION,
-        ObjectPath::try_from(path.clone())?,
-        "org.freedesktop.portal.Request",
-    )
-    .await?;
-    let mut responses = request.receive_signal("Response").await?;
-    let portal = proxy(conn, interface).await?;
-    let reply = timeout(REPLY, method, async {
-        Ok(portal.call_method(method, &body(token)).await?)
-    })
-    .await
-    .with_context(|| format!("{interface}.{method}"))?;
-    let handle: OwnedObjectPath = reply.body().deserialize()?;
-    if handle.as_str() != path {
-        // Portals before 0.9 chose their own path.
-        tracing::debug!("portal request at {} rather than {path}", handle.as_str());
+    let mut handle = OwnedObjectPath::try_from(path.clone())?;
+    let response = timeout(limit + REPLY, method, async {
+        // Listen before asking: the answer can come before the call returns.
         let request = zbus::Proxy::new(
             conn,
             DESTINATION,
@@ -358,31 +367,38 @@ where
             "org.freedesktop.portal.Request",
         )
         .await?;
-        responses = request.receive_signal("Response").await?;
-    }
-    let response = timeout(limit, method, async {
-        let response = async {
+        let mut responses = request.receive_signal("Response").await?;
+        let portal = proxy(conn, interface).await?;
+        let reply = timeout(REPLY, method, async {
+            Ok(portal.call_method(method, &body(token)).await?)
+        })
+        .await?;
+        handle = reply.body().deserialize()?;
+        if handle.as_str() != path {
+            // Portals before 0.9 chose their own path.
+            tracing::debug!("portal request at {} rather than {path}", handle.as_str());
+            let request = zbus::Proxy::new(
+                conn,
+                DESTINATION,
+                handle.clone(),
+                "org.freedesktop.portal.Request",
+            )
+            .await?;
+            responses = request.receive_signal("Response").await?;
+        }
+        timeout(limit, method, async {
             responses
                 .next()
                 .await
                 .context("the portal closed the request without answering")
-        };
-        futures::pin_mut!(response);
-        let gone = wait_for_viewer();
-        futures::pin_mut!(gone);
-        match futures::future::select(response, gone).await {
-            futures::future::Either::Left((result, _)) => result,
-            futures::future::Either::Right((result, _)) => {
-                result?;
-                unreachable!()
-            }
-        }
+        })
+        .await
     })
     .await
     .with_context(|| format!("{interface}.{method}"));
     if response.is_err() {
         // Closing a timed-out request dismisses its permission dialog too.
-        let _ = timeout(CLOSE, "Request.Close", async {
+        let _ = bounded(CLOSE, "Request.Close", async {
             conn.call_method(
                 Some(DESTINATION),
                 handle,
@@ -397,6 +413,7 @@ where
     }
     let message = response?;
     let (code, results): (u32, HashMap<String, OwnedValue>) = message.body().deserialize()?;
+    check_startup()?;
     match code {
         0 => Ok(results),
         1 => bail!(crate::video::CaptureEnded(
@@ -442,8 +459,11 @@ async fn watch_closed(
 async fn gnome_session(conn: &zbus::Connection, handle: &OwnedObjectPath) -> bool {
     timeout(REPLY, "identifying the session portal", async {
         let bus = zbus::fdo::DBusProxy::new(conn).await?;
+        check_startup()?;
         let name = zbus::names::BusName::try_from("org.freedesktop.impl.portal.desktop.gnome")?;
-        if !bus.name_has_owner(name).await? {
+        let owned = bus.name_has_owner(name).await?;
+        check_startup()?;
+        if !owned {
             return Ok(false);
         }
         let reply = conn
@@ -511,7 +531,12 @@ impl Session {
                 kept_approval: false,
                 closed: Arc::new(AtomicBool::new(false)),
             };
-            watch_closed(&conn, handle.clone(), &session.closed).await?;
+            timeout(
+                REPLY,
+                "watching the portal session",
+                watch_closed(&conn, handle.clone(), &session.closed),
+            )
+            .await?;
             if kind == Kind::RemoteDesktop {
                 request(&conn, REMOTE_DESKTOP, "SelectDevices", REPLY, |token| {
                     let mut options = device_options(offer, restore.as_deref());
@@ -552,6 +577,7 @@ impl Session {
             // Test this session's backend object, since desktop environment
             // variables can disagree with portals.conf routing.
             session.pixel_coordinates = gnome_session(&conn, &handle).await;
+            check_startup()?;
             session.check()?;
             tracing::info!(
                 "{} session started: {} stream(s), devices {:#x}, {}",
@@ -572,6 +598,7 @@ impl Session {
     }
 
     pub fn check(&self) -> anyhow::Result<()> {
+        check_startup()?;
         ensure!(
             !self.closed.load(Ordering::Acquire),
             crate::video::CaptureEnded("screen sharing was stopped in the desktop portal".into())
@@ -582,9 +609,10 @@ impl Session {
     /// A PipeWire connection that sees this session's streams.
     pub fn pipewire(&self) -> anyhow::Result<OwnedFd> {
         run(async {
-            let portal = proxy(&self.conn, SCREEN_CAST).await?;
-            let options: HashMap<&str, Value> = HashMap::new();
             let fd: zbus::zvariant::OwnedFd = timeout(REPLY, "OpenPipeWireRemote", async {
+                let portal = proxy(&self.conn, SCREEN_CAST).await?;
+                check_startup()?;
+                let options: HashMap<&str, Value> = HashMap::new();
                 Ok(portal
                     .call("OpenPipeWireRemote", &(&self.handle, options))
                     .await?)
@@ -600,15 +628,38 @@ impl Session {
     pub fn notify<B>(
         &self,
         method: &'static str,
+        stopping: &AtomicBool,
         args: impl FnOnce(OwnedObjectPath) -> B,
     ) -> anyhow::Result<()>
     where
         B: serde::Serialize + zbus::zvariant::DynamicType,
     {
-        self.notify_with_timeout(method, REPLY, args)
+        run(cancellable(
+            self.notify_call(method, INPUT_REPLY, args),
+            || {
+                check_startup()?;
+                ensure!(
+                    !stopping.load(Ordering::Acquire),
+                    "the stream stopped during input"
+                );
+                Ok(())
+            },
+        ))
     }
 
     pub fn notify_with_timeout<B>(
+        &self,
+        method: &'static str,
+        limit: Duration,
+        args: impl FnOnce(OwnedObjectPath) -> B,
+    ) -> anyhow::Result<()>
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType,
+    {
+        run(self.notify_call(method, limit, args))
+    }
+
+    async fn notify_call<B>(
         &self,
         method: &'static str,
         limit: Duration,
@@ -622,12 +673,13 @@ impl Session {
             "this screencast has no input"
         );
         let body = args(self.handle.clone());
-        run(timeout(limit, method, async {
+        bounded(limit, method, async {
             self.conn
                 .call_method(Some(DESTINATION), PATH, Some(REMOTE_DESKTOP), method, &body)
                 .await?;
             Ok(())
-        }))
+        })
+        .await
     }
 }
 
@@ -640,7 +692,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         let conn = self.conn.clone();
         let handle = self.handle.clone();
-        let closed = run(timeout(CLOSE, "Session.Close", async move {
+        let closed = run(bounded(CLOSE, "Session.Close", async move {
             let session =
                 zbus::Proxy::new(&conn, DESTINATION, handle, "org.freedesktop.portal.Session")
                     .await?;
@@ -699,9 +751,19 @@ mod tests {
         started: Arc<AtomicBool>,
         closed: Arc<AtomicBool>,
         response: Option<u32>,
+        cancel_on_response: Option<Arc<AtomicBool>>,
     }
     #[zbus::interface(name = "org.freedesktop.portal.ScreenCast")]
     impl Prompt {
+        async fn open_pipe_wire_remote(
+            &self,
+            _session: OwnedObjectPath,
+            _options: HashMap<String, OwnedValue>,
+        ) -> zbus::zvariant::OwnedFd {
+            self.started.store(true, Ordering::Release);
+            futures::future::pending().await
+        }
+
         async fn start(
             &self,
             options: HashMap<String, OwnedValue>,
@@ -718,6 +780,9 @@ mod tests {
             server
                 .at(path.clone(), PendingRequest(self.closed.clone()))
                 .await?;
+            if let Some(stopping) = &self.cancel_on_response {
+                stopping.store(true, Ordering::Release);
+            }
             self.started.store(true, Ordering::Release);
             if let Some(code) = self.response {
                 conn.emit_signal(
@@ -732,10 +797,13 @@ mod tests {
             Ok(path)
         }
     }
-    struct TestSession;
+    #[derive(Default)]
+    struct TestSession(Arc<AtomicBool>);
     #[zbus::interface(name = "org.freedesktop.portal.Session")]
     impl TestSession {
-        fn close(&self) {}
+        fn close(&self) {
+            self.0.store(true, Ordering::Release);
+        }
     }
 
     #[test]
@@ -756,6 +824,7 @@ mod tests {
                             started: started.clone(),
                             closed: closed.clone(),
                             response: None,
+                            cancel_on_response: None,
                         },
                     )?
                     .build()
@@ -827,6 +896,7 @@ mod tests {
                         started: Arc::new(AtomicBool::new(false)),
                         closed: Arc::new(AtomicBool::new(false)),
                         response: Some(1),
+                        cancel_on_response: None,
                     },
                 )?
                 .build()
@@ -848,6 +918,116 @@ mod tests {
             .await
             .unwrap_err();
             assert!(error.is::<crate::video::CaptureEnded>());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn simultaneous_approval_and_host_stop_cancels_the_queued_response() {
+        let bus = Bus::new();
+        run(async {
+            let stopping = Arc::new(AtomicBool::new(false));
+            let closed = Arc::new(AtomicBool::new(false));
+            let _server = zbus::connection::Builder::address(bus.1.as_str())?
+                .name(DESTINATION)?
+                .serve_at(
+                    PATH,
+                    Prompt {
+                        started: Arc::new(AtomicBool::new(false)),
+                        closed: closed.clone(),
+                        response: Some(0),
+                        cancel_on_response: Some(stopping.clone()),
+                    },
+                )?
+                .build()
+                .await?;
+            let conn = zbus::connection::Builder::address(bus.1.as_str())?
+                .build()
+                .await?;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let _peer = TcpStream::connect(listener.local_addr()?)?;
+            let (tcp, _) = listener.accept()?;
+            let result = during_startup(&tcp, APPROVAL, stopping.clone(), || {
+                run(request(&conn, SCREEN_CAST, "Start", APPROVAL, |token| {
+                    let mut options = no_options();
+                    options.insert("handle_token", token.into());
+                    (options,)
+                }))
+            })?;
+            assert!(stopping.load(Ordering::Acquire));
+            assert!(
+                result.is_err(),
+                "approval succeeded after host cancellation"
+            );
+            assert!(closed.load(Ordering::Acquire), "Request.Close was skipped");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn host_stop_cancels_a_stalled_post_approval_pipewire_remote_call() {
+        let bus = Bus::new();
+        run(async {
+            let started = Arc::new(AtomicBool::new(false));
+            let session_closed = Arc::new(AtomicBool::new(false));
+            let path =
+                OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/stalled")?;
+            let _server = zbus::connection::Builder::address(bus.1.as_str())?
+                .name(DESTINATION)?
+                .serve_at(
+                    PATH,
+                    Prompt {
+                        started: started.clone(),
+                        closed: Arc::new(AtomicBool::new(false)),
+                        response: None,
+                        cancel_on_response: None,
+                    },
+                )?
+                .serve_at(path.clone(), TestSession(session_closed.clone()))?
+                .build()
+                .await?;
+            let conn = zbus::connection::Builder::address(bus.1.as_str())?
+                .build()
+                .await?;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let _peer = TcpStream::connect(listener.local_addr()?)?;
+            let (tcp, _) = listener.accept()?;
+            let stopping = Arc::new(AtomicBool::new(false));
+            let cancel = stopping.clone();
+            let worker = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                while !started.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                cancel.store(true, Ordering::Release);
+            });
+            let now = std::time::Instant::now();
+            let result = during_startup(&tcp, APPROVAL, stopping, || {
+                let session = Session {
+                    conn,
+                    handle: path,
+                    kind: Kind::ScreenCast,
+                    devices: 0,
+                    streams: Vec::new(),
+                    pixel_coordinates: false,
+                    kept_approval: false,
+                    closed: Arc::new(AtomicBool::new(false)),
+                };
+                session.pipewire()
+            })?;
+            worker.join().unwrap();
+            assert!(
+                session_closed.load(Ordering::Acquire),
+                "Session.Close was skipped"
+            );
+            assert!(format!("{:#}", result.unwrap_err()).contains("host stopped"));
+            assert!(
+                now.elapsed() < Duration::from_secs(1),
+                "shutdown took {:?}",
+                now.elapsed()
+            );
             Ok(())
         })
         .unwrap();
@@ -880,6 +1060,99 @@ mod tests {
         }
     }
 
+    struct TextInput {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        stopping: Arc<AtomicBool>,
+        stall: bool,
+    }
+    #[zbus::interface(name = "org.freedesktop.portal.RemoteDesktop")]
+    impl TextInput {
+        async fn notify_keyboard_keysym(
+            &self,
+            _session: OwnedObjectPath,
+            _options: HashMap<String, OwnedValue>,
+            _sym: i32,
+            _state: u32,
+        ) {
+            self.calls.fetch_add(1, Ordering::Release);
+            if self.stall {
+                async_io::Timer::after(Duration::from_secs(2)).await;
+            } else {
+                self.stopping.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    #[test]
+    fn stopping_interrupts_portal_text_and_skips_the_remaining_notifications() {
+        use crate::input::{DisplayRect, Event, InputSink};
+        for stall in [false, true] {
+            let bus = Bus::new();
+            run(async {
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let stopping = Arc::new(AtomicBool::new(false));
+                let path =
+                    OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/text")?;
+                let _server = zbus::connection::Builder::address(bus.1.as_str())?
+                    .name(DESTINATION)?
+                    .serve_at(
+                        PATH,
+                        TextInput {
+                            calls: calls.clone(),
+                            stopping: stopping.clone(),
+                            stall,
+                        },
+                    )?
+                    .serve_at(path.clone(), TestSession::default())?
+                    .build()
+                    .await?;
+                let conn = zbus::connection::Builder::address(bus.1.as_str())?
+                    .build()
+                    .await?;
+                let session = Arc::new(Session {
+                    conn,
+                    handle: path,
+                    kind: Kind::RemoteDesktop,
+                    devices: KEYBOARD,
+                    streams: vec![Stream {
+                        node: 1,
+                        position: None,
+                        size: None,
+                    }],
+                    pixel_coordinates: false,
+                    kept_approval: false,
+                    closed: Arc::new(AtomicBool::new(false)),
+                });
+                let mut sink = super::super::input::Sink::open(Some(session))?;
+                sink.set_stopping(stopping.clone());
+                let worker = if stall {
+                    let calls = calls.clone();
+                    Some(std::thread::spawn(move || {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                        while calls.load(Ordering::Acquire) == 0
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        stopping.store(true, Ordering::Release);
+                    }))
+                } else {
+                    None
+                };
+                let now = std::time::Instant::now();
+                let result = sink.apply(&Event::Text("hello".into()), DisplayRect::default());
+                if let Some(worker) = worker {
+                    worker.join().unwrap();
+                }
+                assert!(result.is_err());
+                assert!(now.elapsed() < Duration::from_millis(500));
+                assert_eq!(calls.load(Ordering::Acquire), 1);
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
     #[test]
     fn portal_releases_share_one_budget_and_drop_does_not_retry() {
         use crate::input::{DisplayRect, Event, InputSink};
@@ -890,7 +1163,7 @@ mod tests {
             let _server = zbus::connection::Builder::address(bus.1.as_str())?
                 .name(DESTINATION)?
                 .serve_at(PATH, SlowInput(releases.clone()))?
-                .serve_at(path.clone(), TestSession)?
+                .serve_at(path.clone(), TestSession::default())?
                 .build()
                 .await?;
             let conn = zbus::connection::Builder::address(bus.1.as_str())?
@@ -954,7 +1227,7 @@ mod tests {
             let path = OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/test")?;
             let server = zbus::connection::Builder::address(bus.1.as_str())?
                 .name(DESTINATION)?
-                .serve_at(path.clone(), TestSession)?
+                .serve_at(path.clone(), TestSession::default())?
                 .build()
                 .await?;
             let conn = zbus::connection::Builder::address(bus.1.as_str())?
