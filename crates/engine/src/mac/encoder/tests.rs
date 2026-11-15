@@ -1584,6 +1584,9 @@ fn ltr_boundary_drops_ahead_frames_and_retries_a_dropped_refresh_with_idr() {
         if !encoder.recovers() {
             return;
         }
+        // Exercise the recovery boundary even when ahead-frame callbacks have
+        // already produced H.264 long-term marks before recover_from runs.
+        encoder.unsafe_h264_refresh = true;
         let image = surface();
         fill(&image, &pattern(0));
         let base = encoder
