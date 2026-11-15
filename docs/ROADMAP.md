@@ -63,10 +63,6 @@ date, and none of it is a tested capability until it leaves this list.
   70 pictures a second on an RX 6600. The decoder's own time and Latch's
   copy to the renderer have not been separated; that comes first.
 - **Windows ten-bit and HDR viewing without a CPU readback.**
-- **Mouse and keyboard sent from the OS event.** The viewer forwards them
-  when its window next draws, which is at once on input but still waits
-  for the frame in progress. Gamepads already go straight from their own
-  thread.
 - **A separate cursor plane on Mac hosts.** Windows and Linux hosts send
   the pointer outside the video; a Mac host draws it into the picture.
 - Apple hardware AV1 encode when the hardware and platform APIs offer it;

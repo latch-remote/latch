@@ -428,6 +428,56 @@ impl Held {
     }
 }
 
+/// One [`Held`] shared by the UI frame and the OS event hook
+/// ([`crate::early`]), so both send with the same masks and either can
+/// release what the other pressed. Both run on the window's thread.
+#[derive(Clone, Default)]
+pub struct SharedHeld(std::rc::Rc<std::cell::RefCell<Held>>);
+
+impl SharedHeld {
+    pub fn key(&self, out: &(impl Sink + ?Sized), vk: i16, down: bool) {
+        self.0.borrow_mut().key(out, vk, down);
+    }
+
+    pub fn button(&self, out: &(impl Sink + ?Sized), b: u8, down: bool) {
+        self.0.borrow_mut().button(out, b, down);
+    }
+
+    pub fn modifiers(&self, out: &(impl Sink + ?Sized), now: Modifiers, cmd_is_ctrl: bool) {
+        self.0.borrow_mut().modifiers(out, now, cmd_is_ctrl);
+    }
+
+    pub fn release_all(&self, out: &(impl Sink + ?Sized)) {
+        self.0.borrow_mut().release_all(out);
+    }
+
+    pub fn chord(&self, out: &(impl Sink + ?Sized), keys: &[i16]) {
+        self.0.borrow_mut().chord(out, keys);
+    }
+
+    pub fn chord_alone(&self, out: &(impl Sink + ?Sized), keys: &[i16]) {
+        self.0.borrow_mut().chord_alone(out, keys);
+    }
+
+    pub fn any_down(&self) -> bool {
+        self.0.borrow().any_down()
+    }
+
+    pub fn is_down(&self, vk: i16) -> bool {
+        self.0.borrow().is_down(vk)
+    }
+
+    /// Whether something holds it right now, so it must not be touched.
+    pub fn busy(&self) -> bool {
+        self.0.try_borrow_mut().is_err()
+    }
+
+    #[cfg(test)]
+    pub fn borrow_for_test(&self) -> std::cell::RefMut<'_, Held> {
+        self.0.borrow_mut()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

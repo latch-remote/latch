@@ -29,6 +29,8 @@ rand.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
+# The same OS-event callback on macOS, Windows, X11 and Wayland.
+egui-winit = { version = "0.31.1", default-features = false }
 semver = "1"
 
 # The versions winit already builds on: nothing new is compiled. Used to
