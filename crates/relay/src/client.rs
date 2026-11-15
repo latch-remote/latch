@@ -1706,12 +1706,24 @@ mod tests {
     }
     #[test]
     fn production_resolution_rejects_tailnet_and_private_addresses() {
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
+
         let mut config =
             ClientConfig::production(Endpoint::new("relay.example", 443).unwrap()).unwrap();
         config.limits.max_frame_bytes = 12345;
-        let config = config
-            .with_tls_roots(rustls::RootCertStore::empty())
+        assert_eq!(
+            config
+                .clone()
+                .with_tls_roots(rustls::RootCertStore::empty())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(include_bytes!("../tests/certs/ca.pem")).unwrap())
             .unwrap();
+        let config = config.with_tls_roots(roots).unwrap();
         assert!(config.public_only);
         assert_eq!(config.limits.max_frame_bytes, 12345);
         for address in [
