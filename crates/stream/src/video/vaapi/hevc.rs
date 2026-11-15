@@ -666,7 +666,7 @@ pub(super) struct Slice {
     beta_offset_div2: i32,
     tc_offset_div2: i32,
     loop_filter_across_slices: bool,
-    entry_points: u32,
+    entry_points: Vec<u32>,
     /// RBSP bytes before the slice data, NAL header included.
     header_bytes: usize,
 }
@@ -745,19 +745,18 @@ impl Slice {
             slice.header(&mut b, s, p)?;
             slice
         };
+        slice.entry_points.clear();
         if p.tiles.is_some() || p.entropy_coding_sync {
-            slice.entry_points = b.ue_max(
+            let count = b.ue_max(
                 (s.ctbs().0 * s.ctbs().1).min(u16::MAX as u32),
                 "num_entry_point_offsets",
             )?;
-            if slice.entry_points > 0 {
+            if count > 0 {
                 let bits = b.ue_max(31, "offset_len_minus1")? + 1;
-                for _ in 0..slice.entry_points {
-                    b.u(bits)?;
+                for _ in 0..count {
+                    slice.entry_points.push(b.u(bits)?);
                 }
             }
-        } else {
-            slice.entry_points = 0;
         }
         if p.slice_header_extension_present {
             let length = b.ue_max(256, "slice_segment_header_extension_length")?;
@@ -1144,15 +1143,18 @@ impl Hevc {
             .map(ScalingLists::va);
         let count = slices.len();
         let mut params = Vec::with_capacity(count);
+        let mut subsets = Vec::new();
         for (n, (slice, nal, epb)) in slices.iter().enumerate() {
             ensure!(slice.pps_id == first.pps_id, "slices with different PPSs");
-            params.push((
-                self.slice_parameters(slice, &sets, nal.len(), *epb, n + 1 == count)?,
-                *nal,
-            ));
+            let mut params_slice =
+                self.slice_parameters(slice, &sets, nal.len(), *epb, n + 1 == count)?;
+            params_slice.entry_offset_to_subset_array =
+                u16::try_from(subsets.len()).context("HEVC subset array exceeds VA-API limits")?;
+            subsets.extend_from_slice(&slice.entry_points);
+            params.push((params_slice, *nal));
         }
         backend
-            .hevc(target, &picture, iq.as_ref(), &params)
+            .hevc(target, &picture, iq.as_ref(), &params, &subsets)
             .map_err(hardware)?;
 
         self.dpb.push((
@@ -1495,7 +1497,7 @@ impl Hevc {
             }
         }
         s.five_minus_max_num_merge_cand = slice.five_minus_max_num_merge_cand as u8;
-        s.num_entry_point_offsets = slice.entry_points as u16;
+        s.num_entry_point_offsets = slice.entry_points.len() as u16;
         s.slice_data_num_emu_prevn_bytes = epb as u16;
         Ok(s)
     }
@@ -1564,6 +1566,76 @@ mod tests {
                 assert!(slice.slice_data_byte_offset > 2);
                 assert!((slice.slice_data_byte_offset as usize) < data.len());
                 assert_eq!(slice.slice_data_size as usize, data.len());
+            }
+        }
+    }
+
+    /// Minimal IDR headers with synthetic payload. Only the parameter
+    /// buffers are exercised, so the recorder never decodes the payload.
+    fn append_slice(au: &mut Vec<u8>, header: &str) {
+        let mut bits = header.to_string();
+        bits.push('1'); // byte_alignment()
+        while !bits.len().is_multiple_of(8) {
+            bits.push('0');
+        }
+        au.extend_from_slice(&[0, 0, 0, 1, 0x28, 1]);
+        for byte in bits.as_bytes().chunks_exact(8) {
+            au.push(
+                byte.iter()
+                    .fold(0, |value, bit| (value << 1) | (bit - b'0')),
+            );
+        }
+        au.extend_from_slice(&[0x55; 32]);
+    }
+
+    #[test]
+    fn tile_and_wavefront_offsets_reach_the_subsets_buffer_in_slice_order() {
+        for tiles in [false, true] {
+            let mut decoder = Hevc::new();
+            let mut backend = Recorder::default();
+            decoder
+                .decode(
+                    include_bytes!("../../../tests/fixtures/decode-probe.hevc"),
+                    &mut backend,
+                )
+                .unwrap();
+            let pps = decoder.pps[0].as_mut().unwrap();
+            pps.tiles = tiles.then_some((2, 2, None, false));
+            pps.entropy_coding_sync = !tiles;
+            pps.dependent_slice_segments = true;
+            pps.output_flag_present = false;
+            pps.num_extra_slice_header_bits = 0;
+            pps.slice_chroma_qp_offsets_present = false;
+            pps.deblocking_override_enabled = false;
+            pps.loop_filter_across_slices = false;
+            pps.slice_header_extension_present = false;
+            let sps = decoder.sps[pps.sps_id as usize].as_mut().unwrap();
+            sps.sao = false;
+            let address_bits = ceil_log2(sps.ctbs().0 * sps.ctbs().1) as usize;
+            let mut au = Vec::new();
+            // First independent I slice, offsets_minus1 = [2, 9].
+            append_slice(&mut au, "10101110110010000101001");
+            // Dependent segments supply their own entry points, including
+            // an empty list that must not inherit the independent slice's.
+            append_slice(&mut au, &format!("0011{:0address_bits$b}010001000101", 1));
+            append_slice(&mut au, &format!("0011{:0address_bits$b}1", 2));
+            decoder.decode(&au, &mut backend).unwrap().unwrap();
+            let picture = backend.hevc.last().unwrap();
+            assert_eq!(picture.subsets, [2, 9, 5]);
+            let counts: Vec<_> = picture
+                .slices
+                .iter()
+                .map(|(s, _)| s.num_entry_point_offsets)
+                .collect();
+            let starts: Vec<_> = picture
+                .slices
+                .iter()
+                .map(|(s, _)| s.entry_offset_to_subset_array)
+                .collect();
+            assert_eq!(counts, [2, 1, 0]);
+            assert_eq!(starts, [0, 2, 3]);
+            for (params, nal) in &picture.slices {
+                assert_eq!(&nal[params.slice_data_byte_offset as usize..], &[0x55; 32]);
             }
         }
     }

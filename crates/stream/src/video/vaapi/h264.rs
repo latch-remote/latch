@@ -796,7 +796,7 @@ impl H264 {
         );
         let pps = self.pps[first.pps_id as usize].clone().expect("parsed");
         if !first.idr {
-            self.fill_frame_num_gap(&sps, first.frame_num);
+            self.fill_frame_num_gap(&sps, &first)?;
         }
         let (top, bottom, frame_num_offset) = self.order(&sps, &first)?;
         ensure!(
@@ -900,40 +900,55 @@ impl H264 {
 
     /// Frames inferred for `frame_num`s a stream skipped (8.2.5.2): they
     /// take their place in the sliding window but have no picture.
-    fn fill_frame_num_gap(&mut self, sps: &Sps, frame_num: u32) {
+    fn fill_frame_num_gap(&mut self, sps: &Sps, slice: &Slice) -> Result<()> {
+        let frame_num = slice.frame_num;
         let max = sps.max_frame_num();
         let prev = self.previous.ref_frame_num;
         if frame_num == prev || frame_num == (prev + 1) % max {
-            return;
+            return Ok(());
         }
         // Lost long-term-only pictures do not introduce short-term references.
         // The next explicit long-term mark/reordering still has to name a
         // reference we retained. Fabricating short-term entries here would
         // change the default list of the resumed LTR stream.
         if !sps.gaps_allowed && self.dpb.iter().all(|p| p.long_term.is_some()) {
-            return;
+            return Ok(());
         }
         let gap = (frame_num + max - prev - 1) % max;
         let window = sps.max_num_ref_frames.max(1);
         let mut unused = (prev + 1) % max;
+        // Non-existing pictures are reference frames with inferred zero
+        // deltas. Types 1 and 2 run the normal POC process (8.2.5.2).
+        let mut inferred = slice.clone();
+        inferred.nal_ref_idc = 1;
+        inferred.delta_poc = [0; 2];
+        inferred.delta_poc_bottom = 0;
         if gap > window {
             // Only the last ones would survive the sliding window.
             self.dpb.retain(|p| p.long_term.is_some());
             unused = (frame_num + max - window) % max;
+            // The discarded prefix still contributes to FrameNumOffset.
+            inferred.frame_num = (unused + max - 1) % max;
+            self.previous.frame_num_offset = self.order(sps, &inferred)?.2;
+            self.previous.frame_num = inferred.frame_num;
         }
         while unused != frame_num {
+            inferred.frame_num = unused;
+            let (top, bottom, offset) = self.order(sps, &inferred)?;
             self.sliding_window(sps, unused);
             self.dpb.push(Picture {
                 surface: va::INVALID_ID,
                 frame_num: unused,
-                top: 0,
-                bottom: 0,
+                top: if sps.poc_type == 0 { 0 } else { top },
+                bottom: if sps.poc_type == 0 { 0 } else { bottom },
                 long_term: None,
             });
             self.previous.ref_frame_num = unused;
             self.previous.frame_num = unused;
+            self.previous.frame_num_offset = offset;
             unused = (unused + 1) % max;
         }
+        Ok(())
     }
 
     /// TopFieldOrderCnt, BottomFieldOrderCnt and FrameNumOffset (8.2.1).
@@ -1671,11 +1686,70 @@ pub(super) mod tests {
         let mut h264 = H264::new();
         h264.mark(&sps, &slice(0, Marking::default()), picture(0));
         h264.mark(&sps, &slice(1, Marking::default()), picture(1));
-        h264.fill_frame_num_gap(&sps, 3);
+        h264.fill_frame_num_gap(&sps, &slice(3, Marking::default()))
+            .unwrap();
         assert_eq!(h264.references(), [(0, None), (1, None), (2, None)]);
         assert_eq!(h264.dpb[2].surface, va::INVALID_ID);
-        h264.fill_frame_num_gap(&sps, 14);
+        h264.fill_frame_num_gap(&sps, &slice(14, Marking::default()))
+            .unwrap();
         assert_eq!(h264.references(), [(11, None), (12, None), (13, None)]);
+    }
+
+    #[test]
+    fn gap_frames_preserve_poc_wrap_and_the_discarded_prefix() {
+        for poc_type in [1, 2] {
+            // A small gap crosses zero, a large gap crosses in its discarded
+            // prefix, and a final case wraps at the current picture itself.
+            for (previous, current, window, base_offset) in
+                [(14, 1, 3, 0), (14, 1, 3, 16), (7, 6, 2, 16), (13, 0, 2, 16)]
+            {
+                let mut sps = sps(window, 4);
+                sps.poc_type = poc_type;
+                sps.offset_for_ref_frame = vec![2];
+                let mut h264 = H264::new();
+                h264.previous = Previous {
+                    frame_num: previous,
+                    ref_frame_num: previous,
+                    frame_num_offset: base_offset,
+                    ..Default::default()
+                };
+                let mut current_slice = slice(current, Marking::default());
+                // The inferred pictures must use reference POC and zero deltas.
+                current_slice.nal_ref_idc = 0;
+                current_slice.delta_poc = [3, 5];
+                h264.fill_frame_num_gap(&sps, &current_slice).unwrap();
+                for picture in &h264.dpb {
+                    let offset = base_offset + if picture.frame_num > previous { 0 } else { 16 };
+                    let expected = 2 * (offset + picture.frame_num as i32);
+                    assert_eq!((picture.top, picture.bottom), (expected, expected));
+                    assert_eq!(picture.surface, va::INVALID_ID);
+                }
+                let mut reference = current_slice.clone();
+                reference.nal_ref_idc = 1;
+                reference.delta_poc = [0; 2];
+                let offset = base_offset + 16;
+                let expected = 2 * (offset + current as i32);
+                assert_eq!(
+                    h264.order(&sps, &reference).unwrap(),
+                    (expected, expected, offset)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gap_frame_offset_overflow_is_reported() {
+        let mut h264 = H264::new();
+        h264.previous = Previous {
+            frame_num: 14,
+            ref_frame_num: 14,
+            frame_num_offset: i32::MAX - 8,
+            ..Default::default()
+        };
+        let sps = sps(2, 4);
+        assert!(h264
+            .fill_frame_num_gap(&sps, &slice(1, Marking::default()))
+            .is_err());
     }
 
     #[test]

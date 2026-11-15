@@ -14,7 +14,8 @@ use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 type Display = *mut c_void;
 type Status = c_int;
@@ -333,9 +334,22 @@ impl Drop for Device {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Output {
+    Readback,
+    Presentation,
+}
+
+impl Output {
+    fn exports(self, renderer_enabled: bool) -> bool {
+        self == Self::Presentation && renderer_enabled
+    }
+}
+
 /// A configured decoder: config, surfaces, context and readback image.
 struct Driver {
     device: Device,
+    output: Output,
     limits: Vec<Limit>,
     config: Id,
     context: Id,
@@ -438,7 +452,9 @@ impl Driver {
             .format
             .clone()
             .context("VA-API readback without a format")?;
-        if super::dmabuf::ENABLED.load(std::sync::atomic::Ordering::Acquire)
+        if self
+            .output
+            .exports(super::dmabuf::ENABLED.load(std::sync::atomic::Ordering::Acquire))
             && d.visible.x == 0
             && d.visible.y == 0
             && d.visible.width == format.width
@@ -708,8 +724,12 @@ impl Backend for Driver {
         picture: &va::PictureParameterHevc,
         iq: Option<&va::IqMatrixHevc>,
         slices: &[(va::SliceHevc, &[u8])],
+        subsets: &[u32],
     ) -> Result<()> {
         let mut parts = vec![(va::PICTURE_PARAMETER_BUFFER, va::bytes(picture))];
+        if !subsets.is_empty() {
+            parts.push((va::SUBSETS_PARAMETER_BUFFER, va::slice(subsets)));
+        }
         if let Some(iq) = iq {
             parts.push((va::IQ_MATRIX_BUFFER, va::bytes(iq)));
         }
@@ -735,7 +755,7 @@ pub struct Vaapi {
 }
 
 impl Vaapi {
-    fn on(device: Device, codec: Codec) -> Result<Self> {
+    fn on(device: Device, codec: Codec, output: Output) -> Result<Self> {
         let limits = limits(&device.reports());
         Ok(Self {
             bitstream: Bitstream::new(codec)?,
@@ -745,6 +765,7 @@ impl Vaapi {
             },
             driver: Driver {
                 device,
+                output,
                 limits,
                 config: INVALID_ID,
                 context: INVALID_ID,
@@ -793,16 +814,50 @@ fn open_direct(codec: Codec, width: u32, height: u32, ten_bit: bool) -> Result<V
     let cap = super::capability(caps, codec, ten_bit, width, height)?;
     let device =
         Device::open(&cap.node)?.with_context(|| format!("{} is gone", cap.node.display()))?;
-    Vaapi::on(device, codec)
+    Vaapi::on(device, codec, Output::Presentation)
 }
 
-/// What every render node was seen to decode, probed once per process
-/// (on a thread with a deadline: a driver that hangs is not waited for).
+/// Successful capabilities live for the process. Empty results may be
+/// transient, so retry them after a cooldown without spawning probe storms.
+#[derive(Default)]
+struct CapabilityCache {
+    caps: OnceLock<Vec<Capability>>,
+    retry_at: Mutex<Option<Instant>>,
+}
+
+impl CapabilityCache {
+    fn get(&self, now: Instant, probe: impl FnOnce() -> Vec<Capability>) -> &[Capability] {
+        if let Some(caps) = self.caps.get() {
+            return caps;
+        }
+        let mut retry_at = self.retry_at.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(caps) = self.caps.get() {
+            return caps;
+        }
+        if retry_at.is_some_and(|deadline| now < deadline) {
+            return &[];
+        }
+        *retry_at = Some(now + Duration::from_secs(30));
+        let caps = probe();
+        if caps.is_empty() {
+            return &[];
+        }
+        self.caps.get_or_init(|| caps)
+    }
+}
+
+/// What every render node was seen to decode. Pixel probes use readback,
+/// with a deadline for driver calls and a cooldown after empty results.
 pub fn capabilities() -> &'static [Capability] {
-    static CAPS: OnceLock<Vec<Capability>> = OnceLock::new();
-    CAPS.get_or_init(|| {
-        if !super::wanted(std::env::var("LATCH_LINUX_DECODER").ok().as_deref()) {
-            tracing::info!("VA-API decoding off (LATCH_LINUX_DECODER=software)");
+    static CACHE: CapabilityCache = CapabilityCache {
+        caps: OnceLock::new(),
+        retry_at: Mutex::new(None),
+    };
+    if !super::wanted(std::env::var("LATCH_LINUX_DECODER").ok().as_deref()) {
+        return &[];
+    }
+    CACHE.get(Instant::now(), || {
+        if STALLED.load(std::sync::atomic::Ordering::Acquire) {
             return Vec::new();
         }
         let (tx, rx) = std::sync::mpsc::channel();
@@ -814,12 +869,14 @@ pub fn capabilities() -> &'static [Capability] {
         if spawned.is_err() {
             return Vec::new();
         }
-        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        match rx.recv_timeout(Duration::from_secs(10)) {
             Ok(caps) => caps,
-            Err(_) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                STALLED.store(true, std::sync::atomic::Ordering::Release);
                 tracing::warn!("VA-API probe did not finish in 10 s; decoding in software");
                 Vec::new()
             }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
         }
     })
 }
@@ -861,7 +918,9 @@ fn probe() -> Vec<Capability> {
             };
             let result = (|| {
                 let device = Device::open(&node)?.context("the node went away")?;
-                let mut decoder = Vaapi::on(device, codec)?;
+                // Pixel validation always needs CPU planes, independent of the
+                // renderer's process-wide DMA-BUF presentation preference.
+                let mut decoder = Vaapi::on(device, codec, Output::Readback)?;
                 let frame = decoder.decode(bytes, true, None)?.context("no picture")?;
                 ensure!(
                     probe_picture_ok(&frame, width, height),
@@ -1038,6 +1097,44 @@ mod tests {
             .is::<super::super::HardwareFailed>());
         assert!(requests.try_recv().is_err());
         assert!(worker.rx.try_recv().unwrap().unwrap().is_some());
+    }
+
+    #[test]
+    fn probe_readback_ignores_renderer_exports() {
+        for enabled in [false, true] {
+            assert!(!Output::Readback.exports(enabled));
+            assert_eq!(Output::Presentation.exports(enabled), enabled);
+        }
+    }
+
+    #[test]
+    fn empty_capabilities_retry_after_the_cooldown() {
+        let cache = CapabilityCache::default();
+        let now = Instant::now();
+        assert!(cache.get(now, Vec::new).is_empty());
+        assert!(cache
+            .get(now + Duration::from_secs(29), || panic!("cooldown"))
+            .is_empty());
+        let caps = cache.get(now + Duration::from_secs(30), || {
+            vec![Capability {
+                codec: Codec::Hevc,
+                ten_bit: true,
+                node: "/dev/dri/renderD128".into(),
+                limit: Limit {
+                    profile: Profile::HevcMain10,
+                    max_width: 4096,
+                    max_height: 4096,
+                },
+            }]
+        });
+        assert_eq!(caps.len(), 1);
+        assert!(caps[0].ten_bit);
+        assert_eq!(
+            cache
+                .get(now + Duration::from_secs(60), || panic!("cached success"))
+                .len(),
+            1
+        );
     }
 
     /// Runs everywhere: without libva or a render node (CI, containers)

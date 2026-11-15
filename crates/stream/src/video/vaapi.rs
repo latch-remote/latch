@@ -9,7 +9,8 @@
 //! AV1 is not decoded here yet (it needs its sequence and frame headers
 //! parsed the same way).
 //!
-//! Each render node is probed once per process: the profiles, entry points,
+//! Successful probes are cached per process, with empty results retried after
+//! a cooldown. Each render node is checked for profiles, entry points,
 //! formats and largest pictures its driver reports, then a real picture of
 //! every codec it claims, decoded and checked against its expected pixels; only what
 //! passes is offered to hosts. Decoded pictures are exported as DMA-BUF planes when the EGL renderer
@@ -157,6 +158,7 @@ pub trait Backend {
         picture: &va::PictureParameterHevc,
         iq: Option<&va::IqMatrixHevc>,
         slices: &[(va::SliceHevc, &[u8])],
+        subsets: &[u32],
     ) -> Result<()>;
 }
 
@@ -470,6 +472,7 @@ mod tests {
         pub picture: va::PictureParameterHevc,
         pub iq: Option<va::IqMatrixHevc>,
         pub slices: Vec<(va::SliceHevc, Vec<u8>)>,
+        pub subsets: Vec<u32>,
     }
 
     /// A backend that keeps what it is given, and fails when told to.
@@ -512,12 +515,14 @@ mod tests {
             picture: &va::PictureParameterHevc,
             iq: Option<&va::IqMatrixHevc>,
             slices: &[(va::SliceHevc, &[u8])],
+            subsets: &[u32],
         ) -> Result<()> {
             anyhow::ensure!(!self.fail, "the device went away");
             self.hevc.push(HevcPicture {
                 target,
                 picture: *picture,
                 iq: iq.copied(),
+                subsets: subsets.to_vec(),
                 slices: slices.iter().map(|(s, d)| (*s, d.to_vec())).collect(),
             });
             Ok(())

@@ -29,6 +29,7 @@ pub const PICTURE_PARAMETER_BUFFER: i32 = 0;
 pub const IQ_MATRIX_BUFFER: i32 = 1;
 pub const SLICE_PARAMETER_BUFFER: i32 = 4;
 pub const SLICE_DATA_BUFFER: i32 = 5;
+pub const SUBSETS_PARAMETER_BUFFER: i32 = 57;
 
 pub const H264_INVALID: u32 = 0x01;
 pub const H264_SHORT_TERM_REFERENCE: u32 = 0x08;
@@ -378,10 +379,10 @@ pub fn bytes<T: Copy>(value: &T) -> BufferData<'_> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn slice(value: &[u8]) -> BufferData<'_> {
+pub fn slice<T: Copy>(value: &[T]) -> BufferData<'_> {
     BufferData {
         ptr: value.as_ptr().cast(),
-        len: value.len(),
+        len: std::mem::size_of_val(value),
         _lifetime: std::marker::PhantomData,
     }
 }
