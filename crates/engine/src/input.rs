@@ -58,6 +58,8 @@ impl DisplayRect {
 }
 
 pub trait InputSink: Send {
+    /// Select negotiated physical positions while preserving legacy injection.
+    fn set_key_positions(&mut self, _accepted: bool) {}
     /// Interrupt platform I/O when the stream is stopping.
     fn set_stopping(&mut self, _stopping: std::sync::Arc<std::sync::atomic::AtomicBool>) {}
 
@@ -161,11 +163,113 @@ impl Held {
     }
 }
 
-/// Windows virtual-key codes to other platforms' key codes.
+/// Windows virtual-key codes to native physical positions.
 pub mod keymap {
+    /// The set-1 scancode of a key on a US keyboard. The viewer sends keys by
+    /// position as US virtual-key codes, and games bind scancodes: mapping them
+    /// through the PC's own layout (French AZERTY turns A into scan 0x10, the
+    /// US Q) would move every binding. Sunshine uses the same fixed table.
+    pub fn us_scan(vk: u16) -> Option<u16> {
+        use latch_proto::keyboard::*;
+        const LETTERS: [u16; 26] = [
+            0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31,
+            0x18, 0x19, 0x10, 0x13, 0x1f, 0x14, 0x16, 0x2f, 0x11, 0x2d, 0x15, 0x2c,
+        ];
+        const NUMPAD: [u16; 10] = [0x52, 0x4f, 0x50, 0x51, 0x4b, 0x4c, 0x4d, 0x47, 0x48, 0x49];
+        const F13_TO_F24: [u16; 12] = [
+            0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x76,
+        ];
+        Some(match vk {
+            KEYPAD_ENTER => 0x1c,
+            KEYPAD_EQUAL => 0x59,
+            INTL_RO => 0x73,
+            INTL_YEN => 0x7d,
+            KANA => 0x70,
+            0x15 => 0x72,
+            0x19 => 0x71,
+            CONVERT | 0x1c => 0x79,
+            NON_CONVERT | 0x1d => 0x7b,
+            0xad => 0x20,
+            0xae => 0x2e,
+            0xaf => 0x30,
+            0xb0 => 0x19,
+            0xb1 => 0x10,
+            0xb2 => 0x24,
+            0xb3 => 0x22,
+            0x41..=0x5a => LETTERS[usize::from(vk - 0x41)],
+            0x31..=0x39 => vk - 0x31 + 0x02,
+            0x30 => 0x0b,
+            0x60..=0x69 => NUMPAD[usize::from(vk - 0x60)],
+            0x70..=0x79 => vk - 0x70 + 0x3b, // F1–F10
+            0x7a => 0x57,                    // F11
+            0x7b => 0x58,                    // F12
+            0x7c..=0x87 => F13_TO_F24[usize::from(vk - 0x7c)],
+            0x08 => 0x0e,               // Backspace
+            0x09 => 0x0f,               // Tab
+            0x0d => 0x1c,               // Enter
+            0x10 | 0xa0 => 0x2a,        // Shift, left Shift
+            0xa1 => 0x36,               // right Shift
+            0x11 | 0xa2 | 0xa3 => 0x1d, // Control (right is extended)
+            0x12 | 0xa4 | 0xa5 => 0x38, // Alt (right is extended)
+            0x13 => 0x45,               // Pause
+            0x14 => 0x3a,               // Caps Lock
+            0x1b => 0x01,               // Escape
+            0x20 => 0x39,               // Space
+            0x21 => 0x49,               // Page Up
+            0x22 => 0x51,               // Page Down
+            0x23 => 0x4f,               // End
+            0x24 => 0x47,               // Home
+            0x25 => 0x4b,               // Left
+            0x26 => 0x48,               // Up
+            0x27 => 0x4d,               // Right
+            0x28 => 0x50,               // Down
+            0x2c => 0x37,               // Print Screen
+            0x2d => 0x52,               // Insert
+            0x2e => 0x53,               // Delete
+            0x5b => 0x5b,               // left Windows
+            0x5c => 0x5c,               // right Windows
+            0x5d => 0x5d,               // Menu
+            0x6a => 0x37,               // numpad *
+            0x6b => 0x4e,               // numpad +
+            0x6c => 0x7e,               // numpad comma (Brazilian ABNT/JIS)
+            0x6d => 0x4a,               // numpad -
+            0x6e => 0x53,               // numpad .
+            0x6f => 0x35,               // numpad /
+            0x90 => 0x45,               // Num Lock
+            0x91 => 0x46,               // Scroll Lock
+            0xba => 0x27,               // ;
+            0xbb => 0x0d,               // =
+            0xbc => 0x33,               // ,
+            0xbd => 0x0c,               // -
+            0xbe => 0x34,               // .
+            0xbf => 0x35,               // /
+            0xc0 => 0x29,               // `
+            0xdb => 0x1a,               // [
+            0xdc => 0x2b,               // \
+            0xdd => 0x1b,               // ]
+            0xde => 0x28,               // '
+            0xe2 => 0x56,               // the key between left Shift and Z
+            _ => return None,
+        })
+    }
+    pub fn extended(vk: u16) -> bool {
+        matches!(vk, 0x21..=0x28 | 0x2c..=0x2e | 0x5b..=0x5d | 0x6f | 0x90 | 0xa3 | 0xa5 | 0xad..=0xb3 | latch_proto::keyboard::KEYPAD_ENTER)
+    }
     /// macOS virtual key code (`kVK_*`, Carbon `Events.h`) for a Windows VK.
     pub fn vk_to_mac(vk: u16) -> Option<u16> {
+        use latch_proto::keyboard::*;
         Some(match vk {
+            KEYPAD_ENTER => 0x4c,
+            KEYPAD_EQUAL => 0x51,
+            INTL_RO => 0x5e,
+            INTL_YEN => 0x5d,
+            KANA | CONVERT => 0x68,
+            NON_CONVERT | 0x19 => 0x66,
+            0x15 => 0x68,
+            0xe2 => 0x0a, // ISO section key
+            0xad => 0x4a, // mute
+            0xae => 0x49, // volume down
+            0xaf => 0x48, // volume up
             // Letters (ANSI layout)
             0x41 => 0x00, // A -> kVK_ANSI_A
             0x42 => 0x0B, // B -> kVK_ANSI_B
@@ -256,6 +360,7 @@ pub mod keymap {
             0x69 => 0x5C, // Keypad 9 -> kVK_ANSI_Keypad9
             0x6A => 0x43, // Multiply -> kVK_ANSI_KeypadMultiply
             0x6B => 0x45, // Add -> kVK_ANSI_KeypadPlus
+            0x6C => 0x5f, // JIS keypad comma
             0x6D => 0x4E, // Subtract -> kVK_ANSI_KeypadMinus
             0x6E => 0x41, // Decimal -> kVK_ANSI_KeypadDecimal
             0x6F => 0x4B, // Divide -> kVK_ANSI_KeypadDivide
@@ -304,7 +409,25 @@ pub mod keymap {
     /// The host layout and active group interpret these positions; never search
     /// for a US symbol in an arbitrary shift level of the host's map.
     pub fn vk_to_xkb_name(vk: u16) -> Option<[u8; 4]> {
+        use latch_proto::keyboard::*;
         Some(match vk {
+            KEYPAD_ENTER => *b"KPEN",
+            KEYPAD_EQUAL => *b"KPEQ",
+            INTL_RO => *b"AB11",
+            INTL_YEN => *b"AE13",
+            KANA => *b"HKTG",
+            CONVERT | 0x1c => *b"HENK",
+            NON_CONVERT | 0x1d => *b"MUHE",
+            0x15 => *b"HNGL",
+            0x19 => *b"HJCV",
+            0xe2 => *b"LSGT",
+            0xad => *b"MUTE",
+            0xae => *b"VOL-",
+            0xaf => *b"VOL+",
+            0xb0 => *b"I171", // evdev KEY_NEXTSONG + 8
+            0xb1 => *b"I173", // KEY_PREVIOUSSONG + 8
+            0xb2 => *b"I174", // KEY_STOPCD + 8
+            0xb3 => *b"I172", // KEY_PLAYPAUSE + 8
             0x08 => *b"BKSP",
             0x09 => *b"TAB\0",
             0x0C => *b"KP5\0",
@@ -331,7 +454,7 @@ pub mod keymap {
             0x5D => *b"MENU",
             0x6A => *b"KPMU",
             0x6B => *b"KPAD",
-            0x6C => *b"KPCO",
+            0x6C => *b"I129", // evdev keypad comma
             0x6D => *b"KPSU",
             0x6E => *b"KPDL",
             0x6F => *b"KPDV",
@@ -479,7 +602,28 @@ pub mod keymap {
     /// the physical key [`vk_to_xkb_name`] names: what the RemoteDesktop
     /// portal and uinput take. XKB's `evdev` keycodes are these plus 8.
     pub fn vk_to_evdev(vk: u16) -> Option<u16> {
-        vk_to_xkb_name(vk).and_then(xkb_name_to_evdev)
+        use latch_proto::keyboard::*;
+        match vk {
+            KEYPAD_ENTER => Some(96),
+            KEYPAD_EQUAL => Some(117),
+            INTL_RO => Some(89),
+            INTL_YEN => Some(124),
+            KANA => Some(93),
+            CONVERT | 0x1c => Some(92),
+            NON_CONVERT | 0x1d => Some(94),
+            0x15 => Some(122),
+            0x19 => Some(123),
+            0xe2 => Some(86),
+            0x6c => Some(121),
+            0xad => Some(113),
+            0xae => Some(114),
+            0xaf => Some(115),
+            0xb0 => Some(163),
+            0xb1 => Some(165),
+            0xb2 => Some(166),
+            0xb3 => Some(164),
+            _ => vk_to_xkb_name(vk).and_then(xkb_name_to_evdev),
+        }
     }
 
     fn xkb_name_to_evdev(name: [u8; 4]) -> Option<u16> {
@@ -560,6 +704,27 @@ pub mod keymap {
     mod tests {
         use super::*;
         use std::collections::HashMap;
+
+        #[test]
+        fn shared_physical_maps_cover_all_viewers_and_function_keys() {
+            for case in latch_proto::keyboard::CASES {
+                let name = vk_to_xkb_name(case.vk).unwrap();
+                assert_eq!(
+                    std::str::from_utf8(&name).unwrap().trim_end_matches('\0'),
+                    case.xkb
+                );
+                assert_eq!(vk_to_mac(case.vk), case.mac);
+                assert_eq!(vk_to_evdev(case.vk), Some(case.linux - 8));
+            }
+            for vk in 0x7c..=0x87 {
+                assert!(vk_to_xkb_name(vk).is_some());
+                assert_eq!(vk_to_mac(vk).is_some(), vk <= 0x83);
+            }
+            for vk in 0x60..=0x6f {
+                assert!(vk_to_xkb_name(vk).is_some(), "{vk:#x}");
+                assert!(vk_to_mac(vk).is_some(), "{vk:#x}");
+            }
+        }
 
         #[test]
         fn every_named_key_has_its_linux_code() {
@@ -674,6 +839,7 @@ pub mod keymap {
             // 2. (VK_CONTROL, VK_LCONTROL) -> kVK_Control (0x3B)
             // 3. (VK_MENU, VK_LMENU) -> kVK_Option (0x3A)
             // 4. (VK_INSERT, VK_HELP) -> kVK_Help (0x72)
+            // 5. Korean/JIS language controls use Mac Kana/Eisu positions.
             let mut mac_to_vks: HashMap<u16, Vec<u16>> = HashMap::new();
             for vk in 0..=512 {
                 if let Some(mac) = vk_to_mac(vk) {
@@ -688,6 +854,14 @@ pub mod keymap {
                         0x3B => vks == [0x11, 0xA2], // VK_CONTROL, VK_LCONTROL
                         0x3A => vks == [0x12, 0xA4], // VK_MENU, VK_LMENU
                         0x72 => vks == [0x2D, 0x2F], // VK_INSERT, VK_HELP
+                        0x68 => {
+                            vks == [
+                                0x15,
+                                latch_proto::keyboard::KANA,
+                                latch_proto::keyboard::CONVERT,
+                            ]
+                        }
+                        0x66 => vks == [0x19, latch_proto::keyboard::NON_CONVERT],
                         _ => false,
                     };
                     assert!(

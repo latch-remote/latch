@@ -73,6 +73,7 @@ pub const HELPER_ARG: &str = "--input-helper";
 pub const DIR: &str = r"Latch\Input";
 /// Both ends say this first; a different build's helper is refused.
 const HELLO: &[u8; 8] = b"LATCHIN1";
+const HELLO2: &[u8; 8] = b"LATCHIN2";
 /// A request: the display rectangle, then one event, at most a text event.
 const MAX_REQUEST: usize = 16 + 2 + latch_proto::input::MAX_TEXT;
 /// The helper exits once no stream has used it for this long.
@@ -234,6 +235,44 @@ pub(super) fn own_integrity() -> u32 {
     own_token().and_then(|t| integrity(&t)).unwrap_or(MEDIUM)
 }
 
+fn helper_event(
+    event: &Event,
+    key_positions: bool,
+    held: &mut std::collections::BTreeSet<u16>,
+) -> Option<Event> {
+    match event {
+        Event::Key {
+            vk,
+            down,
+            modifiers,
+        } if !key_positions => {
+            let target = latch_proto::keyboard::helper_legacy(*vk)?;
+            if *down {
+                held.insert(*vk);
+            } else {
+                held.remove(vk);
+                if held
+                    .iter()
+                    .any(|&source| latch_proto::keyboard::helper_legacy(source) == Some(target))
+                {
+                    return None;
+                }
+            }
+            Some(Event::Key {
+                vk: target,
+                down: *down,
+                modifiers: *modifiers,
+            })
+        }
+        Event::UnknownPosition { .. } => None,
+        Event::ReleaseAll => {
+            held.clear();
+            Some(Event::ReleaseAll)
+        }
+        _ => Some(event.clone()),
+    }
+}
+
 fn encode(event: &Event, display: DisplayRect) -> Vec<u8> {
     let mut out = vec![0, 0];
     out.extend(display.x.to_le_bytes());
@@ -365,11 +404,14 @@ fn serve() -> Result<()> {
 
 /// One stream's input until it closes the pipe. Dropping `local` lets go
 /// of whatever this stream still holds.
-fn serve_client(mut pipe: File) -> Result<()> {
+fn serve_client(mut pipe: impl Read + Write) -> Result<()> {
     let mut hello = [0; HELLO.len()];
     pipe.read_exact(&mut hello)?;
-    ensure!(&hello == HELLO, "a different Latch build asked for input");
-    pipe.write_all(HELLO)?;
+    ensure!(
+        &hello == HELLO || &hello == HELLO2,
+        "a different Latch build asked for input"
+    );
+    pipe.write_all(&hello)?;
     let mut local = Local::default();
     let mut buf = [0u8; MAX_REQUEST];
     loop {
@@ -380,8 +422,10 @@ fn serve_client(mut pipe: File) -> Result<()> {
         let len = usize::from(u16::from_le_bytes(len));
         ensure!(len <= MAX_REQUEST, "input request too long");
         pipe.read_exact(&mut buf[..len])?;
-        let (event, display) = decode(&buf[..len])?;
-        let reply = match local.apply(&event, display) {
+        // Framing is length-delimited. An unsupported message gets an error
+        // reply while later requests can still release keys and inject input.
+        let result = decode(&buf[..len]).and_then(|(event, display)| local.apply(&event, display));
+        let reply = match result {
             Ok(()) => vec![0],
             Err(e) => {
                 let mut message = format!("{e:#}").into_bytes();
@@ -399,10 +443,23 @@ fn serve_client(mut pipe: File) -> Result<()> {
 /// The host's end of the pipe.
 pub(super) struct Client {
     pipe: File,
+    key_positions: bool,
+    legacy_held: std::collections::BTreeSet<u16>,
 }
 
 impl Client {
     fn connect(session: u32, expected: &std::path::Path) -> Result<Self> {
+        // An old helper closes an unrecognised handshake. Reopen its pipe
+        // using v1, validating server identity on both connections.
+        Self::connect_version(session, expected, HELLO2)
+            .or_else(|_| Self::connect_version(session, expected, HELLO))
+    }
+
+    fn connect_version(
+        session: u32,
+        expected: &std::path::Path,
+        version: &[u8; 8],
+    ) -> Result<Self> {
         let mut pipe = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -418,14 +475,18 @@ impl Client {
             image.display(),
             expected.display()
         );
-        pipe.write_all(HELLO)?;
+        pipe.write_all(version)?;
         let mut hello = [0; HELLO.len()];
         pipe.read_exact(&mut hello)?;
         ensure!(
-            &hello == HELLO,
+            &hello == version,
             "the input helper is a different Latch build"
         );
-        Ok(Self { pipe })
+        Ok(Self {
+            pipe,
+            key_positions: &hello == HELLO2,
+            legacy_held: Default::default(),
+        })
     }
 
     /// The outer error is the pipe's (the helper is gone); the inner one
@@ -435,7 +496,10 @@ impl Client {
         event: &Event,
         display: DisplayRect,
     ) -> std::io::Result<Result<()>> {
-        self.pipe.write_all(&encode(event, display))?;
+        let Some(event) = helper_event(event, self.key_positions, &mut self.legacy_held) else {
+            return Ok(Ok(()));
+        };
+        self.pipe.write_all(&encode(&event, display))?;
         let mut status = [0];
         self.pipe.read_exact(&mut status)?;
         match status[0] {
@@ -536,6 +600,114 @@ fn start_task() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v1_aliases_release_only_after_both_sources_and_unknowns_stay_local() {
+        let mut held = Default::default();
+        let key = |vk, down| Event::Key {
+            vk,
+            down,
+            modifiers: 0,
+        };
+        assert!(helper_event(&key(0x0d, true), false, &mut held).is_some());
+        assert!(helper_event(
+            &key(latch_proto::keyboard::KEYPAD_ENTER, true),
+            false,
+            &mut held
+        )
+        .is_some());
+        assert!(helper_event(&key(0x0d, false), false, &mut held).is_none());
+        assert_eq!(
+            helper_event(
+                &key(latch_proto::keyboard::KEYPAD_ENTER, false),
+                false,
+                &mut held
+            ),
+            Some(key(0x0d, false))
+        );
+        assert!(held.is_empty());
+        assert!(helper_event(
+            &Event::UnknownPosition {
+                usage: 0xffff,
+                down: true,
+                modifiers: 0
+            },
+            false,
+            &mut held
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn v1_helper_receives_only_legacy_keys_and_v2_advertises_positions() {
+        let display = DisplayRect::default();
+        for case in latch_proto::keyboard::CASES {
+            let event = Event::Key {
+                vk: case.vk,
+                down: true,
+                modifiers: case.mask,
+            };
+            let old = encode(
+                &helper_event(&event, false, &mut Default::default()).unwrap(),
+                display,
+            );
+            assert_eq!(old[18], 4);
+            assert_eq!(
+                decode(&old[2..]).unwrap().0,
+                helper_event(&event, false, &mut Default::default()).unwrap()
+            );
+            let new = encode(
+                &helper_event(&event, true, &mut Default::default()).unwrap(),
+                display,
+            );
+            assert_eq!(
+                new[18],
+                if latch_proto::keyboard::position(case.vk).is_some() {
+                    8
+                } else {
+                    4
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn both_handshakes_work_and_unknown_requests_leave_pipe_usable() {
+        struct Pipe {
+            input: std::io::Cursor<Vec<u8>>,
+            output: Vec<u8>,
+        }
+        impl Read for Pipe {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.input.read(buf)
+            }
+        }
+        impl Write for Pipe {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.output.extend(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for hello in [HELLO, HELLO2] {
+            let mut bytes = hello.to_vec();
+            bytes.extend(17u16.to_le_bytes());
+            bytes.extend([0; 16]);
+            bytes.push(99);
+            bytes.extend(encode(&Event::ReleaseAll, DisplayRect::default()));
+            let mut pipe = Pipe {
+                input: std::io::Cursor::new(bytes),
+                output: Vec::new(),
+            };
+            serve_client(&mut pipe).unwrap();
+            assert_eq!(&pipe.output[..8], hello);
+            assert_eq!(pipe.output[8], 1);
+            let error_len = u16::from_le_bytes([pipe.output[9], pipe.output[10]]) as usize;
+            assert_eq!(pipe.output[11 + error_len], 0);
+        }
+    }
 
     #[test]
     fn requests_round_trip_and_reject_extra_bytes() {
