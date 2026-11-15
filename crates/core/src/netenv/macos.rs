@@ -2,6 +2,7 @@
 use super::proxy::{destination_url, Proxy, ProxyDiscovery, ProxySource};
 use std::ffi::{c_char, c_void};
 use std::ptr;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 type Ref = *const c_void;
@@ -41,9 +42,9 @@ extern "C" {
 struct ClientContext {
     version: isize,
     info: *mut c_void,
-    retain: Option<unsafe extern "C" fn(*const c_void) -> *const c_void>,
-    release: Option<unsafe extern "C" fn(*const c_void)>,
-    copy_description: Option<unsafe extern "C" fn(*const c_void) -> Ref>,
+    retain: Option<unsafe extern "C" fn(*mut c_void) -> *mut c_void>,
+    release: Option<unsafe extern "C" fn(*mut c_void)>,
+    copy_description: Option<unsafe extern "C" fn(*mut c_void) -> Ref>,
 }
 #[link(name = "CFNetwork", kind = "framework")]
 extern "C" {
@@ -118,20 +119,32 @@ struct PacResult {
     completed: bool,
     proxies: Option<Owned>,
 }
+// The callback supplies an immutable proxy array retained with CFRetain. It can
+// be transferred between threads, with all access serialized by the mutex.
+unsafe impl Send for PacResult {}
+
+unsafe extern "C" fn retain_pac(info: *mut c_void) -> *mut c_void {
+    Arc::increment_strong_count(info.cast::<Mutex<PacResult>>());
+    info
+}
+unsafe extern "C" fn release_pac(info: *mut c_void) {
+    drop(Arc::from_raw(info.cast::<Mutex<PacResult>>()));
+}
 unsafe extern "C" fn pac_callback(info: *mut c_void, proxies: Ref, _error: Ref) {
-    let result = &mut *info.cast::<PacResult>();
-    result.completed = true;
-    if !proxies.is_null() {
-        result.proxies = Some(Owned(CFRetain(proxies)));
+    if let Ok(mut result) = (*info.cast::<Mutex<PacResult>>()).lock() {
+        result.completed = true;
+        if !proxies.is_null() {
+            result.proxies = Some(Owned(CFRetain(proxies)));
+        }
     }
 }
 unsafe fn evaluate(pac: Ref, script: bool, target: Ref, deadline: Instant) -> Option<Owned> {
-    let result = Box::into_raw(Box::new(PacResult::default()));
+    let result = Arc::new(Mutex::new(PacResult::default()));
     let mut context = ClientContext {
         version: 0,
-        info: result.cast(),
-        retain: None,
-        release: None,
+        info: Arc::as_ptr(&result).cast_mut().cast(),
+        retain: Some(retain_pac),
+        release: Some(release_pac),
         copy_description: None,
     };
     let source = Owned(if script {
@@ -140,14 +153,13 @@ unsafe fn evaluate(pac: Ref, script: bool, target: Ref, deadline: Instant) -> Op
         CFNetworkExecuteProxyAutoConfigurationURL(pac, target, pac_callback, &mut context)
     });
     if source.0.is_null() {
-        drop(Box::from_raw(result));
         return None;
     }
     let run_loop = CFRunLoopGetCurrent();
     CFRunLoopAddSource(run_loop, source.0, kCFRunLoopDefaultMode);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if (*result).completed || remaining.is_zero() {
+        if result.lock().unwrap().completed || remaining.is_zero() {
             break;
         }
         let status = CFRunLoopRunInMode(kCFRunLoopDefaultMode, remaining.as_secs_f64(), true);
@@ -155,11 +167,14 @@ unsafe fn evaluate(pac: Ref, script: bool, target: Ref, deadline: Instant) -> Op
             break;
         } // Finished or stopped.
     }
-    // Invalidate before freeing the boxed callback state. CFNetwork provides
-    // no public guarantee that its JavaScript worker stops on invalidation.
+    // CFNetwork delivers the callback on this run loop. Invalidation cancels
+    // delivery, while the context retain/release callbacks keep state alive
+    // for any native work still holding it after the deadline.
     CFRunLoopSourceInvalidate(source.0);
     CFRunLoopRemoveSource(run_loop, source.0, kCFRunLoopDefaultMode);
-    Box::from_raw(result).proxies
+    drop(source);
+    let proxies = result.lock().unwrap().proxies.take();
+    proxies
 }
 
 unsafe fn number(settings: Ref, key: &str) -> i32 {
@@ -396,6 +411,22 @@ pub(super) fn proxies(host: &str, deadline: Instant) -> ProxyDiscovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_context_retains_state_until_its_release() {
+        let result = Arc::new(Mutex::new(PacResult::default()));
+        let weak = Arc::downgrade(&result);
+        let info = Arc::as_ptr(&result).cast_mut().cast();
+        unsafe {
+            retain_pac(info);
+            drop(result);
+            assert!(weak.upgrade().is_some());
+            pac_callback(info, ptr::null(), ptr::null());
+            assert!(weak.upgrade().unwrap().lock().unwrap().completed);
+            release_pac(info);
+        }
+        assert!(weak.upgrade().is_none());
+    }
+
     #[test]
     fn keychain_username_never_becomes_empty_password_auth() {
         let mut warnings = Vec::new();
