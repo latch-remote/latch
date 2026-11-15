@@ -14,37 +14,69 @@ use std::{
     ptr,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
+    time::Duration,
 };
 
 pub const UNAVAILABLE: &str = "Mac host controllers unavailable. Apple requires entitlement com.apple.developer.hid.virtual.device and Apple-authorized signing. Ad-hoc Latch builds cannot create virtual controllers. See docs/MACOS.md.";
 
+const CREATE_ON_ACTIVATE: u32 = 1 << 0;
+static CAPABILITY: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+
 pub fn open(feedback: FeedbackFn) -> Result<Opened> {
-    // Exercise both layouts and bound the advertised capacity by devices the
-    // OS permits concurrently. Every temporary Create reference is released.
-    drop(device(0, PadKind::PlayStation, 0)?);
-    let slots = probe_slots(|slot| device(slot, PadKind::Xbox, 0))?;
-    let mut opened = Pads::opened(Bus, feedback);
-    opened.slots = slots;
-    Ok(opened)
+    capability(&CAPABILITY, || {
+        // CreateOnActivate may defer the kernel's entitlement check. Check the
+        // effective signing entitlement first, then create one inactive object.
+        ensure!(has_entitlement(), UNAVAILABLE);
+        probe_inactive(|options| device(0, PadKind::Xbox, options))
+    })?;
+    // Pads::opened allocates slots only. Actual devices are published by plug.
+    Ok(Pads::opened(Bus, feedback))
 }
 
-fn probe_slots<T>(mut create: impl FnMut(u8) -> Result<T>) -> Result<u8> {
-    let mut devices = vec![create(0)?];
-    for slot in 1..latch_proto::gamepad::MAX_PADS as u8 {
-        match create(slot) {
-            Ok(device) => devices.push(device),
-            Err(_) => break,
-        }
+fn capability(
+    cached: &OnceLock<std::result::Result<(), String>>,
+    probe: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    cached
+        .get_or_init(|| probe().map_err(|error| error.to_string()))
+        .clone()
+        .map_err(anyhow::Error::msg)
+}
+
+fn probe_inactive<T>(create: impl FnOnce(u32) -> Result<T>) -> Result<()> {
+    drop(create(CREATE_ON_ACTIVATE)?);
+    Ok(())
+}
+
+fn has_entitlement() -> bool {
+    // SAFETY: Security returns owned CF references. Only Boolean true grants
+    // capability, including builds whose profile strips an unauthorized key.
+    unsafe {
+        let Ok(task) = Owned::new(SecTaskCreateFromSelf(ptr::null())) else {
+            return false;
+        };
+        let key = string("com.apple.developer.hid.virtual.device");
+        let Ok(value) = Owned::new(SecTaskCopyValueForEntitlement(
+            task.0,
+            key.0,
+            ptr::null_mut(),
+        )) else {
+            return false;
+        };
+        CFGetTypeID(value.0) == CFBooleanGetTypeID() && CFBooleanGetValue(value.0)
     }
-    Ok(devices.len() as u8)
+}
+
+fn wait_for_cancel(receiver: &std::sync::mpsc::Receiver<()>, timeout: Duration) -> bool {
+    receiver.recv_timeout(timeout).is_ok()
 }
 
 struct Bus;
 struct Target {
     device: Option<Owned>,
-    _queue: DispatchRetained<DispatchQueue>,
+    queue: Option<DispatchRetained<DispatchQueue>>,
     kind: PadKind,
     state: Arc<Mutex<Vec<u8>>>,
     stopped: Arc<AtomicBool>,
@@ -59,9 +91,12 @@ impl Drop for Target {
             // owns the Create reference until all in-flight callbacks finish.
             unsafe { IOHIDUserDeviceCancel(device.0) };
             std::mem::forget(device);
-            // Apple's cancellation completion follows every output callback
-            // and releases the kernel device. A takeover must wait for it.
-            let _ = self.cancelled.recv();
+            // If IOKit wedges, retain the queue and the callback-owned Create
+            // reference. A late cancellation can still safely release it.
+            if !wait_for_cancel(&self.cancelled, Duration::from_secs(2)) {
+                tracing::warn!("virtual controller cancellation timed out or disconnected; retaining device and queue to avoid blocking teardown");
+                std::mem::forget(self.queue.take());
+            }
         }
     }
 }
@@ -75,8 +110,7 @@ fn string(s: &str) -> Owned {
 }
 
 fn device(slot: u8, kind: PadKind, options: u32) -> Result<Owned> {
-    // Distinct identities keep temporary capacity probes separate from pads
-    // created later for the session and avoid consumers reusing stale state.
+    // Distinct identities avoid consumers reusing a previous pad's state.
     static NEXT_DEVICE: AtomicU32 = AtomicU32::new(0x4c410000);
     let identity = NEXT_DEVICE.fetch_add(1, Ordering::Relaxed);
     let descriptor = reports::descriptor(kind);
@@ -90,7 +124,7 @@ fn device(slot: u8, kind: PadKind, options: u32) -> Result<Owned> {
         ("VendorID", ffi::number(vendor)),
         ("ProductID", ffi::number(product)),
         ("Product", string("Latch remote controller")),
-        ("Transport", string("USB")),
+        ("Transport", string(reports::transport(kind))),
         (
             "SerialNumber",
             string(&format!("latch-{}-{identity}-{slot}", std::process::id())),
@@ -105,7 +139,8 @@ fn device(slot: u8, kind: PadKind, options: u32) -> Result<Owned> {
         .collect();
     let properties = ffi::dictionary(&entries);
     // SAFETY: the immutable dictionary contains a valid HID descriptor.
-    // No dispatch queue is attached to this probe, so CFRelease destroys it.
+    // Callers use CreateOnActivate, so creation never publishes a device.
+    // The probe releases its inactive object. plug installs callbacks first.
     let raw = unsafe { IOHIDUserDeviceCreateWithProperties(ptr::null(), properties.0, options) };
     ensure!(!raw.is_null(), UNAVAILABLE);
     Owned::new(raw)
@@ -121,7 +156,6 @@ impl VirtualBus for Bus {
 
     fn plug(&mut self, slot: u8, kind: PadKind, feedback: FeedbackFn) -> Result<Target> {
         // Defer kernel publication until get/set handlers are registered.
-        const CREATE_ON_ACTIVATE: u32 = 1;
         let device = device(slot, kind, CREATE_ON_ACTIVATE)?;
         let queue = DispatchQueue::new("app.latch.virtual-pad", None);
         let state = Arc::new(Mutex::new(reports::input(kind, &PadState::default())));
@@ -185,7 +219,7 @@ impl VirtualBus for Bus {
         }
         Ok(Target {
             device: Some(device),
-            _queue: queue,
+            queue: Some(queue),
             kind,
             state,
             stopped,
@@ -209,6 +243,12 @@ impl VirtualBus for Bus {
             "submit virtual controller report",
         )
     }
+}
+
+#[link(name = "Security", kind = "framework")]
+extern "C" {
+    fn SecTaskCreateFromSelf(allocator: Ref) -> Ref;
+    fn SecTaskCopyValueForEntitlement(task: Ref, key: Ref, error: *mut Ref) -> Ref;
 }
 
 extern "C" {
@@ -239,6 +279,9 @@ extern "C" {
 }
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
+    fn CFGetTypeID(value: Ref) -> usize;
+    fn CFBooleanGetTypeID() -> usize;
+    fn CFBooleanGetValue(value: Ref) -> bool;
     fn CFStringCreateWithBytes(
         allocator: Ref,
         bytes: *const u8,
@@ -253,27 +296,47 @@ extern "C" {
 mod tests {
     use super::*;
     #[test]
-    fn capability_probe_counts_concurrent_slots_and_drops_all_devices() {
-        use std::sync::atomic::AtomicUsize;
-        struct Device(Arc<AtomicUsize>);
-        impl Drop for Device {
+    fn probe_creates_one_inactive_object_and_releases_it() {
+        struct Inactive<'a>(&'a std::cell::Cell<usize>);
+        impl Drop for Inactive<'_> {
             fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::SeqCst);
+                self.0.set(self.0.get() + 1);
             }
         }
-        let live = Arc::new(AtomicUsize::new(0));
-        assert_eq!(
-            probe_slots(|slot| {
-                assert_eq!(live.load(Ordering::SeqCst), slot as usize);
-                anyhow::ensure!(slot < 3, "capacity exhausted");
-                live.fetch_add(1, Ordering::SeqCst);
-                Ok(Device(live.clone()))
-            })
-            .unwrap(),
-            3
-        );
-        assert_eq!(live.load(Ordering::SeqCst), 0);
-        assert!(probe_slots::<Device>(|_| anyhow::bail!(UNAVAILABLE)).is_err());
+        let created = std::cell::Cell::new(0);
+        let released = std::cell::Cell::new(0);
+        probe_inactive(|options| {
+            assert_eq!(options, 1 << 0); // IOHIDUserDeviceOptionsCreateOnActivate
+            created.set(created.get() + 1);
+            Ok(Inactive(&released))
+        })
+        .unwrap();
+        assert_eq!((created.get(), released.get()), (1, 1));
+    }
+    #[test]
+    fn capability_is_probed_once_including_denial() {
+        for available in [true, false] {
+            let cached = OnceLock::new();
+            let probes = std::cell::Cell::new(0);
+            for _ in 0..5 {
+                let result = capability(&cached, || {
+                    probes.set(probes.get() + 1);
+                    ensure!(available, UNAVAILABLE);
+                    Ok(())
+                });
+                assert_eq!(result.is_ok(), available);
+            }
+            assert_eq!(probes.get(), 1);
+        }
+    }
+    #[test]
+    fn cancellation_wait_is_bounded_and_accepts_late_completion() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        assert!(!wait_for_cancel(&rx, Duration::from_millis(5)));
+        tx.send(()).unwrap();
+        assert!(wait_for_cancel(&rx, Duration::from_millis(5)));
+        drop(tx);
+        assert!(!wait_for_cancel(&rx, Duration::from_millis(5)));
     }
     #[test]
     fn native_creation_is_capability_gated_and_releases_every_pad() {

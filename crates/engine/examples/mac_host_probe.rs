@@ -13,9 +13,13 @@ fn main() -> anyhow::Result<()> {
     };
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
         fn CGMainDisplayID() -> u32;
         fn CGDisplayBounds(id: u32) -> objc2_core_foundation::CGRect;
     }
+    // SAFETY: preflight only reads permission and never requests a grant.
+    let screen_recording = unsafe { CGPreflightScreenCaptureAccess() };
+    println!("Screen Recording preflight: {screen_recording}");
     // SAFETY: these only query the current display geometry.
     let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
     let display = latch_engine::input::DisplayRect {
@@ -65,6 +69,15 @@ fn main() -> anyhow::Result<()> {
                 pads.sink.unplug_all();
             }
             Err(error) => println!("{error}"),
+        }
+        // Recheck on the actual capture worker after AppKit/run-loop startup.
+        let screen_recording = unsafe { CGPreflightScreenCaptureAccess() };
+        println!("Screen Recording preflight on capture worker: {screen_recording}");
+        if !screen_recording {
+            println!(
+                "Screen Recording permission is missing for this process; real capture skipped"
+            );
+            return Ok(());
         }
         let mut video = match mac::open_video(&VideoConfig {
             color: Default::default(),
@@ -120,7 +133,7 @@ fn main() -> anyhow::Result<()> {
             "failed to restore composition"
         );
         println!(
-            "30 real SCK/VideoToolbox frames, separate cursor and composition toggled successfully"
+            "30 real SCK/VideoToolbox frames; cursor controls and composition restoration succeeded (visible=false uses composited fallback)"
         );
         Ok(())
     })

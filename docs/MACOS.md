@@ -200,31 +200,40 @@ zero controller slots and show the virtual-HID entitlement restriction.
 
 ### Mac host virtual controllers
 
-The host probes `IOHIDUserDeviceCreateWithProperties` before accepting
-controllers. A denied probe advertises zero slots and sends `gamepad_problem`
-in the existing Accept. The viewer shows **Controllers unavailable** and the
-reason, with a persistent warning when a controller is connected. Accessibility
+The host checks its effective virtual-HID entitlement and probes one inactive
+`IOHIDUserDeviceCreateWithProperties` object with `CreateOnActivate` before
+accepting controllers. The result is cached for the process. The probe never
+activates or publishes a kernel device. A denied probe advertises zero slots
+and sends `gamepad_problem` in the existing Accept. When a controller is
+connected, the viewer shows **Controllers unavailable** and a persistent
+warning with the reason. Accessibility
 and Screen Recording grants do not authorize virtual HID creation.
 
 The backend uses Rust FFI to IOKit/CoreFoundation and existing dispatch/block
 bindings. It stages Xbox-style HID and wired DS4 descriptors, normalized
-buttons/sticks/triggers, concurrent slot probing up to the protocol limit of
-16, connect/replacement/disconnect, cancellation on session teardown and
-output-report motor/light mapping. Generic pads use the Xbox layout. Native
-motion/touch sensors and device-specific feature reports are unimplemented.
+buttons/sticks/triggers, up to the protocol limit of 16 lazy slots,
+connect/replacement/disconnect, bounded cancellation on session teardown and
+output-report motor/light mapping. A device is activated only when a viewer
+pad connects. If cancellation fails to complete within two seconds, teardown
+logs the failure and retains its reference and queue for safe late completion.
+Generic pads use the Xbox layout. Native motion/touch sensors and device-specific feature reports are unimplemented.
 Descriptor/report, feedback and lifecycle tests establish byte conversion and
 cleanup. GameController, SDL and Steam compatibility still requires a real
 created device and application testing.
 
 #### Signing required to enable native pads
 
-1. Ask Apple Developer Support to authorize the Boolean entitlement
-   `com.apple.developer.hid.virtual.device` for Latch's user-space
-   `IOHIDUserDevice` controller emulation and Developer ID distribution.
-   Include the bundle identifier and Apple developer team, the personal
-   remote-streaming use case and the need for GameController/HID consumer
-   compatibility. Confirm that Apple can issue the authorization and any
-   required provisioning profile for this distribution method.
+1. Request the Boolean entitlement `com.apple.developer.hid.virtual.device`
+   through Apple's DriverKit/System Extension entitlement request form.
+   Apple's current entitlement documentation describes it as “A Boolean value
+   that indicates whether the driver creates a virtual HID device.” Apple
+   documents this for driver use and may grant it only to DriverKit drivers.
+   Authorization for a user-space `IOHIDUserDevice` app may never be available.
+   Include Latch's bundle identifier and Apple developer team, the user-space
+   controller emulation and Developer ID distribution method, and ask Apple
+   to confirm eligibility. Approved capability authorization must reach the
+   App ID and matching provisioning profile. The request form requires Apple
+   Developer sign-in. [Apple request form](https://developer.apple.com/contact/request/system-extension/)
 2. After approval, sign the actual host executable with the authorized
    Developer ID Application identity and entitlement. Add the approved key to
    the non-ad-hoc entitlement plist in `scripts/bundle-macos.sh`, embed the
@@ -258,7 +267,8 @@ claiming the virtual-HID entitlement also exited with signal 9 before main.
 No virtual device was created or left connected. GameController enumerated
 zero controllers. SDL/Steam visibility and rumble could not be tested without
 creation. Root case not tested because `sudo -n true` required a password.
-No privacy permissions or system settings were changed.
+No privacy permissions or system settings were changed. The root case remains
+untested, including for the revised capability probe.
 
 The committed Rust probe checks the actual backend and real cursor capture,
 with bounded device/frame lifetimes and no service or input injection. It
@@ -275,26 +285,41 @@ A viewer that offers `cursor` receives the system image and visibility through
 the existing cursor controls. In free mode the pointer follows local mouse
 movement while ScreenCaptureKit uses `showsCursor = false`. Captured relative
 mode requests composition, allowing games to control pointer hiding as before.
-Older viewers retain composition. If AppKit cannot read the shape or the main
-queue stops answering, capture restores composition and sends `visible = false`
-to suppress the local plane. A later readable sample restores separate drawing.
+Older viewers retain composition. A hidden visibility reading, an off-display
+pointer, an unreadable/empty shape or a main queue stalled for 250 ms restores
+composition and sends `visible = false` after SCK confirms the change. The
+legacy visibility API's hidden reading is treated as untrusted, even when the
+shape remains readable. SCK then decides whether an application intentionally
+hid the pointer, preserving the composited behaviour of earlier releases.
+Fallback is latched for the capture lifetime, preventing flapping observations
+from repeatedly reconfiguring SCK and requesting keyframes. A capture restart
+clears pending samples and old geometry before sampling the new display. If a
+configuration change fails, the last readable local shape remains enabled
+until composition is confirmed.
 The background host pumps its main run loop while the HTTP service runs on a
 worker, so AppKit sampling also works through the installed service entry point.
 
 `NSCursor.currentSystemCursor` supplies the current system image and hotspot,
-including other applications' cursors. The image is rendered into premultiplied
+including other applications' cursors. This API returned fresh cursor/image
+identities even for an unchanged pointer on the tested Mac. Shape checks run
+at most 30 Hz and compare source bitmap bytes, format, point size, hotspot,
+backing scale and display/encoded geometry before rasterization or base64
+encoding. Per-frame work reads position and visibility. A proposed image
+rectangle at least as large as the backing-scale artwork selects the Retina
+representation before the image is rendered into premultiplied
 sRGB RGBA, converted to straight alpha and scaled from desktop points into
 encoded-picture pixels using the selected display's geometry and aspect fit.
 That accounts for Retina displays and display-specific scale differences. The
 existing protocol bounds the resulting image to 96×96 and rescales the hotspot.
-The cursor is hidden outside the captured display and when its alpha is empty.
+Outside the captured display or with empty alpha, capture uses composition.
 System-wide hidden state uses the exported public `CGCursorIsVisible` function.
 Apple deprecated that visibility API in macOS 10.9 and provides no AppKit
 replacement, so future macOS visibility behaviour needs continued verification.
 The system-image getter is also marked for future deprecation in the current
 SDK. [Apple system cursor API](https://developer.apple.com/documentation/appkit/nscursor/currentsystem)
 
-On the local Apple M3 Pro running macOS 26.6.2 arm64, Screen Recording preflight returned true.
+In the 14 November run on the local Apple M3 Pro running macOS 26.6.2 arm64,
+Screen Recording preflight returned true.
 The Rust probe successfully sampled 100 system cursor shapes through the
 background host's main queue, averaging 1.061 ms per shape in the optimized dev
 build on the shared machine. The 1512×982-point display was aspect-fitted to
@@ -304,7 +329,10 @@ frames encoded and composition was restored successfully. Scheduling cursor
 samples from the video worker averaged 0.014 ms per frame across those frames.
 Visibility was false in that run. A later rebuilt probe returned true and
 sampled 100 cursor images at a mean 0.261 ms, while its Screen Recording
-preflight reported a missing grant. Both visibility values were observed.
+preflight reported a missing grant. The visible reading therefore came from a
+run without real capture. At that point the only successful real-capture run
+reported hidden, and the reason was unexplained. Whether `CGCursorIsVisible`
+tracks other apps' hide/unhide correctly from the installed background service remains unverified.
 No permission was requested or granted by these probes.
 
 An earlier capture attempt timed out, and a separate Swift SCK enumeration
@@ -312,6 +340,22 @@ returned zero displays while CoreGraphics listed one online display. Capture
 succeeded on the bounded retry. No privacy grants or system settings changed.
 Mixed-DPI multi-display sessions, custom game cursors and Mac-to-Windows/Linux
 pointer appearance/input-to-photon remain unqualified.
+
+On 15 November 2026, the revised probe initially printed successful standalone
+Screen Recording preflights while `open_video` refused capture at its permission
+check. A later bounded run opened the same 1512×982-point display and encoded
+30 real SCK/VideoToolbox frames, reported `visible = true`, and restored
+composition through the cursor controls. It observed a 31×44 shape with hotspot
+(5, 5) and then a 35×35 shape with hotspot (14, 9). Temporary instrumentation,
+removed after measurement, counted two rasterizations across 101 native cursor
+samples. Scheduling the shape checks and per-frame visibility/position reads
+averaged 0.009 ms per video frame in that run. These observations establish a
+visible reading during real capture. A clean rebuilt probe also encoded 30 real
+frames, observed four shape updates with `visible = true`, and averaged 0.004 ms
+of cursor scheduling per video frame. Cross-application hide/unhide correctness
+and an end-to-end remote viewer session remain unverified. The virtual-HID
+entitlement check took the denied path. No permission grant or system setting
+changed, and the root case remains untested.
 
 Windows can reuse `VideoPipeline::set_cursor_drawn`, `take_cursor`,
 `CursorUpdate`, the control messages and viewer rendering. After enabling the shared cursor module for Windows and decoding DXGI

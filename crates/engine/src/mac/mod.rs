@@ -172,6 +172,7 @@ impl Video {
     }
     fn restart_capture(&mut self) -> Result<()> {
         self.capture = Capture::video(self.request)?;
+        self.cursor.reset();
         self.cursor
             .sample(self.capture.display, self.config.width, self.config.height);
         self.capture.set_cursor_drawn(self.cursor.drawn())?;
@@ -344,7 +345,8 @@ impl VideoPipeline for Video {
                     self.pending = None;
                     self.encoder.request_keyframe();
                 }
-                !self.cursor.drawn() || drawn
+                // Cursor controls remain supported during a composited fallback.
+                true
             }
             Err(error) => {
                 tracing::warn!(%error, "could not change ScreenCaptureKit cursor composition");

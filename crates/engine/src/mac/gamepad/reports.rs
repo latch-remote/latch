@@ -41,6 +41,14 @@ pub fn identity(kind: PadKind) -> (i64, i64) {
     }
 }
 
+pub fn transport(kind: PadKind) -> &'static str {
+    if kind == PadKind::PlayStation {
+        "USB"
+    } else {
+        "Bluetooth"
+    }
+}
+
 pub fn input(kind: PadKind, state: &PadState) -> Vec<u8> {
     if kind == PadKind::PlayStation {
         let mut out = vec![0; 64];
@@ -103,6 +111,7 @@ pub fn feedback(kind: PadKind, id: u32, bytes: &[u8], mut previous: Feedback) ->
         if id != 5 || payload.len() != 31 {
             return None;
         }
+        // Linux hid-playstation.c, dualshock4_output_report_usb/common.
         if payload[0] & 1 != 0 {
             previous.small = u16::from(payload[3]) * 257;
             previous.large = u16::from(payload[4]) * 257;
@@ -123,10 +132,12 @@ pub fn feedback(kind: PadKind, id: u32, bytes: &[u8], mut previous: Feedback) ->
             }
         };
         Some(Feedback {
-            left_trigger: level(0, 1),
-            right_trigger: level(1, 2),
-            large: level(2, 3),
-            small: level(3, 4),
+            // Linux hid-microsoft.c, xb1s_ff_report: weak/strong are
+            // enable bits 0/1, with magnitudes in payload bytes 4/3.
+            left_trigger: level(3, 1),
+            right_trigger: level(2, 2),
+            large: level(1, 3),
+            small: level(0, 4),
             ..Default::default()
         })
     }
@@ -170,6 +181,44 @@ mod tests {
         }
     }
     #[test]
+    fn transport_matches_the_product_identity() {
+        assert_eq!(
+            (identity(PadKind::Xbox), transport(PadKind::Xbox)),
+            ((0x045e, 0x02fd), "Bluetooth")
+        );
+        assert_eq!(
+            (
+                identity(PadKind::PlayStation),
+                transport(PadKind::PlayStation)
+            ),
+            ((0x054c, 0x05c4), "USB")
+        );
+        assert_eq!(transport(PadKind::Generic), "Bluetooth");
+    }
+    #[test]
+    fn xbox_enable_bits_select_individual_motors_and_linux_main_motor_mask() {
+        for (mask, expected) in [
+            (1, (0, 0, 0, 65535)),
+            (2, (0, 0, 65535, 0)),
+            (4, (0, 65535, 0, 0)),
+            (8, (65535, 0, 0, 0)),
+            (3, (0, 0, 65535, 65535)),
+            (0, (0, 0, 0, 0)),
+        ] {
+            let f = feedback(
+                PadKind::Xbox,
+                3,
+                &[3, mask, 100, 100, 100, 100, 255, 0, 0],
+                Feedback::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                (f.left_trigger, f.right_trigger, f.large, f.small),
+                expected
+            );
+        }
+    }
+    #[test]
     fn reports_map_extremes_hat_and_buttons() {
         let state = PadState {
             left_x: i16::MIN,
@@ -205,6 +254,14 @@ mod tests {
                 .unwrap()
                 .led,
             value.led
+        );
+        report[1] = 2;
+        report[4..6].fill(0);
+        report[6..9].copy_from_slice(&[4, 5, 6]);
+        let lights = feedback(PadKind::PlayStation, 5, &report, value).unwrap();
+        assert_eq!(
+            (lights.small, lights.large, lights.led),
+            (value.small, value.large, Some([4, 5, 6]))
         );
         assert!(feedback(PadKind::PlayStation, 5, &report[..8], value).is_none());
         assert!(feedback(PadKind::Xbox, 3, &report, value).is_none());
