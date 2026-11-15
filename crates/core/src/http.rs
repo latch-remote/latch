@@ -141,13 +141,13 @@ impl Response {
     }
 }
 
-struct DeadlineStream<'a> {
+pub(crate) struct DeadlineStream<'a> {
     stream: &'a mut TcpStream,
     deadline: Option<Instant>,
 }
 
 impl<'a> DeadlineStream<'a> {
-    fn new(stream: &'a mut TcpStream, deadline: Instant) -> Self {
+    pub(crate) fn new(stream: &'a mut TcpStream, deadline: Instant) -> Self {
         Self {
             stream,
             deadline: Some(deadline),

@@ -22,14 +22,14 @@ ssh -F /Users/daniel/.ssh/latch6-lightsail.conf latch6-relay
 
 | Inbound port | Scope and purpose |
 | --- | --- |
-| TCP 22 | Operator /32, pinned key-only SSH |
-| TCP 80 | Public IPv4, Certbot standalone HTTP-01 |
-| TCP 443 | Public IPv4, native TLS ALPN `latch-relay/1` |
-| UDP 443 | Public IPv4, Tailscale peer relay |
-| UDP 41641 | Public IPv4, tailscaled transport and discovery |
+| TCP 22 | Operator IPv4 /32 and current IPv6 /128, pinned key-only SSH |
+| TCP 80 | Public IPv4/IPv6, Certbot standalone HTTP-01 |
+| TCP 443 | Public IPv4/IPv6, native ALPN and HTTPS WebSocket |
+| UDP 443 | Public IPv4/IPv6, Tailscale peer relay |
+| UDP 41641 | Public IPv4/IPv6, tailscaled transport and discovery |
 
 The SSH rule matched the Mac at inspection. When the operator moves networks,
-update only that rule to the current `/32`. Individual Lightsail port operations
+update only that rule to the current `/32` and IPv6 `/128`. Individual Lightsail port operations
 preserve the other rules. Tailscale manages host netfilter rules. UFW is inactive.
 
 ## Relay identity and recovery
@@ -71,6 +71,11 @@ It applies live descriptor and memory limits without restarting either daemon.
 `tune-host.sh` also masks unnecessary modem, multipath, removable-media and
 firmware services. See the exact settings and rationale in the deployment
 report. [Deployment settings](DEPLOYED.md#dual-role-consolidation-on-2026-11-15)
+
+During relay upgrades on the shared host, keep tailscaled, interfaces and network
+management continuously running. Apply individual changed sysctls live and
+update their persistent file. The WebSocket upgrade changed only MTU probing
+from `1` to `2`. Reserve a brief `latch-relay` stop for executable/unit replacement.
 
 ## Bundle and transfer economics
 
@@ -132,20 +137,27 @@ AWS's baseline and transfer documentation.
 
 ## IPv6 and DNS
 
-The instance reports `ipAddressType=ipv4` and no IPv6 addresses. Its static
-allocation supplies IPv4. Lightsail supports enabling dual-stack and assigning
-a separate public IPv6 address, which persists across stop/start. Disabling
-IPv6 or deleting the instance releases that IPv6 address.
+On 2026-11-15, `set-ip-address-type --ip-address-type dualstack` assigned
+`2406:da12:417:7f00:7baf:3615:172a:fe6f`. The running host acquired its global
+address and default route automatically within several minutes. Its existing
+network manager stayed running. Keep the host online while waiting for router
+advertisements/DHCPv6 and inspect `ip -6 addr` and `ip -6 route` before taking
+further action. IPv6 address assignment persists across stop/start. Disabling
+IPv6 or deleting the instance releases the address.
 
-Cloudflare hosts the DNS-only A record for `relay.latch.rune.foo`. There is
-currently no AAAA record. This AWS account has no Route 53 hosted zones.
+The four public port rules now include `::/0`. SSH retains its existing IPv4
+scope and adds only the current operator IPv6 `/128`. IPv4 rules were verified
+equal before and after the change. Tailscaled retains its IPv4 static peer-relay
+endpoint and its existing process/start time.
 
-IPv6 deployment requires enabling Lightsail dual-stack, verifying its assigned
-address/route, adding IPv6 firewall rules, deploying the separately prepared
-dual-stack listener and publishing a DNS-only AAAA with a DNS-edit credential.
-Peer-relay IPv6 also needs UDP firewall rules and an IPv6 static endpoint
-preference. The current native listener binds IPv4. Listener and WebSocket
-deployment belong to the later PR.
+The production relay binds `[::]:443` with IPv4-mapped acceptance. Direct public
+IPv6 checks from the campus Mac verified WebPKI hostname/chain, native ALPN and
+HTTP 200 before publication. Cloudflare now serves a DNS-only AAAA record for
+`relay.latch.rune.foo` at that address, TTL 300. The existing DNS-only A record
+remains `54.116.93.176`. An existing zone DNS-edit credential authorized the
+single AAAA creation. Authoritative DNS and a public recursive resolver returned
+the new record. Boot persistence awaits a separately coordinated maintenance
+window.
 [AWS dual-stack behavior](https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-enable-disable-ipv6.html)
 
 ## Completed teardown

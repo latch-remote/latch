@@ -1,0 +1,121 @@
+[
+  {
+    "addresses": [
+      "64:ff9b::c000:aa"
+    ],
+    "expected": [
+      [
+        "64:ff9b::",
+        96
+      ]
+    ]
+  },
+  {
+    "addresses": [
+      "64:ff9b::c000:ab"
+    ],
+    "expected": [
+      [
+        "64:ff9b::",
+        96
+      ]
+    ]
+  },
+  {
+    "addresses": [
+      "c000:aa::c000:aa"
+    ],
+    "expected": []
+  },
+  {
+    "addresses": [
+      "c000:aa::c000:aa",
+      "c000:aa::c000:ab"
+    ],
+    "expected": [
+      [
+        "c000:aa::",
+        96
+      ]
+    ]
+  },
+  {
+    "addresses": [
+      "c000:aa:c000:ab::c000:aa",
+      "c000:aa:c000:ab::c000:ab"
+    ],
+    "expected": []
+  },
+  {
+    "addresses": [
+      "2001:db8:c000:aa::42",
+      "64:ff9b::c000:aa"
+    ],
+    "expected": [
+      [
+        "2001:db8::",
+        32
+      ],
+      [
+        "64:ff9b::",
+        96
+      ]
+    ]
+  },
+  {
+    "addresses": [
+      "64:ff9b:0:0:100::c000:aa"
+    ],
+    "expected": []
+  },
+  {
+    "addresses": [
+      "2001:db8::1"
+    ],
+    "expected": []
+  },
+  {
+    "addresses": [
+      "2001:db8:c0:0:aa::c000:aa"
+    ],
+    "expected": []
+  },
+  {
+    "addresses": [
+      "2001:db8:c0:0:aa::c000:ab"
+    ],
+    "expected": []
+  },
+  {
+    "addresses": [
+      "2001:db8:c0:0:aa::c000:aa",
+      "2001:db8:c0:0:aa::c000:ab"
+    ],
+    "expected": []
+  },
+  {
+    "addresses": [
+      "64:ff9b::c000:aa",
+      "2001:db8::c000:ab"
+    ],
+    "expected": []
+  },
+  {
+    "addresses": [
+      "2001:db8::c000:aa",
+      "64:ff9b::c000:ab",
+      "2001:db8::c000:ab",
+      "64:ff9b::c000:aa"
+    ],
+    "expected": [
+      [
+        "2001:db8::",
+        96
+      ],
+      [
+        "64:ff9b::",
+        96
+      ]
+    ]
+  }
+]

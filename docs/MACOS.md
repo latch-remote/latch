@@ -510,9 +510,10 @@ ScreenCaptureKit renders the display straight into an IOSurface at the
 stream's size (it scales, with bars where the shapes differ), and
 VideoToolbox encodes that surface; only compressed bytes reach Latch.
 
-- **Which display.** The main one, or the one whose CGDirectDisplayID is
-  in `LATCH_MAC_DISPLAY` in the host's environment. The stream request
-  does not name a display yet.
+- **Which display.** The one the viewer chose (`StreamRequest.display`,
+  a CGDirectDisplayID from the host's status), else the one whose
+  CGDirectDisplayID is in `LATCH_MAC_DISPLAY` in the host's environment,
+  else the main one. A choice that has gone falls back the same way.
 - **How often.** Every refresh of a display no faster than the stream
   (a ProMotion panel reports no fixed rate and gets every refresh too);
   for a slower stream, every k-th refresh with half a refresh of slack,

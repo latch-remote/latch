@@ -1,0 +1,83 @@
+[
+  {
+    "proxy": "http=plain.test:80;https=secure.test:8080;socks=socks.test:1080",
+    "bypass": "*.internal.test;<local>",
+    "host": "relay.test",
+    "expected": [
+      "http://secure.test:8080"
+    ]
+  },
+  {
+    "proxy": "first.test:8080 second.test:3128",
+    "bypass": "",
+    "host": "relay.test",
+    "expected": [
+      "http://first.test:8080",
+      "http://second.test:3128"
+    ]
+  },
+  {
+    "proxy": "secure.test:8080",
+    "bypass": "*.internal.test;<local>",
+    "host": "pc",
+    "expected": [
+      "direct"
+    ]
+  },
+  {
+    "proxy": "secure.test:8080",
+    "bypass": "*.internal.test",
+    "host": "pc.internal.test",
+    "expected": [
+      "direct"
+    ]
+  },
+  {
+    "proxy": "http=plain.test:80",
+    "bypass": "",
+    "host": "relay.test",
+    "expected": [
+      "direct"
+    ]
+  },
+  {
+    "proxy": "http://user:secret@proxy.test:80",
+    "bypass": "",
+    "host": "relay.test",
+    "expected": [
+      "http://[redacted]@proxy.test:80"
+    ]
+  },
+  {
+    "proxy": "https=proxy.test:invalid",
+    "bypass": "",
+    "host": "relay.test",
+    "expected": []
+  },
+  {
+    "proxy": "HTTPS=upper.test:3128",
+    "bypass": "",
+    "host": "relay.test",
+    "expected": [
+      "http://upper.test:3128"
+    ]
+  },
+  {
+    "proxy": "http://user:p=word@proxy.test:80",
+    "bypass": "",
+    "host": "relay.test",
+    "expected": [
+      "http://[redacted]@proxy.test:80"
+    ]
+  },
+  {
+    "proxy": "PROXY first.test:8080; PROXY second.test:3128; DIRECT",
+    "bypass": "",
+    "host": "relay.test",
+    "expected": [
+      "http://first.test:8080",
+      "http://second.test:3128",
+      "direct"
+    ]
+  }
+]

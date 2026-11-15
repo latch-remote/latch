@@ -40,6 +40,7 @@ fn main() -> anyhow::Result<()> {
         fps: 60,
         bitrate_kbps: 10_000,
         codec,
+        display: None,
     })?;
     let mut audio = mac::open_audio()?;
     let mut stream = File::create(path)?;

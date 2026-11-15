@@ -280,6 +280,12 @@ extern "C" {
 extern "C" {
     pub fn CGPreflightScreenCaptureAccess() -> bool;
     pub fn CGMainDisplayID() -> u32;
+    pub fn CGGetOnlineDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+    pub fn CGDisplayIsBuiltin(display: u32) -> u32;
+    #[cfg(test)]
+    pub fn CGDisplayIsOnline(display: u32) -> u32;
+    pub fn CGDisplayModeGetPixelWidth(mode: Ref) -> usize;
+    pub fn CGDisplayModeGetPixelHeight(mode: Ref) -> usize;
     pub fn CGDisplayBounds(display: u32) -> objc2_core_foundation::CGRect;
     pub fn CGDisplayCopyDisplayMode(display: u32) -> Ref;
     pub fn CGDisplayModeGetRefreshRate(mode: Ref) -> f64;
