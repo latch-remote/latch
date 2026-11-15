@@ -218,7 +218,7 @@ GitHub release notes, so each version gets a heading of the form
   preventing service startup. Downloads use a size-derived deadline and rate floor.
   The `Linux updater systemd` CI jobs (x64, arm64, GitHub Ubuntu 24.04 runners with a systemd user manager) show, with a fixture service, that the supervisor survives `systemctl --user restart latch.service`, that a wrong-version replacement is rolled back and the previous release keeps answering, and that a supervisor killed after the swap is rolled back when the service next starts.
   The fixture adds crash-on-start/start-limit rollback and running-service
-  recovery cases. Their CI verification is pending with active/running activation and failed-state start-limit predicates. The real `latch-host` binary under systemd,
+  recovery cases, which pass on both architectures. The real `latch-host` binary under systemd,
   supervisor argv parsing, self-pinning and real GitHub manifest fetching are
   outside that fixture. No Linux desktop machine was available. Real GUI reopening and stream continuity across updates remain untested. Streams
   admitted during probation can be cut by rollback, as on Windows. Refusing

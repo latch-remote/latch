@@ -428,8 +428,8 @@ A restart or health failure restores the previous binary and restarts it.
 The fsynced `linux-update.json` journal records progress, inode identities,
 staging location and outcome. On startup, a service detects an unfinished
 update whose supervisor died and restores the previous inode deterministically.
-A running service also monitors for this failure (not exercised by CI; CI covers recovery at the next service start).
-The added running-service monitor case awaits passing CI evidence. If restoration
+A running service also monitors for this failure. CI covers recovery both at
+the next service start and while the service keeps running. If restoration
 itself fails, the update becomes terminal Failed with the recovery copy retained
 and its path reported. The next update can proceed. A journal flock and phase
 compare-and-set serialize writers. Unsafe or unparsable journals are moved aside
@@ -478,13 +478,12 @@ Docker with Ubuntu 24.04/glibc 2.39. No Linux machine outside CI and containers 
 this work. The `Linux updater systemd` CI jobs passed at `5d2959f` on x64 and arm64 Ubuntu 24.04 runners. They install a fixture `latch.service`, launch the real supervisor from its control group, and check successful probation, wrong-version rollback and rollback after the supervisor is killed following the swap.
 The fixture adds a replacement that crashes on start, including the start
 limit and `reset-failed`, and monitor recovery while the service keeps running.
-These two added cases await passing CI evidence. The fixture gates its crash
+Both added cases passed at `5570388` on x64 and arm64. The fixture gates its crash
 on a new MainPID with ActiveState=active and SubState=running. The start-limit
 check requires a failed unit, at least three fixture starts, a stable restart
 counter and exit status 7. It accepts exit-code and start-limit-hit results.
 Timeouts print full service/supervisor unit state, recent journals and fixture
-history. The previously inspected jobs timed out at an incorrect activation
-predicate, before reaching monitor recovery.
+history.
 The test is ignored during ordinary test runs and requires explicit opt-in
 through the dedicated script, which refuses an existing `latch.service`.
 The fixture bypasses supervisor argv parsing, self-pinning, installation ownership
