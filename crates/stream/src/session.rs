@@ -21,7 +21,7 @@ use latch_proto::video::{
 };
 use latch_proto::wire::{self, Datagram};
 use parking_lot::{Condvar, Mutex};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -973,6 +973,12 @@ pub struct Stats {
     pub frame_budget_ms: f32,
     /// Sustained decoder throughput; zero until overload is detected.
     pub decode_capacity_fps: u32,
+    /// Successful submissions whose own picture was withheld by the decoder.
+    pub decoder_delayed_frames: u64,
+    /// Submitted pictures still awaiting an output, including unresolved errors.
+    pub decoder_pending_frames: u32,
+    /// Decoder outputs/identities discarded after route changes or the 64-input bound.
+    pub decoder_discarded_frames: u64,
     /// Capture to send on the host.
     pub host_ms: f32,
     /// First shard to whole frame.
@@ -3117,6 +3123,15 @@ fn handle(
     }
 }
 
+struct SubmittedFrame {
+    identity: u32,
+    started: Instant,
+    ready: Instant,
+    host_delay: u16,
+    assembly: Duration,
+    route_revision: u64,
+}
+
 /// The decode thread: frames in order, newest picture out.
 fn decode(
     inner: &Arc<Inner>,
@@ -3136,6 +3151,10 @@ fn decode(
     let budget_ms = inner.stats.lock().frame_budget_ms.max(1.0);
     let max_age = decode_max_age((1000.0 / budget_ms) as u32);
     let mut load = DecodeLoad::default();
+    // Only metadata is retained. Output sample times identify inputs even
+    // when a decoder emits several pictures while accepting another one.
+    let mut pending = BTreeMap::new();
+    let mut sample_time = 0i64;
     loop {
         let ((frame, ready), route_revision) = {
             let mut q = inner.queue.lock();
@@ -3168,12 +3187,55 @@ fn decode(
         };
         let start = Instant::now();
         let spare = inner.frames.spare();
-        let decoded = decoder.decode(&frame.data, frame.keyframe, spare);
+        sample_time += 166667;
+        if pending.len() == 64 {
+            pending.pop_first();
+            inner.stats.lock().decoder_discarded_frames += 1;
+            tracing::warn!("decoder exceeded 64 unresolved inputs; discarding oldest identity");
+        }
+        pending.insert(
+            sample_time,
+            SubmittedFrame {
+                identity: frame.frame,
+                started: start,
+                ready,
+                host_delay: frame.host_delay,
+                assembly: frame.assembly,
+                route_revision,
+            },
+        );
+        let decoded = decoder
+            .decode_frames(&frame.data, frame.keyframe, sample_time, spare)
+            .and_then(|pictures| {
+                let mut times = std::collections::BTreeSet::new();
+                if !pictures
+                    .iter()
+                    .all(|(time, _)| pending.contains_key(time) && times.insert(*time))
+                {
+                    inner.stats.lock().decoder_discarded_frames += pictures.len() as u64;
+                    anyhow::bail!("decoder returned an unknown or duplicate sample time");
+                }
+                Ok(pictures)
+            });
+        #[cfg(test)]
+        if let Some(probe) = &inner.pair_probe {
+            probe.decode_call(frame.frame, &decoded, sample_time);
+        }
         if over() {
             // The session may have finished without waiting for this.
             return;
         }
         if inner.relay.lock().revision() != route_revision {
+            // A route committed during this call. Retire its returned
+            // identities while preserving metadata for older held outputs.
+            if let Ok(pictures) = decoded {
+                let discarded = pictures.len() as u64;
+                for (time, _) in pictures {
+                    pending.remove(&time);
+                }
+                inner.stats.lock().decoder_discarded_frames += discarded;
+            }
+            inner.stats.lock().decoder_pending_frames = pending.len() as u32;
             continue;
         }
         let service = start.elapsed();
@@ -3182,9 +3244,15 @@ fn decode(
             inner.emit(Event::Notice(format!("This machine decodes about {fps} fps at this size. Lower the frame rate in Stream settings.")));
         }
         match &decoded {
-            Ok(Some(_)) => (tries, errors) = (0, 0),
-            Ok(None) => tries += 1,
+            Ok(pictures) if !pictures.is_empty() => (tries, errors) = (0, 0),
+            Ok(_) => tries += 1,
             Err(_) => (tries, errors) = (tries + 1, errors + 1),
+        }
+        if decoded
+            .as_ref()
+            .is_ok_and(|pictures| !pictures.iter().any(|(time, _)| *time == sample_time))
+        {
+            inner.stats.lock().decoder_delayed_frames += 1;
         }
         if codec != Codec::H264Baseline
             && (tries >= HARDWARE_PROBATION
@@ -3208,69 +3276,78 @@ fn decode(
             return;
         }
         match decoded {
-            Ok(Some(mut picture)) => {
-                // Serialize publication with the TCP owner's route commit.
-                let route = inner.relay.lock();
-                if route.revision() != route_revision {
-                    continue;
+            Ok(pictures) => {
+                for (time, mut picture) in pictures {
+                    let submitted = pending.remove(&time).expect("validated sample time");
+                    // Serialize publication with the TCP owner's route commit.
+                    let route = inner.relay.lock();
+                    if route.revision() != submitted.route_revision {
+                        inner.stats.lock().decoder_discarded_frames += 1;
+                        continue;
+                    }
+                    if picture.color.bit_depth != color.bit_depth {
+                        // Pictures at another depth would be drawn wrongly;
+                        // the stream starts again without this codec.
+                        *inner.renegotiate.lock() = Some((
+                            codec,
+                            format!(
+                                "{} gave {}-bit pictures for a {}-bit stream",
+                                decoder.name(),
+                                picture.color.bit_depth,
+                                color.bit_depth
+                            ),
+                            video::FailureKind::Decode,
+                        ));
+                        inner.attempt_over.store(true, Ordering::Release);
+                        inner.queue_cv.notify_all();
+                        return;
+                    }
+                    picture.color = color;
+                    let decoded = Instant::now();
+                    picture.decoded_at = Some(decoded);
+                    if decoder.name() != named {
+                        named = decoder.name();
+                        inner.stats.lock().decoder = named;
+                    }
+                    if picture.width > 0 && picture.height > 0 {
+                        let mut st = inner.stats.lock();
+                        st.width = picture.width;
+                        st.height = picture.height;
+                    }
+                    let black = picture.is_black();
+                    tracing::trace!(
+                        frame = submitted.identity,
+                        sample_time = time,
+                        "decoded picture"
+                    );
+                    #[cfg(test)]
+                    if let Some(probe) = &inner.pair_probe {
+                        probe.picture(submitted.identity, &picture);
+                    }
+                    inner.frames.publish(picture);
+                    inner
+                        .published_us
+                        .store(inner.now_us().max(1), Ordering::Relaxed);
+                    (inner.wake)();
+                    {
+                        let mut health = inner.video_health.lock();
+                        health.connected_at.get_or_insert(decoded);
+                        health.frame(decoded, black);
+                    }
+                    inner.connected.store(true, Ordering::Release);
+                    if !inner.announced.swap(true, Ordering::AcqRel) {
+                        inner.emit(Event::Connected);
+                    }
+                    let mut w = inner.decode.lock();
+                    w.frames += 1;
+                    w.decode_us += (decoded - submitted.started).as_micros() as u64;
+                    w.samples_us
+                        .push((decoded - submitted.started).as_micros() as u64);
+                    w.queue_us += (submitted.started - submitted.ready).as_micros() as u64;
+                    w.host_tenths += u64::from(submitted.host_delay);
+                    w.assembly_us += submitted.assembly.as_micros() as u64;
                 }
-                if picture.color.bit_depth != color.bit_depth {
-                    // Pictures at another depth would be drawn wrongly;
-                    // the stream starts again without this codec.
-                    *inner.renegotiate.lock() = Some((
-                        codec,
-                        format!(
-                            "{} gave {}-bit pictures for a {}-bit stream",
-                            decoder.name(),
-                            picture.color.bit_depth,
-                            color.bit_depth
-                        ),
-                        video::FailureKind::Decode,
-                    ));
-                    inner.attempt_over.store(true, Ordering::Release);
-                    inner.queue_cv.notify_all();
-                    return;
-                }
-                picture.color = color;
-                let decoded = Instant::now();
-                picture.decoded_at = Some(decoded);
-                if decoder.name() != named {
-                    named = decoder.name();
-                    inner.stats.lock().decoder = named;
-                }
-                if picture.width > 0 && picture.height > 0 {
-                    let mut st = inner.stats.lock();
-                    st.width = picture.width;
-                    st.height = picture.height;
-                }
-                let black = picture.is_black();
-                #[cfg(test)]
-                if let Some(probe) = &inner.pair_probe {
-                    probe.picture(frame.frame, &picture);
-                }
-                inner.frames.publish(picture);
-                inner
-                    .published_us
-                    .store(inner.now_us().max(1), Ordering::Relaxed);
-                (inner.wake)();
-                {
-                    let mut health = inner.video_health.lock();
-                    health.connected_at.get_or_insert(decoded);
-                    health.frame(decoded, black);
-                }
-                inner.connected.store(true, Ordering::Release);
-                if !inner.announced.swap(true, Ordering::AcqRel) {
-                    inner.emit(Event::Connected);
-                }
-                let mut w = inner.decode.lock();
-                w.frames += 1;
-                w.decode_us += (decoded - start).as_micros() as u64;
-                w.samples_us.push((decoded - start).as_micros() as u64);
-                w.queue_us += (start - ready).as_micros() as u64;
-                w.host_tenths += u64::from(frame.host_delay);
-                w.assembly_us += frame.assembly.as_micros() as u64;
             }
-            Ok(None) => {}
             Err(e) => {
                 tracing::debug!("decode: {e:#}");
                 #[cfg(test)]
@@ -3284,6 +3361,7 @@ fn decode(
                 inner.queue.lock().want_keyframe = true;
             }
         }
+        inner.stats.lock().decoder_pending_frames = pending.len() as u32;
     }
 }
 

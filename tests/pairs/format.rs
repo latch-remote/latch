@@ -14,7 +14,7 @@ pub const FRAMES: usize = 24;
 pub const HELD_SUPER_GAP: bool = true; // PR #109, native capture fixture required.
 pub const RIGHT_SHIFT_GAP: bool = true; // PR #109, native capture fixture required.
 pub const CLIPBOARD_CRLF_GAP: bool = true; // Follow-up PR remains unassigned.
-pub const MAC_VT_MF_GAP: bool = true; // Follow-up PR remains unassigned.
+pub const MAC_VT_MF_GAP: bool = false; // Fixed by the no-reordering bitstream contract.
 
 pub fn input_gap(case: &str, producer: &str) -> bool {
     (RIGHT_SHIFT_GAP && case == "right-shift-identity")

@@ -48,6 +48,11 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Streaming
 
+- Fix stale Mac-host pictures and decoder buffering on Windows. Declare
+  zero H.264/HEVC reordering on hosts, normalize legacy hosts' parameter
+  sets in the Windows viewer, preserve decoder output identities, and
+  expose held-picture counters in stream statistics.
+
 - Choose which of a host's displays to share. Hosts list their displays in
   `/v1/status` (`streamer.displays`), and the viewer offers them in the
   machine's menu in the list and in the stream toolbar, remembered per

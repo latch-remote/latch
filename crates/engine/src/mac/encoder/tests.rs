@@ -167,6 +167,22 @@ fn roundtrip(codec: Codec, allow_hardware: bool) {
         }
         let encoded = encoded.expect("encoder kept dropping the picture for one second");
         assert_eq!(encoded.captured, captured);
+        for nal in latch_codec::h264::nal::nal_units(&encoded.data) {
+            if codec == Codec::Hevc && matches!((nal[0] >> 1) & 63, 32 | 33) {
+                for ordering in latch_codec::bitstream::hevc_ordering(nal).unwrap() {
+                    assert_eq!(
+                        (ordering.reorder_pics, ordering.latency_increase_plus1),
+                        (0, 1)
+                    );
+                }
+            } else if codec != Codec::Hevc && nal[0] & 31 == 7 {
+                let sps = latch_codec::bitstream::h264_sps(nal).unwrap();
+                assert_eq!(
+                    (sps.reorder_frames, sps.buffering),
+                    (Some(0), Some(sps.reference_frames.max(1)))
+                );
+            }
+        }
         if i == 0 || forced {
             assert!(encoded.keyframe, "{codec:?}: requested keyframe at {i}");
             let types = nal_types(&encoded.data, codec == Codec::Hevc);

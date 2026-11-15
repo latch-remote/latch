@@ -21,7 +21,7 @@ IDENTITY = f"{SYSTEM}-{ARCH}"
 EXE = ".exe" if SYSTEM == "windows" else ""
 REQUIRED = {
     "linux": {"software", "capture"},
-    "macos": {"software", "native", "capture"},
+    "macos": {"software", "native", "capture", "legacy-mac"},
     "windows": {"software", "native"},
 }
 # Only these absent hosted devices/backends may produce unavailable rows.
@@ -32,6 +32,10 @@ UNAVAILABLE = {
 }
 INPUT_CASES = ("ansi-a", "azerty-a-at-q", "qwertz-z-at-y", "shift-a", "control-a", "alt-a", "right-shift-identity", "held-super-z", "unicode-commit", "relative-pointer", "wheel-line", "wheel-two-half-notches", "absolute-pointer-button", "button-left", "button-right", "button-middle", "button-x1", "button-x2", "gamepad-report", "clipboard-line-endings")
 SCHEDULES = ("clean", "loss-reorder", "late-audio")
+
+
+def modes(producer):
+    return ("software", "native", "capture") + (("legacy-mac",) if producer.startswith("macos-") else ())
 
 
 def executable(binaries, name):
@@ -206,7 +210,7 @@ def verify(args):
         require_capabilities(manifest, args)
         assert "software.session.json" in manifest["files"]
         assert "gamepad.pad.json" in manifest["files"]
-        for mode in ("software", "native", "capture"):
+        for mode in modes(manifest["producer"]):
             capability = [row for row in manifest["capabilities"] if row.get("mode") == mode]
             assert len(capability) == 1, f"missing or duplicate {mode} capability result"
             assert capability[0]["status"] in ("recorded", "unavailable")
@@ -269,7 +273,7 @@ def summary(artifacts, results, expected):
     inputs = []
     for producer in expected:
         manifest = next(json.loads(p.read_text(encoding="utf-8")) for p in artifacts.rglob("manifest.json") if json.loads(p.read_text(encoding="utf-8"))["producer"] == producer)
-        for mode in ("software", "native", "capture"):
+        for mode in modes(producer):
             available = f"{mode}.session.json" in manifest["files"]
             for decoder in ("software", "native"):
                 required = available and (decoder == "software" or SYSTEM != "linux")

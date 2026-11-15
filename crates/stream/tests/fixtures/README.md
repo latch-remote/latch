@@ -28,3 +28,15 @@ slice headers and reference lists in decoding order through a recording
 backend on every platform. Latch's streaming encoders use low-delay output.
 `vt-ltr-overflow.h264` also exercises retained long-term references across
 frame-number gaps and bounded reference storage.
+
+`mac-long-gop-tiny.h264` and `mac-long-gop-1080.h264` are unnormalized
+VideoToolbox Constrained Baseline output captured from Latch's production
+synthetic IOSurface encoder on Apple Silicon on 2026-11-15. They contain
+32 pictures at 160×98/25 fps/4 Mbps/level 2.1 and 16 pictures at
+1920×1080/60 fps/10 Mbps/level 4.2, with only the first picture forced to
+IDR. Input luma is `32 + 2 * frame_index`, chroma is 128. SPS declares
+one reference, POC type 0 and no bitstream restriction. Windows MF tests
+measure raw steady-state withholding and require each patched access unit
+to return its own sample time immediately, through software and optional
+real DXVA. The original six-frame-IDR pair tape is retained separately in
+`tests/pairs/mac-vt-6.0.0.h264`.

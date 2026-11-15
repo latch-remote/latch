@@ -212,6 +212,25 @@ KeyframeRequest (fallback, older hosts) ────▶ next frame is IDR
 | Windows | Media Foundation + D3D11/DXVA for hardware-probed AV1, HEVC Main/Main10 and H.264 High; Baseline with `latch-codec` fallback. Shared NV12 D3D11 texture → D3D12/wgpu; staging readback when unavailable and for ten-bit P010 (drawn by the native HDR10 swapchain where available) |
 | Linux | Runtime-probed VA-API H.264 and HEVC Main/Main10, with software Baseline fallback. DMA-BUF planes → EGL/GLES where compatible, NV12/P010 readback otherwise |
 
+H.264/HEVC hosts declare zero output reordering. A shared Rust SPS rewriter
+adds H.264 VUI restrictions with zero reordered frames and the minimum
+buffer compatible with the SPS reference count. It sets HEVC VPS/SPS
+sublayer reorder counts to zero and latency-increase-plus-one to one while
+retaining reference storage. VideoToolbox, MF, AMF, NVENC and VA-API output
+passes through this normalization. The Rust encoder already writes the
+H.264 restriction. POC, colour, timing, crop and scaling lists are preserved.
+
+Media Foundation also normalizes incoming parameter sets for 6.0.0 hosts.
+It drains every output and reads the output sample time. The session keeps
+bounded submitted-frame metadata and matches each picture to its original
+identity, route and latency measurements. Held, pending and discarded
+pictures appear in viewer statistics. VideoToolbox disables asynchronous
+and temporal processing, passes per-input callback storage and waits for
+completion. VA-API submits one identified surface and synchronizes that
+surface before returning it. The Rust decoder reconstructs the current
+I/P access unit synchronously. Pair replay requires zero decoder delay
+on each submitted access unit for every available host/viewer combination.
+
 The viewer lists what it decodes; the host picks the first it can encode,
 then fits the request to that encoder (`video::Limits`, reported to
 viewers as `streamer.codecs`; see `docs/PROTOCOL.md`, "Encoder limits").

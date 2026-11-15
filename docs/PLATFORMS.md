@@ -90,6 +90,36 @@ The release's `latch-host` executable embeds the `latch-client` GUI and
 | Updater | **partial** · local exe offer/install, digest + version checks. U-W/all update tests, N fresh installed GUI update measurement.[^update] | **partial** · bundled app replacement/relaunch. U-M installer/update scripts, ad-hoc signing can require privacy reapproval.[^update] | **partial** · manual-update notice only. U-all offer tests.[^update] |
 | Wake sender / relay | **partial** · common WOL packet sender + CPU-gated relay. U/S-W, F-MW relay.[^wake][^relay] | **partial** · common WOL sender + CPU-gated relay. U/S-M, F-WM/MW relay.[^wake][^relay] | **partial** · common WOL sender + CPU-gated relay. U/S-L, N cross-OS public-relay field session.[^wake][^relay] |
 
+## Decoder buffering verification
+
+The 24-picture pre-fix Mac VideoToolbox recording was replayed through
+Windows Media Foundation software decoding and RX 6600 DXVA over a
+non-interactive SSH session. The original SPS withheld each six-picture
+GOP until the next IDR. Host-normalized output and viewer-normalized old
+host output returned each picture on its own submission, including the
+resize. `MF_LOW_LATENCY` and `CODECAPI_AVLowLatencyMode` share one GUID.
+That transform attribute read back as 1 and ICodecAPI as true even while
+the original stream buffered. With POC type 0 held fixed,
+a zero reorder limit produced zero delay with either one or nine DPB slots.
+A reorder limit of one produced one frame of delay with either capacity.
+Long-GOP recordings measured 16 frames of steady decoder delay at
+160×98/level 2.1 and four at 1920×1080/level 4.2, through both software
+and RX 6600 DXVA. Normalization reduced both to zero. The tiny-stream
+measurement exceeds the initial nine-frame estimate from the six-frame
+IDR tape. Mac HEVC VPS/SPS already declared zero reordered pictures and
+five reference-buffer slots, with latency-increase-plus-one zero. Host
+normalization makes the latency bound explicit as one and preserves those
+five slots.
+
+Mac VideoToolbox and the Rust decoder pass local zero-delay replay. Linux
+software, Windows software/MF and Mac VideoToolbox combinations run in the
+pair grid, including the committed 6.0.0 Mac tape. Linux NVENC/VA-API and
+Windows AMF encoding were inspected and normalized at their output
+boundaries. Linux GPU encoders and VA-API decode still require hardware
+qualification. The RX 6600 qualification covers decode and visible picture
+content. Desktop capture, rendering and physical scanout were outside that
+SSH test.
+
 ## Six host → viewer directions
 
 Every row uses the normal codec-intersection, colour and reconnect logic in
@@ -99,7 +129,7 @@ keyboard/mouse/gamepad/clipboard/audio/HDR acceptance record.[^negotiation]
 | Direction | Known session evidence | Unverified | Broken, missing or restricted |
 |---|---|---|---|
 | Windows → Mac | **partial** · F-WM actual DXGI/AMF HEVC desktop delivery, F reverse Windows-software H.264 synthetic input/relay. Numerical Windows HDR→Mac decode/render probes.[^field] | NVIDIA/Intel, AV1 host, real gamepads/rumble, mic cable, clipboard/layout permutations, mixed DPI, physical HDR and scanout. | Windows cursor remains in video. System shortcuts remain viewer-OS dependent.[^wcursor][^viewerinput] |
-| Mac → Windows | **partial** · F-MW synthetic IOSurface→VT H.264→DXVA/client renderer, public relay, synthetic key-to-picture and software audio delivery.[^field] | Full SCK desktop session, HEVC whole session, actual host CGEvent injection, mic, native clipboard, physical HDR and controllers. | Mac host gamepad injection and virtual-display/mode change **missing**. A Windows viewer's Media Foundation decoder withholds and mislabels pictures from Mac VideoToolbox H.264: stale pictures in the pair replay, expected as added delay in a session (issue #118). Windows held Win modifier does not become Mac Command, clipboard edit chords can synthesize Command.[^pads][^resize][^viewerinput] |
+| Mac → Windows | **partial** · F-MW synthetic IOSurface→VT H.264→DXVA/client renderer, public relay, synthetic key-to-picture and software audio delivery.[^field] | Full SCK desktop session, HEVC whole session, actual host CGEvent injection, mic, native clipboard, physical HDR and controllers. | Mac host gamepad injection and virtual-display/mode change **missing**. Windows held Win modifier does not become Mac Command, clipboard edit chords can synthesize Command.[^pads][^resize][^viewerinput] |
 | Windows → Linux | **untested** cross-machine pair, S-L establishes local real receive/decode of synthetic Baseline sessions.[^sessiontests] | Windows-generated Baseline against Linux decoder, all desktop I/O, distro/window-system/DPI combinations. | Linux viewer only advertises H.264 Baseline/SDR8. HEVC/AV1/Main10/HDR viewing **missing**. Windows host must choose H.264/MF or software. Super capture and separate Windows cursor **missing**.[^negotiation][^decode][^wcursor] |
 | Linux → Windows | **untested** cross-machine pair, F-LM validates Linux X11/software source separately, S-W validates viewer receive separately.[^field][^sessiontests] | Linux hardware codecs/Windows decoder combinations, native input/pad/clipboard/audio/mic pair. | Linux Wayland hosting **missing**, X11 required. Linux host is SDR8 and emulates Xbox pads. Held Windows Meta absent at viewer.[^lcap][^lencode][^pads][^viewerinput] |
 | Mac → Linux | **untested** cross-machine pair, U-M proves VT Baseline output with independent decode, S-L proves Rust viewer path separately.[^mencode][^sessiontests] | VT Baseline→Rust interoperability session, native injection, clipboard/audio/mic, raw movement and Retina scaling. | Viewer must negotiate Baseline/SDR8, HEVC/Main10/HDR unavailable. Mac gamepad injection, host mode change and separate cursor **missing**. Linux Super→Command held mapping absent.[^decode][^pads][^resize][^viewerinput] |

@@ -410,6 +410,9 @@ fn main() -> anyhow::Result<()> {
         );
         lines.push(serde_json::json!({
             "fps": s.fps, "mbps": s.mbps, "rtt_ms": s.rtt_ms, "decode_ms": s.decode_ms,
+            "decoder_delayed_frames": s.decoder_delayed_frames,
+            "decoder_pending_frames": s.decoder_pending_frames,
+            "decoder_discarded_frames": s.decoder_discarded_frames,
             "host_ms": s.host_ms, "assembly_ms": s.assembly_ms, "queue_ms": s.queue_ms,
             "loss_pct": s.loss_pct, "fec_recovered": s.fec_recovered,
             "elapsed_ms": t0.elapsed().as_millis(), "window_ms": s.window_ms,

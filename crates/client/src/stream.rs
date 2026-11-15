@@ -986,6 +986,8 @@ impl View {
                         Kv::new("Encode on host", format!("{:.2} ms", stats.host_ms)),
                         Kv::new("Frame assembly", format!("{:.2} ms", stats.assembly_ms)),
                         Kv::new("Decoder queue", format!("{:.2} ms", stats.queue_ms)),
+                        Kv::new("Decoder held frames", format!("{} ({} pending)", stats.decoder_delayed_frames, stats.decoder_pending_frames)),
+                        Kv::new("Decoder discarded frames", stats.decoder_discarded_frames.to_string()),
                         Kv::new("Decode", format!("{:.2} ms", stats.decode_ms)),
                         Kv::new("Codec", stats.codec.to_string()),
                         Kv::new("Encoder on host", stats.encoder.clone()),
@@ -2658,6 +2660,14 @@ fn overlay_rows(live: &Live, s: &latch_stream::Stats, p: &Presented) -> Vec<Row>
                 s.decode_ms, s.decode_p95_ms, s.frame_budget_ms
             ),
             s.decode_capacity_fps > 0,
+        ),
+        row(
+            "Decoder held",
+            format!(
+                "{} total · {} pending · {} discarded",
+                s.decoder_delayed_frames, s.decoder_pending_frames, s.decoder_discarded_frames
+            ),
+            s.decoder_delayed_frames > 0 || s.decoder_pending_frames > 0,
         ),
         row(
             "Decode → UI",

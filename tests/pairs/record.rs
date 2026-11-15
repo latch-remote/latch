@@ -364,6 +364,20 @@ fn record(mode: &str, frames: Vec<(video::EncodedVideo, VideoInfo)>, root: &Path
                     panic!("loss during recording")
                 };
                 if frame.keyframe {
+                    if mode != "legacy-mac" {
+                        for nal in latch_codec::h264::nal::nal_units(&frame.data)
+                            .into_iter()
+                            .filter(|n| n[0] & 31 == 7)
+                        {
+                            let sps = latch_codec::bitstream::h264_sps(nal).unwrap();
+                            assert_eq!(
+                                sps.reorder_frames,
+                                Some(0),
+                                "host must declare no reordering"
+                            );
+                            assert_eq!(sps.buffering, Some(sps.reference_frames.max(1)));
+                        }
+                    }
                     assert!(
                         frame.data.windows(5).any(|nal| {
                             nal[..3] == [0, 0, 1] && nal[3] & 31 == 7 && nal[4] == 66
@@ -537,11 +551,35 @@ fn pair_record() {
     std::env::set_var("LATCH_TEST_AUDIO", "clicks");
     record("software", encoded("software").unwrap(), &root);
     match native_probe() {
-        Ok(()) => record(
-            "native",
-            encoded("native").expect("native encoder opened but encode/resize failed"),
-            &root,
-        ),
+        Ok(()) => {
+            let frames = encoded("native").expect("native encoder opened but encode/resize failed");
+            #[cfg(target_os = "macos")]
+            {
+                // Actual pre-fix 6.0.0 VideoToolbox bytes from pairs run
+                // 43697534260. Reuse their original access-unit boundaries,
+                // including the resize, without running host normalization.
+                let units =
+                    latch_codec::h264::nal::access_units(include_bytes!("mac-vt-6.0.0.h264"));
+                assert_eq!(units.len(), FRAMES);
+                let mut legacy = frames.clone();
+                for ((frame, _), unit) in legacy.iter_mut().zip(units) {
+                    frame.data = unit.to_vec();
+                    for nal in latch_codec::h264::nal::nal_units(unit)
+                        .into_iter()
+                        .filter(|n| n[0] & 31 == 7)
+                    {
+                        assert_eq!(
+                            latch_codec::bitstream::h264_sps(nal)
+                                .unwrap()
+                                .reorder_frames,
+                            None
+                        );
+                    }
+                }
+                record("legacy-mac", legacy, &root);
+            }
+            record("native", frames, &root);
+        }
         Err(error) => format::result(
             "producer.jsonl",
             serde_json::json!({ "producer": format::platform(), "mode": "native", "status": "unavailable", "reason": format!("{error:#}") }),

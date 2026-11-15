@@ -13,10 +13,28 @@ pub(super) struct Probe {
     sound: Mutex<Vec<(u32, usize, String)>>,
     missing: Mutex<Vec<u32>>,
     pub decode_errors: Mutex<Vec<(u32, String)>>,
+    decode_calls: Mutex<Vec<(u32, Vec<i64>)>>,
     pub fec: AtomicU64,
 }
 
 impl Probe {
+    pub fn decode_call(
+        &self,
+        identity: u32,
+        result: &anyhow::Result<Vec<(i64, crate::Frame)>>,
+        submitted: i64,
+    ) {
+        let delays = result
+            .as_ref()
+            .map(|pictures| {
+                pictures
+                    .iter()
+                    .map(|(time, _)| (submitted - time) / 166667)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.decode_calls.lock().push((identity, delays));
+    }
     pub fn picture(&self, identity: u32, frame: &crate::Frame) {
         let pixels = frame.with_planes(|y, ys, uv, cs| {
             let mut pixels = Vec::new();
@@ -57,6 +75,7 @@ fn check(recording: Recording, native: bool, schedule: &str) {
         sound: Mutex::new(Vec::new()),
         missing: Mutex::new(Vec::new()),
         decode_errors: Mutex::new(Vec::new()),
+        decode_calls: Mutex::new(Vec::new()),
         fec: AtomicU64::new(0),
     });
     let recording = Arc::new(recording);
@@ -341,11 +360,6 @@ fn check(recording: Recording, native: bool, schedule: &str) {
     let pictures = probe.pictures.lock();
     let observed_frames: Vec<_> = pictures.iter().map(|p| p.0).collect();
     let expected_frames: Vec<_> = intended.iter().map(|p| p.frame).collect();
-    let gap = format::MAC_VT_MF_GAP
-        && cfg!(windows)
-        && native
-        && recording.producer.starts_with("macos-")
-        && matches!(recording.mode.as_str(), "native" | "capture");
     println!(
         "PAIR_DECODE {}",
         serde_json::json!({
@@ -354,35 +368,22 @@ fn check(recording: Recording, native: bool, schedule: &str) {
             "errors": *probe.decode_errors.lock()
         })
     );
-    if gap {
-        assert_ne!(
-            observed_frames, expected_frames,
-            "Mac VideoToolbox -> Media Foundation gap unexpectedly passes"
-        );
+    assert!(
+        probe.decode_errors.lock().is_empty(),
+        "decoder errors: {:?}",
+        *probe.decode_errors.lock()
+    );
+    for (identity, delays) in probe.decode_calls.lock().iter() {
         assert_eq!(
-            observed_frames,
-            [6, 12, 18],
-            "Mac VideoToolbox -> Media Foundation gap changed"
+            delays,
+            &[0],
+            "frame {identity} must yield its own picture before the next submission"
         );
     }
-    // The MFT releases delayed GOP output at the next IDR. State::drain
-    // returns its latest picture, so each publication carries the last
-    // surviving input before that IDR. Retain both the intended publication
-    // identity and this exact stale-content reference in the known-gap row.
-    let expected: Vec<_> = if gap {
-        observed_frames
-            .iter()
-            .map(|identity| {
-                *intended
-                    .iter()
-                    .rev()
-                    .find(|p| p.frame < *identity)
-                    .expect("previous surviving frame")
-            })
-            .collect()
-    } else {
-        intended.clone()
-    };
+    assert_eq!(session.stats().decoder_delayed_frames, 0);
+    assert_eq!(session.stats().decoder_pending_frames, 0);
+    assert_eq!(session.stats().decoder_discarded_frames, 0);
+    let expected = intended.clone();
     let observed_source_frames: Vec<_> = expected.iter().map(|p| p.frame).collect();
     assert_eq!(
         pictures.len(),
@@ -391,20 +392,10 @@ fn check(recording: Recording, native: bool, schedule: &str) {
         pictures.iter().map(|f| f.0).collect::<Vec<_>>()
     );
     let mut min_psnr = 99f64;
-    for (index, ((identity, width, height, pixels), expected)) in
-        pictures.iter().zip(expected).enumerate()
-    {
+    for ((identity, width, height, pixels), expected) in pictures.iter().zip(expected) {
         assert_eq!(
             (*identity, *width, *height),
-            (
-                if gap {
-                    observed_frames[index]
-                } else {
-                    expected.frame
-                },
-                expected.width,
-                expected.height
-            ),
+            (expected.frame, expected.width, expected.height),
             "frame identity/order/cropping"
         );
         assert_eq!(pixels.len(), expected.pixels.len());
@@ -467,7 +458,7 @@ fn check(recording: Recording, native: bool, schedule: &str) {
     }
     format::result(
         "media.jsonl",
-        serde_json::json!({ "producer": recording.producer, "consumer": format::platform(), "mode": recording.mode, "decoder": if native { "native" } else { "software" }, "backend": session.stats().decoder, "schedule": schedule, "audio_group": audio_group, "recorded_repair_us": repair_us, "concealed": *probe.missing.lock(), "status": if gap { "known-gap" } else { "passed" }, "gap": if gap { Some("mac-vt-mf-native") } else { None }, "observed_frames": observed_frames, "observed_source_frames": observed_source_frames, "observed_sizes": pictures.iter().map(|p| (p.1, p.2)).collect::<Vec<_>>(), "expected_frames": expected_frames, "expected_sizes": intended.iter().map(|p| (p.width, p.height)).collect::<Vec<_>>(), "decode_errors": *probe.decode_errors.lock(), "frames": pictures.len(), "audio": sound.len(), "min_psnr": min_psnr, "keyframe_requests": requests }),
+        serde_json::json!({ "producer": recording.producer, "consumer": format::platform(), "mode": recording.mode, "decoder": if native { "native" } else { "software" }, "backend": session.stats().decoder, "schedule": schedule, "audio_group": audio_group, "recorded_repair_us": repair_us, "concealed": *probe.missing.lock(), "status": "passed", "decode_calls": *probe.decode_calls.lock(), "decoder_delay_frames": session.stats().decoder_delayed_frames, "observed_frames": observed_frames, "observed_source_frames": observed_source_frames, "observed_sizes": pictures.iter().map(|p| (p.1, p.2)).collect::<Vec<_>>(), "expected_frames": expected_frames, "expected_sizes": intended.iter().map(|p| (p.width, p.height)).collect::<Vec<_>>(), "decode_errors": *probe.decode_errors.lock(), "frames": pictures.len(), "audio": sound.len(), "min_psnr": min_psnr, "keyframe_requests": requests }),
     );
 }
 
@@ -572,6 +563,7 @@ fn pair_live() {
         sound: Mutex::new(Vec::new()),
         missing: Mutex::new(Vec::new()),
         decode_errors: Mutex::new(Vec::new()),
+        decode_calls: Mutex::new(Vec::new()),
         fec: AtomicU64::new(0),
     });
     let (tx, rx) = mpsc::channel();
@@ -704,4 +696,110 @@ fn pair_gamepad_record() {
         &serde_json::json!({ "version": format::VERSION, "producer": format::platform(), "bytes": bytes[..length] }),
     );
     session.stop();
+}
+
+#[test]
+fn buffered_decoder_retains_every_output_identity_and_reports_delay() {
+    struct Buffered(Vec<(i64, u8)>);
+    impl video::Decoder for Buffered {
+        fn decode(
+            &mut self,
+            _: &[u8],
+            _: bool,
+            _: Option<crate::Frame>,
+        ) -> anyhow::Result<Option<crate::Frame>> {
+            unreachable!("the session must use timestamped decoding")
+        }
+        fn decode_frames(
+            &mut self,
+            data: &[u8],
+            _: bool,
+            time: i64,
+            _: Option<crate::Frame>,
+        ) -> anyhow::Result<Vec<(i64, crate::Frame)>> {
+            self.0.push((time, data[0]));
+            if self.0.len() < 3 {
+                return Ok(Vec::new());
+            }
+            Ok(std::mem::take(&mut self.0)
+                .into_iter()
+                .map(|(time, value)| {
+                    let mut frame = crate::Frame::default();
+                    frame.fill((2, 2), (&[value; 4], 2), (&[128; 2], 2), false);
+                    (time, frame)
+                })
+                .collect())
+        }
+        fn name(&self) -> &'static str {
+            "buffered regression fixture"
+        }
+    }
+    let probe = Arc::new(Probe {
+        native: false,
+        channels: 0,
+        pictures: Mutex::new(Vec::new()),
+        sound: Mutex::new(Vec::new()),
+        missing: Mutex::new(Vec::new()),
+        decode_errors: Mutex::new(Vec::new()),
+        decode_calls: Mutex::new(Vec::new()),
+        fec: AtomicU64::new(0),
+    });
+    let (events, _) = mpsc::channel();
+    let (wake, wakes) = mpsc::channel();
+    let mut inner = Inner::new(
+        events,
+        Arc::new(FrameSlot::default()),
+        Box::new(move || {
+            let _ = wake.send(());
+        }),
+    );
+    inner.pair_probe = Some(probe.clone());
+    for identity in 0..3 {
+        inner.queue.lock().frames.push_back((
+            InFrame {
+                frame: identity,
+                data: vec![24 + identity as u8 * 8],
+                keyframe: true,
+                recovery: false,
+                host_delay: identity as u16 * 10,
+                assembly: Duration::from_micros(identity as u64 * 100),
+            },
+            Instant::now(),
+        ));
+    }
+    let inner = Arc::new(inner);
+    let thread_inner = inner.clone();
+    let worker = std::thread::spawn(move || {
+        decode(
+            &thread_inner,
+            Box::new(Buffered(Vec::new())),
+            Codec::H264Baseline,
+            Default::default(),
+        )
+    });
+    for _ in 0..3 {
+        wakes.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    inner.stop.store(true, Ordering::Release);
+    inner.queue_cv.notify_all();
+    worker.join().unwrap();
+    assert_eq!(
+        probe
+            .pictures
+            .lock()
+            .iter()
+            .map(|p| (p.0, p.3[0]))
+            .collect::<Vec<_>>(),
+        [(0, 24), (1, 32), (2, 40)]
+    );
+    assert_eq!(
+        *probe.decode_calls.lock(),
+        [(0, vec![]), (1, vec![]), (2, vec![2, 1, 0])]
+    );
+    let stats = inner.stats.lock();
+    assert_eq!(stats.decoder_delayed_frames, 2);
+    assert_eq!(stats.decoder_pending_frames, 0);
+    assert_eq!(stats.decoder_discarded_frames, 0);
+    assert_eq!(inner.decode.lock().host_tenths, 30);
+    assert_eq!(inner.frames.seq(), 3);
 }

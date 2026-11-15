@@ -1,6 +1,6 @@
 //! A desktop encoder with one independently predicted slice per worker band.
 
-mod bits;
+pub(crate) mod bits;
 mod cavlc;
 mod deblock;
 mod effort;

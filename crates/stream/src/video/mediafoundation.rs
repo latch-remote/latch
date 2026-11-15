@@ -105,14 +105,17 @@ impl Drop for SharedSurface {
         }
     }
 }
+type Pictures = Vec<(i64, DecodedNv12)>;
 struct Request {
     bytes: Vec<u8>,
-    reply: mpsc::SyncSender<Result<(Option<DecodedNv12>, &'static str)>>,
+    time: i64,
+    reply: mpsc::SyncSender<Result<(Pictures, &'static str)>>,
 }
 pub struct MfDecoder {
     requests: Option<mpsc::Sender<Request>>,
     stream: (Codec, u32, u32, u8),
     name: &'static str,
+    next_time: i64,
 }
 impl MfDecoder {
     pub fn new() -> Result<Self> {
@@ -163,7 +166,7 @@ impl MfDecoder {
                 }
                 for request in receive {
                     let result = decoder
-                        .decode(&request.bytes)
+                        .decode(&request.bytes, request.time)
                         .map(|frame| (frame, decoder.name()))
                         .context("decode Media Foundation access unit");
                     let _ = request.reply.send(result);
@@ -174,9 +177,27 @@ impl MfDecoder {
             requests: Some(requests),
             stream: (codec, width, height, depth),
             name: worker_deadline::receive(&startup, worker_deadline::STARTUP)??,
+            next_time: 0,
         })
     }
+    /// Convenience for synchronous tools. A buffered or multi-output decoder
+    /// fails explicitly here. Sessions use decode_frames and retain every output.
     pub fn decode(&mut self, annexb: &[u8]) -> Result<Option<DecodedNv12>> {
+        let time = self.next_time;
+        self.next_time = self
+            .next_time
+            .checked_add(166667)
+            .context("sample time overflow")?;
+        let mut pictures = self.decode_frames(annexb, time)?;
+        ensure!(
+            pictures.len() <= 1 && pictures.first().is_none_or(|p| p.0 == time),
+            "decoder buffered pictures; use timestamped decode_frames"
+        );
+        Ok(pictures.pop().map(|(_, picture)| picture))
+    }
+    /// The timestamp is an opaque, unique input identity in 100 ns units.
+    /// Every returned picture carries its MFT output sample's timestamp.
+    pub fn decode_frames(&mut self, annexb: &[u8], time: i64) -> Result<Pictures> {
         ensure!(
             annexb.len() <= 64 * 1024 * 1024,
             "video access unit exceeds 64 MiB"
@@ -184,14 +205,17 @@ impl MfDecoder {
         let (reply, receive) = mpsc::sync_channel(1);
         if self.requests.is_none() {
             let (codec, width, height, depth) = self.stream;
+            let next_time = self.next_time;
             *self = Self::with_stream(codec, width, height, depth)
                 .context(worker_deadline::ReopenFailed)?;
+            self.next_time = next_time;
         }
         self.requests
             .as_ref()
             .expect("reopened worker")
             .send(Request {
                 bytes: annexb.to_vec(),
+                time,
                 reply,
             })
             .context("decoder worker stopped")?;
@@ -243,8 +267,8 @@ pub fn supported() -> Vec<Codec> {
             .filter_map(|(codec, bytes)| {
                 let result: Result<()> = (|| {
                     let mut state = State::new(codec, true, None, 256, 256, 8)?;
-                    for _ in 0..10 {
-                        if state.decode(bytes)?.is_some() {
+                    for index in 0..10 {
+                        if !state.decode(bytes, index * 166667)?.is_empty() {
                             ensure!(state.dxva_used, "decoder returned CPU samples");
                             return Ok(());
                         }
@@ -817,8 +841,8 @@ struct State {
     transform: IMFTransform,
     gpu: Option<Gpu>,
     output_type: Option<IMFMediaType>,
-    latest: Option<DecodedNv12>,
-    time: i64,
+    pictures: Pictures,
+    codec: Codec,
     dxva_used: bool,
 }
 impl State {
@@ -847,14 +871,17 @@ impl State {
                 _ => MFVideoFormat_H264,
             };
             let transform = create_transform(subtype)?;
-            // The H.264 decoder exposes this as a UINT32 transform attribute,
+            // MF_LOW_LATENCY and CODECAPI_AVLowLatencyMode share one GUID.
+            // The H.264 decoder exposes it as a UINT32 transform attribute,
             // not the VT_BOOL encoder property on ICodecAPI. Set it before types.
             // A transform without attributes answers E_NOTIMPL; low latency
             // is a hint, so that decoder runs without it.
             match transform.GetAttributes() {
-                Ok(attributes) => attributes
-                    .SetUINT32(&CODECAPI_AVLowLatencyMode, 1)
-                    .context("enable decoder low-latency mode")?,
+                Ok(attributes) => {
+                    attributes
+                        .SetUINT32(&CODECAPI_AVLowLatencyMode, 1)
+                        .context("enable decoder low-latency mode")?;
+                }
                 Err(error) if error.code() == E_NOTIMPL => {
                     tracing::debug!("the decoder has no attributes; no low-latency attribute")
                 }
@@ -888,8 +915,8 @@ impl State {
                 transform,
                 gpu,
                 output_type: None,
-                latest: None,
-                time: 0,
+                pictures: Vec::new(),
+                codec,
                 dxva_used: dxva,
             };
             match state.output_type() {
@@ -912,7 +939,24 @@ impl State {
                 .transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
                 .context("start decoder input stream")?;
+            tracing::info!(settings = ?state.low_latency(), "decoder low-latency readback");
             Ok(state)
+        }
+    }
+    fn low_latency(&self) -> (Option<u32>, Option<bool>) {
+        // SAFETY: Read on the same MTA as transform creation and decode.
+        unsafe {
+            let attributes = self.transform.GetAttributes().ok();
+            let mf = attributes
+                .as_ref()
+                .and_then(|a| a.GetUINT32(&MF_LOW_LATENCY).ok());
+            let api = self
+                .transform
+                .cast::<ICodecAPI>()
+                .ok()
+                .and_then(|a| a.GetValue(&CODECAPI_AVLowLatencyMode).ok())
+                .and_then(|v| bool::try_from(&v).ok());
+            (mf, api)
         }
     }
     fn output_type(&mut self) -> Result<()> {
@@ -961,7 +1005,16 @@ impl State {
             Ok(())
         }
     }
-    fn decode(&mut self, annexb: &[u8]) -> Result<Option<DecodedNv12>> {
+    fn decode(&mut self, annexb: &[u8], time: i64) -> Result<Pictures> {
+        use latch_codec::bitstream::{low_delay, Format};
+        let bytes = match self.codec {
+            Codec::H264Baseline | Codec::H264High => low_delay(annexb, Format::H264)?,
+            Codec::Hevc => low_delay(annexb, Format::Hevc)?,
+            Codec::Av1 => std::borrow::Cow::Borrowed(annexb),
+        };
+        self.decode_input(&bytes, time)
+    }
+    fn decode_input(&mut self, annexb: &[u8], time: i64) -> Result<Pictures> {
         if self.output_type.is_some() {
             self.drain()?;
         }
@@ -978,9 +1031,8 @@ impl State {
                 buffer.Unlock()?;
                 buffer.SetCurrentLength(length)?;
                 sample.AddBuffer(&buffer)?;
-                sample.SetSampleTime(self.time)?;
+                sample.SetSampleTime(time)?;
                 sample.SetSampleDuration(166667)?;
-                self.time += 166667;
                 match self.transform.ProcessInput(0, &sample, 0) {
                     Err(e) if e.code() == MF_E_NOTACCEPTING => {
                         self.drain()?;
@@ -993,7 +1045,7 @@ impl State {
             }
         }
         self.drain()?;
-        Ok(self.latest.take())
+        Ok(std::mem::take(&mut self.pictures))
     }
     fn drain(&mut self) -> Result<()> {
         if self.output_type.is_none() {
@@ -1094,7 +1146,10 @@ impl State {
                     buffer.Unlock()?;
                     result?
                 };
-                self.latest = Some(picture);
+                let time = sample
+                    .GetSampleTime()
+                    .context("decoder output has no sample time")?;
+                self.pictures.push((time, picture));
             }
         }
         bail!("decoder produced too many outputs without needing input")
@@ -1139,6 +1194,267 @@ mod tests {
             assert!(frame.y[192 * frame.y_stride + 128] <= 20);
             assert_eq!(decoder.name(), "Media Foundation (DXVA)");
         }
+    }
+    fn tape() -> Vec<&'static [u8]> {
+        latch_codec::h264::nal::access_units(include_bytes!(
+            "../../../../tests/pairs/mac-vt-6.0.0.h264"
+        ))
+    }
+    fn replay(state: &mut State, patch: bool) -> Result<Vec<Vec<i64>>> {
+        let mut calls = Vec::new();
+        for (index, bytes) in tape().into_iter().enumerate() {
+            let time = index as i64 * 166667;
+            let pictures = if patch {
+                state.decode(bytes, time)?
+            } else {
+                state.decode_input(bytes, time)?
+            };
+            calls.push(
+                pictures
+                    .into_iter()
+                    .map(|(time, _)| time / 166667)
+                    .collect(),
+            );
+        }
+        Ok(calls)
+    }
+    #[test]
+    fn legacy_mac_outputs_every_picture_with_its_own_sample_time() -> Result<()> {
+        let _runtime = Runtime::new()?;
+        let mut raw = State::new(Codec::H264Baseline, false, None, 160, 98, 8)?;
+        eprintln!(
+            "MF low latency (shared MF/CODECAPI attribute, ICodecAPI): {:?}",
+            raw.low_latency()
+        );
+        let before = replay(&mut raw, false)?;
+        eprintln!("MF software old host before patch: {before:?}");
+        // Read all returned sample times. This test retains delayed outputs
+        // even on an MFT version that has learned to release old streams early.
+        let observed: Vec<_> = before.iter().flatten().copied().collect();
+        assert!(observed.windows(2).all(|pair| pair[0] < pair[1]));
+        let mut patched = State::new(Codec::H264Baseline, false, None, 160, 98, 8)?;
+        let after = replay(&mut patched, true)?;
+        assert_eq!(after, (0..24).map(|i| vec![i]).collect::<Vec<_>>());
+        eprintln!("MF software old host after patch: {after:?}");
+        // A new host's on-wire normalized stream takes the same path and
+        // does not rely on a second rewrite to release its pictures.
+        let mut host = State::new(Codec::H264Baseline, false, None, 160, 98, 8)?;
+        for (index, bytes) in tape().into_iter().enumerate() {
+            let fixed =
+                latch_codec::bitstream::low_delay(bytes, latch_codec::bitstream::Format::H264)?;
+            let pictures = host.decode_input(&fixed, index as i64 * 166667)?;
+            assert_eq!(
+                pictures.iter().map(|p| p.0).collect::<Vec<_>>(),
+                [index as i64 * 166667]
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn explicit_reorder_limit_controls_poc_zero_decoder_delay() -> Result<()> {
+        let _runtime = Runtime::new()?;
+        // Same recorded VT SPS, same POC type 0 and slices. Only the last
+        // two VUI restriction values differ. Larger DPB storage alone must
+        // not authorize output reordering.
+        for (reorder, buffer, hex) in [
+            (0, 1, "2742c015ab4187f08c44d40404041e1108d4"),
+            (0, 9, "2742c015ab4187f08c44d40404041e1108c540"),
+            (1, 1, "2742c015ab4187f08c44d40404041e1108a5"),
+            (1, 9, "2742c015ab4187f08c44d40404041e1108a150"),
+            (9, 9, "2742c015ab4187f08c44d40404041e11088a15"),
+        ] {
+            let sps: Vec<_> = hex
+                .as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
+                .collect();
+            let fields = latch_codec::bitstream::h264_sps(&sps)?;
+            assert_eq!(
+                (fields.poc_type, fields.reorder_frames, fields.buffering),
+                (0, Some(reorder), Some(buffer))
+            );
+            let mut state = State::new(Codec::H264Baseline, false, None, 160, 98, 8)?;
+            let mut calls = Vec::new();
+            for (index, bytes) in tape().into_iter().take(6).enumerate() {
+                let mut unit = Vec::new();
+                for nal in latch_codec::h264::nal::nal_units(bytes) {
+                    unit.extend_from_slice(&[0, 0, 0, 1]);
+                    unit.extend_from_slice(if nal[0] & 31 == 7 { &sps } else { nal });
+                }
+                calls.push(
+                    state
+                        .decode_input(&unit, index as i64 * 166667)?
+                        .into_iter()
+                        .map(|p| p.0 / 166667)
+                        .collect::<Vec<_>>(),
+                );
+            }
+            eprintln!("MF POC=0 reorder={reorder} buffering={buffer}: {calls:?}");
+            if reorder == 0 {
+                assert_eq!(calls, (0..6).map(|i| vec![i]).collect::<Vec<_>>());
+            }
+        }
+        Ok(())
+    }
+    fn long_gop_delay(hardware: bool) -> Result<()> {
+        for (bytes, width, height) in [
+            (
+                include_bytes!("../../tests/fixtures/mac-long-gop-tiny.h264").as_slice(),
+                160,
+                98,
+            ),
+            (
+                include_bytes!("../../tests/fixtures/mac-long-gop-1080.h264").as_slice(),
+                1920,
+                1080,
+            ),
+        ] {
+            let units = latch_codec::h264::nal::access_units(bytes);
+            for patch in [false, true] {
+                let mut state = State::new(Codec::H264Baseline, hardware, None, width, height, 8)?;
+                let mut output = Vec::new();
+                for (index, unit) in units.iter().enumerate() {
+                    let time = index as i64 * 166667;
+                    let pictures = if patch {
+                        state.decode(unit, time)?
+                    } else {
+                        state.decode_input(unit, time)?
+                    };
+                    if hardware && !pictures.is_empty() {
+                        ensure!(state.dxva_used, "decoder returned CPU samples");
+                    }
+                    if patch {
+                        assert_eq!(
+                            pictures.iter().map(|p| p.0).collect::<Vec<_>>(),
+                            [time],
+                            "long-GOP input {index}"
+                        );
+                    }
+                    output.extend(
+                        pictures
+                            .into_iter()
+                            .map(|(time, _)| (index, time / 166667, index as i64 - time / 166667)),
+                    );
+                }
+                eprintln!("long GOP {width}x{height} hardware={hardware} patch={patch}, (call, input, delay)={output:?}");
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn long_gop_sps_normalization_eliminates_decoder_delay() -> Result<()> {
+        let _runtime = Runtime::new()?;
+        long_gop_delay(false)
+    }
+    fn check_picture(frame: &DecodedNv12, reference: &latch_codec::Yuv420) {
+        assert_eq!(
+            (frame.width, frame.height),
+            (reference.width, reference.height)
+        );
+        let width = frame.width as usize;
+        let height = frame.height as usize;
+        for (data, stride, expected, expected_stride, w, h, step, offset) in [
+            (
+                &frame.y,
+                frame.y_stride,
+                &reference.y,
+                reference.y_stride,
+                width,
+                height,
+                1,
+                0,
+            ),
+            (
+                &frame.uv,
+                frame.uv_stride,
+                &reference.u,
+                reference.c_stride,
+                width / 2,
+                height / 2,
+                2,
+                0,
+            ),
+            (
+                &frame.uv,
+                frame.uv_stride,
+                &reference.v,
+                reference.c_stride,
+                width / 2,
+                height / 2,
+                2,
+                1,
+            ),
+        ] {
+            let mut squared_error = 0f64;
+            for y in 0..h {
+                for x in 0..w {
+                    squared_error += (f64::from(data[y * stride + x * step + offset])
+                        - f64::from(expected[y * expected_stride + x]))
+                    .powi(2);
+                }
+            }
+            let mse = squared_error / (w * h) as f64;
+            assert!(mse <= 6.5025, "decoded picture PSNR below 40 dB, MSE={mse}");
+        }
+    }
+    #[test]
+    #[ignore = "decode-only qualification requires a real DXVA adapter"]
+    fn hardware_legacy_mac_outputs_immediately() -> Result<()> {
+        let _runtime = Runtime::new()?;
+        let mut raw = State::new(Codec::H264Baseline, true, None, 160, 98, 8)?;
+        eprintln!("DXVA old host before patch: {:?}", replay(&mut raw, false)?);
+        for patch in [false, true] {
+            let mut reference = latch_codec::h264::Decoder::new();
+            let mut state = State::new(Codec::H264Baseline, true, None, 160, 98, 8)?;
+            let adapter = unsafe {
+                state
+                    .gpu
+                    .as_ref()
+                    .context("no GPU")?
+                    .device
+                    .cast::<IDXGIDevice>()?
+                    .GetAdapter()?
+                    .GetDesc()?
+            };
+            let end = adapter
+                .Description
+                .iter()
+                .position(|c| *c == 0)
+                .unwrap_or(adapter.Description.len());
+            eprintln!(
+                "DXVA adapter {}",
+                String::from_utf16_lossy(&adapter.Description[..end])
+            );
+            let units = tape();
+            let mut calls = Vec::new();
+            for (index, bytes) in units.into_iter().enumerate() {
+                let fixed =
+                    latch_codec::bitstream::low_delay(bytes, latch_codec::bitstream::Format::H264)?;
+                let pictures = if patch {
+                    state.decode(bytes, index as i64 * 166667)?
+                } else {
+                    state.decode_input(&fixed, index as i64 * 166667)?
+                };
+                ensure!(state.dxva_used, "decoder returned CPU samples");
+                ensure!(
+                    pictures.len() == 1 && pictures[0].0 == index as i64 * 166667,
+                    "hardware decoder withheld or misidentified frame {index}"
+                );
+                check_picture(
+                    &pictures[0].1,
+                    reference.decode(bytes)?.context("reference picture")?,
+                );
+                calls.push(index);
+            }
+            eprintln!(
+                "DXVA old-host viewer patch={patch}, low latency={:?}, zero-delay frames={calls:?}",
+                state.low_latency()
+            );
+        }
+        long_gop_delay(true)?;
+        Ok(())
     }
     #[test]
     fn p010_is_reduced_to_sdr_without_reading_padding() {

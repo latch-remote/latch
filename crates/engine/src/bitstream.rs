@@ -14,6 +14,22 @@
 use anyhow::{bail, ensure, Context, Result};
 use std::borrow::Cow;
 
+/// Every H.264/HEVC host disables B pictures. Some encoders leave that
+/// implicit in their parameter sets, which lets viewers buffer whole GOPs.
+/// Apply the shared syntax fix after extracting OS-owned output buffers.
+pub(crate) fn low_delay(codec: crate::video::Codec, bytes: &mut Vec<u8>) -> Result<()> {
+    use latch_codec::bitstream::{low_delay, Format};
+    let format = match codec {
+        crate::video::Codec::H264Baseline | crate::video::Codec::H264High => Format::H264,
+        crate::video::Codec::Hevc => Format::Hevc,
+        crate::video::Codec::Av1 => return Ok(()),
+    };
+    if let Cow::Owned(fixed) = low_delay(bytes, format)? {
+        *bytes = fixed;
+    }
+    Ok(())
+}
+
 const START: [u8; 4] = [0, 0, 0, 1];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

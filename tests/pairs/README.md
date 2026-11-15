@@ -13,6 +13,9 @@ window is open. Both native encoder and capture tapes reopen at frame 12
 with a requested size change from 160×98 to 128×74 and assert both sizes.
 The software tapes share the same deterministic source across OSes. The
 native encoder and capture tapes exercise the OS-specific video paths.
+The Mac producer also emits `legacy-mac.session.json` from the committed
+pre-fix `mac-vt-6.0.0.h264` recording. All consumers must pass this mode,
+including Windows Media Foundation with viewer-side SPS normalization.
 The producer also runs its ramp through the production OS audio conversion
 boundary. macOS copies planar Float32 buffers and converts to i16, Windows
 converts Float32 and PCM24 with the 5.1 side-surround WAVE mask through the
@@ -50,7 +53,13 @@ source with an MSE below 65 per plane and checks its numbered stripe within
 four luma levels. Every IDR must carry a Baseline-profile SPS. Software
 consumer hashes must match exactly. OS decoder Y and UV planes each require at least 40 dB
 PSNR against the software-decoded reference. Dimensions and frame order
-must match exactly. Every synthetic producer forces IDRs at 0, 6, 12 and
+must match exactly. Every decode call must return its own picture before
+the next access unit is submitted. Results retain each call's output delay
+in frames. Empty output, a delayed output, and multiple outputs fail this
+zero-delay contract even when final picture counts match. The session's
+separate buffered-decoder regression verifies that delayed batches retain
+all identities and increment the decoder-held counters.
+Every synthetic producer forces IDRs at 0, 6, 12 and
 18, changes size at 12 and asserts SPS/PPS/IDR repetition.
 
 Audio references include packet sequence, channel count and FNV-1a-64 of
@@ -87,7 +96,7 @@ required OS backend fails CI. The hosted capability contract is explicit.
 
 | Runner | Required producer modes | Required decoders | Explicit unavailable capability |
 |---|---|---|---|
-| macos-15 ARM64 | software, VideoToolbox native, ScreenCaptureKit capture | software, VideoToolbox | none |
+| macos-15 ARM64 | software, VideoToolbox native, ScreenCaptureKit capture, legacy Mac tape | software, VideoToolbox | none |
 | windows-latest x86_64 | software, Media Foundation native | software, Media Foundation | desktop capture, hosted runner has no D3D11 adapter |
 | ubuntu-24.04 x86_64 | software, isolated X11 capture | software | native encoder/decoder, no hardware device |
 | ubuntu-24.04-arm ARM64 | software, isolated X11 capture | software | native encoder/decoder, no hardware device |
@@ -123,7 +132,7 @@ physical pads, rumble motors, physical audio playback, native global
 keyboard capture and user-granted Screen Recording remain outside these
 artifact assertions.
 
-`KNOWN-GAPS.md` names the currently failing media and input contracts. Their exact
+`KNOWN-GAPS.md` names the currently failing input contracts. Their exact
 observed values are asserted, and an unexpected pass fails so a behavior
 fix updates the list. CI summaries contain observed and expected native
 values for every case. Every required producer, media schedule, input
@@ -161,19 +170,20 @@ product follow-up. This PR preserves product timing and tests both timely
 repair and exact late-packet concealment through the real receiver.
 
 
-## VideoToolbox to Media Foundation finding
+## Pre-fix Mac recording
 
-Run 43697534260 reaches all 162 media cells. Six fail on the Windows native
-decoder with Mac native/capture tapes, for all three schedules. Each returns
-only frames 6, 12 and 18, against 24 expected pictures for clean/late-audio
-or 22 for loss/reorder. The same tapes pass Windows software decoding and
-both Mac decoders, and both Linux consumers pass them. Windows native
-decoding of software and Windows-native tapes passes. `MAC_VT_MF_GAP`
-asserts this exact frame sequence, retains the full intended sequence in
-results and fails on unexpected pass. The snapshot also requires the exact stale contents
-from frames 5/11/17 (3/11/17 after loss), with ≥40 dB per-plane PSNR against
-those observed source references. Full intended identities and sizes stay
-in the results. Capture call 12 returns the old 160×98 size. Native call 6
-has only 37.938 dB against its intended picture, or 28.397 dB after loss. Audio, video FEC and causal keyframe
-request assertions continue to run. Decode errors are captured per frame
-for the product follow-up, whose fixing PR remains unassigned.
+`mac-vt-6.0.0.h264` contains the 24 original access units extracted from
+`native.session.json` in `pairs-recording-macos-aarch64` of GitHub Actions
+run 43697534260. The recording includes IDRs at 0/6/12/18 and a resize at
+12. It retains VideoToolbox's original SPS bytes, with POC type 0, one
+reference and no bitstream restriction. The recorder wraps these bytes in
+a fresh protocol-1 session with deterministic audio and reference pictures.
+The host normalizer is bypassed only for this committed test tape.
+
+The two SPS NALs are `2742c015ab4187f08c44d404040408` and
+`2742c015ab4186f043193501010102`. The fixed forms are
+`2742c015ab4187f08c44d40404041e1108d4` and
+`2742c015ab4186f043193501010107844235`. The codec unit tests retain the
+original bytes independently of this tape. The Windows decoder tests
+compare raw playback, host-normalized playback and viewer-normalized
+playback, and isolate the reordering limit from DPB storage and POC type.
