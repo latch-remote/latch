@@ -523,19 +523,31 @@ BASH
 
 For an immediate failure, the block above runs rollback automatically. For a later
 rollback, set `RELAY_HOST`, `RELAY_CERT_NAME` and `backup` to the saved values,
-then run these restore commands as root during another arranged interruption.
+then run this block during another arranged interruption, inside `tmux` or
+`screen` so a dropped SSH session cannot interrupt it. It runs in its own root
+shell, so the renewal timer is restored when it ends, whether it succeeds or
+fails, and a failure does not close the operator's shell.
+
 The current quota stays at its live path. The saved ledger is for audit and
 recovery of damaged storage, and must never overwrite accumulated usage.
 
+The saved configuration contains the certificate that was in service before the
+upgrade. A renewal since then makes that copy older than the current one, and
+Certbot would not replace it until its own next renewal. The block therefore
+reinstalls the current certificate after restoring the configuration.
+
 ```bash
+sudo env RELAY_HOST="$RELAY_HOST" RELAY_CERT_NAME="$RELAY_CERT_NAME" \
+  backup="$backup" RELAY_KIT="$PWD/deploy/relay-tcp" bash <<'BASH'
 set -euo pipefail
-RELAY_KIT="$PWD/deploy/relay-tcp"
+umask 077
 renewal="/etc/letsencrypt/renewal/$RELAY_CERT_NAME.conf"
+lineage="/etc/letsencrypt/live/$RELAY_CERT_NAME"
 restore_timer() {
     result=$?
     trap - EXIT HUP INT TERM
     systemctl enable --now certbot.timer || result=1
-    systemctl is-active --quiet certbot.timer || result=1
+    systemctl is-active --quiet certbot.timer || { echo 'Certbot timer is inactive. Restore renewal scheduling now.' >&2; result=1; }
     exit "$result"
 }
 trap restore_timer EXIT
@@ -544,12 +556,17 @@ trap 'exit 143' HUP TERM
 systemctl stop certbot.timer
 certbot_state=$(systemctl is-active certbot.service || true)
 case "$certbot_state" in inactive|failed) ;; *) echo 'Certbot is running' >&2; exit 1 ;; esac
-systemctl stop latch-relay.service
-cp -a /var/lib/latch-relay/quota "$backup/quota.at-rollback"
+# Check the backup and the current certificate before interrupting service.
 sha256sum --check "$backup/SHA256SUMS"
+openssl x509 -in "$lineage/fullchain.pem" -noout -checkend 86400
+systemctl stop latch-relay.service
+cp -a /var/lib/latch-relay/quota "$backup/quota.at-rollback" \
+    || echo 'The audit copy of the quota failed. Continuing with the rollback.' >&2
 install -m 0755 "$backup/latch-relay" /usr/local/bin/latch-relay
 cp -a "$backup/latch-relay.service" /etc/systemd/system/latch-relay.service
 cp -a "$backup/config/." /etc/latch-relay/
+install -o root -g latch-relay -m 0640 "$lineage/fullchain.pem" /etc/latch-relay/fullchain.pem
+install -o root -g latch-relay -m 0640 "$lineage/privkey.pem" /etc/latch-relay/privkey.pem
 cp -a "$backup/renewal.conf" "$renewal"
 rm -rf /etc/systemd/system/latch-relay.service.d
 if [[ -d "$backup/drop-ins" ]]; then
@@ -558,21 +575,28 @@ fi
 systemctl daemon-reload
 systemctl start latch-relay.service
 systemctl is-active --quiet latch-relay.service
+openssl x509 -in /etc/latch-relay/fullchain.pem -noout -enddate
 python3 "$RELAY_KIT/selftest.py" --live "$RELAY_HOST"
+BASH
 ```
 
 ### Renewal and expiry checks
 
 The deployed certificate registration has no expiry e-mail address. Check renewal
-failures and remaining validity explicitly. The expiry command exits nonzero
-when fewer than 30 days remain. Run it daily through the operator's monitoring
-or scheduler and alert on a nonzero result.
+failures and remaining validity explicitly. The relay serves its own copy,
+`/etc/latch-relay/fullchain.pem`, which the deploy hook replaces after each
+renewal, so check that copy as well as Certbot's: a fresh Certbot certificate
+does not prove the relay is serving it. Each `-checkend` command exits nonzero
+when fewer than 30 days remain, and `is-failed` exits zero when the last
+renewal run failed. Run them daily through the operator's monitoring or
+scheduler and alert on those results.
 
 ```sh
-sudo systemctl --failed certbot.service
-sudo journalctl -u certbot.service --since '7 days ago' --no-pager
-sudo openssl x509 -in "/etc/letsencrypt/live/$RELAY_CERT_NAME/fullchain.pem" -noout -enddate
+sudo openssl x509 -in /etc/latch-relay/fullchain.pem -noout -enddate
+sudo openssl x509 -in /etc/latch-relay/fullchain.pem -noout -checkend 2592000
 sudo openssl x509 -in "/etc/letsencrypt/live/$RELAY_CERT_NAME/fullchain.pem" -noout -checkend 2592000
+sudo systemctl is-failed certbot.service
+sudo journalctl -u certbot.service --since '7 days ago' --no-pager
 sudo systemctl is-active certbot.timer
 ```
 

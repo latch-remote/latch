@@ -92,8 +92,24 @@ def check_upgrade_runbook():
         assert 'install -m 0755 "$backup/latch-relay"' in block
         assert 'cp -a "$backup/config/."' in block
         assert 'cp -a "$backup/quota.before" /var/lib/latch-relay/quota' not in block
+    # The later rollback runs in its own root shell and serves the current
+    # certificate, never the copy saved before the upgrade.
+    later = blocks[1].split("bash <<'BASH'\n", 1)[1].rsplit("\nBASH", 1)[0]
+    subprocess.run(["bash", "-n"], input=later, text=True, check=True)
+    later_order = ["trap restore_timer EXIT", "systemctl stop certbot.timer",
+                   'sha256sum --check "$backup/SHA256SUMS"',
+                   "systemctl stop latch-relay.service",
+                   'cp -a "$backup/config/." /etc/latch-relay/',
+                   '"$lineage/fullchain.pem" /etc/latch-relay/fullchain.pem',
+                   '"$lineage/privkey.pem" /etc/latch-relay/privkey.pem',
+                   "systemctl start latch-relay.service",
+                   'python3 "$RELAY_KIT/selftest.py" --live "$RELAY_HOST"']
+    later_main = later[later.index("trap restore_timer EXIT"):]
+    later_positions = [later_main.index(command) for command in later_order]
+    assert later_positions == sorted(later_positions), "later rollback order changed"
     assert 'no expiry e-mail' in upgrade
     assert '-checkend 2592000' in upgrade
+    assert '-in /etc/latch-relay/fullchain.pem -noout -checkend 2592000' in upgrade
     assert '--live relay.' not in text
     finish = "finish() {\n" + script.split("finish() {\n", 1)[1].split("\n}\ntrap finish EXIT", 1)[0] + "\n}\n"
     with tempfile.TemporaryDirectory(prefix="latch-upgrade-exit-test-") as directory:
@@ -508,7 +524,10 @@ def main():
     parser.add_argument("--live", metavar="HOSTNAME", help="verify public WebPKI TLS and relay ALPN")
     parser.add_argument("--port", type=int, default=443)
     args = parser.parse_args()
-    check_kit()
+    # A live check runs as root on the production relay. It must not also run
+    # the kit's simulated installs there, however well they are redirected.
+    if not args.live or args.binary:
+        check_kit()
     if args.binary:
         check_binary(args.binary)
     if args.live:

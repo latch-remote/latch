@@ -125,14 +125,16 @@ fn merge_observations(latest: &mut NetworkDiagnosis, previous: &NetworkDiagnosis
     } else if latest.captive_portal == CaptivePortal::Unknown {
         latest.captive_portal = previous.captive_portal.clone();
     }
+    // Only the proxy check's own warnings make its empty result incomplete.
+    // Another check timing out says nothing about the proxy settings.
     let incomplete_proxy = latest.proxies.candidates.is_empty()
-        && (latest.proxies.warnings.iter().any(|warning| {
+        && latest.proxies.warnings.iter().any(|warning| {
             !matches!(
                 warning,
                 netenv::NetworkWarning::WindowsServiceSettings
                     | netenv::NetworkWarning::MacStaticFallback
             )
-        }) || !latest.warnings.is_empty());
+        });
     if !latest.proxy_observed || incomplete_proxy {
         latest.proxies = previous.proxies.clone();
     }
@@ -619,9 +621,11 @@ mod tests {
             proxy_observed: true,
             ..Default::default()
         };
+        // The proxy check finished empty. Another check timing out does not
+        // keep the old proxy.
         latest.warnings.push(netenv::NetworkWarning::ChecksTimedOut);
         merge_observations(&mut latest, &previous, false);
-        assert!(proxy_selection(&latest).0.is_some());
+        assert!(proxy_selection(&latest).0.is_none());
     }
 
     #[test]
