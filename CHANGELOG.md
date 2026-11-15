@@ -120,6 +120,10 @@ GitHub release notes, so each version gets a heading of the form
   real headless streams through blocked, lossy, proxy, TLS-inspecting,
   captive-portal and MTU-limited networks. Record decoded video, sound,
   input and path recovery in CI, with strict expected-failure tracking.
+- Keep the relay carrier throughput comparison independent of timer
+  accuracy: its delay shim and sender yield instead of sleeping, so a runner
+  that wakes sleeps late no longer lowers the offered rate or adds to the
+  measured delay. The thresholds are unchanged.
 
 ### Networking
 

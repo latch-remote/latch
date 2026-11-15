@@ -71,7 +71,9 @@ fn websocket_matches_native_video_through_a_delayed_path() {
                 }
                 next += period;
             }
-            thread::sleep(Duration::from_millis(1));
+            // Offer at most one frame per pass, so a sleep that wakes late lowers
+            // the offered rate and adds to every measured age. Yield instead.
+            thread::yield_now();
         }
         assert_eq!(received, queued.len(), "{carrier:?} failed to drain");
         assert!(host.recv_timeout(Duration::ZERO).is_none());

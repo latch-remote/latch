@@ -345,10 +345,17 @@ fn run_gateway_connection(
     client.set_nodelay(true)?;
     let mut to_server = VecDeque::new();
     let mut to_client = VecDeque::new();
+    // A late wake-up is added to the modelled delay. Hosted macOS runners wake
+    // a 1 ms sleep tens of milliseconds late, so the delayed path yields.
+    let precise = matches!(mode, GatewayMode::Delay(_));
     while !stopped.load(Ordering::Acquire) {
         delayed_forward(&client, &server, &mut to_server, delay)?;
         delayed_forward(&server, &client, &mut to_client, delay)?;
-        thread::sleep(Duration::from_millis(1));
+        if precise {
+            thread::yield_now();
+        } else {
+            thread::sleep(Duration::from_millis(1));
+        }
     }
     Ok(())
 }
