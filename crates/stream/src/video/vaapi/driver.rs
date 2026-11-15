@@ -811,81 +811,95 @@ impl Decoder for Vaapi {
 /// A decoder for a negotiated stream, on the node its probe passed on.
 fn open_direct(codec: Codec, width: u32, height: u32, ten_bit: bool) -> Result<Vaapi> {
     let caps = capabilities();
-    let cap = super::capability(caps, codec, ten_bit, width, height)?;
+    let cap = super::capability(&caps, codec, ten_bit, width, height)?;
     let device =
         Device::open(&cap.node)?.with_context(|| format!("{} is gone", cap.node.display()))?;
     Vaapi::on(device, codec, Output::Presentation)
 }
 
-/// Successful capabilities live for the process. Empty results may be
-/// transient, so retry them after a cooldown without spawning probe storms.
+/// Keep proven capabilities while retrying unproven entries after a cooldown.
+/// A timed-out probe stays pending so a hung driver owns at most one worker
+/// and a late result can still be collected by a later lookup.
 #[derive(Default)]
 struct CapabilityCache {
-    caps: OnceLock<Vec<Capability>>,
-    retry_at: Mutex<Option<Instant>>,
+    caps: Vec<Capability>,
+    pending: Option<std::sync::mpsc::Receiver<Vec<Capability>>>,
+    retry_at: Option<Instant>,
 }
 
 impl CapabilityCache {
-    fn get(&self, now: Instant, probe: impl FnOnce() -> Vec<Capability>) -> &[Capability] {
-        if let Some(caps) = self.caps.get() {
-            return caps;
+    fn get(
+        &mut self,
+        now: Instant,
+        timeout: Duration,
+        start_probe: impl FnOnce(Vec<Capability>) -> Option<std::sync::mpsc::Receiver<Vec<Capability>>>,
+    ) -> Vec<Capability> {
+        let mut wait = Duration::ZERO;
+        if self.pending.is_none() && self.retry_at.is_none_or(|deadline| now >= deadline) {
+            self.retry_at = Some(now + Duration::from_secs(30));
+            self.pending = start_probe(self.caps.clone());
+            // Retry in the background when we already have usable codecs.
+            if self.caps.is_empty() {
+                wait = timeout;
+            }
         }
-        let mut retry_at = self.retry_at.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(caps) = self.caps.get() {
-            return caps;
+        if let Some(rx) = &self.pending {
+            match rx.recv_timeout(wait) {
+                Ok(caps) => {
+                    self.caps.extend(caps);
+                    self.pending = None;
+                    self.retry_at = Some(now + Duration::from_secs(30));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.pending = None;
+                    self.retry_at = Some(now + Duration::from_secs(30));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if !wait.is_zero() {
+                        tracing::warn!("VA-API probe is still pending; decoding in software");
+                    }
+                }
+            }
         }
-        if retry_at.is_some_and(|deadline| now < deadline) {
-            return &[];
-        }
-        *retry_at = Some(now + Duration::from_secs(30));
-        let caps = probe();
-        if caps.is_empty() {
-            return &[];
-        }
-        self.caps.get_or_init(|| caps)
+        self.caps.clone()
     }
 }
 
 /// What every render node was seen to decode. Pixel probes use readback,
-/// with a deadline for driver calls and a cooldown after empty results.
-pub fn capabilities() -> &'static [Capability] {
-    static CACHE: CapabilityCache = CapabilityCache {
-        caps: OnceLock::new(),
-        retry_at: Mutex::new(None),
-    };
+/// with a deadline for driver calls and a cooldown before retrying failures.
+pub fn capabilities() -> Vec<Capability> {
+    static CACHE: Mutex<CapabilityCache> = Mutex::new(CapabilityCache {
+        caps: Vec::new(),
+        pending: None,
+        retry_at: None,
+    });
     if !super::wanted(std::env::var("LATCH_LINUX_DECODER").ok().as_deref()) {
-        return &[];
+        return Vec::new();
     }
-    CACHE.get(Instant::now(), || {
-        if STALLED.load(std::sync::atomic::Ordering::Acquire) {
-            return Vec::new();
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
-        let spawned = std::thread::Builder::new()
-            .name("latch-vaapi-probe".into())
-            .spawn(move || {
-                let _ = tx.send(probe());
-            });
-        if spawned.is_err() {
-            return Vec::new();
-        }
-        match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(caps) => caps,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                STALLED.store(true, std::sync::atomic::Ordering::Release);
-                tracing::warn!("VA-API probe did not finish in 10 s; decoding in software");
-                Vec::new()
+    CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(
+        Instant::now(),
+        Duration::from_secs(10),
+        |known| {
+            if STALLED.load(std::sync::atomic::Ordering::Acquire) {
+                return None;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
-        }
-    })
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("latch-vaapi-probe".into())
+                .spawn(move || {
+                    let _ = tx.send(probe(&known));
+                })
+                .ok()?;
+            Some(rx)
+        },
+    )
 }
 
 const PROBE_H264: &[u8] = include_bytes!("../../../tests/fixtures/decode-probe.h264");
 const PROBE_HEVC: &[u8] = include_bytes!("../../../tests/fixtures/decode-probe.hevc");
 const PROBE_HEVC_MAIN10: &[u8] = include_bytes!("../../../tests/fixtures/decode-probe-main10.hevc");
 
-fn probe() -> Vec<Capability> {
+fn probe(known: &[Capability]) -> Vec<Capability> {
     if let Err(e) = api() {
         tracing::info!("VA-API unavailable: {e:#}");
         return Vec::new();
@@ -911,6 +925,12 @@ fn probe() -> Vec<Capability> {
         let vendor = device.vendor.clone();
         drop(device);
         for &(codec, ten_bit, bytes, width, height) in &cases {
+            if known
+                .iter()
+                .any(|cap| cap.node == node && cap.codec == codec && cap.ten_bit == ten_bit)
+            {
+                continue;
+            }
             let Some(limit) =
                 Profile::for_codec(codec, ten_bit).and_then(|p| decoder_for(&limits, p))
             else {
@@ -998,7 +1018,7 @@ pub fn open(codec: Codec, width: u32, height: u32, ten_bit: bool) -> Result<Work
         "VA-API driver stalled earlier"
     );
     // Probe has its own deadline, before the worker's startup deadline.
-    super::capability(capabilities(), codec, ten_bit, width, height)?;
+    super::capability(&capabilities(), codec, ten_bit, width, height)?;
     let (tx, requests) = std::sync::mpsc::sync_channel::<Request>(1);
     let (results, rx) = std::sync::mpsc::channel();
     let (ready, startup) = std::sync::mpsc::channel();
@@ -1107,34 +1127,203 @@ mod tests {
         }
     }
 
+    fn test_capability(codec: Codec, ten_bit: bool) -> Capability {
+        Capability {
+            codec,
+            ten_bit,
+            node: "/dev/dri/renderD128".into(),
+            limit: Limit {
+                profile: Profile::for_codec(codec, ten_bit).unwrap(),
+                max_width: 4096,
+                max_height: 4096,
+            },
+        }
+    }
+
+    fn completed_probe(
+        caps: Vec<Capability>,
+    ) -> Option<std::sync::mpsc::Receiver<Vec<Capability>>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(caps).unwrap();
+        Some(rx)
+    }
+
     #[test]
     fn empty_capabilities_retry_after_the_cooldown() {
-        let cache = CapabilityCache::default();
+        let mut cache = CapabilityCache::default();
         let now = Instant::now();
-        assert!(cache.get(now, Vec::new).is_empty());
         assert!(cache
-            .get(now + Duration::from_secs(29), || panic!("cooldown"))
+            .get(now, Duration::ZERO, |_| completed_probe(Vec::new()))
             .is_empty());
-        let caps = cache.get(now + Duration::from_secs(30), || {
-            vec![Capability {
-                codec: Codec::Hevc,
-                ten_bit: true,
-                node: "/dev/dri/renderD128".into(),
-                limit: Limit {
-                    profile: Profile::HevcMain10,
-                    max_width: 4096,
-                    max_height: 4096,
-                },
-            }]
+        assert!(cache
+            .get(now + Duration::from_secs(29), Duration::ZERO, |_| {
+                panic!("cooldown")
+            })
+            .is_empty());
+        let caps = cache.get(now + Duration::from_secs(30), Duration::ZERO, |known| {
+            assert!(known.is_empty());
+            completed_probe(vec![test_capability(Codec::Hevc, true)])
         });
         assert_eq!(caps.len(), 1);
         assert!(caps[0].ten_bit);
         assert_eq!(
-            cache
-                .get(now + Duration::from_secs(60), || panic!("cached success"))
-                .len(),
-            1
+            cache.get(now + Duration::from_secs(59), Duration::ZERO, |_| {
+                panic!("cached success")
+            }),
+            caps
         );
+    }
+
+    #[test]
+    fn probe_completing_after_its_deadline_is_available_after_the_cooldown() {
+        let mut cache = CapabilityCache::default();
+        let now = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(cache.get(now, Duration::ZERO, |_| Some(rx)).is_empty());
+        assert!(cache
+            .get(now + Duration::from_secs(10), Duration::ZERO, |_| {
+                panic!("pending probe")
+            })
+            .is_empty());
+        // The worker finishes just after its deadline, before the next lookup.
+        let expected = vec![test_capability(Codec::H264High, false)];
+        tx.send(expected.clone()).unwrap();
+        assert_eq!(
+            cache.get(now + Duration::from_secs(31), Duration::ZERO, |_| {
+                panic!("late result was discarded")
+            }),
+            expected
+        );
+    }
+
+    #[test]
+    fn timed_out_probe_accepts_late_success_without_duplicate_workers() {
+        let mut cache = CapabilityCache::default();
+        let now = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(cache.get(now, Duration::ZERO, |_| Some(rx)).is_empty());
+        // Even well past the cooldown, a hung probe keeps its sole worker.
+        for seconds in [10, 31, 61, 91] {
+            assert!(cache
+                .get(now + Duration::from_secs(seconds), Duration::ZERO, |_| {
+                    panic!("duplicated a pending probe")
+                })
+                .is_empty());
+            assert!(cache.pending.is_some());
+        }
+        let expected = vec![test_capability(Codec::H264High, false)];
+        tx.send(expected.clone()).unwrap();
+        let later = now + Duration::from_secs(92);
+        let caps = cache.get(later, Duration::ZERO, |_| panic!("pending probe"));
+        assert_eq!(caps, expected);
+        assert!(cache.pending.is_none());
+        assert!(super::super::capability(&caps, Codec::H264High, false, 256, 256).is_ok());
+        assert_eq!(
+            cache.get(later + Duration::from_secs(29), Duration::ZERO, |_| {
+                panic!("late success was not cached")
+            }),
+            caps
+        );
+    }
+
+    #[test]
+    fn partial_capabilities_retry_unproven_profiles_and_keep_proven_ones() {
+        let mut cache = CapabilityCache::default();
+        let now = Instant::now();
+        let h264 = test_capability(Codec::H264High, false);
+        let requested = latch_proto::color::ColorCapabilities {
+            hdr: true,
+            ten_bit: true,
+            peak_nits: 1000,
+        };
+        let caps = cache.get(now, Duration::ZERO, |_| completed_probe(vec![h264.clone()]));
+        assert_eq!(caps, vec![h264.clone()]);
+        assert_eq!(
+            super::super::codecs(&caps),
+            vec![Codec::H264High, Codec::H264Baseline]
+        );
+        assert!(super::super::capability(&caps, Codec::Hevc, true, 256, 256).is_err());
+        let color = super::super::color(&caps, requested, 256, 256);
+        assert!(!color.ten_bit && !color.hdr);
+        assert_eq!(
+            cache.get(now + Duration::from_secs(29), Duration::ZERO, |_| {
+                panic!("partial result ignored the cooldown")
+            }),
+            caps
+        );
+
+        let later = now + Duration::from_secs(30);
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert_eq!(
+            cache.get(later, Duration::from_secs(5), |known| {
+                assert_eq!(known, vec![h264.clone()]);
+                Some(rx)
+            }),
+            caps
+        );
+        // Main10 is still unproven after this retry.
+        tx.send(vec![test_capability(Codec::Hevc, false)]).unwrap();
+        let caps = cache.get(later, Duration::ZERO, |_| panic!("pending probe"));
+        assert_eq!(
+            caps,
+            vec![h264.clone(), test_capability(Codec::Hevc, false)]
+        );
+        assert!(super::super::capability(&caps, Codec::Hevc, true, 256, 256).is_err());
+        let color = super::super::color(&caps, requested, 256, 256);
+        assert!(!color.ten_bit && !color.hdr);
+        assert_eq!(
+            super::super::codecs(&caps),
+            vec![Codec::Hevc, Codec::H264High, Codec::H264Baseline]
+        );
+
+        let later = later + Duration::from_secs(30);
+        let caps = cache.get(later, Duration::ZERO, |known| {
+            assert_eq!(known, vec![h264, test_capability(Codec::Hevc, false)]);
+            completed_probe(vec![test_capability(Codec::Hevc, true)])
+        });
+        assert_eq!(caps.len(), 3);
+        assert!(super::super::capability(&caps, Codec::Hevc, true, 256, 256).is_ok());
+        assert_eq!(super::super::color(&caps, requested, 256, 256), requested);
+
+        // A subsequent failed retry preserves all the proven entries.
+        let later = later + Duration::from_secs(30);
+        assert_eq!(
+            cache.get(later, Duration::ZERO, |_| completed_probe(Vec::new())),
+            caps
+        );
+    }
+
+    #[test]
+    fn failed_probe_retries_after_the_cooldown() {
+        for disconnected in [false, true] {
+            let mut cache = CapabilityCache::default();
+            let now = Instant::now();
+            assert!(cache
+                .get(now, Duration::ZERO, |_| {
+                    // Either spawning failed or the worker stopped without a result.
+                    if disconnected {
+                        let (_, rx) = std::sync::mpsc::channel();
+                        Some(rx)
+                    } else {
+                        None
+                    }
+                })
+                .is_empty());
+            assert!(cache.pending.is_none());
+            assert!(cache
+                .get(now + Duration::from_secs(29), Duration::ZERO, |_| {
+                    panic!("cooldown")
+                })
+                .is_empty());
+            assert_eq!(
+                cache
+                    .get(now + Duration::from_secs(30), Duration::ZERO, |_| {
+                        completed_probe(vec![test_capability(Codec::H264High, false)])
+                    })
+                    .len(),
+                1
+            );
+        }
     }
 
     /// Runs everywhere: without libva or a render node (CI, containers)
@@ -1143,7 +1332,7 @@ mod tests {
     #[test]
     fn probing_never_fails_and_offers_baseline_regardless() {
         let caps = capabilities();
-        let codecs = super::super::codecs(caps);
+        let codecs = super::super::codecs(&caps);
         assert_eq!(codecs.last(), Some(&Codec::H264Baseline));
         for cap in caps {
             assert!(cap.node.starts_with("/") || cap.node.is_relative());

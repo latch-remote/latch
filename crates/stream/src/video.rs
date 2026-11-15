@@ -491,7 +491,7 @@ fn probed() -> Vec<Codec> {
     }
     #[cfg(target_os = "linux")]
     {
-        vaapi::codecs(vaapi::capabilities())
+        vaapi::codecs(&vaapi::capabilities())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
@@ -651,7 +651,7 @@ impl std::error::Error for HardwareFailed {}
 /// checked again when the host accepts and when parameter sets arrive.
 pub fn decodable_at(codec: Codec, _width: u32, _height: u32) -> bool {
     #[cfg(target_os = "linux")]
-    return vaapi::fits(vaapi::capabilities(), codec, _width, _height);
+    return vaapi::fits(&vaapi::capabilities(), codec, _width, _height);
     #[cfg(not(target_os = "linux"))]
     decodable().contains(&codec)
 }
@@ -663,7 +663,7 @@ pub fn decoder_color(
     _height: u32,
 ) -> latch_proto::color::ColorCapabilities {
     #[cfg(target_os = "linux")]
-    return vaapi::color(vaapi::capabilities(), color, _width, _height);
+    return vaapi::color(&vaapi::capabilities(), color, _width, _height);
     #[cfg(not(target_os = "linux"))]
     color
 }

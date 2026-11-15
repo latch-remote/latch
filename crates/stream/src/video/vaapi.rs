@@ -9,7 +9,7 @@
 //! AV1 is not decoded here yet (it needs its sequence and frame headers
 //! parsed the same way).
 //!
-//! Successful probes are cached per process, with empty results retried after
+//! Successful probes are cached per process, with unproven entries retried after
 //! a cooldown. Each render node is checked for profiles, entry points,
 //! formats and largest pictures its driver reports, then a real picture of
 //! every codec it claims, decoded and checked against its expected pixels; only what
