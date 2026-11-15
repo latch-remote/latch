@@ -12,6 +12,9 @@ mod nvenc;
 mod uinput;
 mod vaapi;
 
+#[cfg(test)]
+pub(crate) use audio::pair_pcm;
+
 use crate::audio::AudioCapture;
 use crate::input::InputSink;
 use crate::video::{VideoConfig, VideoPipeline};
@@ -167,6 +170,3 @@ mod tests {
         assert!(!xwayland_outputs(std::iter::empty()));
     }
 }
-
-#[cfg(test)]
-pub(crate) use audio::pair_pcm;

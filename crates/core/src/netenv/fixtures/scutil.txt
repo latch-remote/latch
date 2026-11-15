@@ -1,0 +1,13 @@
+<dictionary> {
+  ExceptionsList : <array> {
+    0 : *.example.test
+    1 : 169.254/16
+  }
+  HTTPEnable : 1
+  HTTPProxy : unused.test
+  HTTPPort : 8080
+  HTTPSEnable : 1
+  HTTPSProxy : secure-proxy.test
+  HTTPSPort : 3128
+  ExcludeSimpleHostnames : 1
+}

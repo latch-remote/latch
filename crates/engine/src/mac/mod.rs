@@ -6,6 +6,9 @@ mod ffi;
 mod input;
 pub(crate) mod synthetic;
 
+#[cfg(test)]
+pub(crate) use capture::pair_pcm;
+
 use crate::audio::{AudioCapture, CHANNELS, FRAME};
 use crate::input::InputSink;
 use crate::video::{Codec, EncodedVideo, Limits, Pacer, VideoConfig, VideoInfo, VideoPipeline};
@@ -366,6 +369,3 @@ impl AudioCapture for Audio {
         "ScreenCaptureKit system audio · 48 kHz stereo".to_string()
     }
 }
-
-#[cfg(test)]
-pub(crate) use capture::pair_pcm;

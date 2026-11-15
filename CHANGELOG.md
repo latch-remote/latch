@@ -54,6 +54,17 @@ GitHub release notes, so each version gets a heading of the form
   macOS and Linux x64/arm64, with decoded media, native input construction,
   clipboard contracts and explicit known-gap assertions.
 
+### Networking
+
+- Add core network-environment discovery for system proxies, captive portals,
+  Tailscale reachability and IPv4/IPv6/NAT64, with bounded worker calls,
+  credential redaction and a standalone diagnostic example.
+- Keep proxy credentials scoped to their configured host and port, expose
+  typed network warnings, coalesce each network check independently, bound
+  subprocess output and Windows WPAD waits, and validate ambiguous DNS64
+  answers. Refresh the latest requested network generation automatically.
+  Add macOS and Windows system-API smoke tests.
+
 ### Packaging
 
 - Add a Scoop manifest, AUR packages (`latch-remote-bin` from the release
@@ -82,6 +93,11 @@ GitHub release notes, so each version gets a heading of the form
   existing Lightsail instance. Add reproducible socket, queue, forwarding
   offload, descriptor and memory tuning, with bounded before/after measurements,
   bundle and transfer cost estimates, IPv6 findings and completed EC2 teardown.
+
+### Streaming and recovery
+
+- Move relay quota persistence off the network loop and batch durable byte
+  reservations so credited video and priority lanes keep running during disk flushes.
 
 ## 6.0.0 (2026-11-14)
 

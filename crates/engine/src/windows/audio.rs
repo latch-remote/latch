@@ -403,22 +403,6 @@ pub(super) fn open(layout: Layout) -> Result<Box<dyn AudioCapture>> {
         channels,
     }))
 }
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn loopback_opens_when_audio_endpoint_exists() -> anyhow::Result<()> {
-        match super::open(super::Layout::UpTo(8)) {
-            Ok(capture) => eprintln!("{}", capture.describe()),
-            Err(e) => {
-                if !super::super::unavailable(&e, "WASAPI loopback") {
-                    return Err(e);
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
 fn pcm_sample(b: &[u8], float: bool, bits: u16, valid_bits: u16) -> f32 {
     let mut sample = if float {
         if bits == 32 {
@@ -467,4 +451,20 @@ pub(crate) fn pair_pcm(pcm: &[i16]) -> Vec<i16> {
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn loopback_opens_when_audio_endpoint_exists() -> anyhow::Result<()> {
+        match super::open(super::Layout::UpTo(8)) {
+            Ok(capture) => eprintln!("{}", capture.describe()),
+            Err(e) => {
+                if !super::super::unavailable(&e, "WASAPI loopback") {
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
 }

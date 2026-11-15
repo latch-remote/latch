@@ -261,7 +261,11 @@ impl TlsSocket {
     }
     pub fn pump(&mut self, quota: Option<&mut crate::quota::Quota>) -> io::Result<()> {
         if let Some(quota) = quota {
-            quota.credit(&mut self.credit, &mut self.credit_epoch)?;
+            match quota.credit(&mut self.credit, &mut self.credit_epoch) {
+                Ok(()) => (),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => return Err(error),
+            }
         }
         let was_handshaking = self.conn.is_handshaking();
         let early_close = |kind| {
