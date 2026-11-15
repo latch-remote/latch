@@ -692,14 +692,30 @@ older hosts already cannot emit frames beyond this limit.
 
 ### Viewer input scheduling and recovery
 
-Mouse, keyboard and text are forwarded from egui's accumulated input during
-the viewer's UI update, so an event waits for the frame in progress to
-finish; the window repaints at once on input and presents without vsync,
-which bounds that wait by one frame's work. The session sender flushes
-immediately when called, and reliability retries run independently of the
-UI. Gamepad state is sent directly from each platform's gamepad thread.
-Sending mouse and keyboard from the OS event itself is on the
-[roadmap](ROADMAP.md).
+Mouse and keyboard dispatch runs synchronously in egui-winit's OS event
+callbacks on macOS, Windows, X11 and Wayland, after its normal input
+translation and before a repaint. A small local patch in
+`vendor/egui-winit` exposes those callbacks and the input-snapshot boundary.
+The last completed UI frame publishes focus, capture and pointer geometry.
+Both dispatch paths share held keys and buttons and call the existing
+session sender, which flushes immediately. Reliability retries run
+independently of the UI. Gamepads send directly from their platform thread.
+
+Each early event leaves one receipt for its UI frame so the frame can
+observe input without sending it again. Captured movement and wheel
+fractions carry between both paths. Absolute movement and stable free-mode
+clicks also dispatch immediately. A click that changes capture or hides the
+toolbar, a clipboard operation, an input-method event, a local host-key
+shortcut or a geometry change closes early dispatch until the frame handles
+it and republishes policy. Subsequent events wait behind that operation.
+Focus loss releases held input immediately and closes dispatch. Text and
+clipboard synchronization retain the UI path.
+
+At debug level, `input from the OS event` reports the average and maximum
+lead over the UI frame, once per ten seconds of input. This measures the
+interval between dispatch and frame receipt. It includes time until redraw. Network-delivery and input-to-photon
+measurements, real OS-event-to-datagram timing at 60 and 240 fps, pointer-lock behavior and
+IME interaction require live viewer/host hardware.
 
 After an unexpected transport drop, the viewer reconnects with fresh
 negotiation until stopped, with 2/5/10-second waits followed by jittered

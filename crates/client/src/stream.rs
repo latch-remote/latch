@@ -12,7 +12,8 @@
 
 use crate::clipboard::{self, Edit};
 use crate::config::{ClientConfig, StreamSettings};
-use crate::input::{self, Held, Sink};
+use crate::early::{self, Ahead, Early};
+use crate::input::{self, SharedHeld, Sink};
 use crate::path::Path;
 use crate::session::Live;
 use crate::video;
@@ -23,6 +24,7 @@ use egui::{
 use latch_core::api::PowerAction;
 use latch_ui::{self as ui, size, space, theme, Kv, Tone, PALETTE as P};
 use semver::Version;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 /// Below this width the toolbar's menus fold into one More menu, so they
@@ -234,7 +236,9 @@ pub struct View {
     /// key went down, so a stats chord (host key + S) can put both back.
     chord_before: Option<(bool, bool)>,
     settings: Option<StreamSettings>,
-    held: Held,
+    held: SharedHeld,
+    /// Keys and the mouse sent from the OS event, ahead of this frame.
+    pub(crate) early: Early,
     scroll: (f32, f32),
     motion: (f32, f32),
     /// Last measured toolbar height, so the notices sit under it.
@@ -332,6 +336,7 @@ struct Link<'a, S: Sink + ?Sized> {
 
 impl Default for View {
     fn default() -> Self {
+        let held = SharedHeld::default();
         Self {
             recovery_observation: None,
             captured: false,
@@ -342,7 +347,8 @@ impl Default for View {
             presented: Presented::default(),
             chord_before: None,
             settings: None,
-            held: Held::default(),
+            early: Early::new(held.clone()),
+            held,
             scroll: (0.0, 0.0),
             motion: (0.0, 0.0),
             bar_h: size::TOOLBAR,
@@ -423,6 +429,7 @@ impl View {
         live: Option<&Live>,
         out: Option<&S>,
     ) {
+        self.early.disarm();
         // A paste still waiting goes, with what was held back behind it:
         // none of it has reached the PC, and pasting the PC's old clipboard
         // after the user has gone would be worse than nothing.
@@ -632,6 +639,7 @@ impl View {
         if interruption.is_none() {
             self.input(ctx, live, env.cfg, video, bar_rect);
         } else {
+            self.early.disarm();
             self.set_captured(ctx, false);
             self.held.release_all(&live.input);
         }
@@ -1689,16 +1697,29 @@ impl View {
         video: Rect,
         bar: Option<Rect>,
     ) {
+        // Native windows move receipts when egui-winit takes input. The
+        // headless harness enters here directly.
+        #[cfg(test)]
+        self.early.frame_starts();
+        if let Some((motion, scroll)) = self.early.take_remainders() {
+            self.motion = motion.into();
+            self.scroll = scroll.into();
+        }
         #[cfg(test)]
         if let Some(tap) = self.tap.clone() {
+            self.early.listen(tap.clone());
             let connected = tap.connected.get();
-            return self.forward(ctx, live, cfg, video, bar, &*tap, connected);
+            if let Some(gate) = self.forward(ctx, live, cfg, video, bar, &*tap, connected) {
+                self.early.arm(gate.with(tap));
+            }
+            return;
         }
         // Whoever is at this Mac is not driving the test host's desktop.
         if crate::session::test_serve().is_some() {
             return;
         }
-        self.forward(
+        self.early.listen(Rc::new(live.input.clone()));
+        let gate = self.forward(
             ctx,
             live,
             cfg,
@@ -1707,9 +1728,13 @@ impl View {
             &live.input,
             live.input.connected(),
         );
+        if let Some(gate) = gate {
+            self.early.arm(gate.with(Rc::new(live.input.clone())));
+        }
     }
 
-    /// [`View::input`], sending through `out`.
+    /// [`View::input`], sending through `out`. Returns what the OS event
+    /// hook may send until the next frame (see [`early`]).
     #[allow(clippy::too_many_arguments)]
     fn forward<S: Sink + ?Sized>(
         &mut self,
@@ -1720,12 +1745,12 @@ impl View {
         bar: Option<Rect>,
         out: &S,
         connected: bool,
-    ) {
+    ) -> Option<EarlyGate> {
         if self.interrupted.is_some() {
             self.held.release_all(out);
             self.set_captured(ctx, false);
             crate::macos::stream_owns_keys(false);
-            return;
+            return None;
         }
         let (events, modifiers, pointer, focused) = ctx.input(|i| {
             (
@@ -1805,7 +1830,7 @@ impl View {
             if self.held.any_down() || self.captured || self.pending.is_some() {
                 self.reset_with(ctx, Some(live), Some(out));
             }
-            return;
+            return None;
         }
         // A paste whose text has arrived goes before anything this frame.
         self.settle_paste(&link, false);
@@ -1858,7 +1883,7 @@ impl View {
                     self.bar_shown = bar;
                 }
             }
-            return;
+            return None;
         }
         self.capture_chord_held = false;
         self.chord_before = None;
@@ -1986,6 +2011,10 @@ impl View {
             {
                 continue;
             }
+            // Sent already, from the OS event.
+            if self.sent_early(&ev) {
+                continue;
+            }
             match ev {
                 // The pointer is never held back behind a paste.
                 Event::PointerMoved(p) if !self.captured && over_stream => self.moved_to = Some(p),
@@ -2028,6 +2057,82 @@ impl View {
         if let Some(p) = &self.pending {
             ctx.request_repaint_after(p.until.saturating_duration_since(Instant::now()));
         }
+        // Until the next frame, the OS event hook may send what this frame
+        // would have sent as it stands now. Behind a paste everything
+        // waits, and while an input method composes the keys are its own.
+        let keys = keys_to_pc && !self.composing;
+        let mouse = self.captured && connected && !popup && !overlay;
+        let free_mouse = connected && !popup && !overlay;
+        (self.pending.is_none() && self.interrupted.is_none() && (keys || mouse || free_mouse))
+            .then(|| {
+                self.early.set_remainders(self.motion, self.scroll);
+                let mut pointer_region = ctx.screen_rect();
+                if let Some(bar) = bar {
+                    pointer_region.min.y = pointer_region.min.y.max(bar.max.y);
+                }
+                EarlyGate {
+                    keys,
+                    local_focus: !keys_belong_to_pc,
+                    mouse,
+                    cmd_is_ctrl: self.cmd_is_ctrl(cfg),
+                    motion_scale,
+                    video,
+                    pointer_region: if free_mouse {
+                        pointer_region
+                    } else {
+                        Rect::NOTHING
+                    },
+                    ctx: ctx.clone(),
+                    over_stream,
+                    ppp,
+                    free_clicks: free_mouse && !cfg.capture_mouse && !self.bar_shown,
+                    caps: self.caps,
+                }
+            })
+    }
+
+    /// Whether the OS event hook sent `ev` already, so the frame must not.
+    fn sent_early(&mut self, ev: &Event) -> bool {
+        let ahead = match *ev {
+            Event::Key {
+                physical_key: Some(physical),
+                pressed,
+                ..
+            } => match input::vk(physical) {
+                Some(vk) => Ahead::Key(vk, pressed),
+                None => return false,
+            },
+            Event::PointerButton {
+                button, pressed, ..
+            } => match input::button(button) {
+                Some(b) => Ahead::Button(b, pressed),
+                None => return false,
+            },
+            Event::MouseMoved(d) => Ahead::Motion(d.x, d.y),
+            Event::PointerMoved(p) => Ahead::Position(p),
+            Event::MouseWheel { unit, delta, .. } => {
+                let (h, v) = wheel_to_host(unit, delta);
+                Ahead::Scroll(h, v)
+            }
+            _ => return false,
+        };
+        let claimed = self.early.claim(ahead);
+        if claimed {
+            if let Event::Key {
+                key,
+                pressed,
+                modifiers,
+                ..
+            } = ev
+            {
+                self.cmd_since_v_up |= modifiers.command;
+                if *key == egui::Key::V && !pressed {
+                    self.pasted_since_v_up = false;
+                    self.cmd_since_v_up = false;
+                }
+            }
+        }
+        claimed
     }
 
     /// Send `item` now, or hold it behind a paste still on its way.
@@ -2254,6 +2359,42 @@ impl View {
     }
 }
 
+/// What a frame lets the OS event hook send, before the sink is known.
+struct EarlyGate {
+    keys: bool,
+    local_focus: bool,
+    mouse: bool,
+    cmd_is_ctrl: bool,
+    motion_scale: f32,
+    video: Rect,
+    pointer_region: Rect,
+    ctx: egui::Context,
+    over_stream: bool,
+    ppp: f32,
+    free_clicks: bool,
+    caps: Option<bool>,
+}
+
+impl EarlyGate {
+    fn with(self, out: Rc<dyn Sink>) -> early::Gate {
+        early::Gate {
+            keys: self.keys,
+            local_focus: self.local_focus,
+            mouse: self.mouse,
+            cmd_is_ctrl: self.cmd_is_ctrl,
+            motion_scale: self.motion_scale,
+            video: self.video,
+            pointer_region: self.pointer_region,
+            ctx: self.ctx,
+            over_stream: self.over_stream,
+            ppp: self.ppp,
+            free_clicks: self.free_clicks,
+            caps: self.caps,
+            out,
+        }
+    }
+}
+
 /// Whether a V let go was a ⌘V egui swallowed: the PC never saw V go
 /// down, no paste came from it, and ⌘ was down since the last V.
 fn swallowed_paste(v_seen_down: bool, pasted: bool, cmd: bool) -> bool {
@@ -2279,7 +2420,7 @@ fn caps_tap(seen: Option<bool>, now: Option<bool>, keys_to_pc: bool) -> (Option<
 /// (horizontal, vertical). egui's +x moves the content right, which is
 /// scrolling left; Latch's horizontal scroll, like Windows' and
 /// Linux's, is positive to the right. Vertical agrees: +y is up.
-fn wheel_to_host(unit: egui::MouseWheelUnit, delta: Vec2) -> (f32, f32) {
+pub(crate) fn wheel_to_host(unit: egui::MouseWheelUnit, delta: Vec2) -> (f32, f32) {
     let scale = match unit {
         egui::MouseWheelUnit::Point => 3.0,
         egui::MouseWheelUnit::Line => 120.0,
@@ -2312,7 +2453,7 @@ fn host_cursor_rect(
 }
 
 /// Free mouse mode maps the bars to the nearest pixel in the picture.
-fn mouse_position_in_video(p: Pos2, video: Rect, ppp: f32) -> (i16, i16, i16, i16) {
+pub(crate) fn mouse_position_in_video(p: Pos2, video: Rect, ppp: f32) -> (i16, i16, i16, i16) {
     let width = ((video.width() * ppp).round() as i16).max(2);
     let height = ((video.height() * ppp).round() as i16).max(2);
     // Rect's far edges are inclusive, but pixels are zero-based. Latch
@@ -4532,6 +4673,327 @@ pub(crate) mod tests {
                 Sent::Motion(3, 3),
             ]
         );
+    }
+
+    // Keys and the mouse from the OS event, ahead of the frame (`early`).
+
+    fn os_key(k: Key, down: bool, mods: Modifiers) -> early::Native {
+        early::Native::Key {
+            physical: Some(k),
+            logical: Some(k),
+            down,
+            repeat: false,
+            mods,
+        }
+    }
+
+    fn os(h: &egui_kittest::Harness<'_, Fixture>, ev: early::Native) -> bool {
+        h.state().view.early.deliver(ev, Instant::now())
+    }
+
+    #[test]
+    fn keys_from_the_os_event_go_before_the_frame_and_only_once() {
+        let (mut h, tap) = recording(View::default(), true);
+        frame(&mut h, vec![], Modifiers::NONE);
+        assert!(h.state().view.early.armed(), "the stream has the keys");
+        assert!(os(&h, early::Native::Modifiers(Modifiers::SHIFT)));
+        assert!(os(&h, os_key(Key::W, true, Modifiers::SHIFT)));
+        assert!(os(&h, os_key(Key::W, false, Modifiers::SHIFT)));
+        assert_eq!(
+            tap.take(),
+            [
+                Sent::Key(VK_SHIFT, true, MOD_SHIFT),
+                Sent::Key(VK_W, true, MOD_SHIFT),
+                Sent::Key(VK_W, false, MOD_SHIFT),
+            ],
+            "sent with no frame drawn"
+        );
+        // The frame that brings the same events sends none of them again.
+        frame(
+            &mut h,
+            vec![
+                key(Key::W, true, Modifiers::SHIFT),
+                key(Key::W, false, Modifiers::SHIFT),
+            ],
+            Modifiers::SHIFT,
+        );
+        assert_eq!(tap.take(), []);
+        assert!(h.state().view.early.armed());
+        // What the hook did not see still goes from the frame.
+        frame(
+            &mut h,
+            vec![key(Key::T, true, Modifiers::SHIFT)],
+            Modifiers::NONE,
+        );
+        assert_eq!(
+            tap.take(),
+            [
+                Sent::Key(VK_T, true, MOD_SHIFT),
+                Sent::Key(VK_SHIFT, false, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn focus_loss_releases_held_input_while_a_paste_disables_early_dispatch() {
+        let (mut h, tap) = recording(View::default(), true);
+        frame(&mut h, vec![], Modifiers::NONE);
+        assert!(os(&h, os_key(Key::W, true, Modifiers::NONE)));
+        h.state_mut().view.pending = Some(PendingPaste {
+            id: 1,
+            until: Instant::now() + Duration::from_secs(60),
+            queued: Vec::new(),
+        });
+        frame(
+            &mut h,
+            vec![key(Key::W, true, Modifiers::NONE)],
+            Modifiers::NONE,
+        );
+        // Another frame must not discard the release path either.
+        frame(&mut h, vec![], Modifiers::NONE);
+        assert!(!h.state().view.early.armed());
+        assert!(h.state().view.held.is_down(VK_W));
+        tap.take();
+        h.state().view.early.on_event(
+            Some(&egui_winit::winit::event::WindowEvent::Focused(false)),
+            &[],
+            Modifiers::NONE,
+        );
+        assert_eq!(tap.take(), [Sent::Key(VK_W, false, 0), Sent::ReleaseAll]);
+        assert!(!h.state().view.held.any_down());
+    }
+
+    #[test]
+    fn toolbar_tab_from_the_os_event_waits_for_local_focus() {
+        for mods in [Modifiers::NONE, Modifiers::SHIFT] {
+            let (mut h, tap) = recording(view_with_bar(), true);
+            frame(&mut h, vec![], mods);
+            assert!(h.ctx.memory(|m| m.focused()).is_none());
+            assert!(h.state().view.early.armed());
+            tap.take();
+            assert!(!os(&h, os_key(Key::Tab, true, mods)));
+            assert!(!os(&h, os_key(Key::Tab, false, mods)));
+            assert!(tap.take().is_empty());
+            frame(
+                &mut h,
+                vec![key(Key::Tab, true, mods), key(Key::Tab, false, mods)],
+                mods,
+            );
+            assert!(h.ctx.memory(|m| m.focused()).is_some());
+            assert!(!tap
+                .take()
+                .iter()
+                .any(|s| matches!(s, Sent::Key(VK_TAB, _, _))));
+        }
+    }
+
+    #[test]
+    fn the_host_key_from_the_os_event_is_left_to_the_frame() {
+        let (mut h, tap) = recording(View::default(), true);
+        frame(&mut h, vec![], Modifiers::NONE);
+        assert!(os(&h, early::Native::Modifiers(Modifiers::CTRL)));
+        assert!(!os(&h, early::Native::Modifiers(CTRL_ALT)));
+        // S with the host key held toggles the stats and is not the PC's.
+        assert!(!os(&h, os_key(Key::S, true, CTRL_ALT)));
+        assert_eq!(tap.keys(), [(VK_CONTROL, true)]);
+        frame(&mut h, vec![key(Key::S, true, CTRL_ALT)], CTRL_ALT);
+        let v = &h.state().view;
+        assert!(v.stats, "the frame saw the host key and S");
+        assert!(!v.early.armed(), "nothing goes ahead while it is held");
+        assert!(!v.held.any_down());
+        let keys = tap.keys();
+        assert_eq!(keys, [(VK_CONTROL, false)], "Ctrl let go, nothing else");
+        frame(&mut h, vec![], Modifiers::NONE);
+        assert!(h.state().view.early.armed(), "back once it is let go");
+    }
+
+    #[test]
+    fn a_captured_mouse_moves_and_clicks_from_the_os_event_once() {
+        let view = View {
+            captured: true,
+            grabbed: true,
+            ..View::default()
+        };
+        let (mut h, tap) = recording(view, true);
+        frame(&mut h, vec![], Modifiers::NONE);
+        // 1920 stream pixels across 640 points: three per point.
+        let press = |down| early::Native::Button {
+            button: BUTTON_LEFT,
+            down,
+            mods: Modifiers::NONE,
+            pos: None,
+        };
+        assert!(os(&h, early::Native::Motion { dx: 3.5, dy: 0.0 }));
+        assert!(os(&h, press(true)));
+        assert_eq!(
+            tap.take(),
+            [Sent::Motion(10, 0), Sent::Button(BUTTON_LEFT, true)]
+        );
+        frame(
+            &mut h,
+            vec![
+                Event::MouseMoved(Vec2::new(3.5, 0.0)),
+                click(ON_PICTURE, true),
+                // Not seen by the hook: the frame sends it.
+                Event::MouseMoved(Vec2::new(1.0, 1.0)),
+            ],
+            Modifiers::NONE,
+        );
+        assert_eq!(tap.take(), [Sent::Motion(3, 3)]);
+        assert!(h.state().view.held.any_down(), "the button is still held");
+    }
+
+    #[test]
+    fn what_follows_a_free_click_keeps_its_place_behind_it() {
+        let (mut h, tap) = recording(view_with_bar(), true);
+        h.state_mut().cfg.capture_mouse = false;
+        frame(&mut h, vec![], Modifiers::NONE);
+        assert!(os(&h, os_key(Key::Y, true, Modifiers::NONE)));
+        let press = early::Native::Button {
+            button: BUTTON_LEFT,
+            down: true,
+            mods: Modifiers::NONE,
+            pos: Some(ON_PICTURE),
+        };
+        assert!(!os(&h, press), "the click must hide the toolbar first");
+        assert!(!os(&h, os_key(Key::Y, false, Modifiers::NONE)));
+        assert_eq!(tap.take(), [Sent::Key(VK_Y, true, 0)]);
+        frame(
+            &mut h,
+            vec![
+                key(Key::Y, true, Modifiers::NONE),
+                Event::PointerMoved(ON_PICTURE),
+                click(ON_PICTURE, true),
+                key(Key::Y, false, Modifiers::NONE),
+            ],
+            Modifiers::NONE,
+        );
+        assert_eq!(
+            tap.take(),
+            [
+                Sent::Position(20, 170, 640, 360),
+                Sent::Button(BUTTON_LEFT, true),
+                Sent::Key(VK_Y, false, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn fractional_motion_and_scroll_survive_both_dispatch_paths() {
+        let view = View {
+            captured: true,
+            grabbed: true,
+            ..View::default()
+        };
+        let (mut h, tap) = recording(view, true);
+        frame(&mut h, vec![], Modifiers::NONE);
+        let input = |wheel| {
+            vec![
+                Event::MouseMoved(Vec2::new(0.25, 0.0)),
+                Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, wheel),
+                    modifiers: Modifiers::NONE,
+                },
+            ]
+        };
+        let first = input(0.1);
+        h.state().view.early.on_event(None, &first, Modifiers::NONE);
+        assert!(tap.take().is_empty());
+        frame(&mut h, first, Modifiers::NONE);
+        assert!(tap.take().is_empty());
+        assert_eq!(h.state().view.motion, (0.75, 0.0));
+        assert!((h.state().view.scroll.1 - 0.3).abs() < 0.0001);
+        let second = input(0.3);
+        h.state()
+            .view
+            .early
+            .on_event(None, &second, Modifiers::NONE);
+        assert_eq!(tap.take(), [Sent::Motion(1, 0), Sent::Scroll(1, 0)]);
+        frame(&mut h, second, Modifiers::NONE);
+        assert!(
+            tap.take().is_empty(),
+            "the UI claims both fractional events"
+        );
+        assert_eq!(h.state().view.motion, (0.5, 0.0));
+        assert!((h.state().view.scroll.1 - 0.2).abs() < 0.0001);
+    }
+
+    #[test]
+    fn stable_free_pointer_input_and_keys_send_in_os_order_once() {
+        let (mut h, tap) = recording(View::default(), true);
+        h.state_mut().cfg.capture_mouse = false;
+        frame(&mut h, vec![], Modifiers::NONE);
+        let events = vec![
+            Event::PointerMoved(ON_PICTURE),
+            click(ON_PICTURE, true),
+            key(Key::A, true, Modifiers::NONE),
+            Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: Vec2::new(1.0, -1.0),
+                modifiers: Modifiers::NONE,
+            },
+            click(ON_PICTURE, false),
+            key(Key::A, false, Modifiers::NONE),
+        ];
+        h.state()
+            .view
+            .early
+            .on_event(None, &events, Modifiers::NONE);
+        assert_eq!(
+            tap.take(),
+            [
+                Sent::Position(20, 170, 640, 360),
+                Sent::Position(20, 170, 640, 360),
+                Sent::Button(BUTTON_LEFT, true),
+                Sent::Key(0x41, true, 0),
+                Sent::Scroll(-120, -120),
+                Sent::Position(20, 170, 640, 360),
+                Sent::Button(BUTTON_LEFT, false),
+                Sent::Key(0x41, false, 0),
+            ]
+        );
+        frame(&mut h, events, Modifiers::NONE);
+        assert!(tap.take().is_empty());
+        assert!(!h.state().view.captured);
+        assert!(!h.state().view.held.any_down());
+    }
+
+    #[test]
+    fn an_input_method_keeps_later_input_behind_its_commit() {
+        let (mut h, tap) = recording(View::default(), true);
+        frame(&mut h, vec![], Modifiers::NONE);
+        let events = vec![
+            Event::Ime(egui::ImeEvent::Enabled),
+            Event::Ime(egui::ImeEvent::Commit("あ".into())),
+            key(Key::A, true, Modifiers::NONE),
+        ];
+        h.state()
+            .view
+            .early
+            .on_event(None, &events, Modifiers::NONE);
+        assert!(tap.take().is_empty());
+        frame(&mut h, events, Modifiers::NONE);
+        assert_eq!(
+            tap.take(),
+            [Sent::Text("あ".into()), Sent::Key(0x41, true, 0)]
+        );
+    }
+
+    #[test]
+    fn nothing_goes_ahead_under_a_panel_or_before_the_stream_connects() {
+        let (mut h, _) = recording(View::default(), true);
+        // The panel opens from the toolbar, with the mouse given back.
+        let v = &mut h.state_mut().view;
+        v.captured = false;
+        v.settings = Some(ClientConfig::default().stream);
+        frame(&mut h, vec![], Modifiers::NONE);
+        assert!(!h.state().view.early.armed());
+        assert!(!os(&h, os_key(Key::A, true, Modifiers::NONE)));
+        let (mut h, tap) = recording(View::default(), false);
+        frame(&mut h, vec![], Modifiers::NONE);
+        assert!(!h.state().view.early.armed());
+        assert!(tap.take().is_empty());
     }
 
     #[test]

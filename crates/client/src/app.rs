@@ -212,6 +212,7 @@ impl Drop for ClientApp {
 
 impl ClientApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        crate::early::install(&cc.egui_ctx);
         let discovery = Arc::new(Mutex::new(Discovery::default()));
         let stop = session::spawn_discovery(discovery.clone(), cc.egui_ctx.clone());
         let mut app =

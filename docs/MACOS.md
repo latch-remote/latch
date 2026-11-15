@@ -15,7 +15,8 @@ capacity estimate; lower FPS/size and reconnect to act on it.
 
 Latch for the Mac is one native app: every machine on your Tailscale
 account, a Connect button each, a power menu, the stream itself, and a
-**Sharing** tab so a Windows PC or another Mac can open this desktop. Latch's stream protocol is compiled in, video is captured with ScreenCaptureKit
+**Sharing** tab so another desktop can open this Mac, within the
+[platform support limits](PLATFORMS.md). Latch's stream protocol is compiled in, video is captured with ScreenCaptureKit
 and encoded with VideoToolbox (H.264 and HEVC), decoded with VideoToolbox
 (including AV1 where hardware supports it), audio is coded losslessly
 with `lpcm-rice`, and the picture is drawn in Latch's own window under a toolbar.
@@ -175,8 +176,10 @@ the Mac cursor's position is sent 1:1 instead and nothing is captured.
 On a narrow window everything but **Stream settings** and **Disconnect**
 folds into one **More** menu.
 
-Everything else on the keyboard goes to the PC as pressed, in the order it
-was pressed. With **Command acts as Ctrl** on (the default), ⌘C, ⌘V, ⌘Z and
+Keys delivered to Latch are forwarded in order when its window next draws.
+Physical keys use a US-oriented mapping; differing host/viewer layouts and
+OS-reserved shortcuts have limits listed in the [platform audit](PLATFORMS.md).
+With **Command acts as Ctrl** on (the default), ⌘C, ⌘V, ⌘Z and
 the rest do on Windows and Linux what they do on the Mac, and ⌘ can stay
 held across several of them; a Mac at the other end always gets ⌘ as
 Command. While the stream has the keys, ⌘Q, ⌘H and ⌘+/⌘−/⌘0 go to the PC

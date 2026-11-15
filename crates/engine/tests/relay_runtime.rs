@@ -7,7 +7,7 @@ use latch_relay::{Cancel, ClientConfig, Endpoint};
 use latch_stream::{Event, Frame, FrameSlot, Session, Settings};
 use std::{
     io::Write,
-    net::{Ipv4Addr, TcpListener, UdpSocket},
+    net::{Ipv4Addr, TcpListener},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc,
@@ -16,6 +16,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "support/relay_pilot.rs"]
 mod relay;
 use relay::Pilot;
@@ -39,9 +41,8 @@ impl Running {
     }
     fn with_pattern(config: ClientConfig, blackhole: bool, pattern: &str) -> Self {
         std::env::set_var("LATCH_TEST_PATTERN", pattern);
-        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let (udp, listener) = ports::udp_and_tcp_on_one_port();
         let port = udp.local_addr().unwrap().port();
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
         let server = Server::bind(
             0,
             Options {

@@ -4,10 +4,13 @@ use latch_engine::server::{Options, Server};
 use latch_proto::control::{self, Accept, Codec, End, Message, StreamRequest};
 use latch_stream::{Event, FrameSlot, Session, Settings};
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
+
+#[path = "support/ports.rs"]
+mod ports;
 
 fn request(name: &str) -> StreamRequest {
     StreamRequest {
@@ -236,9 +239,8 @@ fn post_accept_end_close_and_missing_media_are_reported_as_failures() {
 /// Keep control traffic healthy while selectively breaking the media or input
 /// path. The host finishes only when the viewer closes its control socket.
 fn impaired_host(mode: &'static str) -> (u16, std::thread::JoinHandle<()>) {
-    let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let (udp, listener) = ports::udp_and_tcp_on_one_port();
     let port = udp.local_addr().unwrap().port();
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
     let worker = std::thread::spawn(move || {
         let (mut tcp, peer) = listener.accept().unwrap();
         tcp.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
