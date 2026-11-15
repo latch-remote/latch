@@ -114,10 +114,8 @@ fn connect_address(
     #[cfg(target_os = "linux")]
     if let x11rb::reexports::x11rb_protocol::parse_display::ConnectAddress::Socket(path) = address {
         use std::os::linux::net::SocketAddrExt;
-        use std::os::unix::ffi::OsStrExt;
-        let stream =
-            std::os::unix::net::SocketAddr::from_abstract_name(path.as_os_str().as_bytes())
-                .and_then(|name| std::os::unix::net::UnixStream::connect_addr(&name));
+        let stream = std::os::unix::net::SocketAddr::from_abstract_name(path.as_bytes())
+            .and_then(|name| std::os::unix::net::UnixStream::connect_addr(&name));
         if let Ok(stream) = stream {
             return DefaultStream::from_unix_stream(stream);
         }
