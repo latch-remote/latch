@@ -65,6 +65,7 @@ impl Path {
         match state.path {
             latch_stream::path::MediaPath::LatchRelay => Tone::Neutral,
             latch_stream::path::MediaPath::TailscaleUdp(_) => self.tone(),
+            _ => Tone::Neutral,
         }
     }
 
@@ -77,6 +78,7 @@ impl Path {
             latch_stream::path::MediaPath::TailscaleUdp(_) => {
                 format!("Tailscale UDP · {}", self.label())
             }
+            _ => "Media path".into(),
         }
     }
 

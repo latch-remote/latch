@@ -32,6 +32,7 @@ struct Network {
     queue: Duration,
     uplink: Option<Arc<parking_lot::Mutex<gateway::Uplink>>>,
     policy: bool,
+    fps: u32,
 }
 impl Default for Network {
     fn default() -> Self {
@@ -42,6 +43,7 @@ impl Default for Network {
             queue: Duration::from_millis(200),
             uplink: None,
             policy: true,
+            fps: 30,
         }
     }
 }
@@ -95,7 +97,15 @@ impl Running {
         height: u32,
         network: Network,
     ) -> Self {
+        let fps = network.fps;
         std::env::set_var("LATCH_TEST_PATTERN", pattern);
+        // Filler NALs retain the requested network load. Small real pictures
+        // leave CPU for the relay, FEC and decoder on three-core CI runners.
+        let (width, height) = if pattern == "load" {
+            (64, 64)
+        } else {
+            (width, height)
+        };
         let (udp, listener) = listeners::proxy();
         let port = listener.local_addr().unwrap().port();
 
@@ -103,7 +113,7 @@ impl Running {
             0,
             Options {
                 relay: Some(config.clone()),
-                ..Options::default()
+                ..listeners::options::options()
             },
         )
         .unwrap();
@@ -216,7 +226,7 @@ impl Running {
                 color: Default::default(),
                 width,
                 height,
-                fps: 30,
+                fps,
                 bitrate_kbps: kbps,
                 hevc: false,
                 av1: false,
@@ -434,9 +444,6 @@ fn automatic_blackhole_recovery_real_tls_input_and_udp_fallback() {
     let _serial = SESSION_TEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("latch_stream=debug,latch_engine=info,latch_relay=debug")
-        .try_init();
     let mut pilot = Pilot::start();
     {
         let running = Running::start(pilot.config.clone(), true);
@@ -807,7 +814,7 @@ fn relay_audio_and_microphone_pipeline(config: ClientConfig, policy: bool) {
                     }),
                 })
             })),
-            ..Options::default()
+            ..listeners::options::options()
         },
     )
     .unwrap();
@@ -1024,7 +1031,8 @@ fn recovered_udp_switches_back_at_twenty_and_sixty_megabits() {
     let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
     let pilot = Pilot::start();
     for kbps in [20_000, 60_000] {
-        let running = Running::with_rate(pilot.config.clone(), true, "still", kbps, 128, 128);
+        // Continuous motion gives each frame a fresh picture during handoff.
+        let running = Running::with_rate(pilot.config.clone(), true, "sweep", kbps, 64, 64);
         running.wait(Duration::from_secs(2), || {
             running.session.connected() && running.session.relay_active()
         });
@@ -1127,9 +1135,6 @@ fn bursty_seventeen_percent_udp_loss_switches_without_reconnecting() {
 
 #[test]
 fn udp_policer_selects_relay_and_a_relay_close_recovers_in_under_a_second() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("latch_stream=debug,latch_engine=debug,latch_relay=info")
-        .try_init();
     let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
     let mut pilot = Pilot::start();
     let running = Running::with_rate(pilot.config.clone(), false, "load", 20_000, 128, 128);
@@ -1200,9 +1205,6 @@ fn flapping_udp_bounds_switches_and_preserves_a_held_key() {
 
 #[test]
 fn auto_on_a_twenty_five_megabit_uplink_adapts_on_udp_until_random_loss_persists() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("latch_stream=debug,latch_engine=debug,latch_relay=info")
-        .try_init();
     let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
     let pilot = Pilot::start();
     let running = Running::with_network(
@@ -1301,7 +1303,7 @@ fn silent_relay_black_hole_gets_a_fresh_relay_picture_within_one_second() {
     let gateway = gateway::Gateway::start(pilot.config.endpoint.port(), None);
     let mut config = pilot.config.clone();
     config.endpoint = Endpoint::new("localhost", gateway.port).unwrap();
-    let running = Running::start(config, true);
+    let running = Running::with_rate(config, true, "sweep", 2000, 64, 64);
     running.wait(Duration::from_secs(2), || {
         running.session.connected() && running.session.relay_active()
     });
@@ -1462,7 +1464,7 @@ fn withdrawn_preparation_reuses_its_authorized_grant_on_a_new_attempt() {
 fn mtu_floor_recovers_udp_video_cadence_without_a_relay_grant() {
     let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
     let pilot = Pilot::start();
-    let running = Running::with_rate(pilot.config.clone(), false, "sweep", 6000, 320, 192);
+    let running = Running::with_rate(pilot.config.clone(), false, "load", 6000, 64, 64);
     running.max_datagram.store(592, Ordering::Release);
     running.wait(Duration::from_secs(2), || running.session.connected());
     running.wait(Duration::from_secs(1), || {
@@ -1488,4 +1490,98 @@ fn mtu_floor_recovers_udp_video_cadence_without_a_relay_grant() {
     );
     assert!(!running.session.relay_active());
     assert_eq!(pilot.metrics.grants_created.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn delayed_relay_survives_its_first_large_keyframe_and_spends_one_grant() {
+    use tracing_subscriber::prelude::*;
+    struct FirstAck(Arc<AtomicU64>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FirstAck {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Sample(u64);
+            impl tracing::field::Visit for Sample {
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    if field.name() == "first_relay_ack_us" {
+                        self.0 = value;
+                    }
+                }
+                fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            }
+            let mut sample = Sample(0);
+            event.record(&mut sample);
+            if sample.0 > 0 {
+                let _ = self
+                    .0
+                    .compare_exchange(0, sample.0, Ordering::AcqRel, Ordering::Acquire);
+            }
+        }
+    }
+    let _serial = SESSION_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let first_ack = Arc::new(AtomicU64::new(0));
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(
+        FirstAck(first_ack.clone()).with_filter(tracing_subscriber::filter::filter_fn(
+            |metadata| metadata.fields().field("first_relay_ack_us").is_some(),
+        )),
+    ))
+    .unwrap();
+    let pilot = Pilot::start();
+    let gateway = gateway::Gateway::with_delay(
+        pilot.config.endpoint.port(),
+        Some(8000),
+        Duration::from_millis(150),
+    );
+    let mut host_config = pilot.config.clone();
+    host_config.endpoint = Endpoint::new("localhost", gateway.port).unwrap();
+    let running = Running::with_network(
+        host_config,
+        false,
+        "load",
+        8000,
+        64,
+        64,
+        Network {
+            fps: 10,
+            ..Default::default()
+        },
+    );
+    running.wait(Duration::from_secs(3), || running.session.connected());
+    running.hold_key();
+    running.blackhole.store(true, Ordering::Release);
+    running.wait(Duration::from_secs(6), || {
+        running.session.relay_active() && first_ack.load(Ordering::Acquire) > 0
+    });
+    let start = Instant::now();
+    let first_picture = running.frames.seq();
+    let mut previous = first_picture;
+    for _ in 0..8 {
+        running.wait(Duration::from_secs(1), || {
+            assert!(
+                running.session.relay_active(),
+                "healthy delayed relay left its route"
+            );
+            running.frames.seq() >= previous + 5
+        });
+        previous = running.frames.seq();
+    }
+    running.wait(Duration::from_secs(4), || {
+        assert!(running.session.relay_active());
+        start.elapsed() >= Duration::from_secs(4)
+    });
+    let ack = Duration::from_micros(first_ack.load(Ordering::Acquire));
+    assert!(
+        ack > Duration::from_millis(350),
+        "fixture did not exercise the old watchdog {ack:?}"
+    );
+    assert_eq!(pilot.metrics.grants_created.load(Ordering::Acquire), 1);
+    eprintln!(
+        "150 ms one-way relay legs first video ACK {ack:?}, healthy for {:?}, pictures {}, wire budget {} kbps, grants 1",
+        start.elapsed(),
+        running.frames.seq() - first_picture,
+        running.session.stats().wire_budget_kbps
+    );
+    running.release_key();
 }

@@ -826,8 +826,9 @@ with its original sixty-second dwell, one-second padding, 50 Mbps ceiling
 and two-second handoff cooldown.
 
 With `media_path_policy` negotiated, `UdpProbeSized { first, kbps,
-datagram_size }` accepts 2,000–1,000,000 kbps and 576–1,200-byte datagrams.
-The host sizes it from 110% of actual relay delivery, capped by the request.
+datagram_size }` accepts 2,000–1,250,000 kbps and 576–1,200-byte datagrams.
+The host sizes it from 110% of actual relay delivery, capped at 125% of the
+request.
 The receiver responds with `UdpProbeReady { first }`. After 100 ms settle,
 padding ramps from 25% to 100% over 200 ms and holds for 400 ms. Both peers
 round `kbps × 525 / 8 / (datagram_size + 80)` packets to whole sixteen-packet

@@ -1059,9 +1059,17 @@ two seconds and three consecutive failures use thirty seconds.
 
 A host-side relay watchdog tracks real video ACK progress independently of
 viewer reports. An outstanding frame without progress for
-`max(350 ms, 2 × measured video ACK RTT + 100 ms)` resets the relay and
-requests fresh authorization or usable UDP. The relay crate retains its
-existing hard deadlines. The application watchdog handles silent black holes
+`max(floor, 2 × ACK RTT + 100 ms) + frame serialization time` resets the
+relay and requests fresh authorization or usable UDP. The initial RTT comes
+from elapsed TLS, lane attachment and end-to-end key setup. This
+conservative seed includes peer setup waits and leaves headroom for
+fresh-connection slow start.
+Until the first video ACK,
+the floor is at least 750 ms and the configured relay stall timeout. Later
+ACKs use a 350 ms floor. Serialization uses the largest pending frame's bytes
+and the current relay wire budget. The relay crate also seeds its video ACK
+estimate from setup and retains its existing frame, write and queue deadlines.
+The application watchdog handles silent black holes
 before that deadline where RTT permits. Invalid control and bounded inbox
 exhaustion still terminate the session.
 
@@ -1070,12 +1078,15 @@ are thirty and then sixty seconds, retained across successful handoffs.
 A failed, cancelled or unanswered check waits sixty seconds before retrying.
 Each test uses
 110% of the relay's mean delivered rate over the previous five seconds,
-bounded by a 2 Mbps minimum and the requested ceiling. It never sizes itself
+bounded by a 2 Mbps minimum and 125% of the requested ceiling.
+The peak headroom lets the ramp prove 90% of relay delivery even when the
+relay reaches the requested ceiling. It never sizes itself
 from an unused Auto ceiling. `UdpProbeReady` installs the receiver before the
 100 ms settle period. Padding ramps from 25% to 100% over 200 ms and holds
-for 400 ms. A delayed sender may finish within another 250 ms. Per-turn
-credit is capped at five milliseconds, so scheduler delays cannot accumulate
-a packet dump. The relay encoder subtracts the current UDP reservation from
+for 400 ms. A delayed sender may finish within another 250 ms. Send
+credit follows elapsed time, capped at forty milliseconds of the ramp's
+integrated rate, so coarse turns retain their budget and long stalls discard
+older credit. The relay encoder subtracts the current UDP reservation from
 the same measured budget, retaining a 1 Mbps video floor. Probe traffic thus
 replaces relay encoder budget. The 2 Mbps probe floor adds at most 1 Mbps
 beside the minimum relay stream.
@@ -1085,8 +1096,9 @@ grace. Relay ACK growth over `max(100 ms, baseline ACK RTT)` from the pre-probe
 snapshot, or outstanding
 ACK age beyond `min(baseline RTT, 250 ms) + 150 ms`, also stops padding.
 A test must deliver at least 99.5% of all announced positions, including
-its tail, over 450–1,000 ms with mean wire delivery at least 45% of the peak
-ramped rate. Sixteen-packet train rounding accounts for the low-rate floor.
+its tail, over 450–1,000 ms with mean wire delivery at least 90% of the
+relay's measured delivered mean before the check. Sixteen-packet train
+rounding accounts for the low-rate floor.
 A successful handoff starts the UDP controller at 90% of the measured delivered mean,
 with its original requested ceiling retained for later congestion-controlled
 growth. Three returns per rolling minute cap flapping. Padding occupies at

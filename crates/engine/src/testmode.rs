@@ -48,7 +48,7 @@ pub fn motion() -> Option<Motion> {
         "still" => Some(Motion::Still),
         "sweep" => Some(Motion::Sweep),
         "noise" => Some(Motion::Noise),
-        "load" => Some(Motion::Sweep),
+        "load" => Some(Motion::Still),
         _ => None,
     }
 }
@@ -109,9 +109,11 @@ impl VideoPipeline for LoadPattern {
     fn next(
         &mut self,
         keyframe: bool,
-        idle: Duration,
+        _idle: Duration,
     ) -> anyhow::Result<crate::video::EncodedVideo> {
-        let mut frame = self.pipeline.next(keyframe, idle)?;
+        // Repeat at frame cadence. Filler establishes the wire load while
+        // unchanged pictures keep capture and encoding cheap on CI runners.
+        let mut frame = self.pipeline.next(keyframe, Duration::ZERO)?;
         let bytes = (u64::from(self.kbps) * 1000 / 8 / u64::from(self.fps.max(1))) as usize;
         if frame.data.len() + 6 < bytes {
             frame.data.extend_from_slice(&[0, 0, 0, 1, 12]);

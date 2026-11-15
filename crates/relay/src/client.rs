@@ -990,6 +990,7 @@ struct State {
     closed: Option<(io::ErrorKind, String)>,
     closed_delivered: bool,
     frame_ack_elapsed: Option<Duration>,
+    setup_rtt: [Option<Duration>; 2],
     connections: [Option<ConnectionInfo>; 2],
     failure: Option<ConnectError>,
 }
@@ -1106,6 +1107,20 @@ impl Transport {
     /// Selected carrier and ladder diagnostics for a lane, available after setup.
     pub fn connection_info(&self, lane: Lane) -> Option<ConnectionInfo> {
         self.shared.state.lock().unwrap().connections[lane as usize].clone()
+    }
+    /// Conservative initial RTT estimate from TLS, attachment and key setup.
+    /// Includes peer setup waits, allowing for slow start on fresh lanes.
+    /// Available after Ready, before the first video acknowledgment.
+    pub fn setup_rtt(&self) -> Option<Duration> {
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .setup_rtt
+            .iter()
+            .flatten()
+            .copied()
+            .max()
     }
     /// Typed terminal connection failure, including failed ladder attempts.
     pub fn failure(&self) -> Option<ConnectError> {
@@ -1305,7 +1320,8 @@ fn run_lane(
     lane: Lane,
     shared: &Shared,
 ) -> io::Result<()> {
-    let setup_deadline = Instant::now() + config.limits.setup_timeout;
+    let setup_started = Instant::now();
+    let setup_deadline = setup_started + config.limits.setup_timeout;
     let (mut socket, info) = open(config, &shared.cancel, setup_deadline)?;
     shared.state.lock().unwrap().connections[lane as usize] = Some(info);
     if exchange(
@@ -1363,6 +1379,9 @@ fn run_lane(
                     return Err(invalid("relay key confirmation required"));
                 }
                 confirmed = true;
+                let setup_rtt = setup_started.elapsed();
+                shared.state.lock().unwrap().setup_rtt[lane as usize] = Some(setup_rtt);
+                video_rtt.sample(setup_rtt);
                 shared.ready(lane)?;
             } else if lane == Lane::Video && plaintext[0] == 6 {
                 if plaintext.len() != 5 {

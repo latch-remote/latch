@@ -1150,6 +1150,7 @@ impl View {
                                         path.media_label(&state)
                                     }
                                     latch_stream::path::MediaPath::TailscaleUdp(_) => path.label(),
+                                    _ => path.media_label(&state),
                                 };
                                 ui::tag(ui, Some(path.media_tone(&state)), &route).on_hover_text(
                                     format!(

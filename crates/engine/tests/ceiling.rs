@@ -1,6 +1,9 @@
 //! A host encoding in software holds a request to what its CPU keeps up
 //! with, whatever the viewer asked: its own process, since the ceiling is
 //! the engine's for the whole host.
+#[path = "support/options.rs"]
+mod options;
+
 use latch_engine::server::{Options, Server};
 use latch_engine::software::{self, Ceiling};
 use latch_proto::control::{Codec, StreamRequest};
@@ -21,7 +24,7 @@ fn a_cold_software_host_does_not_take_4k_at_the_display_refresh_rate() {
                     Ok(None)
                 }
             })),
-            ..Options::default()
+            ..options::options()
         },
     )
     .unwrap();

@@ -40,6 +40,9 @@ pub struct Gateway {
 }
 impl Gateway {
     pub fn start(target: u16, kbps: Option<u32>) -> Self {
+        Self::with_delay(target, kbps, Duration::ZERO)
+    }
+    pub fn with_delay(target: u16, kbps: Option<u32>, delay: Duration) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -74,32 +77,55 @@ impl Gateway {
                                 let (stop, blackhole) = (stop.clone(), blackhole.clone());
                                 workers.push(thread::spawn(move || {
                                     source
-                                        .set_read_timeout(Some(Duration::from_millis(10)))
+                                        .set_read_timeout(Some(Duration::from_millis(1)))
                                         .unwrap();
                                     sink.set_write_timeout(Some(Duration::from_millis(100)))
                                         .unwrap();
-                                    let mut bytes = [0; 4096];
+                                    let mut bytes = [0; 16 * 1024];
+                                    let mut pending = std::collections::VecDeque::new();
+                                    let mut queued_bytes = 0;
+                                    let mut eof = false;
                                     while !stop.load(Ordering::Acquire) {
+                                        while pending
+                                            .front()
+                                            .is_some_and(|(due, _)| *due <= Instant::now())
+                                        {
+                                            let (_, packet): (Instant, Vec<u8>) =
+                                                pending.pop_front().unwrap();
+                                            queued_bytes -= packet.len();
+                                            if id > blackhole.load(Ordering::Acquire)
+                                                && sink.write_all(&packet).is_err()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                        // Bound buffering while allowing propagation delay to
+                                        // overlap reads. Sleeping per read would cap throughput
+                                        // at one buffer per delay interval.
+                                        if eof && pending.is_empty() {
+                                            break;
+                                        }
+                                        if eof || queued_bytes >= 1024 * 1024 {
+                                            thread::sleep(Duration::from_millis(1));
+                                            continue;
+                                        }
                                         match source.read(&mut bytes) {
-                                            Ok(0) => break,
+                                            Ok(0) => eof = true,
                                             Ok(count) => {
                                                 if id <= blackhole.load(Ordering::Acquire) {
                                                     continue;
                                                 }
-                                                if let Some(limit) = &limit {
-                                                    let due = limit
-                                                        .lock()
-                                                        .schedule(count, Duration::MAX)
-                                                        .unwrap();
-                                                    thread::sleep(
-                                                        due.saturating_duration_since(
-                                                            Instant::now(),
-                                                        ),
-                                                    );
-                                                }
-                                                if sink.write_all(&bytes[..count]).is_err() {
-                                                    break;
-                                                }
+                                                let due = limit.as_ref().map_or_else(
+                                                    Instant::now,
+                                                    |limit| {
+                                                        limit
+                                                            .lock()
+                                                            .schedule(count, Duration::MAX)
+                                                            .unwrap()
+                                                    },
+                                                ) + delay;
+                                                pending.push_back((due, bytes[..count].to_vec()));
+                                                queued_bytes += count;
                                             }
                                             Err(error)
                                                 if matches!(

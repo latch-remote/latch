@@ -1,5 +1,8 @@
 //! Reserve the real host media socket and its control listener together.
 use latch_engine::server::{Options, Server};
+
+#[path = "options.rs"]
+pub mod options;
 use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::sync::Arc;
 
@@ -15,14 +18,7 @@ pub fn proxy() -> (UdpSocket, TcpListener) {
 pub fn host() -> (Arc<Server>, TcpListener) {
     ports::retry_bind(|port| {
         let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
-        // UDP fixtures must not inherit the production relay default.
-        let server = Server::bind(
-            tcp.local_addr()?.port(),
-            Options {
-                relay: None,
-                ..Options::default()
-            },
-        )?;
+        let server = Server::bind(tcp.local_addr()?.port(), options::options())?;
         Ok((server, tcp))
     })
 }

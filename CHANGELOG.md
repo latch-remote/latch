@@ -17,6 +17,10 @@ GitHub release notes, so each version gets a heading of the form
   and publish a DNS-only AAAA while preserving the existing A record.
 - Add explicit carrier and CONNECT proxy options to the bounded paired probe,
   with per-lane diagnostics and carrier-selection regression tests.
+- Consolidate the Seoul native TCP/TLS and Tailscale UDP peer relays on the
+  existing Lightsail instance. Add reproducible socket, queue, forwarding
+  offload, descriptor and memory tuning, with bounded before/after measurements,
+  bundle and transfer cost estimates, IPv6 findings and completed EC2 teardown.
 
 ### Relay connectivity
 
@@ -103,13 +107,6 @@ GitHub release notes, so each version gets a heading of the form
 - Document host and viewer support on Windows, macOS and Linux, with code
   evidence, verification scope, all six streaming directions and in-flight
   work. Correct platform and cursor claims.
-
-### Deployment
-
-- Consolidate the Seoul native TCP/TLS and Tailscale UDP peer relays on the
-  existing Lightsail instance. Add reproducible socket, queue, forwarding
-  offload, descriptor and memory tuning, with bounded before/after measurements,
-  bundle and transfer cost estimates, IPv6 findings and completed EC2 teardown.
 
 ### Streaming and recovery
 

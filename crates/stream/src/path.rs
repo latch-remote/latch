@@ -5,6 +5,7 @@ use latch_proto::wire::{self, Datagram};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum UdpPath {
     #[default]
@@ -14,6 +15,7 @@ pub enum UdpPath {
     Derp,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaPath {
     TailscaleUdp(UdpPath),
@@ -130,12 +132,38 @@ impl PathReason {
     }
 }
 
+/// Local progress toward a possible transport change. The committed path
+/// and its age remain available while negotiation or measurement runs.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathActivity {
+    PreparingRelay,
+    TestingUdp,
+}
+
+impl PathActivity {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::PreparingRelay => "Preparing the relay",
+            Self::TestingUdp => "Testing the direct path",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaPathState {
     pub path: MediaPath,
     pub reason: PathReason,
     pub carrier: Option<Carrier>,
     pub since: Instant,
+    pub activity: Option<PathActivity>,
+}
+
+impl MediaPathState {
+    /// Time on the committed path, suitable for duration fields in logs.
+    pub fn age(&self) -> Duration {
+        self.since.elapsed()
+    }
 }
 
 /// Only committed media changes reach the notice stream. Diagnostic refinement
@@ -143,6 +171,7 @@ pub struct MediaPathState {
 pub(crate) struct PathNotices {
     previous: MediaPathState,
     last_notice: Option<Instant>,
+    last_emitted: Option<MediaPathState>,
     pending: Option<MediaPathState>,
 }
 
@@ -151,6 +180,7 @@ impl PathNotices {
         Self {
             previous,
             last_notice: None,
+            last_emitted: None,
             pending: None,
         }
     }
@@ -186,6 +216,17 @@ impl PathNotices {
             return None;
         }
         let notice = self.pending.take()?;
+        if self.last_emitted.as_ref().is_some_and(|last| {
+            matches!(last.path, MediaPath::LatchRelay)
+                == matches!(notice.path, MediaPath::LatchRelay)
+                && !matches!(
+                    notice.reason,
+                    PathReason::CaptivePortal | PathReason::TlsInterception | PathReason::ProxyAuth
+                )
+        }) {
+            return None;
+        }
+        self.last_emitted = Some(notice.clone());
         self.last_notice = Some(now);
         Some(notice)
     }
@@ -198,6 +239,7 @@ impl Default for MediaPathState {
             reason: PathReason::Initial,
             carrier: None,
             since: Instant::now(),
+            activity: None,
         }
     }
 }
@@ -519,6 +561,29 @@ mod tests {
             notices.observe(state.clone(), now + Duration::from_secs(61)),
             Some(state)
         );
+    }
+
+    #[test]
+    fn a_coalesced_round_trip_does_not_repeat_the_last_emitted_transport() {
+        let now = Instant::now();
+        let mut state = MediaPathState::default();
+        let mut notices = PathNotices::new(state.clone());
+        state.path = MediaPath::LatchRelay;
+        state.reason = PathReason::UdpBlocked;
+        assert!(notices.observe(state.clone(), now).is_some());
+        state.path = MediaPath::TailscaleUdp(UdpPath::Direct);
+        state.reason = PathReason::UdpRecovered;
+        assert!(notices
+            .observe(state.clone(), now + Duration::from_secs(5))
+            .is_none());
+        state.path = MediaPath::LatchRelay;
+        state.reason = PathReason::UdpLoss { percent: 17 };
+        assert!(notices
+            .observe(state.clone(), now + Duration::from_secs(10))
+            .is_none());
+        assert!(notices
+            .observe(state, now + Duration::from_secs(20))
+            .is_none());
     }
 
     #[test]
