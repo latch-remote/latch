@@ -220,7 +220,7 @@ In-flight markers describe proposed changes and confer no implemented support.
 |---|---|---|---|
 | [#77](https://github.com/latch-remote/latch/issues/77) | `t3/send-input-on-os-events` | [#101](https://github.com/latch-remote/latch/pull/101), open | Viewer keyboard/mouse/scroll dispatch latency on W/M/L |
 | [#78](https://github.com/latch-remote/latch/issues/78) | `t3/choose-shared-display` | [#103](https://github.com/latch-remote/latch/pull/103), open | Host selection and viewer chooser, DPI/capture/input geometry |
-| [#79](https://github.com/latch-remote/latch/issues/79) | `t3/linux-vaapi-decode` | [#104](https://github.com/latch-remote/latch/pull/104), open | Linux decode codecs, colour precision and possible presentation path, codec/HDR scope unverified |
+| [#79](https://github.com/latch-remote/latch/issues/79) | `t3/linux-vaapi-decode` | [#104](https://github.com/latch-remote/latch/pull/104), open | VA-API H.264/HEVC Main/Main10 and EGL DMA-BUF presentation implemented in the PR, CPU readback fallback and SDR output, Intel/AMD hardware verification pending |
 | [#80](https://github.com/latch-remote/latch/issues/80) | `t3/wayland-capture-input` | [#102](https://github.com/latch-remote/latch/pull/102), open | Linux host capture/input/permissions/display/cursor |
 | [#81](https://github.com/latch-remote/latch/issues/81), closed | `t3/add-package-manager-support` | [#93](https://github.com/latch-remote/latch/pull/93), merged | Windows Scoop, Linux AUR/Nix definitions, external publication pending |
 | — | `t3/port-major-dependency-updates` | [#100](https://github.com/latch-remote/latch/pull/100), open | macOS API bindings, X11 bindings, dynamic GPU library loading and build compatibility |
