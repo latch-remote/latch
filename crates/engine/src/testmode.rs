@@ -133,6 +133,9 @@ impl VideoPipeline for LoadPattern {
         }
         Ok(frame)
     }
+    fn software_timings(&self) -> Option<crate::software::SoftwareTimings> {
+        self.pipeline.software_timings()
+    }
     fn set_bitrate(&mut self, kbps: u32) {
         self.kbps = kbps;
         self.pipeline.set_bitrate(kbps);

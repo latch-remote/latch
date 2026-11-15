@@ -172,6 +172,7 @@ pub(crate) struct Controller {
 
 struct PathSample {
     at: Instant,
+    duration: Duration,
     sent: u32,
     received: u32,
     loss: f32,
@@ -468,8 +469,12 @@ impl Controller {
         let old = self.budget;
         let mut recent_loss = report.loss_pct;
         if self.media_path_policy {
+            let sample_duration = self.path_samples.back().map_or(window, |previous| {
+                window.min(now.saturating_duration_since(previous.at))
+            });
             self.path_samples.push_back(PathSample {
                 at: now,
+                duration: sample_duration,
                 sent: self.sent_kbps.unwrap_or(0),
                 received: report.received_kbps,
                 // Reassembly can report old losses while a large frame is
@@ -494,27 +499,43 @@ impl Controller {
             let recent: Vec<_> = self
                 .path_samples
                 .iter()
-                .filter(|sample| now.saturating_duration_since(sample.at) <= period)
+                .filter_map(|sample| {
+                    let remaining = period.saturating_sub(now.saturating_duration_since(sample.at));
+                    let ms = sample.duration.min(remaining).as_millis() as u64;
+                    (ms > 0).then_some((sample, ms))
+                })
                 .collect();
-            let count = recent.len() as u64;
+            let duration = recent.iter().map(|(_, ms)| ms).sum::<u64>();
             let sent = recent
                 .iter()
-                .map(|sample| u64::from(sample.sent))
+                .map(|(sample, ms)| u64::from(sample.sent) * ms)
                 .sum::<u64>();
-            let loss = recent.iter().map(|sample| sample.loss).sum::<f32>();
-            recent_loss = loss / count.max(1) as f32;
+            let loss = recent
+                .iter()
+                .map(|(sample, ms)| sample.loss * *ms as f32)
+                .sum::<f32>();
+            recent_loss = loss / duration.max(1) as f32;
             // Compare actual sends below previously demonstrated delivery.
-            // A FIFO drains at this offer. A policer or random loss can keep
-            // discarding packets after that backoff without a standing queue.
-            if count >= 4
-                && recent.first().is_some_and(|sample| {
-                    now.saturating_duration_since(sample.at) >= period * 3 / 4
-                })
+            // Weight the covered receive time, including partial edge windows.
+            // A coarse receiver can provide a full period in fewer reports.
+            let qualified = Duration::from_millis(duration) >= period * 3 / 4
                 && sent > 0
-                && sent * 5 < u64::from(earlier_delivery) * count * 4
-                && loss >= count as f32 * 10.0
-                && delay < 20.0f32.max(rtt.as_secs_f32() * 200.0)
-            {
+                && sent * 5 < u64::from(earlier_delivery) * duration * 4
+                && loss >= duration as f32 * 10.0
+                && delay < 20.0f32.max(rtt.as_secs_f32() * 200.0);
+            tracing::debug!(
+                feedback_ms = report.window_ms,
+                evidence_ms = duration,
+                samples = recent.len(),
+                earlier_delivery,
+                offered_kbps = sent / duration.max(1),
+                loss = recent_loss,
+                delay_ms = delay,
+                queue_ms,
+                qualified,
+                "UDP reduced-offer evidence"
+            );
+            if qualified {
                 self.random_damage_until = now + LOSSY_MEMORY;
             }
         }
@@ -2509,6 +2530,76 @@ mod media_path_tests {
                 random_loss || !fifo,
                 "random loss {random_loss}, FIFO {fifo}, budget {}",
                 controller.budget()
+            );
+        }
+    }
+
+    #[test]
+    fn reduced_offer_damage_uses_elapsed_feedback_time() {
+        let start = Instant::now();
+        let mut controller = Controller::new(5000, start);
+        controller.enable_media_policy(true);
+        for tick in 0..=8 {
+            let reduced = tick >= 5;
+            controller.observe_sent(if reduced { 2000 } else { 5000 });
+            controller.update(
+                start + Duration::from_millis(tick * 120),
+                &Report {
+                    window_ms: 120,
+                    rtt_ms: 2.0,
+                    loss_pct: if reduced { 30.0 } else { 0.0 },
+                    unrecovered_loss_pct: Some(if reduced { 30.0 } else { 0.0 }),
+                    received_kbps: if reduced { 1400 } else { 5000 },
+                    frames_lost: u64::from(reduced),
+                    ..Default::default()
+                },
+                2.0,
+                0.0,
+            );
+        }
+        // Three 120-ms windows contain more evidence than four nominal
+        // 50-ms reports. A slower receiver must retain that evidence.
+        assert!(controller.udp_damage());
+    }
+
+    #[test]
+    fn overlapping_feedback_windows_cannot_create_extra_damage_evidence() {
+        let start = Instant::now();
+        let mut controller = Controller::new(5000, start);
+        controller.enable_media_policy(true);
+        for tick in 0..=4 {
+            controller.observe_sent(5000);
+            controller.update(
+                start + Duration::from_millis(tick * 120),
+                &Report {
+                    window_ms: 120,
+                    rtt_ms: 2.0,
+                    received_kbps: 5000,
+                    ..Default::default()
+                },
+                2.0,
+                0.0,
+            );
+        }
+        for _ in 0..20 {
+            controller.observe_sent(2000);
+            controller.update(
+                start + Duration::from_millis(500),
+                &Report {
+                    window_ms: 120,
+                    rtt_ms: 2.0,
+                    received_kbps: 1400,
+                    loss_pct: 30.0,
+                    unrecovered_loss_pct: Some(30.0),
+                    frames_lost: 1,
+                    ..Default::default()
+                },
+                2.0,
+                0.0,
+            );
+            assert!(
+                !controller.udp_damage(),
+                "twenty ms of new evidence was counted repeatedly"
             );
         }
     }

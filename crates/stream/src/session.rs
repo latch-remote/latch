@@ -3026,6 +3026,14 @@ fn busy_video(stats: &Stats) -> bool {
             || !stats.application_limited)
 }
 
+fn udp_quality_recovered(stats: &Stats, report: &Report) -> bool {
+    report.fps > 0.0
+        && report.loss_pct < 3.0
+        && report.frames_lost == 0
+        && !relay_bandwidth_limited(stats)
+        && !relay_fec_limited(stats)
+}
+
 #[derive(Default)]
 struct LegacyFallback {
     damage_since: Option<Instant>,
@@ -3248,10 +3256,25 @@ fn control_loop(inner: &Arc<Inner>, tcp: &mut TcpStream, accept: &Accept) -> Out
                     stats.wire_budget_kbps,
                     stats.udp_damage,
                 );
+                let recovered = udp_quality_recovered(&stats, &report);
+                tracing::debug!(
+                    feedback_ms = report.window_ms,
+                    received_fps = report.fps,
+                    raw_loss = report.loss_pct,
+                    frames_lost = report.frames_lost,
+                    wire_kbps = stats.wire_budget_kbps,
+                    applied_kbps = stats.applied_bitrate_kbps,
+                    application_limited = stats.application_limited,
+                    udp_damage = stats.udp_damage,
+                    quality_recovered = recovered,
+                    ?candidate,
+                    retained_reason = ?reason,
+                    "media path policy feedback"
+                );
                 if candidate.is_some() {
                     reason = candidate;
                     healthy_since = None;
-                } else if report.fps > 0.0 && report.loss_pct < 3.0 && report.frames_lost == 0 {
+                } else if recovered {
                     let since = *healthy_since.get_or_insert(now);
                     if now.saturating_duration_since(since) >= rtt.max(Duration::from_millis(100)) {
                         reason = None;
@@ -5045,6 +5068,43 @@ mod tests {
             .iter()
             .any(|event| matches!(event, Event::Notice(message) if message == &notice.message)));
         assert!(events.iter().all(|event| !matches!(event, Event::Network(status) if status.needs_sign_in || status.portal_url.is_some())));
+    }
+
+    #[test]
+    fn policer_backoff_keeps_relay_preparation_needed_until_quality_recovers() {
+        let mut stats = Stats {
+            requested_bitrate_kbps: 20_000,
+            wire_budget_kbps: 2009,
+            applied_bitrate_kbps: 844,
+            received_fps: 19.8,
+            mbps: 1.16,
+            application_limited: false,
+            ..Default::default()
+        };
+        let report = Report {
+            fps: 19.8,
+            ..Default::default()
+        };
+        assert!(
+            !udp_quality_recovered(&stats, &report),
+            "a policer cut cleared packet loss while picture quality stayed limited"
+        );
+        stats.wire_budget_kbps = 20_000;
+        assert!(
+            !udp_quality_recovered(&stats, &report),
+            "FEC still consumes the requested picture budget"
+        );
+        stats.applied_bitrate_kbps = 13_220;
+        stats.mbps = 13.0;
+        assert!(udp_quality_recovered(&stats, &report));
+        stats.wire_budget_kbps = 2009;
+        stats.applied_bitrate_kbps = 844;
+        stats.application_limited = true;
+        stats.mbps = 0.02;
+        assert!(
+            udp_quality_recovered(&stats, &report),
+            "an idle desktop can withdraw a preparation"
+        );
     }
 
     #[test]

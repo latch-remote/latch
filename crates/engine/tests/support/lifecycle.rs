@@ -76,6 +76,7 @@ fn session(addr: SocketAddr) -> Arc<Session> {
         fec: AtomicU8::new(DEFAULT_FEC_PERCENT),
         heard_us: AtomicU64::new(0),
         frames: AtomicU64::new(0),
+        video: Mutex::default(),
         bytes: AtomicU64::new(0),
         transport: TransportState::new(1000),
         keyframe_requests: Mutex::default(),

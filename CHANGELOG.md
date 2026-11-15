@@ -193,6 +193,10 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Testing
 
+- Report host frame production, capture/conversion/encode timing, send progress
+  and pacing lateness on relay runtime failures. Give the UDP forwarder full
+  socket buffers, retry temporary send backpressure, and drive delayed TCP
+  forwarding with socket readiness and delivery deadlines.
 - Add a Linux network-namespace harness and privileged Docker runner for
   real headless streams through blocked, lossy, proxy, TLS-inspecting,
   captive-portal and MTU-limited networks. Record decoded video, sound,
@@ -260,6 +264,13 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Streaming and recovery
 
+- Preserve elapsed UDP pacing credit across late scheduler wakes, bounded to
+  32 ms within an active frame. Bound idle credit and apply rate cuts immediately.
+- Weight reduced-offer UDP loss evidence by covered receive time so coarse
+  feedback windows can qualify a damaged path for relay recovery. Retain relay
+  preparation while bitrate or FEC still limits a busy picture after loss clears.
+- Preserve the 100 ms idle-picture repeat phase across late wakes and restart
+  the phase after a long stall.
 - Prepare relay recovery after 350 ms without UDP. Distinguish persistent
   UDP damage from shared-uplink congestion and use RTT-relative recovery
   timers. Detect silent relay ACK stalls before the hard transport deadline.

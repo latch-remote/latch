@@ -102,6 +102,21 @@ impl Default for Options {
     }
 }
 
+/// Host-side video progress, independent of the viewer receiving a complete frame.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VideoDiagnostics {
+    pub frames_produced: u64,
+    pub frames_sent: u64,
+    pub encoded_bytes: u64,
+    pub produce_time: Duration,
+    pub max_produce_time: Duration,
+    pub software: Option<crate::software::SoftwareTimings>,
+    pub pacing_waits: u64,
+    pub pacing_wait: Duration,
+    pub pacing_max_lateness: Duration,
+    producing_since: Option<Instant>,
+}
+
 /// What `/v1/status` says about streaming.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ServerStatus {
@@ -120,6 +135,7 @@ pub struct ServerStatus {
     pub send_retries: u64,
     pub socket_send_bytes: usize,
     pub socket_receive_bytes: usize,
+    pub video: VideoDiagnostics,
 }
 
 /// Why a stream request was turned down, as an HTTP status and a sentence.
@@ -198,6 +214,11 @@ impl Server {
                 session.transport.queue_us.load(Ordering::Relaxed) as f32 / 1000.0;
             status.send_errors = session.transport.errors.load(Ordering::Relaxed);
             status.send_retries = session.transport.retries.load(Ordering::Relaxed);
+            status.video = session.video.lock().clone();
+            status.video.frames_sent = session.frames.load(Ordering::Relaxed);
+            if let Some(since) = status.video.producing_since {
+                status.video.produce_time = since.elapsed();
+            }
         }
         status
     }
@@ -575,6 +596,7 @@ impl Server {
             fec_burst: AtomicU8::new(0),
             heard_us: AtomicU64::new(self.now_us()),
             frames: AtomicU64::new(0),
+            video: Mutex::new(VideoDiagnostics::default()),
             bytes: AtomicU64::new(0),
             transport: TransportState::new(initial_budget),
             keyframe_requests: Mutex::default(),
@@ -1111,6 +1133,8 @@ impl Server {
                             sent_kbps,
                             received_kbps = r.received_kbps,
                             decoder_queue_ms = r.queue_ms,
+                            udp_damage = controller.udp_damage(),
+                            application_limited = controller.application_limited(),
                             relay = session.relay.active(),
                             loss = r.loss_pct,
                             "bitrate controller decision"
@@ -1425,6 +1449,7 @@ struct Session {
     /// When the viewer was last heard from, on the server's clock.
     heard_us: AtomicU64,
     frames: AtomicU64,
+    video: Mutex<VideoDiagnostics>,
     bytes: AtomicU64,
     transport: TransportState,
     /// Which keyframe requests ask for a keyframe not already sent.
@@ -2103,7 +2128,22 @@ fn encode_video(
         // Short idle repeats bound how long a request arriving inside next
         // waits. Send every returned frame: discarding an encoded repeat
         // would discard a reference needed by subsequent P-frames.
-        let mut frame = match pipeline.next(keyframe, IDLE_REPEAT) {
+        let producing = Instant::now();
+        session.video.lock().producing_since = Some(producing);
+        let produced = pipeline.next(keyframe, IDLE_REPEAT);
+        {
+            let mut diagnostics = session.video.lock();
+            diagnostics.producing_since = None;
+            diagnostics.produce_time = producing.elapsed();
+            diagnostics.max_produce_time =
+                diagnostics.max_produce_time.max(diagnostics.produce_time);
+            diagnostics.software = pipeline.software_timings();
+            if let Ok(frame) = &produced {
+                diagnostics.frames_produced += 1;
+                diagnostics.encoded_bytes += frame.data.len() as u64;
+            }
+        }
+        let mut frame = match produced {
             Ok(f) => f,
             Err(e) => {
                 if session.stopping() {
@@ -2251,6 +2291,7 @@ fn paced_video(
         let probe = session.transport.probe.lock().take();
         let probe_addr = *session.addr.lock();
         if let (Some((train, count)), Some(addr)) = (probe, probe_addr) {
+            pacer.begin_frame(Instant::now(), session.pace_kbps.load(Ordering::Relaxed));
             let mut packets = Vec::with_capacity(usize::from(count));
             for index in 0..count {
                 let mut buf = Vec::with_capacity(latch_proto::MAX_DATAGRAM);
@@ -2365,6 +2406,7 @@ fn paced_video(
             }
             continue;
         }
+        pacer.begin_frame(Instant::now(), session.pace_kbps.load(Ordering::Relaxed));
         let measured_size = session.relay.datagram_size();
         if measured_size != datagram_size {
             datagram_size = measured_size;
@@ -2492,7 +2534,15 @@ fn send_paced_batch(
         let (count, wait) = pacer.batch(Instant::now(), &batch[sent..], rate);
         if count == 0 {
             let deadline = Instant::now() + wait;
-            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            let started = Instant::now();
+            std::thread::sleep(deadline.saturating_duration_since(started));
+            let now = Instant::now();
+            let mut diagnostics = session.video.lock();
+            diagnostics.pacing_waits += 1;
+            diagnostics.pacing_wait += now.saturating_duration_since(started);
+            diagnostics.pacing_max_lateness = diagnostics
+                .pacing_max_lateness
+                .max(now.saturating_duration_since(deadline));
             continue;
         }
         if let Some(queued) = queued {

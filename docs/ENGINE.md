@@ -690,7 +690,9 @@ What shows the engine is right, other than its authors:
 
 All host pipelines use the same start-to-start deadline scheduler. Work time
 is inside the interval; a deadline missed by a whole interval resets the grid to the
-actual capture time, without catch-up trains (`video::Pacer`). Idle repeats remain bounded at 100 ms.
+actual capture time, without catch-up trains (`video::Pacer`). Idle repeats
+preserve their 100 ms phase across late wakes, resetting after a whole missed
+idle interval.
 Encoding feeds a two-frame bounded channel to a dedicated video sender;
 backpressure preserves encoded references. When pacing is active, the producer
 does not capture the next picture while an encoded frame is already queued
@@ -701,15 +703,14 @@ a large keyframe still takes its unavoidable wire serialization time. Clean
 paths retain the two-frame overlap. Cancellation may discard queued
 media. Audio, input acknowledgements and pings bypass the video queue.
 
-Under pressure video uses a wire-byte token bucket at 2.5 times the wire budget,
-with the existing burst cap (two datagrams, or 1 ms of credit plus one
-datagram, whichever is larger). The sender spends elapsed credit in batches
-through the normal GSO/USO/batch fallback and reloads the current rate between
-batches. Waits accumulate up to 1 ms of credit and use an absolute deadline;
-there is no final spin. A rate cut clamps saved credit to the new burst cap. While
-pacing, waiting in that bucket is not sender pressure (it would only slow the
-bucket further); a clean path still sends every frame, keyframes included,
-at once. The encoder allowance reserves audio separately,
+Video uses a wire-byte token bucket at its current pacing rate. A new frame
+starts with at most two datagrams or 1 ms of credit plus one datagram,
+whichever is larger. Within that frame, elapsed send credit survives late
+scheduler wakes, capped at 32 ms plus one datagram. Idle capture time retains
+the ordinary one-ms cap. The sender spends credit in batches through the
+normal GSO/USO/batch fallback and reloads the current rate between batches.
+Waits request at most 1 ms using an absolute deadline. A rate change clamps
+saved credit immediately to the ordinary burst cap. The encoder allowance reserves audio separately,
 then compounds header overhead with rounded FEC rather than adding the two.
 For a loaded sender, cuts use the lower of budget and successful send rate,
 bounded by received throughput +7%. A sender is application-limited after
@@ -1092,9 +1093,12 @@ a previously unmeasured UDP path starts paced at at most 8 Mbps, then grows
 under congestion control. A measured UDP return retains its proven start rate.
 The host congestion controller first
 reduces the actual offered load below demonstrated delivery so a shared FIFO
-can drain. Over at least 300 ms, or the feedback horizon on a distant path,
-four receive windows with 10% mean raw loss at less than 80% of previously
-delivered throughput establish residual UDP damage. Windows with more than
+can drain. Within a trailing period of at least 300 ms, or the feedback
+horizon on a distant path, covered receive time of at least three quarters
+of that period with 10% time-weighted mean raw loss at less than 80% of
+previously delivered throughput establishes residual UDP damage. Report
+intervals bound each sample's credit and partial edge windows are clipped.
+Windows with more than
 100 ms of local send backlog cannot establish this evidence. Standing delay
 above `max(20 ms, 20% of baseline RTT)` suppresses it. Evidence lasts three
 seconds while fresh window-mean loss remains at least 3%.
@@ -1120,8 +1124,10 @@ showing continuous demand. FEC cost alone also requires
 preserves picture quality keeps UDP.
 
 The host has one grant worker and a six-second negotiation deadline. If the
-trigger clears before the offer, the viewer withdraws preparation. Loss-based
-preparation requires clean completed video for `max(100 ms, RTT)` before
+trigger clears before the offer, the viewer withdraws preparation. A clean
+loss window clears a busy-quality trigger only after bitrate and FEC limits
+also recover, preserving preparation while a policer backoff still limits the
+picture. Loss-based preparation requires clean completed video for `max(100 ms, RTT)` before
 clearing, allowing isolated receive/report gaps during continued damage. Its retry
 backoff grows through 2, 4, 8, 16 and 30 seconds. The host parks a completed
 grant and its host lanes for reuse for at most twenty seconds, bounded by

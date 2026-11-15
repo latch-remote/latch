@@ -62,6 +62,8 @@ struct Running {
     downstream: Arc<parking_lot::Mutex<latch_proto::sim::Link>>,
     max_datagram: Arc<AtomicU64>,
     probe_packets: Arc<parking_lot::Mutex<Vec<(Instant, usize)>>>,
+    proxy_buffers: latch_proto::transport::SocketBuffers,
+    proxy_send_retries: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     host: Option<JoinHandle<()>>,
     proxy: Option<JoinHandle<()>>,
@@ -100,6 +102,12 @@ impl Running {
         height: u32,
         network: Network,
     ) -> Self {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                "latch_engine::server=debug,latch_engine::congestion=debug,latch_stream::session=debug,latch_relay=info",
+            )
+            .with_test_writer()
+            .try_init();
         let fps = network.fps;
         std::env::set_var("LATCH_TEST_PATTERN", pattern);
         // Filler NALs retain the requested network load. Small real pictures
@@ -110,6 +118,10 @@ impl Running {
             (width, height)
         };
         let (udp, listener) = listeners::proxy();
+        let proxy_buffers =
+            latch_proto::transport::configure_socket(&udp, 8 * 1024 * 1024, 8 * 1024 * 1024)
+                .unwrap();
+        let proxy_send_retries = Arc::new(AtomicU64::new(0));
         let port = listener.local_addr().unwrap().port();
 
         let server = Server::bind(
@@ -137,6 +149,7 @@ impl Running {
         let max_datagram = Arc::new(AtomicU64::new(1200));
         let probe_packets = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let proxy = {
+            let proxy_send_retries = proxy_send_retries.clone();
             let probe_packets = probe_packets.clone();
             let downstream = downstream.clone();
             let max_datagram = max_datagram.clone();
@@ -154,6 +167,7 @@ impl Running {
                     12,
                 );
                 let mut shared_flight = std::collections::VecDeque::new();
+                let mut upstream_ready = std::collections::VecDeque::new();
                 while !stop.load(Ordering::Acquire) {
                     for _ in 0..256 {
                         let Ok((len, from)) = udp.recv_from(&mut bytes) else {
@@ -176,8 +190,12 @@ impl Running {
                             upstream.send(Instant::now(), &bytes[..len]);
                         }
                     }
-                    for bytes in upstream.receive(Instant::now()) {
-                        let _ = udp.send_to(&bytes, (Ipv4Addr::LOCALHOST, host_port));
+                    upstream_ready.extend(upstream.receive(Instant::now()));
+                    while let Some(bytes) = upstream_ready.front() {
+                        if !forward_datagram(&udp, bytes, host_port, &proxy_send_retries) {
+                            break;
+                        }
+                        upstream_ready.pop_front();
                     }
                     let target = viewer_port.load(Ordering::Acquire) as u16;
                     for bytes in downstream.lock().receive(Instant::now()) {
@@ -197,10 +215,14 @@ impl Running {
                         .front()
                         .is_some_and(|(due, _)| *due <= Instant::now())
                     {
-                        let (_, bytes) = shared_flight.pop_front().unwrap();
-                        if target != 0 && !blackhole.load(Ordering::Acquire) {
-                            let _ = udp.send_to(&bytes, (Ipv4Addr::LOCALHOST, target));
+                        let (_, bytes) = shared_flight.front().unwrap();
+                        if target != 0
+                            && !blackhole.load(Ordering::Acquire)
+                            && !forward_datagram(&udp, bytes, target, &proxy_send_retries)
+                        {
+                            break;
                         }
+                        shared_flight.pop_front();
                     }
                     thread::sleep(Duration::from_micros(200));
                 }
@@ -264,6 +286,8 @@ impl Running {
             downstream,
             max_datagram,
             probe_packets,
+            proxy_buffers,
+            proxy_send_retries,
             stop,
             host: Some(host),
             proxy: Some(proxy),
@@ -369,6 +393,12 @@ impl Running {
 }
 impl Drop for Running {
     fn drop(&mut self) {
+        if thread::panicking() {
+            eprintln!("host diagnostics {:?}; path {:?}; network {:?}; proxy buffers {:?}; proxy send retries {}; simulated UDP {:?}",
+                self.server.status(), self.session.media_path(), self.session.network_status(),
+                self.proxy_buffers, self.proxy_send_retries.load(Ordering::Relaxed),
+                self.downstream.lock().counts());
+        }
         self.session.stop();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !self.session.finished() && Instant::now() < deadline {
@@ -394,6 +424,17 @@ impl Drop for Running {
         }
     }
 }
+fn forward_datagram(udp: &UdpSocket, bytes: &[u8], port: u16, retries: &AtomicU64) -> bool {
+    match udp.send_to(bytes, (Ipv4Addr::LOCALHOST, port)) {
+        Ok(_) => true,
+        Err(error) if latch_proto::transport::send_buffer_full(&error) => {
+            retries.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        Err(error) => panic!("fixture UDP forwarding failed: {error}"),
+    }
+}
+
 fn square(frame: &Frame) -> bool {
     let mut sum = 0u64;
     for y in 16..48 {

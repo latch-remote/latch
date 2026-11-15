@@ -119,6 +119,11 @@ pub trait VideoPipeline: Send {
         false
     }
 
+    /// Last completed CPU capture, conversion and encode timings, when available.
+    fn software_timings(&self) -> Option<crate::software::SoftwareTimings> {
+        None
+    }
+
     /// Returns any pending cursor visibility or shape update to send to the viewer.
     fn take_cursor(&mut self) -> Option<CursorUpdate> {
         None

@@ -4,18 +4,33 @@ use std::time::{Duration, Instant};
 pub(crate) struct Pacer {
     tokens: f64,
     updated: Instant,
+    kbps: u32,
 }
+// Repay late scheduler wakes during a frame, with at most one 30-fps slot
+// of credit. Idle capture time still receives the original one-ms allowance.
+const MAX_CREDIT: Duration = Duration::from_millis(32);
 const BURST: f64 = (2 * (latch_proto::MAX_DATAGRAM + 80)) as f64;
 impl Pacer {
     pub(crate) fn new(now: Instant) -> Self {
         Self {
             tokens: BURST,
             updated: now,
+            kbps: 0,
         }
     }
-    /// Spend elapsed-time credit as a batch, bounded by the existing burst
-    /// allowance. Waiting accumulates about one millisecond rather than waking
-    /// once per datagram. The caller reloads the rate on every attempt.
+    pub(crate) fn begin_frame(&mut self, now: Instant, kbps: u32) {
+        let rate = f64::from(kbps) * 1000.0 / 8.0;
+        let burst = BURST.max(rate * 0.001 + (latch_proto::MAX_DATAGRAM + 80) as f64);
+        self.tokens = (self.tokens
+            + now.saturating_duration_since(self.updated).as_secs_f64() * rate)
+            .min(burst);
+        self.updated = now;
+        self.kbps = kbps;
+    }
+
+    /// Spend elapsed-time credit, including late wakes within an active frame.
+    /// Rate changes clamp credit immediately to the ordinary one-ms burst.
+    /// The caller reloads the rate on every attempt.
     pub(crate) fn batch(
         &mut self,
         now: Instant,
@@ -25,10 +40,17 @@ impl Pacer {
         if kbps == 0 {
             self.tokens = BURST;
             self.updated = now;
+            self.kbps = 0;
             return (packets.len(), Duration::ZERO);
         }
         let rate = f64::from(kbps) * 1000.0 / 8.0;
-        let burst = BURST.max(rate * 0.001 + (latch_proto::MAX_DATAGRAM + 80) as f64);
+        let credit = if self.kbps == kbps {
+            MAX_CREDIT.as_secs_f64()
+        } else {
+            0.001
+        };
+        self.kbps = kbps;
+        let burst = BURST.max(rate * credit + (latch_proto::MAX_DATAGRAM + 80) as f64);
         self.tokens = (self.tokens
             + now.saturating_duration_since(self.updated).as_secs_f64() * rate)
             .min(burst);
@@ -126,6 +148,54 @@ mod batch_tests {
         assert_eq!(p.batch(later, &packets, 5_000).0, 0);
         assert_eq!(p.batch(later, &packets, 0).0, 32);
     }
+    #[test]
+    fn coarse_wakes_preserve_the_active_frame_rate() {
+        let packets = vec![vec![0; 1200]; 32];
+        for tick_ms in [1, 16, 30] {
+            for kbps in [2000, 20_000, 60_000] {
+                let start = Instant::now();
+                let mut now = start;
+                let mut pacer = Pacer::new(start);
+                let mut bytes = 0;
+                while now < start + Duration::from_secs(3) {
+                    let (count, wait) = pacer.batch(now, &packets, kbps);
+                    bytes += count * 1280;
+                    if count == 0 {
+                        now += wait.max(Duration::from_millis(tick_ms));
+                    }
+                }
+                let achieved = bytes as f64 * 8.0 / 3.0 / 1000.0;
+                eprintln!("{tick_ms} ms wakes at {kbps} kbps delivered {achieved:.0} kbps");
+                assert!(
+                    achieved >= f64::from(kbps) * 0.95,
+                    "{tick_ms} ms wake at {kbps} kbps delivered {achieved:.0} kbps"
+                );
+                assert!(achieved <= f64::from(kbps) * 1.02);
+            }
+        }
+    }
+
+    #[test]
+    fn capture_idle_and_long_stalls_keep_credit_bounded() {
+        let start = Instant::now();
+        let packets = vec![vec![0; 1200]; 1024];
+        let mut pacer = Pacer::new(start);
+        pacer.batch(start, &packets, 60_000);
+        let later = start + Duration::from_secs(10);
+        pacer.begin_frame(later, 60_000);
+        assert_eq!(pacer.batch(later, &packets, 60_000).0, 6);
+        let count = pacer
+            .batch(later + Duration::from_secs(10), &packets, 60_000)
+            .0;
+        assert!(count * 1280 <= 60_000 * 32 / 8 + 1280);
+        assert_eq!(
+            pacer
+                .batch(later + Duration::from_secs(10), &packets, 1000)
+                .0,
+            0
+        );
+    }
+
     #[test]
     fn high_rate_batches_reuse_elapsed_credit() {
         let at = Instant::now();

@@ -109,6 +109,27 @@ impl Gateway {
                                             thread::sleep(Duration::from_millis(1));
                                             continue;
                                         }
+                                        // SO_RCVTIMEO is rounded by the platform's socket
+                                        // timer. Wait for readability or the next delivery
+                                        // instead, so a quiet input cannot delay queued bytes.
+                                        let wait = pending.front().map_or(
+                                            Duration::from_millis(1),
+                                            |(due, _)| {
+                                                due.saturating_duration_since(Instant::now())
+                                                    .min(Duration::from_millis(1))
+                                            },
+                                        );
+                                        let interest = latch_proto::transport::SocketInterest {
+                                            socket: (&source).into(),
+                                            readable: true,
+                                            writable: false,
+                                        };
+                                        if latch_proto::transport::wait_sockets(&[interest], wait)
+                                            .unwrap()
+                                            == 0
+                                        {
+                                            continue;
+                                        }
                                         match source.read(&mut bytes) {
                                             Ok(0) => eof = true,
                                             Ok(count) => {
