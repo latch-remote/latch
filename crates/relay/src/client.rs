@@ -1709,8 +1709,14 @@ mod tests {
         let mut config =
             ClientConfig::production(Endpoint::new("relay.example", 443).unwrap()).unwrap();
         config.limits.max_frame_bytes = 12345;
-        let config = config
+        assert!(config
+            .clone()
             .with_tls_roots(rustls::RootCertStore::empty())
+            .is_err());
+        let config = config
+            .with_tls_roots(rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            })
             .unwrap();
         assert!(config.public_only);
         assert_eq!(config.limits.max_frame_bytes, 12345);
