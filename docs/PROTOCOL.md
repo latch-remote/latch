@@ -89,7 +89,7 @@ type byte and the payload and is at most 65 536. Payloads are JSON objects.
 | 3 | `Keepalive` | either | `{}` |
 | 4 | `Notice` | host → viewer | `{"kind": "audio" \| "video" \| "input", "message": string}`; `message` empty clears it |
 | 5 | `Report` | either | `{"fps", "loss_pct", "decode_ms", "rtt_ms"}`, every 50 ms (older viewers: 250 ms or once a second), for bitrate and FEC feedback |
-| 6 | `Cursor` | host → viewer | `{"visible": bool, "shape": null \| {"serial": u32, "width": u32, "height": u32, "hot_x": u32, "hot_y": u32, "rgba": "<base64>"}}`; only after an `Accept` with `cursor` true; sent when visibility or shape changes (`shape` null: unchanged); straight-alpha RGBA, at most 96×96 |
+| 6 | `Cursor` | host → viewer | `{"visible": bool, "shape": null \| {"serial": u32, "width": u32, "height": u32, "hot_x": u32, "hot_y": u32, "rgba": "<base64>"}}`; only after an `Accept` with `cursor` true; sent when visibility or shape changes (`shape` null: unchanged); straight-alpha sRGB RGBA, at most 96×96 |
 | 7 | `DrawCursor` | viewer → host | `{"draw": bool}`; tells host whether to composite pointer into video |
 | 8 | `Relay` | either | `{"session": u32, "attempt": u64, "action": RelayAction}`; negotiated only when request and accept both set `relay` |
 
@@ -98,6 +98,57 @@ active. Codes 0 (intentional end), 1 (takeover), and 5 (host stopping) stop
 automatic reconnect. Code 6 is a recoverable transport failure, including
 priority backpressure or a full bounded control inbox. Every cursor update
 uses the original ordered connection, regardless of its serialized size.
+
+Windows and Mac hosts use the shared shape/visibility tracker and serial
+allocator. Protocol 1 carries the same `Cursor` and `DrawCursor` objects on
+all host platforms. In focused free-mouse mode the viewer places the shape at
+its local pointer, including while stationary and while video is blocked.
+If an application warps the host pointer or another mouse moves it while the
+focused viewer is driving it, the drawn cursor stays at the local position
+until the user next moves the mouse. Host hover effects can therefore diverge
+from the drawn cursor while local input is stationary.
+An unfocused viewer keeps its OS pointer, paints no local plane and sends no
+`DrawCursor` updates. Captured mode uses the host-composited cursor. Drawing
+waits for valid stream geometry, using the negotiated size until complete stats
+arrive. Shapes and visibility remain host-authoritative in every mode.
+
+Windows publishes pointer-only DXGI shape and visibility changes through a
+coalescing control mailbox before video conversion or encoding. The shared
+tracker retains readable pixels across temporary failures and assigns a fresh
+process-wide serial when the shape changes or capture restarts. Visibility-only
+publication compares scalar state and copies pixels only for a new serial.
+The mailbox retains an unsent shape across coalesced visibility updates and
+deduplicates each viewer's wire state by serial and visibility. Local pointer
+motion requires no cursor control traffic or host position sampling thread.
+
+Colour cursors use straight-alpha sRGB on the wire. DXGI colour buffers are
+straight-alpha BGRA, matching Microsoft's Desktop Duplication sample, which
+uploads those bytes unchanged and blends using `SRC_ALPHA` and
+`INV_SRC_ALPHA`. The GDI bitmap fallback unpremultiplies its colour bitmap
+once on read. Mac sources that supply premultiplied pixels must likewise
+unpremultiply before sending. Monochrome inversion uses white pixels with a
+dark outline, and masked colour uses copy/transparent pixels plus the same
+outlined inversion. Arbitrary colour XOR and unreadable shapes stay
+composited, with plane visibility false during fallback. Hidden and off-output
+pointers are reported invisible. The fallback caches by system cursor handle
+and retries unsuccessful reads after 250 ms. Video has a zero cursor-wait bound.
+If both the current bitmap and system arrow are unreadable, frames continue
+with the last readable bitmap, or without one if none is available. The host logs
+once per failure episode, and idle capture ticks repaint the pointer when a
+bitmap becomes readable. Reopening the same captured output retains and
+rescales its shape, including when the resolution changes, and re-sends it.
+Changing outputs resets per-output cursor state. Reconnect resets the viewer's
+cached texture because a restarted host can reuse shape serials.
+[Microsoft's colour-buffer upload and blend state](https://github.com/microsoft/Windows-classic-samples/blob/main/Samples/DXGIDesktopDuplication/cpp/OutputManager.cpp)
+
+On native HDR output, separate RGBA uses the viewer's SDR UI white, mapped by
+its local compositor. The composited HDR path encodes the cursor at the host
+SDR white level in nits (the host's white multiplier × 80, then BT.2020/PQ).
+The cursor protocol carries no SDR white luminance metadata, so the viewer
+cannot reproduce the host's chosen luminance in its UI plane. Consequently,
+captured/free switches can change cursor brightness when those white levels
+differ. SDR output uses sRGB white in both paths. Physical HDR cursor
+brightness and live Windows capture of the separate plane remain unverified.
 
 `Accept`:
 
@@ -497,6 +548,10 @@ Switching displays mid-stream is a new session; there is no control
 message for it. The host places the pointer in the new picture before
 relative input resumes. Windows codec negotiation probes the adapter that
 drives the selected output, with capability results cached per adapter.
+Windows cursor positions use the actual captured output's physical origin and
+stream-content fit. Pointers on other outputs are reported invisible for both
+separate-plane and composited drawing. Missing-display fallback switches cursor
+ownership to the fallback output.
 
 Windows choices saved as GDI source names by earlier versions follow the
 missing-display fallback. New choices use monitor device paths so source
@@ -504,8 +559,8 @@ renumbering preserves the selected monitor. Windows keeps the pre-session
 list throughout preparation and restoration as well as capture.
 
 `streamer.captured_display`, when present, names the display the running
-pipeline actually captures. macOS reports this even when a missing choice
-fell back to another display. The viewer uses it to mark the current
+pipeline actually captures. macOS and Windows report this even when a missing
+choice fell back to another display. The viewer uses it to mark the current
 capture and allows choosing the requested display again after reconnecting
 it. Older hosts omit this additive status field.
 
