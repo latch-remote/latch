@@ -74,8 +74,8 @@ pub fn vk(code: KeyCode) -> Option<u16> {
 }
 
 /// True sided Ctrl/Meta swap. The caller chooses its shortcut scope.
-pub fn shortcut(vk: u16, viewer_mac: bool, host_mac: bool, map: bool) -> u16 {
-    if !map || viewer_mac == host_mac {
+pub fn shortcut(vk: u16, viewer_mac: bool, host_mac: bool, map: bool, relative: bool) -> u16 {
+    if !map || viewer_mac == host_mac || (relative && (!viewer_mac || matches!(vk, 0xa2 | 0xa3))) {
         return vk;
     }
     match vk {
@@ -106,6 +106,8 @@ struct State {
     alt_gr: bool,
     installed: bool,
     key_positions: bool,
+    #[cfg(windows)]
+    ctx: egui::Context,
     owned: bool,
     pressed: BTreeSet<u16>,
 }
@@ -116,13 +118,21 @@ thread_local! {
 
 pub fn install(cc: &eframe::CreationContext<'_>) {
     let ctx = &cc.egui_ctx;
-    STATE.with_borrow_mut(|s| s.installed = true);
+    STATE.with_borrow_mut(|s| {
+        s.installed = true;
+        #[cfg(windows)]
+        {
+            s.ctx = ctx.clone();
+        }
+    });
     ctx.data_mut(|d| {
         d.insert_temp(
             egui_winit::EventHook::keyboard_id(),
             egui_winit::EventHook {
                 on_event: |viewport, native, events, mods| {
                     if viewport == egui::ViewportId::ROOT {
+                        #[cfg(windows)]
+                        windows::drain(native);
                         STATE.with_borrow_mut(|s| {
                             let first = s.pending.len();
                             s.event(native, events, mods);
@@ -132,6 +142,8 @@ pub fn install(cc: &eframe::CreationContext<'_>) {
                 },
                 on_frame: |viewport| {
                     if viewport == egui::ViewportId::ROOT {
+                        #[cfg(windows)]
+                        windows::drain(None);
                         STATE.with_borrow_mut(|s| s.frame = Some(std::mem::take(&mut s.pending)));
                     }
                 },
@@ -159,9 +171,26 @@ pub(crate) fn test_frame(frame: Frame) {
 #[cfg(test)]
 pub(crate) fn test_install(installed: bool) {
     STATE.with_borrow_mut(|s| {
-        s.installed = installed;
-        s.key_positions = installed;
+        *s = State {
+            installed,
+            key_positions: installed,
+            ..State::default()
+        };
     });
+}
+
+#[cfg(test)]
+pub(crate) fn test_capture(
+    physical: PhysicalKey,
+    logical: egui_winit::winit::keyboard::Key,
+    down: bool,
+    events: &[Event],
+    mods: Modifiers,
+) -> Frame {
+    STATE.with_borrow_mut(|s| {
+        s.capture((physical, &logical), (down, false), false, events, mods);
+        std::mem::take(&mut s.pending)
+    })
 }
 
 pub fn available() -> bool {
@@ -222,6 +251,12 @@ pub fn alt_gr() -> bool {
     STATE.with_borrow(|s| s.alt_gr)
 }
 
+pub fn shutdown() {
+    owns_keys(false);
+    #[cfg(target_os = "linux")]
+    linux::shutdown();
+}
+
 pub fn owns_keys(owned: bool) {
     STATE.with_borrow_mut(|s| {
         if owned && !s.owned {
@@ -247,9 +282,11 @@ pub fn owns_keys(owned: bool) {
         }
         s.owned = owned;
     });
-    #[cfg(windows)]
-    windows::owns_keys(owned);
-    #[cfg(target_os = "linux")]
+    // Constructed stream tests exercise capture state without acquiring a
+    // machine-wide native hook or grab. The isolated Xvfb test calls Linux directly.
+    #[cfg(all(windows, not(test)))]
+    windows::owns_keys(owned, &STATE.with_borrow(|s| s.ctx.clone()));
+    #[cfg(all(target_os = "linux", not(test)))]
     linux::owns_keys(owned);
     #[cfg(target_os = "macos")]
     let _ = owned;
@@ -257,9 +294,14 @@ pub fn owns_keys(owned: bool) {
 
 impl State {
     fn event(&mut self, native: Option<&WindowEvent>, events: &[Event], mods: Modifiers) {
-        if matches!(native, Some(WindowEvent::Focused(false))) {
+        if matches!(
+            native,
+            Some(
+                WindowEvent::Focused(false) | WindowEvent::CloseRequested | WindowEvent::Destroyed
+            )
+        ) {
             #[cfg(windows)]
-            windows::owns_keys(false);
+            windows::owns_keys(false, &self.ctx);
             #[cfg(target_os = "linux")]
             linux::owns_keys(false);
             self.alt_gr = false;
@@ -277,21 +319,33 @@ impl State {
         let iso = latch_proto::keyboard::apple_keyboard_is_iso();
         #[cfg(not(target_os = "macos"))]
         let iso = false;
-        let Some(code) = event_key(
-            event.physical_key,
-            &event.logical_key,
+        self.capture(
+            (event.physical_key, &event.logical_key),
+            (event.state.is_pressed(), event.repeat),
             iso,
-            self.key_positions,
-        ) else {
-            self.fallback_key(&event.logical_key, events);
+            events,
+            mods,
+        );
+    }
+
+    fn capture(
+        &mut self,
+        (physical, logical): (PhysicalKey, &egui_winit::winit::keyboard::Key),
+        (down, repeat): (bool, bool),
+        iso: bool,
+        events: &[Event],
+        mods: Modifiers,
+    ) {
+        let Some(code) = event_key(physical, logical, iso, self.key_positions) else {
+            self.fallback_key(logical, events);
             return;
         };
-        self.logical_modifier(code, &event.logical_key, event.state.is_pressed());
+        self.logical_modifier(code, logical, down);
         self.key(
             code,
-            event.state.is_pressed(),
-            event.repeat,
-            matches!(event.logical_key, egui_winit::winit::keyboard::Key::Dead(_)),
+            down,
+            repeat,
+            matches!(logical, egui_winit::winit::keyboard::Key::Dead(_)),
             events,
             mods,
         );
@@ -391,6 +445,11 @@ impl State {
                 | KeyCode::MediaStop
                 | KeyCode::MediaPlayPause
         ) {
+            #[cfg(target_os = "linux")]
+            if linux::local_media(code, down) {
+                self.pressed.clear();
+                crate::early::capture_lost();
+            }
             return;
         }
         let Some(vk) = vk(code) else {
@@ -431,6 +490,8 @@ pub fn text_position(vk: u16) -> bool {
         | latch_proto::keyboard::KEYPAD_EQUAL | latch_proto::keyboard::INTL_RO | latch_proto::keyboard::INTL_YEN)
 }
 
+#[cfg(any(windows, target_os = "linux", test))]
+mod hook;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(windows)]

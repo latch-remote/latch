@@ -8,6 +8,18 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Input
 
+- Preserve main's default Command/Ctrl and clipboard mapping in every mouse
+  mode, including 6.0.0 hosts. Limit new swap halves to a free mouse and make
+  Send keys as pressed the explicit all-mode opt-out. Restore the Mac Quit
+  and Hide menu override in windowed free-mouse streams.
+- Move Windows keyboard capture to a dedicated message-loop thread with a
+  bounded queue, all-modifier ordering and a 250 ms UI watchdog. Release X11
+  grabs after a 250 ms UI stall and replay grabbed media controls locally.
+  Constructed-event tests cover every viewer/host pair and default mouse
+  state, with bytes recorded from main. Isolated Xvfb tests cover local
+  media replay and grab expiry. Real keyboards and Windows hook timeouts
+  remain unverified.
+
 - Restore legacy keyboard compatibility, negotiate elevated helper positions,
   and acknowledge unknown future positions without blocking input. Recover
   native Mac ISO/JIS positions, scope system-key capture to fullscreen or

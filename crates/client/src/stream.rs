@@ -270,6 +270,7 @@ pub struct View {
     cmd_since_v_up: bool,
     /// Whether the host uses Command for its application shortcuts.
     host_mac: bool,
+    viewer_mac: bool,
     /// Texture handle and shape serial for rendering host cursor locally.
     cursor_texture: Option<(u32, egui::TextureHandle)>,
     /// Whether the host is currently told to draw its pointer into video.
@@ -369,6 +370,7 @@ impl Default for View {
             pasted_since_v_up: false,
             cmd_since_v_up: false,
             host_mac: false,
+            viewer_mac: cfg!(target_os = "macos"),
             cursor_texture: None,
             host_cursor_drawn: false,
             caps: None,
@@ -1815,7 +1817,7 @@ impl View {
             ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)),
             self.captured,
         );
-        crate::macos::stream_owns_keys(system_capture);
+        crate::macos::stream_owns_keys(keys_to_pc);
         crate::keyboard::owns_keys(system_capture && crate::keyboard::available());
         if ctx.options(|o| o.zoom_with_keyboard) == keys_to_pc {
             ctx.options_mut(|o| o.zoom_with_keyboard = !keys_to_pc);
@@ -2116,6 +2118,7 @@ impl View {
                     mouse,
                     cmd_is_ctrl: self.cmd_is_ctrl(cfg),
                     host_mac: self.host_mac,
+                    viewer_mac: self.viewer_mac,
                     map_shortcuts: self.map_shortcuts(cfg),
                     motion_scale,
                     video,
@@ -2202,9 +2205,10 @@ impl View {
                 self.held.shortcut_key(
                     out,
                     key,
-                    cfg!(target_os = "macos"),
+                    self.viewer_mac,
                     self.host_mac,
                     self.map_shortcuts(link.cfg),
+                    self.captured,
                 );
                 return;
             }
@@ -2389,7 +2393,7 @@ impl View {
     }
 
     fn map_shortcuts(&self, cfg: &ClientConfig) -> bool {
-        cfg.cmd_is_ctrl && !self.captured && !cfg.capture_mouse
+        cfg.cmd_is_ctrl
     }
 
     /// Whether ⌘ goes to the PC as Ctrl. A Mac there gets Command whatever
@@ -2400,8 +2404,8 @@ impl View {
 
     /// What ⌘ stands for in a clipboard shortcut.
     fn clipboard_modifier(&self, cfg: &ClientConfig) -> i16 {
-        if (cfg!(target_os = "macos") && (self.host_mac || !self.map_shortcuts(cfg)))
-            || (!cfg!(target_os = "macos") && self.host_mac && self.map_shortcuts(cfg))
+        if (self.host_mac && self.map_shortcuts(cfg))
+            || (self.viewer_mac && !self.map_shortcuts(cfg))
         {
             input::VK_LWIN
         } else {
@@ -2426,9 +2430,10 @@ impl View {
         // the same sided swap as ordinary native shortcuts when its source
         // modifier is still held. A delayed paste can outlive that modifier.
         if crate::keyboard::available()
-            && !cfg!(target_os = "macos")
+            && !self.viewer_mac
             && self.host_mac
             && self.map_shortcuts(link.cfg)
+            && !self.captured
             && [0xa2, 0xa3, 0x5b, 0x5c]
                 .iter()
                 .any(|&vk| self.held.physical_down(vk))
@@ -2445,13 +2450,14 @@ impl View {
                     false,
                     true,
                     true,
+                    false,
                 );
             }
             return;
         }
         if alone
             || (crate::keyboard::available()
-                && !cfg!(target_os = "macos")
+                && !self.viewer_mac
                 && self.host_mac
                 && self.map_shortcuts(link.cfg))
         {
@@ -2469,6 +2475,7 @@ struct EarlyGate {
     mouse: bool,
     cmd_is_ctrl: bool,
     host_mac: bool,
+    viewer_mac: bool,
     map_shortcuts: bool,
     motion_scale: f32,
     video: Rect,
@@ -2488,6 +2495,7 @@ impl EarlyGate {
             mouse: self.mouse,
             cmd_is_ctrl: self.cmd_is_ctrl,
             host_mac: self.host_mac,
+            viewer_mac: self.viewer_mac,
             map_shortcuts: self.map_shortcuts,
             motion_scale: self.motion_scale,
             video: self.video,
@@ -2893,7 +2901,6 @@ pub(crate) mod tests {
     fn native_pc_copy_to_mac_uses_the_held_modifier_side() {
         for (source, target) in [(0xa2, 0x5b), (0xa3, 0x5c)] {
             let (mut h, tap) = recording_on(View::default(), true, "macos");
-            h.state_mut().cfg.capture_mouse = false;
             crate::keyboard::test_install(true);
             crate::keyboard::test_frame(vec![
                 (
@@ -2934,7 +2941,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn toolbar_keys_follow_host_and_game_capture_disables_mapping() {
+    fn toolbar_keys_follow_host_and_mapping_is_independent_of_mouse_mode() {
         for host_mac in [false, true] {
             for label in ["Command+Tab", "Command+Space"] {
                 assert_eq!(toolbar_key_for_host(label, host_mac), host_mac);
@@ -2949,31 +2956,14 @@ pub(crate) mod tests {
                 assert_eq!(toolbar_key_for_host(label, host_mac), !host_mac);
             }
         }
-        let mut cfg = ClientConfig {
-            capture_mouse: false,
-            ..Default::default()
-        };
+        let mut cfg = ClientConfig::default();
         let mut view = View::default();
-        // The native observer is installed by production. Enable it here
-        // to test game policy through the normal view helper.
-        crate::keyboard::test_install(true);
+        assert!(cfg.capture_mouse);
         assert!(view.map_shortcuts(&cfg));
         view.captured = true;
+        assert!(view.map_shortcuts(&cfg));
+        cfg.cmd_is_ctrl = false;
         assert!(!view.map_shortcuts(&cfg));
-        view.captured = false;
-        cfg.capture_mouse = true;
-        assert!(!view.map_shortcuts(&cfg));
-        crate::keyboard::test_install(false);
-        assert!(
-            !view.map_shortcuts(&cfg),
-            "legacy hosts also use as-pressed in game mode"
-        );
-        cfg.capture_mouse = false;
-        view.captured = true;
-        assert!(
-            !view.map_shortcuts(&cfg),
-            "legacy hosts also use as-pressed during relative capture"
-        );
     }
 
     #[test]
@@ -4555,7 +4545,7 @@ pub(crate) mod tests {
 
     /// A stream view at the smallest window whose input goes to a
     /// recording instead of the PC, with the other machine running `os`.
-    fn recording_on(
+    pub(super) fn recording_on(
         view: View,
         connected: bool,
         os: &str,
@@ -4582,7 +4572,7 @@ pub(crate) mod tests {
         recording_on(view, connected, "windows")
     }
 
-    fn key(key: Key, pressed: bool, modifiers: Modifiers) -> Event {
+    pub(super) fn key(key: Key, pressed: bool, modifiers: Modifiers) -> Event {
         Event::Key {
             key,
             physical_key: Some(key),
@@ -4602,7 +4592,11 @@ pub(crate) mod tests {
     }
 
     /// One frame with these events, ending with `end` held.
-    fn frame(h: &mut egui_kittest::Harness<'_, Fixture>, events: Vec<Event>, end: Modifiers) {
+    pub(super) fn frame(
+        h: &mut egui_kittest::Harness<'_, Fixture>,
+        events: Vec<Event>,
+        end: Modifiers,
+    ) {
         h.input_mut().events.extend(events);
         h.input_mut().modifiers = end;
         h.run_steps(1);
@@ -4732,9 +4726,6 @@ pub(crate) mod tests {
     #[test]
     fn command_z_with_command_let_go_in_the_same_frame_is_still_undo() {
         let (mut h, tap) = recording(View::default(), true);
-        h.state_mut().cfg.capture_mouse = false;
-        h.state_mut().view.captured = false;
-        h.run_steps(1);
         frame(&mut h, vec![key(Key::Z, true, CMD)], Modifiers::NONE);
         assert_eq!(
             tap.take(),
@@ -4747,28 +4738,38 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn legacy_game_and_relative_capture_send_command_as_pressed() {
+    fn legacy_command_mapping_survives_default_game_and_relative_modes() {
         for os in ["windows", "linux", "macos"] {
-            for (capture_mouse, captured) in [(true, false), (false, true)] {
-                let (mut h, tap) = recording_on(View::default(), true, os);
-                h.state_mut().cfg.capture_mouse = capture_mouse;
-                h.state_mut().view.captured = captured;
-                h.run_steps(1);
+            for captured in [false, true] {
+                let (mut h, tap) = recording_on(
+                    View {
+                        captured,
+                        ..View::default()
+                    },
+                    true,
+                    os,
+                );
+                assert!(h.state().cfg.capture_mouse);
                 assert!(!crate::keyboard::available());
                 frame(
                     &mut h,
                     vec![key(Key::Z, true, CMD), key(Key::Z, false, CMD)],
                     Modifiers::NONE,
                 );
+                let (modifier, mask) = if os == "macos" {
+                    (VK_LWIN, latch_stream::input::MOD_META)
+                } else {
+                    (VK_CONTROL, MOD_CTRL)
+                };
                 assert_eq!(
                     tap.take(),
                     [
-                        Sent::Key(VK_LWIN, true, latch_stream::input::MOD_META),
-                        Sent::Key(VK_Z, true, latch_stream::input::MOD_META),
-                        Sent::Key(VK_Z, false, latch_stream::input::MOD_META),
-                        Sent::Key(VK_LWIN, false, 0),
+                        Sent::Key(modifier, true, mask),
+                        Sent::Key(VK_Z, true, mask),
+                        Sent::Key(VK_Z, false, mask),
+                        Sent::Key(modifier, false, 0),
                     ],
-                    "{os}, capture_mouse={capture_mouse}, captured={captured}"
+                    "{os}, captured={captured}"
                 );
             }
         }
@@ -4777,9 +4778,6 @@ pub(crate) mod tests {
     #[test]
     fn a_mac_there_gets_command_as_command() {
         let (mut h, tap) = recording_on(View::default(), true, "macOS");
-        h.state_mut().cfg.capture_mouse = false;
-        h.state_mut().view.captured = false;
-        h.run_steps(1);
         assert!(h.state().cfg.cmd_is_ctrl, "the default, for Windows");
         frame(&mut h, vec![key(Key::Z, true, CMD)], CMD);
         assert_eq!(tap.keys(), [(VK_LWIN, true), (VK_Z, true)]);
@@ -5361,9 +5359,6 @@ pub(crate) mod tests {
     fn a_paste_goes_before_what_was_typed_after_it() {
         // Nothing to send first (an image on the Mac): at once, in order.
         let (mut h, tap) = recording(View::default(), true);
-        h.state_mut().cfg.capture_mouse = false;
-        h.state_mut().view.captured = false;
-        h.run_steps(1);
         frame(
             &mut h,
             vec![
@@ -5384,9 +5379,6 @@ pub(crate) mod tests {
         );
         // Text on its way: Return waits for it, then follows the paste.
         let (mut h, tap) = recording(View::default(), true);
-        h.state_mut().cfg.capture_mouse = false;
-        h.state_mut().view.captured = false;
-        h.run_steps(1);
         frame(&mut h, vec![], CMD);
         assert_eq!(tap.keys(), [(VK_CONTROL, true)]);
         h.state_mut().view.pending = Some(PendingPaste {
@@ -5428,9 +5420,6 @@ pub(crate) mod tests {
     #[test]
     fn a_paste_that_waits_too_long_goes_once_and_losing_focus_drops_it() {
         let (mut h, tap) = recording(View::default(), true);
-        h.state_mut().cfg.capture_mouse = false;
-        h.state_mut().view.captured = false;
-        h.run_steps(1);
         h.state_mut().view.pending = Some(PendingPaste {
             id: 7,
             until: Instant::now(),
@@ -5477,9 +5466,6 @@ pub(crate) mod tests {
         // egui swallows ⌘V's press when the Mac's clipboard has no text;
         // only the V let go shows.
         let (mut h, tap) = recording(View::default(), true);
-        h.state_mut().cfg.capture_mouse = false;
-        h.state_mut().view.captured = false;
-        h.run_steps(1);
         frame(&mut h, vec![], CMD);
         assert_eq!(tap.keys(), [(VK_CONTROL, true)]);
         frame(&mut h, vec![key(Key::V, false, CMD)], CMD);
@@ -6035,4 +6021,14 @@ pub(crate) mod tests {
         h.run_steps(1);
         assert!(h.state().actions.contains(&Action::Reconnect));
     }
+}
+
+#[cfg(test)]
+mod keyboard_regressions {
+    use super::tests::*;
+    use super::*;
+    use crate::input::{Sent, VK_CONTROL, VK_LWIN};
+    use egui::{Event, Key, Modifiers};
+    include!("keyboard/stream_fixture.rs");
+    include!("keyboard/stream_regressions.rs");
 }

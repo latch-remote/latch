@@ -79,7 +79,7 @@ The release's `latch-host` executable embeds the `latch-client` GUI and
 | SDR presentation / latency | **works** · wgpu DX12, same-adapter D3D11 shared textures for NV12, newest-frame slot. U-W import/layout, F renderer preparation.[^present] | **works** · wgpu Metal imports IOSurface planes. U-M shader/import, F renderer preparation.[^present] | **partial** · wgpu uploads CPU NV12, native-GPU output unmeasured. U-all shader math, N Linux window session measurement.[^present] |
 | HDR presentation | **partial** · native HDR10 child swapchain, SDR tone-map fallback, display-change stabilization. U-W state/shader, F-HDR readback, physical HDR panel untested.[^present] | **partial** · native RGBA16Float Metal EDR layer, tone-map fallback. U-M state/shader, F-HDR readback, physical HDR panel untested.[^present] | **missing** · no native HDR output/capability. N.[^present][^colour] |
 | Vsync / low-latency mode | **partial** · `AutoNoVsync`, requested frame latency 1, compositor/driver may choose fallback. F preparation timings, scanout N.[^present] | **partial** · same wgpu policy, native EDR layer for HDR. F preparation timings, scanout N.[^present] | **partial** · same wgpu policy, N real display latency.[^present] |
-| Keyboard capture / layouts | **partial** · native sided physical keys + IME/dead-key text. Focus-scoped low-level hook captures Win and Alt+Tab. Secure attention/Win+L remain OS-reserved. U-all translation/recorder + U-W hook policy, event-time dispatch with frame ordering for clipboard/IME.[^viewerinput][^flight] | **partial** · native sided positions + IME/dead-key text and AppKit menu-key overrides. Cmd maps to Ctrl by default for W/L, Cmd for Mac. Cmd-Tab/Space stay local. U-M menu + U-all shared translation/recorder and event-time dispatch.[^viewerinput][^flight] | **partial** · native sided positions including Super, a focus-scoped X11 keyboard grab + IME/dead-key text. Ctrl maps to Cmd by default for Mac hosts. Wayland compositor grabs stay local. winit exposes no Wayland shortcut-inhibit API. U-all shared translation/recorder and event-time dispatch.[^viewerinput][^flight] |
+| Keyboard capture / layouts | **partial** · native sided physical keys + IME/dead-key text. A dedicated capture-thread hook captures Win and Alt+Tab with a 250 ms UI lease. Secure attention/Win+L remain OS-reserved. U-all translation/recorder + U-W hook policy, event-time dispatch with frame ordering for clipboard/IME.[^viewerinput][^flight] | **partial** · native sided positions + IME/dead-key text and AppKit menu-key overrides. Cmd maps to Ctrl by default for W/L, Cmd for Mac. Cmd-Tab/Space stay local. U-M menu + U-all shared translation/recorder and event-time dispatch.[^viewerinput][^flight] | **partial** · native sided positions including Super, a focus-scoped X11 keyboard grab + IME/dead-key text. Ctrl uses a scoped editing-chord swap toward Mac hosts while the mouse is free. Clipboard mapping survives relative capture. Wayland compositor grabs stay local. winit exposes no Wayland shortcut-inhibit API. U-all shared translation/recorder and event-time dispatch.[^viewerinput][^flight] |
 | Mouse relative / pointer lock | **partial** · egui raw `MouseMoved`, Locked/Confined grab, scaled/accumulated before send at redraw. U-all recorder/fit, N pair acceleration parity. In flight (issue #77, `t3/send-input-on-os-events`).[^viewerinput][^flight] | **partial** · same pipeline + native pointer hide, display/stream scaling. U-all recorder, N Retina/raw-game pair qualification. In flight (issue #77, `t3/send-input-on-os-events`).[^viewerinput][^flight] | **partial** · egui Locked/Confined depends on window system/compositor. U-all recorder, N X11/Wayland lock qualification. In flight (issue #77, `t3/send-input-on-os-events`).[^viewerinput][^flight] |
 | Scroll capture | **works** · egui point/line/page conversion to signed wheel units. U-all unit/sign tests, N physical-device pair feel. Dispatch in flight (issue #77, `t3/send-input-on-os-events`).[^scroll][^flight] | **works** · same conversion, point deltas retained as fractional remainders. U-all unit/sign tests, N trackpad pair feel. Dispatch in flight (issue #77, `t3/send-input-on-os-events`).[^scroll][^flight] | **works** · same conversion. U-all unit/sign tests, N physical-device pair feel. Dispatch in flight (issue #77, `t3/send-input-on-os-events`).[^scroll][^flight] |
 | Touch / pen capture | **missing** · no dedicated protocol events. N.[^wireinput] | **missing** · same. N.[^wireinput] | **missing** · same. N.[^wireinput] |
@@ -123,17 +123,34 @@ keyboard/mouse/gamepad/clipboard/audio/HDR acceptance record.[^negotiation]
    acceptance in all six pairs unverified.
    Host tests construct Windows INPUT and unposted Mac CGEvents. Linux tests
    check numeric codes against real XKB US/UK/DE/FR/Korean/Japanese keymaps.
-   The default swaps Mac Cmd/Ctrl fully toward PCs. PC-to-Mac swaps only
-   A/C/X/V/Z/F chords, including Shift, with Alt combinations excluded.
-   Game/relative capture uses as-pressed. See USING.md for the exact scope.
-   System chords require focused fullscreen or captured-mouse mode on
-   Windows/X11. Mac Cmd+Tab/Space, Wayland compositor grabs, Windows secure
-   attention and Win+L retain OS restrictions. X11 retries refused grabs,
-   and an active grab can hold the session keyboard if Latch hangs.
-   Viewer media controls stay local, with X11 media-daemon bindings possibly
-   inhibited during a grab. Windows hooks install only during capture and
-   release on focus loss, teardown and app drop. Hook callbacks preserve
-   Shift-before-Win ordering while winit retains AltGr filtering.
+   Default-configuration stream tests cover all nine viewer/host combinations
+   in windowed/fullscreen and released/relative states, both event-time and
+   frame dispatch, through native capture, Held and InputSender datagrams.
+   Legacy bytes match a recording made by running main at `bf5da0d`.
+   Constructed events select each producer OS. Only the running OS uses
+   winit's real scancode decoder, and Windows Super is represented by the
+   hook queue's output. The USING.md table defines mapping in every mode.
+   Mac Command → Ctrl and PC-to-Mac clipboard Command preserve main in
+   every mode. Only the new swap halves stop during actual relative capture.
+   The game setting alone leaves mapping enabled. Send keys as pressed is
+   the explicit all-mode opt-out, including clipboard chords.
+   Windows/X11 system capture requires focused fullscreen or captured mouse.
+   Mac app-menu overrides retain main's focused-stream behaviour in a free
+   window as well. Mac Cmd+Tab/Space, Wayland compositor shortcuts, Windows
+   secure attention and Win+L retain OS restrictions.
+   Windows hook callbacks run on a dedicated message-loop thread with fixed
+   state and bounded nonblocking queue delivery. All modifiers precede Win,
+   with AltGr filtering. Loss of the 250 ms UI lease, queue delivery or
+   foreground ownership ends capture. Focus loss and teardown join the
+   worker, and RAII unhooks on unwind. Portable tests cover queue failure,
+   orphan releases, modifier ordering and AltGr across frame boundaries.
+   X11 retries refused grabs. A helper on winit's thread-enabled Xlib
+   connection releases grabs after 250 ms without a UI heartbeat, sampled
+   every 10 ms. Media presses release capture and replay locally through
+   XTest. An isolated Xvfb test covers passive media bindings and timed
+   ungrab. A stuck display lock, server or suspended process can delay the
+   watchdog. Windows hook scheduling, timeout recovery and physical desktop
+   media bindings remain unverified on real hardware.
    German Mac ISO keyboards, Korean Windows IME toggling, native
    window-manager chords and mixed-layout hardware remain unverified.
    Mac F21–F24/media Stop have no injector equivalent. Kana/Eisu

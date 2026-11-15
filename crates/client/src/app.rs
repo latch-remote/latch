@@ -199,7 +199,7 @@ pub struct ClientApp {
 
 impl Drop for ClientApp {
     fn drop(&mut self) {
-        crate::keyboard::owns_keys(false);
+        crate::keyboard::shutdown();
         self.commit();
         self.save_tx.take();
         if let Some(worker) = self.save_worker.take() {
@@ -3371,6 +3371,7 @@ pub(crate) mod snapshots {
             mouse: true,
             cmd_is_ctrl: true,
             host_mac: false,
+            viewer_mac: cfg!(target_os = "macos"),
             map_shortcuts: false,
             motion_scale: 1.0,
             video: region,

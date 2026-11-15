@@ -305,6 +305,19 @@ native path is selected before physical-text suppression. An older viewer
 sends its existing kind-4 keys to a new host. Input ordering, retransmission
 and InputAck cover kind 8 in the same sequence space as every other event.
 
+Default shortcut mapping preserves main's Mac Command → PC Ctrl and
+clipboard Command toward Mac hosts in every mouse mode, including relative
+capture and a 6.0.0 host. Recorded `bf5da0d` datagrams cover all viewer/host
+pairs with default settings and released/relative mouse states. Negotiated
+native input adds sided identities and the USING.md modifier swaps.
+Only the new swap halves stop during actual relative capture. The explicit
+Send keys as pressed setting sends physical modifiers, including clipboard
+chords, in every mode. These are viewer policies and require no additional
+wire capability. Viewer media controls remain local. Windows hook and X11
+grab watchdogs release capture on a stalled UI and release remote held state
+when UI dispatch resumes. Constructed-event tests verify serialization and
+mapping. They provide no real-keyboard or cross-machine acceptance record.
+
 The Windows elevated helper negotiates its pipe separately. New clients
 try `LATCHIN2` and reconnect with `LATCHIN1` for an old helper. A new helper
 echoes either handshake, preserving v1 clients. Only a v2 echo advertises

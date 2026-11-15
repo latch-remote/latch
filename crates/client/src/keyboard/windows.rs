@@ -1,66 +1,152 @@
-//! Focus/capture-scoped Windows system shortcuts. Ordinary modifier events
-//! share the hook's ordering so a posted Shift cannot follow a sent Win.
+//! A capture-scoped hook on its own message-loop thread. The callback only
+//! checks ownership, updates fixed-size state and tries bounded queue sends.
 
-use super::{Key, STATE};
+use super::{
+    hook::{Capture, Event, Lease, QUEUE_SIZE},
+    Key, STATE,
+};
 use std::{
     cell::RefCell,
-    collections::{BTreeSet, VecDeque},
+    collections::VecDeque,
+    sync::{
+        mpsc::{self, Receiver, SyncSender},
+        Arc,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 use windows::Win32::{
     Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM},
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentProcessId},
-    UI::WindowsAndMessaging::*,
+    UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 
-#[derive(Default)]
-struct Capture {
-    hook: HHOOK,
-    warned: bool,
-    consumed: BTreeSet<u16>,
+struct Worker {
+    lease: Arc<Lease>,
+    events: Receiver<Event>,
+    thread: Option<JoinHandle<()>>,
     forwarded: VecDeque<Key>,
+    pending: VecDeque<Event>,
 }
-impl Drop for Capture {
+impl Drop for Worker {
     fn drop(&mut self) {
-        if !self.hook.0.is_null() {
-            // SAFETY: this thread owns this installed hook.
-            let _ = unsafe { UnhookWindowsHookEx(self.hook) };
+        self.lease.fail();
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
+    }
+}
+
+struct Hook {
+    handle: HHOOK,
+    lease: Arc<Lease>,
+    events: SyncSender<Event>,
+    capture: Capture,
+    repaint: egui::Context,
+    dirty: bool,
+}
+impl Drop for Hook {
+    fn drop(&mut self) {
+        if !self.handle.0.is_null() {
+            // SAFETY: the installing thread drops its hook, including on unwind.
+            let _ = unsafe { UnhookWindowsHookEx(self.handle) };
         }
     }
 }
 thread_local! {
-    static CAPTURE: RefCell<Capture> = RefCell::new(Capture::default());
+    static WORKER: RefCell<Option<Worker>> = const { RefCell::new(None) };
+    static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
 }
 
-pub fn owns_keys(owned: bool) {
-    CAPTURE.with_borrow_mut(|capture| {
-        if !owned {
-            *capture = Capture::default();
-        } else if capture.hook.0.is_null() {
-            // SAFETY: callback and module live through the hook's lifetime.
-            match unsafe {
-                GetModuleHandleW(None).and_then(|module| {
-                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), HINSTANCE(module.0), 0)
+pub fn owns_keys(owned: bool, ctx: &egui::Context) {
+    if !owned {
+        WORKER.with_borrow_mut(|worker| *worker = None);
+        return;
+    }
+    drain(None);
+    WORKER.with_borrow_mut(|worker| {
+        if worker
+            .as_ref()
+            .is_some_and(|w| !w.lease.active(w.lease.elapsed()))
+        {
+            *worker = None;
+        }
+        if let Some(worker) = worker {
+            worker.lease.renew();
+            return;
+        }
+        let lease = Arc::new(Lease::default());
+        let (tx, rx) = mpsc::sync_channel(QUEUE_SIZE);
+        let thread_lease = lease.clone();
+        let ctx = ctx.clone();
+        match thread::Builder::new()
+            .name("keyboard-capture".into())
+            .spawn(move || run(thread_lease, tx, ctx))
+        {
+            Ok(thread) => {
+                *worker = Some(Worker {
+                    lease,
+                    events: rx,
+                    thread: Some(thread),
+                    forwarded: VecDeque::new(),
+                    pending: VecDeque::new(),
                 })
-            } {
-                Ok(hook) => {
-                    capture.hook = hook;
-                    capture.warned = false;
-                }
-                Err(error) => {
-                    if !capture.warned {
-                        tracing::warn!(%error, "cannot capture Windows system shortcuts");
-                    }
-                    capture.warned = true;
-                }
             }
+            Err(error) => tracing::warn!(%error, "cannot start Windows keyboard capture"),
         }
     });
 }
 
+// Called before each native event and frame, on the UI thread. Publishing
+// through the existing observer keeps Held, early receipts and datagrams shared.
+pub fn drain(native: Option<&egui_winit::winit::event::WindowEvent>) {
+    use egui_winit::winit::{event::WindowEvent, keyboard::PhysicalKey};
+    let native_key = match native {
+        Some(WindowEvent::KeyboardInput { event, .. }) => match event.physical_key {
+            PhysicalKey::Code(code) => super::vk(code).map(|vk| Key {
+                vk,
+                down: event.state.is_pressed(),
+            }),
+            _ => None,
+        },
+        _ => None,
+    };
+    let (events, failed) = WORKER.with_borrow_mut(|worker| {
+        let Some(worker) = worker else {
+            return (Vec::new(), false);
+        };
+        let failed = !worker.lease.active(worker.lease.elapsed());
+        if failed {
+            return (Vec::new(), true);
+        }
+        worker.lease.renew();
+        worker
+            .pending
+            .extend(worker.events.try_iter().take(QUEUE_SIZE));
+        let events = super::hook::take_ready(&mut worker.pending, native_key);
+        worker.forwarded.extend(
+            events
+                .iter()
+                .filter(|e| matches!(e.key.vk, 0xa0..=0xa5))
+                .map(|e| e.key),
+        );
+        (events, false)
+    });
+    if failed {
+        crate::early::capture_lost();
+    } else {
+        for event in events {
+            publish(event);
+        }
+    }
+}
+
 pub fn take_forwarded(key: Key) -> bool {
-    CAPTURE.with_borrow_mut(|capture| {
-        if capture.forwarded.front() == Some(&key) {
-            capture.forwarded.pop_front();
+    WORKER.with_borrow_mut(|worker| {
+        let Some(worker) = worker else { return false };
+        if worker.forwarded.front() == Some(&key) {
+            worker.forwarded.pop_front();
             true
         } else {
             false
@@ -68,62 +154,158 @@ pub fn take_forwarded(key: Key) -> bool {
     })
 }
 
-fn captures(vk: u16, alt: bool) -> bool {
-    matches!(vk, 0x5b | 0x5c) || (alt && matches!(vk, 0x09 | 0x20 | 0x73))
+fn foreground() -> (bool, HKL) {
+    let mut process = 0;
+    // SAFETY: reads foreground identity and its keyboard layout.
+    unsafe {
+        let thread = GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut process));
+        (process == GetCurrentProcessId(), GetKeyboardLayout(thread))
+    }
 }
 
-impl Capture {
-    fn consume(&mut self, key: Key, alt: bool) -> bool {
-        if key.down {
-            if captures(key.vk, alt) {
-                self.consumed.insert(key.vk);
-                return true;
-            }
-            false
-        } else {
-            // An activation chord can press Win before this hook exists.
-            // Its release belongs to the local OS, even if focused now.
-            self.consumed.remove(&key.vk)
+fn has_altgr(layout: HKL) -> bool {
+    let normal = [0; 256];
+    let mut altgr = normal;
+    altgr[0x11] = 0x80;
+    altgr[0x12] = 0x80;
+    // Match winit's definition, a printable Ctrl+Alt character differs from
+    // the unmodified character. Flag 4 leaves the layout's dead-key state alone.
+    (0..256).any(|vk| {
+        let mut plain = [0; 8];
+        let mut modified = [0; 8];
+        // SAFETY: all keyboard-state and output buffers have the API's sizes.
+        unsafe {
+            let scan = MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC, layout);
+            let a = ToUnicodeEx(vk, scan, &normal, &mut plain, 4, layout);
+            let b = ToUnicodeEx(vk, scan, &altgr, &mut modified, 4, layout);
+            a > 0 && b > 0 && (a != b || plain != modified)
         }
+    })
+}
+
+fn run(lease: Arc<Lease>, events: SyncSender<Event>, ctx: egui::Context) {
+    let (_, mut layout) = foreground();
+    let mut state = Hook {
+        handle: HHOOK::default(),
+        lease: lease.clone(),
+        events,
+        capture: Capture::new(has_altgr(layout)),
+        repaint: ctx,
+        dirty: false,
+    };
+    // SAFETY: callback and module remain valid until the thread unhooks.
+    let installed = unsafe {
+        GetModuleHandleW(None).and_then(|module| {
+            SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), HINSTANCE(module.0), 0)
+        })
+    };
+    match installed {
+        Ok(handle) => state.handle = handle,
+        Err(error) => {
+            tracing::warn!(%error, "cannot capture Windows system shortcuts");
+            lease.fail();
+            return;
+        }
+    }
+    HOOK.with_borrow_mut(|slot| *slot = Some(state));
+    // PeekMessage dispatches the hook's sent messages on this dedicated thread.
+    // The short park also services the lease when there are no key messages.
+    while lease.active(lease.elapsed()) {
+        let (owned, current_layout) = foreground();
+        if !owned {
+            lease.fail();
+            break;
+        }
+        if layout != current_layout {
+            layout = current_layout;
+            let altgr = has_altgr(layout);
+            HOOK.with_borrow_mut(|slot| {
+                if let Some(h) = slot {
+                    h.capture.altgr = altgr;
+                }
+            });
+        }
+        let mut msg = MSG::default();
+        // SAFETY: this thread owns this message queue.
+        while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() } {
+            if msg.message == WM_QUIT {
+                lease.fail();
+                break;
+            }
+            unsafe {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        HOOK.with_borrow_mut(|slot| {
+            if let Some(h) = slot {
+                if std::mem::take(&mut h.dirty) {
+                    h.repaint.request_repaint();
+                }
+            }
+        });
+        thread::park_timeout(Duration::from_millis(2));
+    }
+    HOOK.with_borrow_mut(|slot| *slot = None);
+}
+
+fn deliver(tx: &SyncSender<Event>, lease: &Lease, event: Event) -> bool {
+    if tx.try_send(event).is_ok() {
+        true
+    } else {
+        lease.fail();
+        false
     }
 }
 
 unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 {
-        // SAFETY: WH_KEYBOARD_LL supplies this record for HC_ACTION.
-        let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-        let mut process = 0;
-        // SAFETY: query foreground process identity only.
-        unsafe {
-            GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut process));
+    // Never unwind through Windows. Hook's thread-local RAII unhooks on worker panic.
+    let swallowed = std::panic::catch_unwind(|| {
+        if code != HC_ACTION as i32 {
+            return false;
         }
-        if process == unsafe { GetCurrentProcessId() } && !event.flags.contains(LLKHF_INJECTED) {
-            let key = Key {
-                vk: event.vkCode as u16,
-                down: !event.flags.contains(LLKHF_UP),
+        // SAFETY: HC_ACTION supplies this record for WH_KEYBOARD_LL.
+        let raw = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        if raw.flags.contains(LLKHF_INJECTED) {
+            return false;
+        }
+        HOOK.with_borrow_mut(|slot| {
+            let Some(h) = slot else { return false };
+            if !h.lease.active(h.lease.elapsed()) || !foreground().0 {
+                h.lease.fail();
+                return false;
+            }
+            let event = Event {
+                key: Key {
+                    vk: raw.vkCode as u16,
+                    down: !raw.flags.contains(LLKHF_UP),
+                },
+                alt: raw.flags.contains(LLKHF_ALTDOWN),
+                time: raw.time,
+                altgr: h.capture.altgr,
             };
-            let alt = event.flags.contains(LLKHF_ALTDOWN);
-            let swallowed = CAPTURE.with_borrow_mut(|capture| capture.consume(key, alt));
-            // Shift is unambiguous in the hook. Let winit filter the synthetic
-            // Control generated by AltGr before Ctrl/Alt reach the host.
-            let modifier = matches!(key.vk, 0xa0 | 0xa1);
-            if swallowed || modifier {
-                if modifier {
-                    CAPTURE.with_borrow_mut(|capture| capture.forwarded.push_back(key));
-                }
-                publish(key, alt);
+            h.capture.consume(event, |e| {
+                h.dirty = true;
+                deliver(&h.events, &h.lease, e)
+            })
+        })
+    });
+    match swallowed {
+        Ok(true) => return LRESULT(1),
+        Err(_) => HOOK.with_borrow(|slot| {
+            if let Some(h) = slot {
+                h.lease.fail();
             }
-            if swallowed {
-                return LRESULT(1);
-            }
-        }
+        }),
+        Ok(false) => {}
     }
-    // SAFETY: pass unhandled input through unchanged.
+    // SAFETY: all unowned events, failures and orphan ups pass to Windows.
     unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
 }
 
-fn publish(key: Key, alt: bool) {
-    STATE.with_borrow_mut(|s| {
+fn publish(event: Event) {
+    let key = event.key;
+    let mods = STATE.with_borrow_mut(|s| {
         if key.down {
             s.pressed.insert(key.vk);
         } else {
@@ -140,12 +322,12 @@ fn publish(key: Key, alt: bool) {
             Some(key),
             false,
         ));
-    });
-    let mods = STATE.with_borrow(|s| egui::Modifiers {
-        shift: s.pressed.contains(&0xa0) || s.pressed.contains(&0xa1),
-        ctrl: s.pressed.contains(&0xa2) || s.pressed.contains(&0xa3),
-        alt,
-        ..egui::Modifiers::NONE
+        egui::Modifiers {
+            shift: s.pressed.contains(&0xa0) || s.pressed.contains(&0xa1),
+            ctrl: s.pressed.contains(&0xa2) || s.pressed.contains(&0xa3),
+            alt: event.alt,
+            ..egui::Modifiers::NONE
+        }
     });
     crate::early::physical(key, mods);
 }
@@ -153,80 +335,36 @@ fn publish(key: Key, alt: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn hook_publication_orders_shift_before_win() {
-        STATE.with_borrow_mut(|s| s.pending.clear());
-        let shift = Key {
-            vk: 0xa1,
-            down: true,
-        };
-        let win = Key {
-            vk: 0x5b,
-            down: true,
-        };
-        publish(shift, false);
-        publish(win, false);
-        STATE.with_borrow_mut(|s| {
-            assert_eq!(
-                s.pending
-                    .iter()
-                    .filter_map(|(_, key, _)| *key)
-                    .collect::<Vec<_>>(),
-                [shift, win]
-            );
-            s.pending.clear();
-            s.pressed.clear();
-        });
-    }
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
-    fn ownership_requires_consumed_down_and_survives_alt_release() {
-        let mut capture = Capture::default();
-        for vk in [0x5b, 0x5c, 0x09, 0x20, 0x73] {
-            assert!(!capture.consume(Key { vk, down: false }, true));
-            assert!(capture.consume(Key { vk, down: true }, true));
-            assert!(capture.consume(Key { vk, down: false }, false));
-            assert!(!capture.consume(Key { vk, down: false }, true));
+    fn capture_owner_joins_its_worker_on_drop_and_unwind() {
+        for panic in [false, true] {
+            let stopped = Arc::new(AtomicBool::new(false));
+            let result = std::panic::catch_unwind({
+                let stopped = stopped.clone();
+                move || {
+                    let lease = Arc::new(Lease::default());
+                    let thread_lease = lease.clone();
+                    let (_, events) = mpsc::sync_channel(QUEUE_SIZE);
+                    let thread = thread::spawn(move || {
+                        while !thread_lease.failed.load(Ordering::Acquire) {
+                            thread::park_timeout(Duration::from_millis(2));
+                        }
+                        stopped.store(true, Ordering::Release);
+                    });
+                    let _owner = Worker {
+                        lease,
+                        events,
+                        thread: Some(thread),
+                        forwarded: VecDeque::new(),
+                        pending: VecDeque::new(),
+                    };
+                    assert!(!panic, "exercise unwinding teardown");
+                }
+            });
+            assert_eq!(result.is_err(), panic);
+            assert!(stopped.load(Ordering::Acquire));
         }
-        assert!(!capture.consume(
-            Key {
-                vk: 0x09,
-                down: true
-            },
-            false
-        ));
-        assert!(!capture.consume(
-            Key {
-                vk: 0x41,
-                down: true
-            },
-            true
-        ));
-    }
-    #[test]
-    fn forwarded_modifier_order_and_release_clear_without_installing() {
-        CAPTURE.with_borrow_mut(|capture| {
-            capture.forwarded.push_back(Key {
-                vk: 0xa0,
-                down: true,
-            });
-            capture.forwarded.push_back(Key {
-                vk: 0xa0,
-                down: false,
-            });
-        });
-        assert!(take_forwarded(Key {
-            vk: 0xa0,
-            down: true
-        }));
-        assert!(take_forwarded(Key {
-            vk: 0xa0,
-            down: false
-        }));
-        owns_keys(false);
-        CAPTURE.with_borrow(|c| {
-            assert!(c.hook.0.is_null());
-            assert!(c.consumed.is_empty());
-        });
     }
 }

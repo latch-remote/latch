@@ -331,6 +331,7 @@ impl Held {
         viewer_mac: bool,
         host_mac: bool,
         map: bool,
+        relative: bool,
     ) {
         let scoped = !viewer_mac && host_mac;
         // Only these common editing shortcuts acquire Command on a Mac.
@@ -346,7 +347,7 @@ impl Held {
             && chord_keys
                 .clone()
                 .all(|vk| editing(vk) || matches!(vk, 0xa0..=0xa3 | 0x5b | 0x5c));
-        let active = map && (!scoped || safe_chord);
+        let active = map && (!scoped || (safe_chord && !relative));
         // PC->Mac swaps are chord-scoped, including the displaced Super.
         if scoped {
             let modifiers: Vec<_> = self
@@ -356,7 +357,8 @@ impl Held {
                 .map(|(&source, &target)| (source, target))
                 .collect();
             for (source, target) in modifiers {
-                let next = crate::keyboard::shortcut(source, viewer_mac, host_mac, active) as i16;
+                let next = crate::keyboard::shortcut(source, viewer_mac, host_mac, active, relative)
+                    as i16;
                 if next != target {
                     self.physical.remove(&source);
                     if !self.physical.values().any(|&held| held == target) {
@@ -367,7 +369,7 @@ impl Held {
                 }
             }
         }
-        let target = crate::keyboard::shortcut(key.vk, viewer_mac, host_mac, active);
+        let target = crate::keyboard::shortcut(key.vk, viewer_mac, host_mac, active, relative);
         self.physical_key(out, key.vk, key.down, target);
     }
 
@@ -533,10 +535,11 @@ impl SharedHeld {
         viewer_mac: bool,
         host_mac: bool,
         map: bool,
+        relative: bool,
     ) {
         self.0
             .borrow_mut()
-            .shortcut_key(out, key, viewer_mac, host_mac, map);
+            .shortcut_key(out, key, viewer_mac, host_mac, map, relative);
     }
 
     pub fn physical_down(&self, source: u16) -> bool {
@@ -622,6 +625,7 @@ mod tests {
                                         vm,
                                         hm,
                                         map,
+                                        false,
                                     );
                                 }
                                 let editing =
@@ -658,6 +662,7 @@ mod tests {
                                         vm,
                                         hm,
                                         map,
+                                        false,
                                     );
                                 }
                                 if let Some(vk) = shift {
@@ -684,6 +689,7 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
             );
         }
         assert_eq!(held.physical[&0xa2], 0x5b);
@@ -697,6 +703,7 @@ mod tests {
             false,
             true,
             true,
+            false,
         );
         assert_eq!(
             held.physical[&0xa2], 0xa2,
@@ -711,6 +718,7 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
             );
         }
         assert_eq!(held.physical[&0xa2], 0xa2);

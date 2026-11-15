@@ -78,6 +78,7 @@ pub struct Gate {
     pub mouse: bool,
     pub cmd_is_ctrl: bool,
     pub host_mac: bool,
+    pub viewer_mac: bool,
     pub map_shortcuts: bool,
     /// Stream pixels per unit of raw movement.
     pub motion_scale: f32,
@@ -163,6 +164,14 @@ fn current() -> Option<Early> {
 pub fn physical(key: crate::keyboard::Key, mods: Modifiers) {
     if let Some(early) = current() {
         early.deliver(Native::Physical { key, mods }, Instant::now());
+    }
+}
+
+/// Recover remote state when a capture worker loses its delivery lease.
+#[cfg(any(windows, target_os = "linux"))]
+pub fn capture_lost() {
+    if let Some(early) = current() {
+        early.on_event(Some(&WindowEvent::Focused(false)), &[], Modifiers::NONE);
     }
 }
 
@@ -435,9 +444,10 @@ impl State {
                 self.held.shortcut_key(
                     out,
                     key,
-                    cfg!(target_os = "macos"),
+                    gate.viewer_mac,
                     gate.host_mac,
-                    gate.map_shortcuts && !gate.mouse,
+                    gate.map_shortcuts,
+                    gate.mouse,
                 );
                 Outcome::Sent(Some(Ahead::Physical(key.vk, key.down)))
             }
@@ -660,6 +670,7 @@ mod tests {
             mouse,
             cmd_is_ctrl: true,
             host_mac: false,
+            viewer_mac: cfg!(target_os = "macos"),
             map_shortcuts: false,
             motion_scale: 1.0,
             video: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
@@ -830,6 +841,7 @@ mod tests {
             mouse: true,
             cmd_is_ctrl: true,
             host_mac: false,
+            viewer_mac: cfg!(target_os = "macos"),
             map_shortcuts: false,
             motion_scale: 2.0,
             video: Rect::NOTHING,
