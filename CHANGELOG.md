@@ -8,12 +8,20 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Windows streaming
 
-- Send a separate Windows cursor plane with scaled hotspots, output-relative
-  position and visibility, including pointer movement on a static desktop.
+- Add partial support for a separate Windows cursor plane with scaled
+  hotspots, output-relative position and visibility, including pointer movement
+  on a static desktop.
   Convert DXGI colour, monochrome and masked-colour shapes, outline inverted
   regions, and retain GPU composition for unsupported XOR or unreadable data.
-  Older viewers keep host-composited cursors. Add cross-platform buffer tests
-  and a synthetic cursor-control session independent of video production.
+  Viewers without cursor support keep host-composited cursors. 6.0.0 viewers
+  receive shapes and visibility without positions. Add cross-platform buffer
+  tests and a synthetic cursor-control session independent of video production.
+  Live Windows capture of the separate plane is unverified.
+- Keep focused free-mouse placement local, deduplicate each viewer's cursor
+  controls and limit position-only updates to 120 Hz. Cache fallback bitmaps
+  with a 250 ms failure retry, preserve shapes across resolution changes and
+  reset viewer cursor textures on reconnect. Test capture ownership through
+  mode switches, idle timeouts, fallback and capture/output restarts.
 
 ### Relay connectivity
 

@@ -1,7 +1,7 @@
 //! The cursor uses a pixel shader compiled by the system d3dcompiler_47.dll.
 //! This preserves XOR cursors without reading the desktop back to the CPU.
 use super::display;
-use crate::windows_cursor::{Control, Plane, ShapeInfo};
+use crate::windows_cursor::{CaptureState, Control, Owner, Plane, PointerSample, ShapeInfo};
 use crate::{
     input::DisplayRect,
     software::{Bgra, CpuCapture},
@@ -455,11 +455,9 @@ fn shape_info(info: &DXGI_OUTDUPL_POINTER_SHAPE_INFO) -> ShapeInfo {
 pub(super) struct Capture {
     plane: Plane,
     stream_size: (u32, u32),
-    pointer_known: bool,
+    cursor_state: CaptureState,
     composite_pointer: DXGI_OUTDUPL_POINTER_POSITION,
-    fallback_needed: bool,
     last_drawn: bool,
-    separate: bool,
     pub hdr_output: bool,
     ten_bit: bool,
     pub gpu: Gpu,
@@ -589,11 +587,9 @@ impl Capture {
         Ok(Self {
             plane: Plane::new(Control::composited()),
             stream_size: (display.width, display.height),
-            pointer_known: false,
+            cursor_state: CaptureState::default(),
             composite_pointer: Default::default(),
-            fallback_needed: true,
             last_drawn: true,
-            separate: false,
             hdr_output,
             ten_bit,
             gpu,
@@ -617,7 +613,7 @@ impl Capture {
         self.plane = Plane::new(control);
         self.stream_size = size;
     }
-    fn cursor_status(&mut self) -> bool {
+    fn cursor_status(&mut self) -> Option<bool> {
         let _dpi = display::DpiAwareness::physical();
         let mut cursor = CURSORINFO {
             cbSize: std::mem::size_of::<CURSORINFO>() as u32,
@@ -634,7 +630,7 @@ impl Capture {
             known.then_some(cursor.flags == CURSOR_SHOWING),
             on_output,
             self.pointer.Visible.as_bool(),
-            self.pointer_known,
+            self.cursor_state.pointer_known,
         );
         self.composite_pointer = self.pointer;
         if known && !visible {
@@ -644,38 +640,74 @@ impl Capture {
         // no readable shape. A fallback shape never authorizes a separate plane.
         if visible
             && !embedded
-            && (self.renderer.shape.is_none() || self.fallback_needed || !self.pointer_known)
+            && (self.renderer.shape.is_none()
+                || self.cursor_state.fallback_needed
+                || !self.cursor_state.pointer_known)
         {
-            match super::cursor::system_shape(cursor.hCursor)
-                .or_else(|_| {
-                    // SAFETY: LoadCursorW borrows the shared system arrow.
-                    let arrow = unsafe {
-                        windows::Win32::UI::WindowsAndMessaging::LoadCursorW(
-                            None,
-                            windows::Win32::UI::WindowsAndMessaging::IDC_ARROW,
-                        )
-                    }?;
-                    super::cursor::system_shape(arrow)
-                })
-                .and_then(|(shape, bytes)| {
-                    self.renderer.shape(&self.gpu, &shape, &bytes)?;
-                    self.shape = shape;
-                    Ok(())
-                }) {
-                Ok(()) => {
-                    self.composite_pointer.Visible = true.into();
-                    self.composite_pointer.Position = POINT {
-                        x: cursor.ptScreenPos.x - self.display.x - self.shape.HotSpot.x,
-                        y: cursor.ptScreenPos.y - self.display.y - self.shape.HotSpot.y,
-                    };
+            let now = Instant::now();
+            if (self.renderer.shape.is_none() || self.cursor_state.fallback_needed)
+                && self
+                    .cursor_state
+                    .fallback_due(cursor.hCursor.0 as usize, now)
+            {
+                let mut actual_shape = true;
+                let result = super::cursor::system_shape(cursor.hCursor)
+                    .or_else(|_| {
+                        actual_shape = false;
+                        // SAFETY: LoadCursorW borrows the shared system arrow.
+                        let arrow = unsafe {
+                            windows::Win32::UI::WindowsAndMessaging::LoadCursorW(
+                                None,
+                                windows::Win32::UI::WindowsAndMessaging::IDC_ARROW,
+                            )
+                        }?;
+                        super::cursor::system_shape(arrow)
+                    })
+                    .and_then(|(shape, bytes)| {
+                        self.renderer.shape(&self.gpu, &shape, &bytes)?;
+                        self.shape = shape;
+                        self.cursor_state.shape_uploaded();
+                        Ok(())
+                    });
+                self.cursor_state
+                    .fallback_read(result.is_ok() && actual_shape, now);
+                if let Err(error) = result {
+                    tracing::warn!("system cursor fallback unavailable: {error:#}");
                 }
-                Err(error) => tracing::warn!("system cursor fallback unavailable: {error:#}"),
+            }
+            self.composite_pointer.Visible = self.renderer.shape.is_some().into();
+            if known {
+                self.composite_pointer.Position = POINT {
+                    x: cursor.ptScreenPos.x - self.display.x - self.shape.HotSpot.x,
+                    y: cursor.ptScreenPos.y - self.display.y - self.shape.HotSpot.y,
+                };
             }
         }
-        let separate = self.plane.separate(known && self.pointer_known, embedded);
+        let separate = self.plane.separate(
+            known && self.cursor_state.pointer_known && !self.cursor_state.fallback_needed,
+            embedded,
+        );
+        let (_, owner) = self.cursor_state.update(
+            PointerSample {
+                os_visible: known.then_some(cursor.flags == CURSOR_SHOWING),
+                on_output,
+                dxgi_visible: self.pointer.Visible.as_bool(),
+                position: [
+                    self.composite_pointer.Position.x,
+                    self.composite_pointer.Position.y,
+                ],
+            },
+            separate,
+        );
+        self.composite_pointer.Visible = (owner == Owner::Host).into();
         self.plane.publish(visible, position, separate);
-        separate
+        // Keep the session alive while bitmap reads retry. No frame with a
+        // missing visible cursor is emitted, even if the system arrow failed.
+        self.cursor_state
+            .can_render(self.renderer.shape.is_some())
+            .then_some(separate)
     }
+
     fn render(&mut self, separate: bool) -> Result<()> {
         let mut pointer = self.composite_pointer;
         if separate {
@@ -709,7 +741,8 @@ impl Capture {
                 (self.rotation, self.white, self.hdr_output),
             )?;
         }
-        self.separate = separate;
+        self.cursor_state.rendered();
+        self.has_frame = true;
         self.cpu_seeded = false;
         Ok(())
     }
@@ -783,7 +816,7 @@ impl Capture {
         self.display = display;
         self.rotation = desc.Rotation;
         self.plane.invalidate();
-        self.pointer_known = false;
+        self.cursor_state.restart();
         self.pointer = Default::default();
         self.shape = Default::default();
         self.renderer.shape = None;
@@ -801,7 +834,9 @@ impl Capture {
             .load(std::sync::atomic::Ordering::Relaxed);
         if self.has_frame && drawn != self.last_drawn {
             self.last_drawn = drawn;
-            let separate = self.cursor_status();
+            let Some(separate) = self.cursor_status() else {
+                return Ok(false);
+            };
             self.render(separate)?;
             return Ok(true);
         }
@@ -840,12 +875,10 @@ impl Capture {
         };
         match acquired {
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                let was_visible = self.composite_pointer.Visible;
-                let separate = self.cursor_status();
-                if self.has_frame
-                    && (separate != self.separate
-                        || (!separate && was_visible != self.composite_pointer.Visible))
-                {
+                let Some(separate) = self.cursor_status() else {
+                    return Ok(false);
+                };
+                if self.cursor_state.needs_render() {
                     self.render(separate)?;
                     return Ok(true);
                 }
@@ -856,7 +889,7 @@ impl Capture {
                 // own only one duplication per output. Mark the copy unavailable
                 // so repeated reopen failures cannot stream a stale desktop forever.
                 self.plane.invalidate();
-                self.pointer_known = false;
+                self.cursor_state.restart();
                 self.duplication = None;
                 self.has_frame = false;
                 self.cpu_seeded = false;
@@ -869,7 +902,7 @@ impl Capture {
         }
         self.captured = Instant::now();
         let mut shape_bytes = None;
-        let mut desktop_changed = info.LastPresentTime != 0 || !self.has_frame;
+        let mut desktop_changed = info.LastPresentTime != 0 || !self.cursor_state.source_ready;
         let copied = (|| -> Result<()> {
             let texture: ID3D11Texture2D = resource.context("DXGI returned no frame")?.cast()?;
             // Use the acquired texture as the final authority on physical size;
@@ -906,10 +939,11 @@ impl Capture {
                 self.display.width = width;
                 self.display.height = height;
                 desktop_changed = true;
-                self.plane.invalidate();
+                let fit = self.display.fitted(self.stream_size.0, self.stream_size.1);
+                self.plane.resize((width, height), (fit.width, fit.height));
             }
             if info.LastMouseUpdateTime != 0 {
-                self.pointer_known = true;
+                self.cursor_state.pointer_known = true;
                 self.pointer = info.PointerPosition;
             }
             if info.PointerShapeBufferSize > 0 {
@@ -933,7 +967,7 @@ impl Capture {
                 } else {
                     tracing::warn!("DXGI pointer shape unreadable; retaining composited pointer");
                     self.plane.invalidate();
-                    self.fallback_needed = true;
+                    self.cursor_state.fallback_needed = true;
                 }
             }
             if desktop_changed {
@@ -941,6 +975,7 @@ impl Capture {
                 unsafe {
                     self.gpu.context.CopyResource(&self.source, &texture);
                 }
+                self.cursor_state.source_ready = true;
             }
             Ok(())
         })();
@@ -965,9 +1000,9 @@ impl Capture {
                     "DXGI pointer upload failed; retaining composited pointer: {error:#}"
                 );
                 self.plane.invalidate();
-                self.fallback_needed = true;
+                self.cursor_state.fallback_needed = true;
             } else {
-                self.fallback_needed = false;
+                self.cursor_state.dxgi_shape();
                 self.shape = shape;
                 let source = (self.display.width, self.display.height);
                 let fit = self.display.fitted(self.stream_size.0, self.stream_size.1);
@@ -975,14 +1010,15 @@ impl Capture {
                     .shape(shape_info(&shape), &bytes, source, (fit.width, fit.height));
             }
         }
-        let separate = self.cursor_status();
+        let Some(separate) = self.cursor_status() else {
+            return Ok(false);
+        };
         let changed = desktop_changed
-            || separate != self.separate
+            || self.cursor_state.needs_render()
             || (!separate && (info.LastMouseUpdateTime != 0 || shape_changed));
         if changed {
             self.render(separate)?;
         }
-        self.has_frame = true;
         Ok(changed)
     }
 }

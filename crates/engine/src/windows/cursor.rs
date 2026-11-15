@@ -97,7 +97,16 @@ pub(super) fn system_shape(cursor: HCURSOR) -> Result<(DXGI_OUTDUPL_POINTER_SHAP
     };
     let alpha =
         !icon.0.hbmColor.is_invalid() && bytes.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0);
-    if !alpha {
+    if alpha {
+        // GetIconInfo's 32-bit colour bitmap is premultiplied. Normalize it
+        // to the straight-alpha DXGI/shader contract, once per bitmap read.
+        for pixel in bytes.as_chunks_mut::<4>().0 {
+            let a = pixel[3];
+            for channel in &mut pixel[..3] {
+                *channel = crate::windows_cursor::straight(*channel, a);
+            }
+        }
+    } else {
         for (pixel, mask) in bytes
             .as_chunks_mut::<4>()
             .0

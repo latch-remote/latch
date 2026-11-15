@@ -1289,6 +1289,41 @@ fn cursor_mailbox_retains_shape_when_moves_are_coalesced() {
 }
 
 #[test]
+fn cursor_mailbox_deduplicates_the_negotiated_wire_state() {
+    for positions in [false, true] {
+        let mailbox = CursorMailbox::default();
+        let publish = |x| {
+            mailbox.publish(control::Cursor {
+                visible: true,
+                position: positions.then_some([x, 2]),
+                shape: None,
+            })
+        };
+        publish(1);
+        mailbox.pending.lock().take().unwrap();
+        publish(1);
+        assert!(mailbox.pending.lock().is_none());
+        publish(2);
+        assert_eq!(mailbox.pending.lock().is_some(), positions);
+        mailbox.pending.lock().take();
+        for _ in 0..100 {
+            mailbox.publish(control::Cursor {
+                visible: false,
+                position: None,
+                shape: None,
+            });
+        }
+        assert!(!mailbox.pending.lock().take().unwrap().visible);
+        mailbox.publish(control::Cursor {
+            visible: false,
+            position: None,
+            shape: None,
+        });
+        assert!(mailbox.pending.lock().is_none());
+    }
+}
+
+#[test]
 fn synthetic_dxgi_session_delivers_cursor_while_video_waits() {
     use crate::windows_cursor::{Control, Plane, ShapeInfo};
     struct PointerVideo {
@@ -1320,17 +1355,24 @@ fn synthetic_dxgi_session_delivers_cursor_while_video_waits() {
             bytes[128] = 192; // A 2×2 inverting region survives half-size scaling.
             bytes[132] = 192;
             self.plane.shape(metadata, &bytes, (64, 64), (32, 32));
+            let mut now = Instant::now();
             while let Ok(command) = self.commands.recv() {
+                now += Duration::from_millis(10);
                 match command {
-                    0 => self
-                        .plane
-                        .publish(true, [10, 20], self.plane.separate(true, false)),
-                    1 => self
-                        .plane
-                        .publish(true, [11, 21], self.plane.separate(true, false)),
-                    2 => self
-                        .plane
-                        .publish(false, [11, 21], self.plane.separate(true, false)),
+                    0 => {
+                        self.plane
+                            .publish_at(true, [10, 20], self.plane.separate(true, false), now)
+                    }
+                    1 => {
+                        self.plane
+                            .publish_at(true, [11, 21], self.plane.separate(true, false), now)
+                    }
+                    2 => self.plane.publish_at(
+                        false,
+                        [11, 21],
+                        self.plane.separate(true, false),
+                        now,
+                    ),
                     3 => self.plane.invalidate(),
                     _ => break,
                 }
@@ -1380,13 +1422,26 @@ fn synthetic_dxgi_session_delivers_cursor_while_video_waits() {
                 (17, 17, 1, 2)
             );
             commands.send(1).unwrap();
-            let moved = read_cursor(&mut viewer);
-            assert_eq!(moved.position, positions.then_some([11, 21]));
-            assert!(moved.shape.is_none());
+            if positions {
+                let moved = read_cursor(&mut viewer);
+                assert_eq!(moved.position, Some([11, 21]));
+                assert!(moved.shape.is_none());
+            }
             commands.send(2).unwrap();
             assert!(!read_cursor(&mut viewer).visible);
             commands.send(3).unwrap();
-            assert!(!read_cursor(&mut viewer).visible);
+            commands.send(1).unwrap(); // Still composited/invisible after invalidation.
+            viewer
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let error = viewer.peek(&mut [0]).unwrap_err();
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ),
+                "{error}"
+            );
             assert_eq!(session.frames.load(Ordering::Relaxed), 0);
             session.stop.store(true, Ordering::Release);
             commands.send(4).unwrap();

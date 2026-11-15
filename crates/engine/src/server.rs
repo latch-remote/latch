@@ -1640,15 +1640,38 @@ fn play_mic(session: &Session, packet: Option<&latch_proto::wire::AudioPacket<'_
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CursorWireState {
+    visible: bool,
+    position: Option<[i32; 2]>,
+    serial: u32,
+}
 /// Latest cursor state with pending shapes retained across coalesced moves.
 /// The capture worker never waits for a socket write or an encoded picture.
 #[derive(Default)]
 struct CursorMailbox {
     pending: Mutex<Option<control::Cursor>>,
     ready: Condvar,
+    last: Mutex<Option<CursorWireState>>,
 }
 impl CursorMailbox {
     fn publish(&self, mut cursor: control::Cursor) {
+        let mut last = self.last.lock();
+        // The sink has already removed unnegotiated fields. Compare the wire
+        // state using the shape serial, without retaining or comparing pixels.
+        let serial = cursor.shape.as_ref().map_or_else(
+            || last.as_ref().map_or(0, |state| state.serial),
+            |shape| shape.serial,
+        );
+        let state = CursorWireState {
+            visible: cursor.visible,
+            position: cursor.position,
+            serial,
+        };
+        if *last == Some(state) {
+            return;
+        }
+        *last = Some(state);
         let mut pending = self.pending.lock();
         if cursor.shape.is_none() {
             cursor.shape = pending.as_mut().and_then(|old| old.shape.take());

@@ -6,6 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
+use std::time::{Duration, Instant};
 
 // Viewers cache textures by serial across capture/encoder reopen.
 static NEXT_SERIAL: AtomicU32 = AtomicU32::new(1);
@@ -79,6 +80,10 @@ impl ShapeInfo {
         for (i, pixel) in pixels.into_iter().enumerate() {
             let [b, g, r, a] = pixel.to_le_bytes();
             let color = match self.kind {
+                // Microsoft's Desktop Duplication sample uploads the colour
+                // buffer directly and blends with SRC_ALPHA / INV_SRC_ALPHA.
+                // DXGI therefore supplies straight-alpha BGRA, unlike GDI's
+                // premultiplied colour bitmap used by the fallback.
                 2 => [r, g, b, a],
                 1 | 4 => {
                     if a == 0 {
@@ -146,6 +151,25 @@ impl ShapeInfo {
     }
 }
 
+pub(crate) fn straight(channel: u8, alpha: u8) -> u8 {
+    if alpha == 0 {
+        0
+    } else {
+        ((u32::from(channel) * 255 + u32::from(alpha) / 2) / u32::from(alpha)).min(255) as u8
+    }
+}
+
+/// Position-only messages are coalesced to at most 120 Hz. Shape and visibility
+/// changes bypass the interval so mode switches and hiding remain immediate.
+const POSITION_INTERVAL: Duration = Duration::from_micros(8_334);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Published {
+    visible: bool,
+    position: Option<[i32; 2]>,
+    serial: u32,
+}
+
 #[derive(Default)]
 pub(crate) struct Control {
     pub drawn: AtomicBool,
@@ -164,7 +188,9 @@ pub(crate) struct Plane {
     pub control: Arc<Control>,
     pub shape: Option<CursorShape>,
     shape_visible: bool,
-    last: Option<Cursor>,
+    last: Option<Published>,
+    last_sent: Option<Instant>,
+    source_shape: Option<(ShapeInfo, Vec<u8>)>,
     serial: u32,
 }
 impl Plane {
@@ -174,10 +200,29 @@ impl Plane {
             shape: None,
             shape_visible: false,
             last: None,
+            last_sent: None,
+            source_shape: None,
             serial: 0,
         }
     }
     pub fn shape(&mut self, info: ShapeInfo, bytes: &[u8], source: (u32, u32), stream: (u32, u32)) {
+        self.convert_shape(info, bytes, source, stream);
+        self.source_shape = Some((info, bytes.to_vec()));
+    }
+    /// A resize changes scaling, not the DXGI shape. DXGI need not resend it.
+    pub fn resize(&mut self, source: (u32, u32), stream: (u32, u32)) {
+        if let Some((info, bytes)) = self.source_shape.take() {
+            self.convert_shape(info, &bytes, source, stream);
+            self.source_shape = Some((info, bytes));
+        }
+    }
+    fn convert_shape(
+        &mut self,
+        info: ShapeInfo,
+        bytes: &[u8],
+        source: (u32, u32),
+        stream: (u32, u32),
+    ) {
         let mut shape = info.rgba(bytes, self.serial);
         if let Some(shape) = shape.as_mut() {
             crate::software::scale_cursor(shape, source, stream);
@@ -224,28 +269,179 @@ impl Plane {
             && self.shape.is_some()
     }
     pub fn publish(&mut self, visible: bool, position: [i32; 2], separate: bool) {
-        let current = Cursor {
-            visible: visible && separate && self.shape_visible,
-            position: Some(position),
-            shape: self.shape.clone(),
+        self.publish_at(visible, position, separate, Instant::now());
+    }
+    pub(crate) fn publish_at(
+        &mut self,
+        visible: bool,
+        position: [i32; 2],
+        separate: bool,
+        now: Instant,
+    ) {
+        let visible = visible && separate && self.shape_visible;
+        let serial = if visible {
+            self.serial
+        } else {
+            self.last.map_or(0, |last| last.serial)
         };
-        if self.last.as_ref() == Some(&current) {
+        let current = Published {
+            visible,
+            position: visible.then_some(position),
+            serial,
+        };
+        if self.last == Some(current) {
+            return;
+        }
+        let position_only = self
+            .last
+            .is_some_and(|last| last.visible == current.visible && last.serial == current.serial);
+        if position_only
+            && self
+                .last_sent
+                .is_some_and(|at| now.duration_since(at) < POSITION_INTERVAL)
+        {
             return;
         }
         let Some(sink) = self.control.sink.lock().clone() else {
             return;
         };
-        let mut update = current.clone();
-        if self.last.as_ref().and_then(|c| c.shape.as_ref()) == current.shape.as_ref() {
-            update.shape = None;
-        }
-        sink(update);
+        sink(Cursor {
+            visible,
+            position: current.position,
+            shape: if visible && self.last.is_none_or(|last| last.serial != serial) {
+                self.shape.clone()
+            } else {
+                None
+            },
+        });
         self.last = Some(current);
+        self.last_sent = Some(now);
     }
     pub fn invalidate(&mut self) {
         self.shape = None;
         self.shape_visible = false;
+        self.source_shape = None;
         self.publish(false, [0, 0], false);
+    }
+}
+
+/// Cursor ownership and fallback caching, shared by the real DXGI capture
+/// loop and fake pointer sources in tests. Hidden cursors require no drawing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Owner {
+    Hidden,
+    Desktop,
+    Host,
+    Viewer,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct PointerSample {
+    pub os_visible: Option<bool>,
+    pub on_output: bool,
+    pub dxgi_visible: bool,
+    pub position: [i32; 2],
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DrawState {
+    owner: Owner,
+    position: [i32; 2],
+    revision: u64,
+}
+pub(crate) struct CaptureState {
+    pub pointer_known: bool,
+    pub fallback_needed: bool,
+    pub source_ready: bool,
+    fallback_key: Option<usize>,
+    fallback_cached: bool,
+    retry_at: Option<Instant>,
+    revision: u64,
+    current: Option<DrawState>,
+    rendered: Option<DrawState>,
+}
+impl Default for CaptureState {
+    fn default() -> Self {
+        Self {
+            pointer_known: false,
+            fallback_needed: true,
+            source_ready: false,
+            fallback_key: None,
+            fallback_cached: false,
+            retry_at: None,
+            revision: 0,
+            current: None,
+            rendered: None,
+        }
+    }
+}
+impl CaptureState {
+    pub fn restart(&mut self) {
+        *self = Self::default();
+    }
+    pub fn fallback_due(&mut self, key: usize, now: Instant) -> bool {
+        if self.fallback_key != Some(key) {
+            self.fallback_key = Some(key);
+            self.fallback_cached = false;
+            self.retry_at = None;
+        }
+        !self.fallback_cached && self.retry_at.is_none_or(|at| now >= at)
+    }
+    pub fn fallback_read(&mut self, success: bool, now: Instant) {
+        self.fallback_cached = success;
+        self.retry_at = Some(now + Duration::from_millis(250));
+    }
+    pub fn shape_uploaded(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+    pub fn dxgi_shape(&mut self) {
+        self.fallback_needed = false;
+        // The renderer now holds the DXGI texture, so a later fallback must
+        // restore its own bitmap even if the OS handle stayed the same.
+        self.fallback_cached = false;
+        self.retry_at = None;
+        self.shape_uploaded();
+    }
+    pub fn update(&mut self, sample: PointerSample, separate: bool) -> (bool, Owner) {
+        let (visible, embedded) = visibility(
+            sample.os_visible,
+            sample.on_output,
+            sample.dxgi_visible,
+            self.pointer_known,
+        );
+        let owner = if !visible {
+            Owner::Hidden
+        } else if embedded {
+            Owner::Desktop
+        } else if separate {
+            Owner::Viewer
+        } else {
+            Owner::Host
+        };
+        self.current = Some(DrawState {
+            owner,
+            position: if owner == Owner::Host {
+                sample.position
+            } else {
+                [0; 2]
+            },
+            revision: if owner == Owner::Host {
+                self.revision
+            } else {
+                0
+            },
+        });
+        (visible, owner)
+    }
+    pub fn can_render(&self, bitmap_ready: bool) -> bool {
+        self.source_ready
+            && self
+                .current
+                .is_some_and(|state| state.owner != Owner::Host || bitmap_ready)
+    }
+    pub fn needs_render(&self) -> bool {
+        self.current != self.rendered
+    }
+    pub fn rendered(&mut self) {
+        self.rendered = self.current;
     }
 }
 
@@ -293,6 +489,238 @@ mod tests {
             hot_x: 0,
             hot_y: 0,
         }
+    }
+    #[test]
+    fn support_docs_keep_live_windows_capture_unverified() {
+        let platforms = include_str!("../../../docs/PLATFORMS.md");
+        let cursor = platforms
+            .lines()
+            .find(|line| line.starts_with("| Cursor |"))
+            .unwrap();
+        assert!(cursor.starts_with("| Cursor | **partial**"));
+        assert!(cursor.contains("live Windows capture is unverified"));
+        for direction in ["| Windows → Mac |", "| Windows → Linux |"] {
+            let row = platforms
+                .lines()
+                .find(|line| line.starts_with(direction))
+                .unwrap();
+            assert!(row.contains("live Windows capture is unverified"));
+        }
+        let changelog = include_str!("../../../CHANGELOG.md");
+        assert!(changelog.contains("Live Windows capture of the separate plane is unverified"));
+    }
+    #[test]
+    fn hdr_cursor_white_difference_is_documented() {
+        let protocol = include_str!("../../../docs/PROTOCOL.md");
+        assert!(protocol.contains("SDR white level in nits"));
+        assert!(protocol.contains("captured/free switches can change cursor brightness"));
+        assert!(protocol.contains("carries no SDR white luminance metadata"));
+    }
+    #[test]
+    fn gdi_premultiplied_fallback_matches_straight_dxgi_colours() {
+        assert_eq!(
+            [straight(10, 128), straight(20, 128), straight(30, 128)],
+            [20, 40, 60]
+        );
+        assert_eq!(straight(99, 0), 0);
+        assert_eq!(straight(128, 128), 255);
+        assert_eq!(straight(7, 255), 7);
+        // DXGI supplies straight alpha, including semi-transparent edges.
+        let shape = info(2, 1, 1, 4).rgba(&[20, 40, 60, 128], 1).unwrap();
+        assert_eq!(shape.decode_rgba().unwrap(), [60, 40, 20, 128]);
+    }
+    #[test]
+    fn position_updates_are_bounded_and_never_resend_cached_pixels() {
+        let control = Control::composited();
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let received = updates.clone();
+        *control.sink.lock() = Some(Arc::new(move |cursor| received.lock().push(cursor)));
+        let mut plane = Plane::new(control);
+        plane.shape(info(2, 1, 1, 4), &[255; 4], (1, 1), (1, 1));
+        let pixels = plane.shape.as_ref().unwrap().rgba.as_ptr();
+        let now = Instant::now();
+        plane.publish_at(true, [0, 0], true, now);
+        for x in 1..1000 {
+            plane.publish_at(true, [x, 0], true, now + Duration::from_micros(x as u64));
+        }
+        assert_eq!(updates.lock().len(), 1);
+        plane.publish_at(true, [999, 0], true, now + POSITION_INTERVAL);
+        assert_eq!(updates.lock().len(), 2);
+        assert!(updates.lock()[1].shape.is_none());
+        assert_eq!(plane.shape.as_ref().unwrap().rgba.as_ptr(), pixels);
+        // Hiding bypasses the rate limit. Invisible pointer moves send nothing.
+        plane.publish_at(true, [1000, 0], false, now + POSITION_INTERVAL);
+        for x in 1001..2000 {
+            plane.publish_at(true, [x, 0], false, now + POSITION_INTERVAL);
+        }
+        assert_eq!(updates.lock().len(), 3);
+        assert!(!updates.lock()[2].visible);
+        assert_eq!(updates.lock()[2].position, None);
+    }
+    #[test]
+    fn fallback_reads_once_per_handle_and_retries_failures_after_250_ms() {
+        let mut state = CaptureState::default();
+        let now = Instant::now();
+        let mut reads = 0;
+        for micros in 0..1000 {
+            let at = now + Duration::from_micros(micros);
+            if state.fallback_due(1, at) {
+                reads += 1;
+                state.fallback_read(true, at);
+                state.shape_uploaded();
+            }
+        }
+        assert_eq!(reads, 1); // No first mouse move is needed for caching.
+        assert!(state.fallback_due(2, now));
+        state.fallback_read(false, now);
+        assert!(!state.fallback_due(2, now + Duration::from_millis(249)));
+        assert!(state.fallback_due(2, now + Duration::from_millis(250)));
+        state.fallback_read(true, now + Duration::from_millis(250));
+        assert!(!state.fallback_due(2, now + Duration::from_secs(1)));
+        state.restart();
+        assert!(state.fallback_due(2, now + Duration::from_secs(1)));
+    }
+    #[test]
+    fn fallback_waits_for_a_bitmap_and_desktop_then_recovers_on_an_idle_tick() {
+        let mut state = CaptureState::default();
+        let sample = PointerSample {
+            os_visible: Some(true),
+            on_output: true,
+            dxgi_visible: false,
+            position: [1, 2],
+        };
+        assert_eq!(state.update(sample, false).1, Owner::Host);
+        assert!(!state.can_render(true)); // No desktop has been acquired.
+        state.source_ready = true;
+        let now = Instant::now();
+        assert!(state.fallback_due(1, now));
+        state.fallback_read(false, now); // Both bitmap and system arrow failed.
+        assert!(!state.can_render(false)); // Never emit a cursor-free frame.
+        assert!(!state.fallback_due(1, now + Duration::from_millis(100)));
+        assert!(state.fallback_due(1, now + Duration::from_millis(250)));
+        state.fallback_read(true, now + Duration::from_millis(250));
+        state.shape_uploaded();
+        state.update(sample, false); // Timeout tick, with no new mouse event.
+        assert!(state.can_render(true));
+        assert!(state.needs_render());
+        state.rendered();
+        assert!(!state.needs_render());
+    }
+    #[test]
+    fn capture_state_assigns_exactly_one_drawer_through_idle_modes_and_recovery() {
+        struct FakePointer {
+            state: CaptureState,
+            plane: Plane,
+            sample: PointerSample,
+        }
+        impl FakePointer {
+            fn tick(&mut self, expected: Owner, repaint: bool) {
+                let (_, embedded) = visibility(
+                    self.sample.os_visible,
+                    self.sample.on_output,
+                    self.sample.dxgi_visible,
+                    self.state.pointer_known,
+                );
+                let separate = self.plane.separate(
+                    self.sample.os_visible.is_some()
+                        && self.state.pointer_known
+                        && !self.state.fallback_needed,
+                    embedded,
+                );
+                let (visible, owner) = self.state.update(self.sample, separate);
+                assert_eq!(owner, expected);
+                assert!(self.state.can_render(true));
+                assert_eq!(self.state.can_render(false), owner != Owner::Host);
+                let host_draws = matches!(owner, Owner::Desktop | Owner::Host);
+                let viewer_draws = owner == Owner::Viewer;
+                assert_eq!(
+                    u8::from(host_draws) + u8::from(viewer_draws),
+                    u8::from(visible)
+                );
+                assert_eq!(self.state.needs_render(), repaint);
+                self.state.rendered();
+            }
+            fn shape(&mut self) {
+                self.plane
+                    .shape(info(2, 4, 4, 16), &[255; 64], (100, 100), (100, 100));
+                self.state.dxgi_shape();
+            }
+        }
+        let control = Control::composited();
+        *control.sink.lock() = Some(Arc::new(|_| {}));
+        control.drawn.store(false, Ordering::Relaxed);
+        let mut pointer = FakePointer {
+            state: CaptureState {
+                source_ready: true,
+                ..Default::default()
+            },
+            plane: Plane::new(control.clone()),
+            sample: PointerSample {
+                os_visible: Some(true),
+                on_output: true,
+                dxgi_visible: false,
+                position: [10, 20],
+            },
+        };
+        pointer.tick(Owner::Host, true); // Startup, cached system bitmap.
+        pointer.tick(Owner::Host, false); // Idle AcquireNextFrame timeout.
+        pointer.state.shape_uploaded();
+        pointer.tick(Owner::Host, true); // A fallback texture changed on timeout.
+        pointer.state.pointer_known = true;
+        pointer.sample.dxgi_visible = true;
+        pointer.shape();
+        pointer.tick(Owner::Viewer, true);
+        pointer.sample.position = [15, 20];
+        pointer.tick(Owner::Viewer, false); // Position-only update skips video.
+        control.drawn.store(true, Ordering::Relaxed);
+        pointer.tick(Owner::Host, true); // Capture mouse without a new DXGI frame.
+        pointer.sample.position = [16, 20];
+        pointer.tick(Owner::Host, true); // OS fallback movement on a timeout.
+        control.drawn.store(false, Ordering::Relaxed);
+        pointer.tick(Owner::Viewer, true);
+        pointer.tick(Owner::Viewer, false);
+        pointer.plane.resize((200, 200), (100, 100));
+        assert_eq!(pointer.plane.shape.as_ref().unwrap().width, 2);
+        pointer.tick(Owner::Viewer, false); // Resolution change retains the plane.
+        pointer.sample.dxgi_visible = false;
+        pointer.tick(Owner::Desktop, true); // Cursor already embedded by DXGI.
+        pointer.sample.os_visible = Some(false);
+        pointer.tick(Owner::Hidden, true);
+        pointer.sample.os_visible = Some(true);
+        pointer.sample.on_output = false;
+        pointer.tick(Owner::Hidden, false);
+        pointer.sample.on_output = true;
+        pointer.sample.dxgi_visible = true;
+        pointer.sample.os_visible = None;
+        pointer.tick(Owner::Host, true); // Failed OS query retains composition.
+        pointer.sample.os_visible = Some(true);
+        pointer.plane.invalidate();
+        pointer.state.fallback_needed = true;
+        pointer.tick(Owner::Host, false); // Unreadable DXGI shape.
+        pointer
+            .plane
+            .shape(info(4, 1, 1, 4), &[1, 2, 3, 255], (1, 1), (1, 1));
+        pointer.tick(Owner::Host, false); // Arbitrary XOR stays composited.
+        for output_changed in [false, true] {
+            if output_changed {
+                pointer.plane = Plane::new(control.clone());
+                pointer.state = CaptureState::default();
+            } else {
+                pointer.plane.invalidate();
+                pointer.state.restart();
+            }
+            assert!(!pointer.state.source_ready);
+            pointer.state.source_ready = true; // First desktop after reopening.
+            pointer.sample.dxgi_visible = false;
+            pointer.tick(Owner::Host, true);
+            pointer.tick(Owner::Host, false);
+            pointer.state.pointer_known = true;
+            pointer.sample.dxgi_visible = true;
+            pointer.shape();
+            pointer.tick(Owner::Viewer, true);
+        }
+        *control.sink.lock() = None;
+        pointer.tick(Owner::Host, true); // A viewer without a plane sink uses composition.
     }
     #[test]
     fn colour_alpha_and_padded_odd_rows_are_straight_rgba() {
@@ -490,15 +918,16 @@ mod tests {
         assert!(plane.separate(true, false));
         assert!(!plane.separate(false, false));
         assert!(!plane.separate(true, true));
-        plane.publish(true, [10, 20], true);
+        let now = Instant::now();
+        plane.publish_at(true, [10, 20], true, now);
         let first = updates.lock()[0].shape.clone().unwrap();
         assert_eq!(
             (first.width, first.height, first.hot_x, first.hot_y),
             (2, 2, 1, 1)
         );
         plane.shape(metadata, &[255; 80], (3840, 2160), (1920, 1080));
-        plane.publish(true, [11, 20], true);
-        plane.publish(true, [11, 20], true);
+        plane.publish_at(true, [11, 20], true, now + POSITION_INTERVAL);
+        plane.publish_at(true, [11, 20], true, now + POSITION_INTERVAL);
         assert_eq!(updates.lock().len(), 2);
         assert!(updates.lock()[1].shape.is_none());
         plane.publish(false, [11, 20], true);

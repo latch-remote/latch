@@ -100,18 +100,48 @@ priority backpressure or a full bounded control inbox. Every cursor update
 uses the original ordered connection, regardless of its serialized size.
 
 `Cursor.position` is sent only when the request offers `cursor_position`, and
-cursor messages still require `Accept.cursor`. An absent position retains the
-local-pointer placement used by 6.0.0 hosts/viewers. Both new fields default to
-absent/false, and 6.0.0 peers ignore unknown JSON fields. Shapes/visibility and
-`DrawCursor` retain their existing meanings and protocol version 1.
+cursor messages still require `Accept.cursor`. In focused free-mouse mode the
+viewer's local pointer is authoritative, including while stationary. Host
+positions never override it, so pointer placement has no network round trip.
+An unfocused free-mouse viewer uses the host hotspot to show other input
+sources or application warps. A missing position keeps local placement, as
+with 6.0.0 peers. Captured mode uses the host-composited cursor. Drawing waits
+for valid stream geometry, using the negotiated size until complete stats
+arrive. Shapes and visibility remain host-authoritative in every mode.
+Both new fields default to absent/false, and 6.0.0 peers ignore unknown JSON
+fields. Shapes/visibility and `DrawCursor` retain their existing meanings and
+protocol version 1.
 
 Windows publishes pointer-only DXGI updates independently of video frames.
-Colour cursors use straight sRGB alpha, monochrome inversion uses white pixels
-with a dark outline, and masked colour uses copy/transparent pixels plus the
-same outlined inversion. Arbitrary colour XOR and unreadable shapes stay
+Position-only updates are coalesced to at most 120 Hz, with the latest position
+published on a subsequent capture tick. Shape and visibility changes are
+immediate. Invisible planes omit positions. Each viewer's wire state is
+deduplicated after removing fields it did not negotiate, so 6.0.0 viewers
+receive no duplicate controls for pointer-only motion.
+
+Colour cursors use straight-alpha sRGB on the wire. DXGI colour buffers are
+straight-alpha BGRA, matching Microsoft's Desktop Duplication sample, which
+uploads those bytes unchanged and blends using `SRC_ALPHA` and
+`INV_SRC_ALPHA`. The GDI bitmap fallback unpremultiplies its colour bitmap
+once on read. Mac sources that supply premultiplied pixels must likewise
+unpremultiply before sending. Monochrome inversion uses white pixels with a
+dark outline, and masked colour uses copy/transparent pixels plus the same
+outlined inversion. Arbitrary colour XOR and unreadable shapes stay
 composited, with plane visibility false during fallback. Hidden and off-output
-pointers are reported invisible. Separate RGBA uses the viewer's SDR UI white
-on SDR and HDR sessions, while the composited HDR path uses host SDR white.
+pointers are reported invisible. The fallback caches by system cursor handle
+and retries unsuccessful reads after 250 ms. Resolution changes rescale the
+retained shape, and reconnect resets the viewer's cached texture because a
+restarted host can reuse shape serials.
+[Microsoft's colour-buffer upload and blend state](https://github.com/microsoft/Windows-classic-samples/blob/main/Samples/DXGIDesktopDuplication/cpp/OutputManager.cpp)
+
+On native HDR output, separate RGBA uses the viewer's SDR UI white, mapped by
+its local compositor. The composited HDR path encodes the cursor at the host
+SDR white level in nits (the host's white multiplier × 80, then BT.2020/PQ).
+The cursor protocol carries no SDR white luminance metadata, so the viewer
+cannot reproduce the host's chosen luminance in its UI plane. Consequently,
+captured/free switches can change cursor brightness when those white levels
+differ. SDR output uses sRGB white in both paths. Physical HDR cursor
+brightness and live Windows capture of the separate plane remain unverified.
 
 `Accept`:
 
