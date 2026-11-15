@@ -163,6 +163,31 @@ pub(crate) fn straight(channel: u8, alpha: u8) -> u8 {
 /// changes bypass the interval so mode switches and hiding remain immediate.
 const POSITION_INTERVAL: Duration = Duration::from_micros(8_334);
 
+/// Sample position independently of capture, encoding and video pacing. Two
+/// ticks bound sampling plus coalescing to 16.668 ms, excluding OS scheduling
+/// and control-transport backpressure. Shape and ownership stay capture-owned.
+pub(crate) fn position_worker(
+    control: &Control,
+    stop: &std::sync::mpsc::Receiver<()>,
+    mut sample: impl FnMut() -> Option<[i32; 2]>,
+) {
+    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stop.recv_timeout(POSITION_INTERVAL)
+    {
+        if control.drawn.load(Ordering::Relaxed)
+            || !control
+                .publication
+                .lock()
+                .last
+                .is_some_and(|last| last.visible)
+        {
+            continue;
+        }
+        if let Some(point) = sample() {
+            control.publish_position_at(point, Instant::now());
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Published {
     visible: bool,
@@ -170,10 +195,61 @@ struct Published {
     serial: u32,
 }
 
+#[derive(Clone, Copy)]
+struct PositionSource {
+    display: crate::input::DisplayRect,
+    stream: (u32, u32),
+}
+#[derive(Default)]
+struct Publication {
+    last: Option<Published>,
+    last_sent: Option<Instant>,
+    source: Option<PositionSource>,
+}
+impl Publication {
+    fn publish(
+        &mut self,
+        control: &Control,
+        current: Published,
+        shape: Option<&CursorShape>,
+        now: Instant,
+    ) {
+        if self.last == Some(current) {
+            return;
+        }
+        let position_only = self
+            .last
+            .is_some_and(|last| last.visible == current.visible && last.serial == current.serial);
+        if position_only
+            && self
+                .last_sent
+                .is_some_and(|at| now.saturating_duration_since(at) < POSITION_INTERVAL)
+        {
+            return;
+        }
+        let Some(sink) = control.sink.lock().clone() else {
+            return;
+        };
+        sink(Cursor {
+            visible: current.visible,
+            position: current.position,
+            shape: if current.visible && self.last.is_none_or(|last| last.serial != current.serial)
+            {
+                shape.cloned()
+            } else {
+                None
+            },
+        });
+        self.last = Some(current);
+        self.last_sent = Some(now);
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Control {
     pub drawn: AtomicBool,
     pub sink: Mutex<Option<crate::video::CursorSink>>,
+    publication: Mutex<Publication>,
 }
 impl Control {
     pub fn composited() -> Arc<Self> {
@@ -182,25 +258,45 @@ impl Control {
             ..Default::default()
         })
     }
+    fn publish_position_at(&self, point: [i32; 2], now: Instant) {
+        let mut publication = self.publication.lock();
+        let (Some(source), Some(last)) = (publication.source, publication.last) else {
+            return;
+        };
+        // Only capture may enable a plane or replace its shape. Position
+        // sampling keeps the latest known shape moving until capture resumes.
+        if self.drawn.load(Ordering::Relaxed) || !last.visible {
+            return;
+        }
+        let (point, on_output) = position(point, source.display, source.stream);
+        if on_output {
+            publication.publish(
+                self,
+                Published {
+                    position: Some(point),
+                    ..last
+                },
+                None,
+                now,
+            );
+        }
+    }
 }
 
 pub(crate) struct Plane {
     pub control: Arc<Control>,
     pub shape: Option<CursorShape>,
     shape_visible: bool,
-    last: Option<Published>,
-    last_sent: Option<Instant>,
     source_shape: Option<(ShapeInfo, Vec<u8>)>,
     serial: u32,
 }
 impl Plane {
     pub fn new(control: Arc<Control>) -> Self {
+        *control.publication.lock() = Publication::default();
         Self {
             control,
             shape: None,
             shape_visible: false,
-            last: None,
-            last_sent: None,
             source_shape: None,
             serial: 0,
         }
@@ -279,43 +375,31 @@ impl Plane {
         now: Instant,
     ) {
         let visible = visible && separate && self.shape_visible;
+        let mut publication = self.control.publication.lock();
         let serial = if visible {
             self.serial
         } else {
-            self.last.map_or(0, |last| last.serial)
+            publication.last.map_or(0, |last| last.serial)
         };
-        let current = Published {
-            visible,
-            position: visible.then_some(position),
-            serial,
-        };
-        if self.last == Some(current) {
-            return;
-        }
-        let position_only = self
-            .last
-            .is_some_and(|last| last.visible == current.visible && last.serial == current.serial);
-        if position_only
-            && self
-                .last_sent
-                .is_some_and(|at| now.duration_since(at) < POSITION_INTERVAL)
-        {
-            return;
-        }
-        let Some(sink) = self.control.sink.lock().clone() else {
-            return;
-        };
-        sink(Cursor {
-            visible,
-            position: current.position,
-            shape: if visible && self.last.is_none_or(|last| last.serial != serial) {
-                self.shape.clone()
-            } else {
-                None
+        publication.publish(
+            &self.control,
+            Published {
+                visible,
+                position: visible.then_some(position),
+                serial,
             },
-        });
-        self.last = Some(current);
-        self.last_sent = Some(now);
+            self.shape.as_ref(),
+            now,
+        );
+    }
+    pub fn track_position(
+        &self,
+        display: crate::input::DisplayRect,
+        stream: (u32, u32),
+        separate: bool,
+    ) {
+        self.control.publication.lock().source =
+            separate.then_some(PositionSource { display, stream });
     }
     pub fn invalidate(&mut self) {
         self.shape = None;
@@ -351,6 +435,7 @@ pub(crate) struct CaptureState {
     pub pointer_known: bool,
     pub fallback_needed: bool,
     pub source_ready: bool,
+    pub bitmap_warning: bool,
     fallback_key: Option<usize>,
     fallback_cached: bool,
     retry_at: Option<Instant>,
@@ -364,6 +449,7 @@ impl Default for CaptureState {
             pointer_known: false,
             fallback_needed: true,
             source_ready: false,
+            bitmap_warning: false,
             fallback_key: None,
             fallback_cached: false,
             retry_at: None,
@@ -390,6 +476,7 @@ impl CaptureState {
         self.retry_at = Some(now + Duration::from_millis(250));
     }
     pub fn shape_uploaded(&mut self) {
+        self.bitmap_warning = false;
         self.revision = self.revision.wrapping_add(1);
     }
     pub fn dxgi_shape(&mut self) {
@@ -431,11 +518,9 @@ impl CaptureState {
         });
         (visible, owner)
     }
-    pub fn can_render(&self, bitmap_ready: bool) -> bool {
-        self.source_ready
-            && self
-                .current
-                .is_some_and(|state| state.owner != Owner::Host || bitmap_ready)
+    pub fn can_render(&self) -> bool {
+        // Cursor recovery must never hold up a usable desktop picture.
+        self.source_ready && self.current.is_some()
     }
     pub fn needs_render(&self) -> bool {
         self.current != self.rendered
@@ -558,6 +643,70 @@ mod tests {
         assert_eq!(updates.lock()[2].position, None);
     }
     #[test]
+    fn position_worker_delivers_final_motion_while_video_is_blocked() {
+        let control = Control::composited();
+        control.drawn.store(false, Ordering::Relaxed);
+        let (updates, received) = std::sync::mpsc::channel();
+        *control.sink.lock() = Some(Arc::new(move |cursor| {
+            updates.send(cursor).unwrap();
+        }));
+        let mut plane = Plane::new(control.clone());
+        plane.shape(info(2, 1, 1, 4), &[255; 4], (100, 100), (100, 100));
+        plane.track_position(
+            crate::input::DisplayRect {
+                width: 100,
+                height: 100,
+                ..Default::default()
+            },
+            (100, 100),
+            true,
+        );
+        let now = Instant::now();
+        plane.publish_at(true, [0, 0], true, now);
+        received.recv().unwrap();
+        let final_motion = now + Duration::from_micros(1);
+        control.publish_position_at([9, 7], final_motion);
+        assert!(received.try_recv().is_err());
+        // Deterministic deadline, with no capture tick or encoded frame.
+        control.publish_position_at([9, 7], now + POSITION_INTERVAL);
+        let moved = received.try_recv().unwrap();
+        assert_eq!(moved.position, Some([9, 7]));
+        assert!(moved.shape.is_none());
+        assert!(
+            control
+                .publication
+                .lock()
+                .last_sent
+                .unwrap()
+                .duration_since(final_motion)
+                <= POSITION_INTERVAL * 2
+        );
+
+        let (stop, stopped) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker_control = &control;
+            scope.spawn(move || position_worker(worker_control, &stopped, || Some([19, 17])));
+            // Model an encoder or network pacer that never requests capture
+            // again. The OS position sampler still sends the final position.
+            let moved = received.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(moved.position, Some([19, 17]));
+            assert!(moved.shape.is_none());
+            stop.send(()).unwrap();
+        });
+        // Idle sampling never adds a shape, changes ownership, or revives a
+        // hidden/unreadable plane. Other outputs cannot move this plane.
+        control.publish_position_at([101, 40], now + POSITION_INTERVAL * 10);
+        assert!(received.try_recv().is_err());
+        control.drawn.store(true, Ordering::Relaxed);
+        control.publish_position_at([30, 40], now + POSITION_INTERVAL * 10);
+        assert!(received.try_recv().is_err());
+        control.drawn.store(false, Ordering::Relaxed);
+        plane.invalidate();
+        received.recv().unwrap();
+        control.publish_position_at([30, 40], now + POSITION_INTERVAL * 10);
+        assert!(received.try_recv().is_err());
+    }
+    #[test]
     fn fallback_reads_once_per_handle_and_retries_failures_after_250_ms() {
         let mut state = CaptureState::default();
         let now = Instant::now();
@@ -581,7 +730,7 @@ mod tests {
         assert!(state.fallback_due(2, now + Duration::from_secs(1)));
     }
     #[test]
-    fn fallback_waits_for_a_bitmap_and_desktop_then_recovers_on_an_idle_tick() {
+    fn frames_keep_flowing_when_no_cursor_bitmap_ever_arrives() {
         let mut state = CaptureState::default();
         let sample = PointerSample {
             os_visible: Some(true),
@@ -590,19 +739,47 @@ mod tests {
             position: [1, 2],
         };
         assert_eq!(state.update(sample, false).1, Owner::Host);
-        assert!(!state.can_render(true)); // No desktop has been acquired.
+        assert!(!state.can_render()); // Still need the first desktop picture.
         state.source_ready = true;
         let now = Instant::now();
+        let mut reads = 0;
+        for millis in 0..2000 {
+            let at = now + Duration::from_millis(millis);
+            if state.fallback_due(1, at) {
+                reads += 1;
+                state.fallback_read(false, at); // Current bitmap and arrow failed.
+            }
+            state.update(sample, false);
+            assert!(state.can_render(), "video stalled at {millis} ms");
+            state.rendered();
+        }
+        assert_eq!(reads, 8); // Recovery keeps its 250 ms backoff.
+    }
+    #[test]
+    fn pointer_recovery_repaints_an_idle_desktop_after_cursor_free_frames() {
+        let mut state = CaptureState {
+            source_ready: true,
+            ..Default::default()
+        };
+        let sample = PointerSample {
+            os_visible: Some(true),
+            on_output: true,
+            dxgi_visible: false,
+            position: [1, 2],
+        };
+        let now = Instant::now();
+        state.update(sample, false);
         assert!(state.fallback_due(1, now));
-        state.fallback_read(false, now); // Both bitmap and system arrow failed.
-        assert!(!state.can_render(false)); // Never emit a cursor-free frame.
+        state.fallback_read(false, now);
+        assert!(state.can_render());
+        state.rendered(); // The desktop was delivered without a bitmap.
         assert!(!state.fallback_due(1, now + Duration::from_millis(100)));
         assert!(state.fallback_due(1, now + Duration::from_millis(250)));
         state.fallback_read(true, now + Duration::from_millis(250));
         state.shape_uploaded();
-        state.update(sample, false); // Timeout tick, with no new mouse event.
-        assert!(state.can_render(true));
-        assert!(state.needs_render());
+        assert_eq!(state.update(sample, false).1, Owner::Host);
+        assert!(state.can_render());
+        assert!(state.needs_render()); // No new desktop or mouse event needed.
         state.rendered();
         assert!(!state.needs_render());
     }
@@ -629,8 +806,7 @@ mod tests {
                 );
                 let (visible, owner) = self.state.update(self.sample, separate);
                 assert_eq!(owner, expected);
-                assert!(self.state.can_render(true));
-                assert_eq!(self.state.can_render(false), owner != Owner::Host);
+                assert!(self.state.can_render());
                 let host_draws = matches!(owner, Owner::Desktop | Owner::Host);
                 let viewer_draws = owner == Owner::Viewer;
                 assert_eq!(

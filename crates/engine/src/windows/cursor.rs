@@ -7,6 +7,19 @@ use windows::Win32::{
     UI::WindowsAndMessaging::*,
 };
 
+/// Query only the visible pointer's hotspot. This runs on its own
+/// thread and never touches D3D resources or reads a cursor bitmap.
+pub(super) fn position_sample() -> Option<[i32; 2]> {
+    let _dpi = super::display::DpiAwareness::physical();
+    let mut cursor = CURSORINFO {
+        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: cursor is initialized with the SDK structure size.
+    unsafe { GetCursorInfo(&mut cursor) }.ok()?;
+    (cursor.flags == CURSOR_SHOWING).then_some([cursor.ptScreenPos.x, cursor.ptScreenPos.y])
+}
+
 struct Icon(ICONINFO);
 impl Drop for Icon {
     fn drop(&mut self) {

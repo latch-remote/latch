@@ -103,21 +103,31 @@ uses the original ordered connection, regardless of its serialized size.
 cursor messages still require `Accept.cursor`. In focused free-mouse mode the
 viewer's local pointer is authoritative, including while stationary. Host
 positions never override it, so pointer placement has no network round trip.
-An unfocused free-mouse viewer uses the host hotspot to show other input
-sources or application warps. A missing position keeps local placement, as
-with 6.0.0 peers. Captured mode uses the host-composited cursor. Drawing waits
-for valid stream geometry, using the negotiated size until complete stats
+If an application warps the host pointer or another mouse moves it while the
+focused viewer is driving it, the drawn cursor stays at the local position
+until the user next moves the mouse. Host hover effects can therefore diverge
+from the drawn cursor while local input is stationary.
+An unfocused free-mouse viewer draws a host-position plane only while the local
+pointer is outside the stream area. Inside that area the visible local OS arrow
+is the only viewer-drawn pointer. Hosts without positions retain the 6.0.0
+viewer behavior, including returning before cursor drawing and `DrawCursor`
+updates while unfocused. Captured mode uses the host-composited cursor. Drawing
+waits for valid stream geometry, using the negotiated size until complete stats
 arrive. Shapes and visibility remain host-authoritative in every mode.
 Both new fields default to absent/false, and 6.0.0 peers ignore unknown JSON
 fields. Shapes/visibility and `DrawCursor` retain their existing meanings and
 protocol version 1.
 
 Windows publishes pointer-only DXGI updates independently of video frames.
-Position-only updates are coalesced to at most 120 Hz, with the latest position
-published on a subsequent capture tick. Shape and visibility changes are
-immediate. Invisible planes omit positions. Each viewer's wire state is
-deduplicated after removing fields it did not negotiate, so 6.0.0 viewers
-receive no duplicate controls for pointer-only motion.
+Position-only updates are coalesced to at most 120 Hz. A separate OS-position
+sampler runs every 8.334 ms independently of capture, encoding and video pacing.
+For an established visible plane, the final position enters the control mailbox
+within two ticks (16.668 ms) after motion stops, excluding OS scheduling and
+control-transport backpressure. The sampler never enables a hidden plane or
+changes cursor ownership. Shape and visibility changes from capture bypass the
+rate limit. Invisible planes omit positions. Each viewer's wire state is
+deduplicated after removing fields it did not negotiate, so 6.0.0 viewers receive
+no duplicate controls for pointer-only motion.
 
 Colour cursors use straight-alpha sRGB on the wire. DXGI colour buffers are
 straight-alpha BGRA, matching Microsoft's Desktop Duplication sample, which
@@ -129,9 +139,13 @@ dark outline, and masked colour uses copy/transparent pixels plus the same
 outlined inversion. Arbitrary colour XOR and unreadable shapes stay
 composited, with plane visibility false during fallback. Hidden and off-output
 pointers are reported invisible. The fallback caches by system cursor handle
-and retries unsuccessful reads after 250 ms. Resolution changes rescale the
-retained shape, and reconnect resets the viewer's cached texture because a
-restarted host can reuse shape serials.
+and retries unsuccessful reads after 250 ms. Video has a zero cursor-wait bound.
+If both the current bitmap and system arrow are unreadable, frames continue
+with the last readable bitmap, or without one if none is available. The host logs
+once per failure episode, and idle capture ticks repaint the pointer when a
+bitmap becomes readable. Resolution changes rescale the retained shape, and
+reconnect resets the viewer's cached texture because a restarted host can reuse
+shape serials.
 [Microsoft's colour-buffer upload and blend state](https://github.com/microsoft/Windows-classic-samples/blob/main/Samples/DXGIDesktopDuplication/cpp/OutputManager.cpp)
 
 On native HDR output, separate RGBA uses the viewer's SDR UI white, mapped by

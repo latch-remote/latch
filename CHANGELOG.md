@@ -22,6 +22,12 @@ GitHub release notes, so each version gets a heading of the form
   with a 250 ms failure retry, preserve shapes across resolution changes and
   reset viewer cursor textures on reconnect. Test capture ownership through
   mode switches, idle timeouts, fallback and capture/output restarts.
+- Continue Windows video immediately when all cursor bitmap reads fail, retry
+  recovery on its backoff, and publish the final position of an established
+  visible cursor within 16.668 ms independently of video pacing. Suppress extra
+  cursor planes over an unfocused viewer's local arrow, preserve no-position
+  host behavior and test actual viewer painting across cursor ownership states.
+  Document focused local-pointer authority when host warps or other mice move it.
 
 ### Relay connectivity
 

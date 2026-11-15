@@ -672,7 +672,10 @@ impl Capture {
                 self.cursor_state
                     .fallback_read(result.is_ok() && actual_shape, now);
                 if let Err(error) = result {
-                    tracing::warn!("system cursor fallback unavailable: {error:#}");
+                    if !self.cursor_state.bitmap_warning {
+                        tracing::warn!("system cursor fallback unavailable, continuing video with the last readable bitmap if available: {error:#}");
+                        self.cursor_state.bitmap_warning = true;
+                    }
                 }
             }
             self.composite_pointer.Visible = self.renderer.shape.is_some().into();
@@ -699,13 +702,14 @@ impl Capture {
             },
             separate,
         );
-        self.composite_pointer.Visible = (owner == Owner::Host).into();
+        self.composite_pointer.Visible =
+            (owner == Owner::Host && self.renderer.shape.is_some()).into();
+        self.plane
+            .track_position(self.display, self.stream_size, separate);
         self.plane.publish(visible, position, separate);
-        // Keep the session alive while bitmap reads retry. No frame with a
-        // missing visible cursor is emitted, even if the system arrow failed.
-        self.cursor_state
-            .can_render(self.renderer.shape.is_some())
-            .then_some(separate)
+        // Deliver usable desktop pictures immediately while bitmap recovery
+        // retries on its backoff. Missing pointer data never freezes video.
+        self.cursor_state.can_render().then_some(separate)
     }
 
     fn render(&mut self, separate: bool) -> Result<()> {

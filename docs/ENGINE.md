@@ -194,7 +194,11 @@ and a one-pixel dark outline. Arbitrary colour XOR remains in the GPU compositor
 Malformed shapes, unknown visibility and desktop-embedded pointers also keep
 composition enabled. If DXGI shape retrieval fails, GetIconInfo/GetDIBits recover
 a system cursor for composition, with the shared system arrow as the final
-readable-shape fallback. Hidden/suppressed and off-output cursors stay hidden.
+readable-shape fallback. Cursor recovery never delays a usable desktop frame.
+If both reads fail, video continues immediately with the last readable bitmap,
+or without one if none is available, with one warning per failure episode and
+retries every 250 ms. An idle capture tick repaints the retained desktop when a bitmap becomes available.
+Hidden/suppressed and off-output cursors stay hidden.
 
 Shapes already contain the host's physical DPI sizing. The Linux scaler scales
 Windows shapes and hotspots to the stream content, including the 96×96 wire
@@ -202,7 +206,22 @@ bound. Positions are hotspot coordinates relative to the output, fitted into the
 stream including letterboxing. Pointer-only DXGI acquisitions publish through
 a coalescing mailbox and a separate control sender before conversion/encoding.
 They leave the retained video picture alone while the separate plane is active.
-Shape data is sent only when the converted/scaled shape changes.
+Shape data is sent only when the converted/scaled shape changes. A separate
+OS-position worker samples every 8.334 ms, sharing serial-based publication
+and the 120 Hz position limit with capture. It continues while encoding or video
+pacing blocks capture. For an established visible plane, the final position
+enters the control mailbox within 16.668 ms of motion stopping, excluding OS
+scheduling and control-transport backpressure. The worker never enables a hidden
+plane, changes ownership or touches D3D resources, and is joined on pipeline drop.
+
+While a focused free-mouse viewer drives the pointer, its local position is
+authoritative. If an application warps the host pointer or another mouse moves
+it, the drawn cursor stays at the local position until the user next moves the
+mouse. Hover effects on the host can diverge while the local pointer is still.
+An unfocused viewer with host positions draws the plane only when the local
+pointer is outside the stream area. Inside it, the local OS arrow stays visible
+and the viewer adds no plane. No-position hosts keep the previous unfocused
+behavior, with no plane painting or `DrawCursor` updates.
 
 Separate cursor bytes remain sRGB on SDR and HDR desktops/sessions. The viewer
 renders them with its SDR UI white, including over native HDR presentation. The
