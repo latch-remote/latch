@@ -38,15 +38,16 @@ releases without this script.
 
 ## Publishing
 
-None of these are set up yet. Each needs an account owned by a maintainer.
+**Scoop.** Published in [latch-remote/scoop-bucket](https://github.com/latch-remote/scoop-bucket)
+as `bucket/latch.json`, copied from `scoop/latch.json` here. Users run
+`scoop bucket add latch https://github.com/latch-remote/scoop-bucket` and
+`scoop install latch/latch`. The bucket's Excavator workflow runs
+`checkver` every four hours and commits new versions itself, so a release
+needs no change there. Copy the manifest across only when something other
+than the version and hash changes.
 
-**Scoop.** Create a public bucket repository (for example
-`latch-remote/scoop-bucket`) with `bucket/latch.json` copied from here.
-Users run `scoop bucket add latch https://github.com/latch-remote/scoop-bucket`
-and `scoop install latch/latch`. The
-[bucket template](https://github.com/ScoopInstaller/BucketTemplate) includes
-a scheduled Excavator workflow that runs `checkver` and commits new
-versions. The Extras bucket is an alternative, subject to its review.
+The AUR and nixpkgs packages are not published yet. Each needs an account
+owned by a maintainer.
 
 **AUR.** With an AUR account and an SSH key registered on it, for each of
 `latch-remote` and `latch-remote-bin`:
