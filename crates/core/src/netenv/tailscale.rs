@@ -92,7 +92,7 @@ pub(super) fn diagnose(
     let health = serde_json::from_str::<Health>(status_json).unwrap_or_default();
     let netcheck = netcheck_json.and_then(|json| tailscale::parse_netcheck(json).ok());
     let mut result = classify(&status, health.health.as_deref().unwrap_or_default(), peer);
-    if result.derp_region.is_none() {
+    if peer.is_none() && result.derp_region.is_none() {
         let region = if !status.self_node.relay.is_empty() {
             status.self_node.relay.as_str()
         } else {
@@ -172,7 +172,7 @@ fn classify(status: &Status, health: &[String], peer: Option<&str>) -> Tailscale
     if !node.peer_relay.is_empty() {
         let mut result = TailscaleDiagnosis::new(
             R::PeerRelay,
-            "Tailscale is using a relay on your network. This path still needs working UDP.",
+            "Tailscale is going through one of your own machines acting as a relay. This path still needs working UDP.",
         );
         result.peer_relay = Some(node.peer_relay.clone());
         return result;

@@ -156,17 +156,33 @@ fn scutil_fixtures() {
 fn linux_desktop_fixtures() {
     let text = include_str!("fixtures/gsettings.txt");
     let result = linux::gsettings(text, "relay.test").unwrap();
-    assert_eq!(
-        addresses(&result),
-        ["http://[redacted]@secure-proxy.test:3128"]
-    );
+    assert_eq!(addresses(&result), ["http://secure-proxy.test:3128"]);
+    assert!(matches!(
+        &result.candidates[0].proxy,
+        Proxy::Http {
+            credentials: None,
+            ..
+        }
+    ));
+    let same_host = text.replace("secure-proxy.test", "plain-proxy.test");
+    let result = linux::gsettings(&same_host, "relay.test").unwrap();
+    assert!(matches!(
+        &result.candidates[0].proxy,
+        Proxy::Http {
+            credentials: None,
+            ..
+        }
+    ));
+    let same_endpoint = same_host.replace("https port 3128", "https port 8080");
+    let result = linux::gsettings(&same_endpoint, "relay.test").unwrap();
     let Proxy::Http {
         credentials: Some(credentials),
         ..
     } = &result.candidates[0].proxy
     else {
-        panic!();
+        panic!()
     };
+    assert_eq!(credentials.username(), "alice");
     assert_eq!(credentials.password(), "p'ass");
     assert_eq!(
         addresses(&linux::gsettings(text, "a.internal.test").unwrap()),
@@ -185,7 +201,7 @@ fn linux_desktop_fixtures() {
     let auto =
         linux::gsettings(&text.replace("mode 'manual'", "mode 'auto'"), "relay.test").unwrap();
     assert!(auto.candidates.is_empty());
-    assert!(auto.warnings[0].contains("PAC"));
+    assert!(auto.warnings[0] == NetworkWarning::LinuxPacUnavailable);
     assert!(linux::gsettings("garbage", "relay.test").is_none());
     let kde = include_str!("fixtures/kioslaverc");
     assert_eq!(
@@ -235,6 +251,9 @@ fn status_and_netcheck_fixtures() {
     ] {
         let result = tailscale::diagnose(status, Some(netcheck), peer);
         assert_eq!(result.reason, reason);
+        if peer.is_some() && reason != R::DerpOnly {
+            assert_eq!(result.derp_region, None, "{peer:?}");
+        }
         assert!(!result.netcheck.unwrap().udp);
         assert!(!result.message.is_empty());
         assert!(!reason.code().is_empty());
@@ -360,6 +379,8 @@ fn portal_http_fixtures() {
     assert_eq!(url.as_str(), "https://portal.test/login?token=private#id");
     assert!(!format!("{portal:?} {url}").contains("private"));
     assert!(!format!("{portal:?}").contains("secret"));
+    assert!(!format!("{portal:?} {url}").contains("/login"));
+    assert_eq!(format!("{url}"), "https://portal.test/");
     let portal = classify(&target, b"HTTP/1.1 302 Found\r\nLocation: /signin\r\n\r\n");
     let CaptivePortal::Captive {
         portal_url: Some(url),
@@ -407,6 +428,7 @@ fn cache_never_returns_another_network_or_options() {
     let mut cache = NetworkEnvironment {
         cached: None,
         pending: Some((1, options.clone(), rx)),
+        queued: None,
     };
     assert!(cache.get(1, &options).is_none());
     tx.send(NetworkDiagnosis::default()).unwrap();
@@ -414,7 +436,7 @@ fn cache_never_returns_another_network_or_options() {
     assert!(cache.get(1, &options).is_some());
     assert!(cache.get(2, &options).is_none());
     assert!(cache.get(1, &Options::new("another.test")).is_none());
-    assert!(cache.request(1, options));
+    assert_eq!(cache.request(1, options), RequestStatus::Cached);
     assert!(cache.pending.is_none());
 }
 #[test]
@@ -466,6 +488,10 @@ fn portal_probe_accepts_chunked_and_bounds_a_stalled_server() {
     let addr = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -522,22 +548,54 @@ fn aggregate_returns_partial_results_at_the_deadline() {
 }
 
 #[test]
-fn timed_out_workers_remain_capped_until_they_finish() {
-    let mut releases = Vec::new();
-    for _ in 0..8 {
-        let (tx, rx) = mpsc::channel::<()>();
-        assert!(spawn_job(move || {
-            let _ = rx.recv();
-        }));
-        releases.push(tx);
-    }
-    assert!(!spawn_job(|| panic!("worker limit must reject this job")));
-    drop(releases);
+fn stalled_checks_coalesce_without_starving_other_kinds() {
+    let slots: [Arc<JobSlot>; 4] = std::array::from_fn(|_| Arc::new(JobSlot::default()));
+    let options = Options::new("relay.test");
+    let (release, stalled) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
     let deadline = Instant::now() + Duration::from_secs(2);
-    while JOBS.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
-        std::thread::yield_now();
+    assert!(slots[0].subscribe(
+        CheckKind::Proxy,
+        &options,
+        tx.clone(),
+        deadline,
+        move || {
+            stalled.recv().unwrap();
+            Observation::Proxy(ProxyDiscovery::one(Proxy::Direct, ProxySource::MacSystem))
+        }
+    ));
+    for _ in 0..30 {
+        assert!(
+            slots[0].subscribe(CheckKind::Proxy, &options, tx.clone(), deadline, || panic!(
+                "coalesced requests must never start another OS job"
+            ))
+        );
     }
-    assert_eq!(JOBS.load(Ordering::Acquire), 0);
+    assert!(!slots[0].subscribe(
+        CheckKind::Proxy,
+        &Options::new("different.test"),
+        tx.clone(),
+        deadline,
+        || panic!("different inputs must remain pending")
+    ));
+    assert!(
+        slots[2].subscribe(CheckKind::Tailscale, &options, tx, deadline, || {
+            Observation::Tailscale(TailscaleDiagnosis::unknown())
+        })
+    );
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        Observation::Tailscale(_)
+    ));
+    assert!(rx.try_recv().is_err());
+    release.send(()).unwrap();
+    for _ in 0..31 {
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Observation::Proxy(_)
+        ));
+    }
+    assert!(slots[0].0.lock().unwrap().is_none());
 }
 
 #[test]
@@ -574,4 +632,213 @@ fn https_destination_accepts_ip_literals_and_rejects_url_components() {
     ] {
         assert!(destination_url(host).is_none());
     }
+}
+
+#[test]
+fn kde_environment_mode_resolves_the_bypass_variable() {
+    let env = BTreeMap::from([
+        ("PROXY".into(), "http://alice:secret@kde.test:8080".into()),
+        ("relay.test".into(), "bypass.test".into()),
+    ]);
+    let config = "[Proxy Settings]\nProxyType=4\nhttpsProxy=PROXY\nNoProxyFor=relay.test";
+    let result = linux::kioslaverc(config, "relay.test", &env).unwrap();
+    assert_eq!(addresses(&result), ["http://[redacted]@kde.test:8080"]);
+    assert_eq!(
+        addresses(&linux::kioslaverc(config, "bypass.test", &env).unwrap()),
+        ["direct"]
+    );
+    // Credentials remain tied to their own KDE/environment URL.
+    let Proxy::Http {
+        host,
+        port,
+        credentials: Some(auth),
+    } = &result.candidates[0].proxy
+    else {
+        panic!()
+    };
+    assert_eq!(
+        (host.as_str(), *port, auth.password()),
+        ("kde.test", 8080, "secret")
+    );
+}
+
+#[test]
+fn socks_fallback_is_diagnosed_and_https_credentials_stay_local() {
+    let result = winhttp(
+        "http=plain.test:80;socks=socks.test:1080",
+        "",
+        "relay.test",
+        ProxySource::WindowsUser,
+    );
+    assert!(result.candidates.is_empty());
+    assert_eq!(result.warnings, [NetworkWarning::UnsupportedPacProtocol]);
+    let result = winhttp(
+        "http=http://alice:secret@plain.test:80;https=secure.test:443",
+        "",
+        "relay.test",
+        ProxySource::WindowsUser,
+    );
+    assert_eq!(addresses(&result), ["http://secure.test:443"]);
+    let env = BTreeMap::from([
+        ("HTTPS_PROXY".into(), "secure.test:443".into()),
+        (
+            "ALL_PROXY".into(),
+            "http://alice:secret@other.test:80".into(),
+        ),
+    ]);
+    assert_eq!(
+        addresses(&environment(&env, "relay.test").unwrap()),
+        ["http://secure.test:443"]
+    );
+}
+
+#[test]
+fn scutil_ignores_scoped_dictionaries() {
+    let text = "<dictionary> {\nHTTPSEnable : 1\nHTTPSProxy : global.test\nHTTPSPort : 8080\n__SCOPED__ : <dictionary> {\nen0 : <dictionary> {\nHTTPSEnable : 1\nHTTPSProxy : scoped.test\nHTTPSPort : 3128\nExceptionsList : <array> {\n0 : relay.test\n}\n}\n}\n}";
+    assert_eq!(
+        addresses(&scutil(text, "relay.test")),
+        ["http://global.test:8080"]
+    );
+}
+
+#[test]
+fn clat_with_dns64_is_ipv6_only() {
+    let ips = ["192.0.0.2".parse().unwrap(), "2001:db8::1".parse().unwrap()];
+    let prefixes = [Nat64Prefix {
+        address: "64:ff9b::".parse().unwrap(),
+        length: 96,
+    }];
+    assert!(!ip::ipv6_only(&ips, &[]));
+    assert!(ip::ipv6_only(&ips, &prefixes));
+    assert!(!ip::ipv6_only(
+        &[ips[0], ips[1], "192.168.1.2".parse().unwrap()],
+        &prefixes
+    ));
+}
+
+#[test]
+fn configured_probe_overrides_a_lagging_native_portal_hint() {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = ProbeTarget::new(
+        &format!("http://{}/probe", listener.local_addr().unwrap()),
+        204,
+        &[],
+    )
+    .unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        crate::http::read_request(&mut stream).unwrap().unwrap();
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+            .unwrap();
+    });
+    assert_eq!(
+        portal::detect_with_native(&[target], Instant::now() + Duration::from_secs(2), || {
+            CaptivePortal::Captive { portal_url: None }
+        }),
+        CaptivePortal::OpenInternet
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn cache_restarts_the_latest_generation_from_poll() {
+    let mut options = Options::new("relay.test");
+    options.timeout = Duration::from_millis(100);
+    let (tx, rx) = mpsc::channel();
+    let mut cache = NetworkEnvironment {
+        pending: Some((1, options.clone(), rx)),
+        ..Default::default()
+    };
+    assert_eq!(cache.request(2, options.clone()), RequestStatus::Pending);
+    assert_eq!(cache.request(3, options.clone()), RequestStatus::Pending);
+    tx.send(NetworkDiagnosis::default()).unwrap();
+    cache.poll();
+    assert_eq!(cache.pending.as_ref().unwrap().0, 3);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while cache.get(3, &options).is_none() && Instant::now() < deadline {
+        cache.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(cache.get(3, &options).is_some());
+    assert!(cache.get(2, &options).is_none());
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[test]
+fn real_system_proxy_smoke() {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        tx.send(proxy::discover(&Options::new("relay.test"), deadline))
+            .unwrap();
+    });
+    let result = rx
+        .recv_timeout(Duration::from_millis(3500))
+        .expect("OS proxy API deadline");
+    for candidate in result.candidates {
+        assert_ne!(candidate.source, ProxySource::Override);
+        if let Proxy::Http { host, port, .. } = candidate.proxy {
+            assert!(!host.is_empty());
+            assert_ne!(port, 0);
+            assert!(destination_url(&host).is_some());
+        }
+    }
+    for warning in result.warnings {
+        assert!(!warning.message().contains('@'));
+        assert!(!warning.code().is_empty());
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn real_windows_portal_smoke() {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        tx.send(windows::portal()).unwrap();
+    });
+    let _ = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("WinRT connectivity API deadline");
+}
+
+#[test]
+fn warning_codes_are_stable_and_messages_are_credential_free() {
+    use NetworkWarning as W;
+    let warnings = [
+        (W::ChecksPending, "checks_pending"),
+        (W::ChecksTimedOut, "checks_timed_out"),
+        (W::InvalidProxy, "invalid_proxy"),
+        (W::InvalidDestination, "invalid_destination"),
+        (W::UnsupportedPacProtocol, "unsupported_pac_protocol"),
+        (W::MalformedPacCandidate, "malformed_pac_candidate"),
+        (W::PacEvaluatorUnavailable, "pac_evaluator_unavailable"),
+        (W::IncompleteSystemProxy, "incomplete_system_proxy"),
+        (W::LinuxPacUnavailable, "linux_pac_unavailable"),
+        (W::PacFailed, "pac_failed"),
+        (W::UnsupportedSystemProtocol, "unsupported_system_protocol"),
+        (W::MacStaticFallback, "mac_static_fallback"),
+        (W::MacSettingsUnavailable, "mac_settings_unavailable"),
+        (W::WpadFailed, "wpad_failed"),
+        (W::KeychainCredentialsUnread, "keychain_credentials_unread"),
+        (W::WindowsServiceSettings, "windows_service_settings"),
+    ];
+    for (warning, code) in warnings {
+        assert_eq!(warning.code(), code);
+        assert!(!warning.message().is_empty());
+        assert!(!warning.message().contains('@'));
+    }
+    assert_eq!(
+        W::KeychainCredentialsUnread.severity(),
+        WarningSeverity::Informational
+    );
+    assert_eq!(W::ChecksTimedOut.severity(), WarningSeverity::Actionable);
 }

@@ -1,5 +1,8 @@
 use super::proxy::{destination_url, winhttp, Proxy, ProxyDiscovery, ProxySource};
 use super::CaptivePortal;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Instant;
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{GlobalFree, HGLOBAL};
@@ -22,6 +25,37 @@ impl Drop for Session {
     }
 }
 
+// Numeric callback tokens avoid retaining pointers into timed-out callers.
+// Closing an async resolver cancels WPAD/PAC. Late callbacks find no receiver.
+fn callbacks() -> &'static Mutex<HashMap<usize, mpsc::Sender<bool>>> {
+    static CALLBACKS: OnceLock<Mutex<HashMap<usize, mpsc::Sender<bool>>>> = OnceLock::new();
+    CALLBACKS.get_or_init(Mutex::default)
+}
+unsafe extern "system" fn proxy_callback(
+    _handle: *mut std::ffi::c_void,
+    context: usize,
+    status: u32,
+    _info: *mut std::ffi::c_void,
+    _length: u32,
+) {
+    if matches!(
+        status,
+        WINHTTP_CALLBACK_STATUS_GETPROXYFORURL_COMPLETE | WINHTTP_CALLBACK_STATUS_REQUEST_ERROR
+    ) {
+        if let Ok(callbacks) = callbacks().lock() {
+            if let Some(tx) = callbacks.get(&context) {
+                let _ = tx.send(status == WINHTTP_CALLBACK_STATUS_GETPROXYFORURL_COMPLETE);
+            }
+        }
+    }
+}
+struct CallbackToken(usize);
+impl Drop for CallbackToken {
+    fn drop(&mut self) {
+        callbacks().lock().unwrap().remove(&self.0);
+    }
+}
+
 unsafe fn auto_proxy(
     url: &str,
     pac: &str,
@@ -33,31 +67,33 @@ unsafe fn auto_proxy(
         WINHTTP_ACCESS_TYPE_NO_PROXY,
         PCWSTR::null(),
         PCWSTR::null(),
-        0,
+        WINHTTP_FLAG_ASYNC,
     ));
     if session.0.is_null() {
         return None;
     }
-    let milliseconds = deadline
-        .saturating_duration_since(Instant::now())
-        .as_millis()
-        .clamp(1, 15000) as i32;
-    let _ = WinHttpSetTimeouts(
-        session.0,
-        milliseconds,
-        milliseconds,
-        milliseconds,
-        milliseconds,
-    );
     let target: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
     let pac: Vec<u16> = pac.encode_utf16().chain(Some(0)).collect();
-    // Explicit PAC first, then WPAD on failure. Never send current Windows
-    // credentials to a discovered PAC server (fAutoLogonIfChallenged=false).
-    for detect in [false, true] {
+    // Match WinHTTP/IE precedence. fAutoLogonIfChallenged stays false.
+    for detect in [true, false] {
         if (!detect && pac.len() == 1) || (detect && !auto_detect) {
             continue;
         }
-        let mut options = WINHTTP_AUTOPROXY_OPTIONS {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let mut handle = std::ptr::null_mut();
+        if WinHttpCreateProxyResolver(session.0, &mut handle) != 0 {
+            return None;
+        }
+        let resolver = Session(handle);
+        WinHttpSetStatusCallback(
+            resolver.0,
+            Some(proxy_callback),
+            WINHTTP_CALLBACK_FLAG_GETPROXYFORURL_COMPLETE | WINHTTP_CALLBACK_FLAG_REQUEST_ERROR,
+            0,
+        );
+        let options = WINHTTP_AUTOPROXY_OPTIONS {
             dwFlags: if detect {
                 WINHTTP_AUTOPROXY_AUTO_DETECT
             } else {
@@ -75,41 +111,89 @@ unsafe fn auto_proxy(
             },
             ..Default::default()
         };
-        let mut info = WINHTTP_PROXY_INFO::default();
-        let success =
-            WinHttpGetProxyForUrl(session.0, PCWSTR(target.as_ptr()), &mut options, &mut info)
-                .is_ok();
-        let proxy = take_string(info.lpszProxy);
-        let bypass = take_string(info.lpszProxyBypass);
-        if success {
-            let source = if detect {
-                ProxySource::WindowsWpad
-            } else {
-                ProxySource::WindowsPac
-            };
-            return Some(if info.dwAccessType == WINHTTP_ACCESS_TYPE_NO_PROXY {
-                ProxyDiscovery::one(Proxy::Direct, source)
-            } else {
-                winhttp(
-                    &proxy,
-                    &bypass,
-                    url::Url::parse(url).ok()?.host_str()?,
-                    source,
-                )
-            });
+        static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(1);
+        let token = CallbackToken(NEXT_TOKEN.fetch_add(1, Ordering::Relaxed));
+        let (tx, rx) = mpsc::channel();
+        callbacks().lock().unwrap().insert(token.0, tx);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // Reserve time for explicit PAC when WPAD is absent or stalls.
+        let attempt_deadline = if detect && pac.len() > 1 {
+            Instant::now() + remaining / 2
+        } else {
+            deadline
+        };
+        let error = WinHttpGetProxyForUrlEx(resolver.0, PCWSTR(target.as_ptr()), &options, token.0);
+        if error != windows::Win32::Foundation::ERROR_IO_PENDING.0
+            || rx.recv_timeout(attempt_deadline.saturating_duration_since(Instant::now()))
+                != Ok(true)
+        {
+            continue;
         }
-        if Instant::now() >= deadline {
-            break;
+        let mut info = WINHTTP_PROXY_RESULT::default();
+        if WinHttpGetProxyResult(resolver.0, &mut info) != 0 {
+            continue;
         }
+        let source = if detect {
+            ProxySource::WindowsWpad
+        } else {
+            ProxySource::WindowsPac
+        };
+        let result = proxy_result(&info, source);
+        WinHttpFreeProxyResult(&mut info);
+        return Some(result);
     }
     None
 }
 
+unsafe fn proxy_result(info: &WINHTTP_PROXY_RESULT, source: ProxySource) -> ProxyDiscovery {
+    let mut result = ProxyDiscovery::default();
+    if info.pEntries.is_null() {
+        return result;
+    }
+    for entry in std::slice::from_raw_parts(info.pEntries, info.cEntries as usize) {
+        if entry.fBypass.as_bool() || !entry.fProxy.as_bool() {
+            result.candidates.push(super::ProxyCandidate {
+                proxy: Proxy::Direct,
+                source,
+            });
+        } else if entry.ProxyScheme == WINHTTP_INTERNET_SCHEME_HTTP {
+            if let Ok(host) = entry.pwszProxy.to_string() {
+                if !host.is_empty() && entry.ProxyPort != 0 {
+                    result.candidates.push(super::ProxyCandidate {
+                        proxy: Proxy::Http {
+                            host,
+                            port: entry.ProxyPort,
+                            credentials: None,
+                        },
+                        source,
+                    });
+                }
+            }
+        } else {
+            result
+                .warnings
+                .push(super::NetworkWarning::UnsupportedPacProtocol);
+        }
+    }
+    result
+}
+
+fn settings_warnings(found_user: bool, explicit_pac_failed: bool) -> Vec<super::NetworkWarning> {
+    let mut warnings = Vec::new();
+    if !found_user {
+        warnings.push(super::NetworkWarning::WindowsServiceSettings);
+    }
+    if explicit_pac_failed {
+        warnings.push(super::NetworkWarning::PacFailed);
+    }
+    warnings
+}
+
 pub(super) fn proxies(host: &str, deadline: Instant) -> ProxyDiscovery {
-    let mut warnings = vec!["Windows proxy discovery reads the calling account's Internet settings. A background service may see different settings from the signed-in desktop. Configure an explicit proxy for that service when needed.".into()];
     unsafe {
         let mut config = WINHTTP_CURRENT_USER_IE_PROXY_CONFIG::default();
         let found_user = WinHttpGetIEProxyConfigForCurrentUser(&mut config).is_ok();
+        let mut warnings = settings_warnings(found_user, false);
         let pac = take_string(config.lpszAutoConfigUrl);
         let proxy = take_string(config.lpszProxy);
         let bypass = take_string(config.lpszProxyBypass);
@@ -120,7 +204,9 @@ pub(super) fn proxies(host: &str, deadline: Instant) -> ProxyDiscovery {
                 result.warnings.extend(warnings);
                 return result;
             }
-            warnings.push("Automatic proxy discovery failed or timed out. Static settings are used when available.".into());
+            // No WPAD is an ordinary direct network. Only an explicitly
+            // configured PAC failure asks the user to fix settings.
+            warnings = settings_warnings(found_user, !pac.is_empty());
         }
         if found_user && !proxy.is_empty() {
             let mut result = winhttp(&proxy, &bypass, host, ProxySource::WindowsUser);
@@ -135,7 +221,7 @@ pub(super) fn proxies(host: &str, deadline: Instant) -> ProxyDiscovery {
         let bypass = take_string(info.lpszProxyBypass);
         let mut result = if found_machine && info.dwAccessType == WINHTTP_ACCESS_TYPE_NAMED_PROXY {
             winhttp(&proxy, &bypass, host, ProxySource::WindowsMachine)
-        } else if !pac.is_empty() || config.fAutoDetect.as_bool() {
+        } else if !pac.is_empty() {
             ProxyDiscovery::default()
         } else {
             ProxyDiscovery::one(
@@ -170,5 +256,73 @@ pub(super) fn portal() -> CaptivePortal {
         Ok(Level::InternetAccess) => CaptivePortal::OpenInternet,
         Ok(Level::None) => CaptivePortal::NoConnectivity,
         _ => CaptivePortal::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn absent_wpad_has_no_warning_and_explicit_pac_failure_is_actionable() {
+        use super::super::{NetworkWarning as W, WarningSeverity};
+        assert!(settings_warnings(true, false).is_empty());
+        assert_eq!(settings_warnings(true, true), [W::PacFailed]);
+        assert_eq!(W::PacFailed.severity(), WarningSeverity::Actionable);
+        assert_eq!(settings_warnings(false, false), [W::WindowsServiceSettings]);
+        assert_eq!(
+            W::WindowsServiceSettings.severity(),
+            WarningSeverity::Informational
+        );
+    }
+
+    #[test]
+    fn real_auto_detection_obeys_the_deadline() {
+        let start = Instant::now();
+        unsafe {
+            let _ = auto_proxy(
+                "https://relay.test/",
+                "",
+                true,
+                start + Duration::from_millis(250),
+            );
+        }
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn async_result_preserves_order_and_direct_choice() {
+        let host: Vec<u16> = "proxy.test".encode_utf16().chain(Some(0)).collect();
+        let mut entries = [
+            WINHTTP_PROXY_RESULT_ENTRY {
+                fProxy: true.into(),
+                ProxyScheme: WINHTTP_INTERNET_SCHEME_HTTP,
+                pwszProxy: PWSTR(host.as_ptr().cast_mut()),
+                ProxyPort: 8080,
+                ..Default::default()
+            },
+            WINHTTP_PROXY_RESULT_ENTRY::default(),
+        ];
+        let info = WINHTTP_PROXY_RESULT {
+            cEntries: 1,
+            pEntries: entries.as_mut_ptr(),
+        };
+        let result = unsafe { proxy_result(&info, ProxySource::WindowsPac) };
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(
+            result.candidates[0].proxy.to_string(),
+            "http://proxy.test:8080"
+        );
+        let result = unsafe {
+            proxy_result(
+                &WINHTTP_PROXY_RESULT {
+                    cEntries: 2,
+                    ..info
+                },
+                ProxySource::WindowsPac,
+            )
+        };
+        assert_eq!(result.candidates[1].proxy, Proxy::Direct);
     }
 }

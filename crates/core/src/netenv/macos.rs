@@ -126,10 +126,10 @@ unsafe extern "C" fn pac_callback(info: *mut c_void, proxies: Ref, _error: Ref) 
     }
 }
 unsafe fn evaluate(pac: Ref, script: bool, target: Ref, deadline: Instant) -> Option<Owned> {
-    let mut result = PacResult::default();
+    let result = Box::into_raw(Box::new(PacResult::default()));
     let mut context = ClientContext {
         version: 0,
-        info: (&mut result as *mut PacResult).cast(),
+        info: result.cast(),
         retain: None,
         release: None,
         copy_description: None,
@@ -140,13 +140,14 @@ unsafe fn evaluate(pac: Ref, script: bool, target: Ref, deadline: Instant) -> Op
         CFNetworkExecuteProxyAutoConfigurationURL(pac, target, pac_callback, &mut context)
     });
     if source.0.is_null() {
+        drop(Box::from_raw(result));
         return None;
     }
     let run_loop = CFRunLoopGetCurrent();
     CFRunLoopAddSource(run_loop, source.0, kCFRunLoopDefaultMode);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if result.completed || remaining.is_zero() {
+        if (*result).completed || remaining.is_zero() {
             break;
         }
         let status = CFRunLoopRunInMode(kCFRunLoopDefaultMode, remaining.as_secs_f64(), true);
@@ -154,10 +155,11 @@ unsafe fn evaluate(pac: Ref, script: bool, target: Ref, deadline: Instant) -> Op
             break;
         } // Finished or stopped.
     }
-    // Invalidate before the stack callback context goes out of scope.
+    // Invalidate before freeing the boxed callback state. CFNetwork provides
+    // no public guarantee that its JavaScript worker stops on invalidation.
     CFRunLoopSourceInvalidate(source.0);
     CFRunLoopRemoveSource(run_loop, source.0, kCFRunLoopDefaultMode);
-    result.proxies
+    Box::from_raw(result).proxies
 }
 
 unsafe fn number(settings: Ref, key: &str) -> i32 {
@@ -227,14 +229,7 @@ unsafe fn collect(
                 }
                 let username = text(CFDictionaryGetValue(entry, kCFProxyUsernameKey));
                 let password = text(CFDictionaryGetValue(entry, kCFProxyPasswordKey));
-                let credentials = if username.is_some() || password.is_some() {
-                    Some(super::Credentials::new(
-                        username.unwrap_or_default(),
-                        password.unwrap_or_default(),
-                    ))
-                } else {
-                    None
-                };
+                let credentials = system_credentials(username, password, &mut result.warnings);
                 result.candidates.push(super::ProxyCandidate {
                     proxy: Proxy::Http {
                         host,
@@ -266,15 +261,51 @@ unsafe fn collect(
                         result,
                         depth + 1,
                     );
+                    // The PAC result owns the complete ordered decision.
+                    // CFNetwork's static tail must not add a DIRECT option.
+                    return;
                 } else {
-                    result.warnings.push("Automatic proxy evaluation failed or timed out. Check this network's proxy settings.".into());
+                    result.warnings.push(super::NetworkWarning::PacFailed);
                 }
             }
         } else {
             result
                 .warnings
-                .push("The system selected an unsupported proxy protocol.".into());
+                .push(super::NetworkWarning::UnsupportedSystemProtocol);
         }
+    }
+}
+
+fn system_credentials(
+    username: Option<String>,
+    password: Option<String>,
+    warnings: &mut Vec<super::NetworkWarning>,
+) -> Option<super::Credentials> {
+    match (username, password) {
+        (username, Some(password)) => Some(super::Credentials::new(
+            username.unwrap_or_default(),
+            password,
+        )),
+        (Some(_), None) => {
+            warnings.push(super::NetworkWarning::KeychainCredentialsUnread);
+            None
+        }
+        (None, None) => None,
+    }
+}
+
+unsafe fn finish_wpad(
+    evaluated: Option<Owned>,
+    fallback: Vec<super::ProxyCandidate>,
+    target: Ref,
+    deadline: Instant,
+    result: &mut ProxyDiscovery,
+) {
+    if let Some(wpad) = evaluated {
+        collect(wpad.0, target, ProxySource::MacWpad, deadline, result, 1);
+    } else {
+        result.warnings.push(super::NetworkWarning::WpadFailed);
+        result.candidates = fallback;
     }
 }
 
@@ -288,12 +319,14 @@ pub(super) fn proxies(host: &str, deadline: Instant) -> ProxyDiscovery {
         if settings.0.is_null() {
             if let Some(snapshot) = super::command("/usr/sbin/scutil", &["--proxy"], deadline) {
                 let mut fallback = super::proxy::scutil(&snapshot, host);
-                fallback.warnings.push("CFNetwork settings were unavailable. Static system proxy settings were read with scutil.".into());
+                fallback
+                    .warnings
+                    .push(super::NetworkWarning::MacStaticFallback);
                 return fallback;
             }
             result
                 .warnings
-                .push("macOS proxy settings are unavailable.".into());
+                .push(super::NetworkWarning::MacSettingsUnavailable);
             return result;
         }
         let proxies = Owned(CFNetworkCopyProxiesForURL(target.0, settings.0));
@@ -354,23 +387,7 @@ pub(super) fn proxies(host: &str, deadline: Instant) -> ProxyDiscovery {
                     break;
                 }
             }
-            if let Some(wpad) = evaluated {
-                collect(
-                    wpad.0,
-                    target.0,
-                    ProxySource::MacWpad,
-                    deadline,
-                    &mut result,
-                    1,
-                );
-            } else {
-                result.warnings.push("Automatic proxy discovery failed or timed out. DHCP and DNS WPAD did not return a usable PAC result.".into());
-            }
-            for candidate in fallback {
-                if !result.candidates.contains(&candidate) {
-                    result.candidates.push(candidate);
-                }
-            }
+            finish_wpad(evaluated, fallback, target.0, deadline, &mut result);
         }
     }
     result
@@ -379,6 +396,83 @@ pub(super) fn proxies(host: &str, deadline: Instant) -> ProxyDiscovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn keychain_username_never_becomes_empty_password_auth() {
+        let mut warnings = Vec::new();
+        assert!(system_credentials(Some("alice".into()), None, &mut warnings).is_none());
+        assert_eq!(
+            warnings,
+            [super::super::NetworkWarning::KeychainCredentialsUnread]
+        );
+        let auth =
+            system_credentials(Some("alice".into()), Some("secret".into()), &mut warnings).unwrap();
+        assert_eq!((auth.username(), auth.password()), ("alice", "secret"));
+        // An explicitly supplied empty password remains usable.
+        assert_eq!(
+            system_credentials(Some("alice".into()), Some(String::new()), &mut warnings)
+                .unwrap()
+                .password(),
+            ""
+        );
+    }
+
+    #[test]
+    fn successful_wpad_owns_the_direct_decision() {
+        let target = url("https://relay.test/").unwrap();
+        for direct in [false, true] {
+            let script = string(&format!(
+                "function FindProxyForURL(url, host) {{ return 'PROXY pac.test:8080{}'; }}",
+                if direct { "; DIRECT" } else { "" }
+            ))
+            .unwrap();
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            let fallback = ProxyDiscovery::one(Proxy::Direct, ProxySource::MacSystem).candidates;
+            let mut result = ProxyDiscovery::default();
+            unsafe {
+                let evaluated =
+                    evaluate(script.0, true, target.0, deadline).expect("PAC evaluation");
+                finish_wpad(Some(evaluated), fallback, target.0, deadline, &mut result);
+            }
+            assert_eq!(result.candidates.len(), if direct { 2 } else { 1 });
+            assert!(result
+                .candidates
+                .iter()
+                .all(|c| c.source == ProxySource::MacWpad));
+            assert_eq!(
+                result.candidates.iter().any(|c| c.proxy == Proxy::Direct),
+                direct
+            );
+        }
+        let mut result = ProxyDiscovery::default();
+        unsafe {
+            finish_wpad(
+                None,
+                ProxyDiscovery::one(Proxy::Direct, ProxySource::MacSystem).candidates,
+                target.0,
+                Instant::now(),
+                &mut result,
+            );
+        }
+        assert_eq!(result.candidates[0].proxy, Proxy::Direct);
+    }
+
+    #[test]
+    fn looping_pac_returns_at_the_deadline() {
+        let script = string("function FindProxyForURL(url, host) { while (true) {} }").unwrap();
+        let target = url("https://relay.test/").unwrap();
+        let start = Instant::now();
+        unsafe {
+            assert!(evaluate(
+                script.0,
+                true,
+                target.0,
+                start + std::time::Duration::from_millis(100)
+            )
+            .is_none());
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
     #[test]
     fn framework_evaluates_pac_in_order() {
         let script = string("function FindProxyForURL(url, host) { return 'PROXY first.test:8080; PROXY second.test:3128; DIRECT'; }").unwrap();
@@ -427,6 +521,10 @@ mod tests {
             let mut stream = loop {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
                         stream
                             .set_read_timeout(Some(Duration::from_secs(1)))
                             .unwrap();

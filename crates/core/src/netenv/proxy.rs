@@ -143,7 +143,7 @@ pub struct ProxyDiscovery {
     /// Ordered, including DIRECT only where settings/PAC explicitly allow it,
     /// or where no supported configuration was found.
     pub candidates: Vec<ProxyCandidate>,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<super::NetworkWarning>,
 }
 impl ProxyDiscovery {
     pub(super) fn one(proxy: Proxy, source: ProxySource) -> Self {
@@ -155,9 +155,7 @@ impl ProxyDiscovery {
     pub(super) fn add(&mut self, value: &str, source: ProxySource) {
         match Proxy::parse(value) {
             Ok(proxy) => self.candidates.push(ProxyCandidate { proxy, source }),
-            Err(_) => self
-                .warnings
-                .push("A configured proxy is malformed or uses an unsupported protocol.".into()),
+            Err(_) => self.warnings.push(super::NetworkWarning::InvalidProxy),
         }
     }
 }
@@ -183,7 +181,7 @@ pub(super) fn discover(options: &Options, deadline: Instant) -> ProxyDiscovery {
     }
     if destination_url(&options.destination_host).is_none() {
         return ProxyDiscovery {
-            warnings: vec!["The HTTPS destination hostname is invalid.".into()],
+            warnings: vec![super::NetworkWarning::InvalidDestination],
             ..Default::default()
         };
     }
@@ -339,12 +337,12 @@ pub(super) fn pac_result(value: &str, source: ProxySource) -> ProxyDiscovery {
             } else {
                 result
                     .warnings
-                    .push("The PAC result includes an unsupported proxy protocol.".into());
+                    .push(super::NetworkWarning::UnsupportedPacProtocol);
             }
         } else {
             result
                 .warnings
-                .push("The PAC result includes a malformed candidate.".into());
+                .push(super::NetworkWarning::MalformedPacCandidate);
         }
     }
     result
@@ -380,8 +378,9 @@ pub(super) fn winhttp(
         })
         .collect();
     let entries: Vec<_> = if https.is_empty() {
-        entries
-            .into_iter()
+        let defaults: Vec<_> = entries
+            .iter()
+            .copied()
             .filter(|entry| {
                 entry.contains("://")
                     || !entry.split_once('=').is_some_and(|(key, _)| {
@@ -390,7 +389,20 @@ pub(super) fn winhttp(
                             .any(|scheme| key.eq_ignore_ascii_case(scheme))
                     })
             })
-            .collect()
+            .collect();
+        if defaults.is_empty()
+            && entries.iter().any(|entry| {
+                entry
+                    .split_once('=')
+                    .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("socks"))
+            })
+        {
+            return ProxyDiscovery {
+                warnings: vec![super::NetworkWarning::UnsupportedPacProtocol],
+                ..Default::default()
+            };
+        }
+        defaults
     } else {
         https
     };
@@ -406,11 +418,28 @@ pub(super) fn winhttp(
 
 #[cfg(any(test, target_os = "macos"))]
 pub(super) fn scutil(text: &str, host: &str) -> ProxyDiscovery {
-    let fields: BTreeMap<_, _> = text
-        .lines()
-        .filter_map(|line| line.trim().split_once(" : "))
-        .map(|(k, v)| (k.trim(), v.trim()))
-        .collect();
+    let mut fields = BTreeMap::new();
+    let mut depth = 0usize;
+    let mut exceptions = false;
+    for line in text.lines().map(str::trim) {
+        if line.ends_with('{') {
+            if depth == 1 {
+                exceptions = line.starts_with("ExceptionsList : ");
+            }
+            depth += 1;
+            continue;
+        }
+        if line == "}" {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if let Some((key, value)) = line.split_once(" : ") {
+            // Only global keys and the global ExceptionsList array.
+            if depth <= 1 || (depth == 2 && exceptions && key.parse::<u32>().is_ok()) {
+                fields.insert(key.trim(), value.trim());
+            }
+        }
+    }
     let mut result = ProxyDiscovery::default();
     let exceptions = fields
         .iter()
@@ -428,7 +457,7 @@ pub(super) fn scutil(text: &str, host: &str) -> ProxyDiscovery {
     {
         result
             .warnings
-            .push("Automatic proxy settings require the macOS PAC evaluator.".into());
+            .push(super::NetworkWarning::PacEvaluatorUnavailable);
     }
     if fields.get("HTTPSEnable") == Some(&"1") {
         if let (Some(host), Some(port)) = (fields.get("HTTPSProxy"), fields.get("HTTPSPort")) {
@@ -436,7 +465,7 @@ pub(super) fn scutil(text: &str, host: &str) -> ProxyDiscovery {
         } else {
             result
                 .warnings
-                .push("The system HTTPS proxy is incomplete.".into());
+                .push(super::NetworkWarning::IncompleteSystemProxy);
         }
     }
     if result.candidates.is_empty() && result.warnings.is_empty() {

@@ -43,7 +43,7 @@ impl ProbeTarget {
         })
     }
 }
-/// Sign-in destination. Query and fragment can contain portal session tokens.
+/// Sign-in destination. Paths, queries and fragments can contain session tokens.
 /// Only `as_str` exposes them. Formatting always removes them.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PortalUrl(Url);
@@ -55,6 +55,7 @@ impl PortalUrl {
 impl std::fmt::Display for PortalUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut safe = self.0.clone();
+        safe.set_path("/");
         safe.set_query(None);
         safe.set_fragment(None);
         write!(f, "{safe}")
@@ -169,10 +170,17 @@ fn native(deadline: Instant) -> CaptivePortal {
 }
 
 pub(super) fn detect(targets: &[ProbeTarget], deadline: Instant) -> CaptivePortal {
-    let native = native(deadline);
-    if matches!(native, CaptivePortal::Captive { .. }) || targets.is_empty() {
-        return native;
+    if targets.is_empty() {
+        return native(deadline);
     }
+    detect_with_native(targets, deadline, || native(deadline))
+}
+
+pub(super) fn detect_with_native(
+    targets: &[ProbeTarget],
+    deadline: Instant,
+    native: impl FnOnce() -> CaptivePortal,
+) -> CaptivePortal {
     let mut restricted = false;
     for (index, target) in targets.iter().enumerate() {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -191,10 +199,10 @@ pub(super) fn detect(targets: &[ProbeTarget], deadline: Instant) -> CaptivePorta
         }
     }
     if restricted {
-        CaptivePortal::Restricted
-    } else if native == CaptivePortal::OpenInternet {
-        native
-    } else {
-        CaptivePortal::NoConnectivity
+        return CaptivePortal::Restricted;
+    }
+    match native() {
+        state @ (CaptivePortal::OpenInternet | CaptivePortal::Captive { .. }) => state,
+        _ => CaptivePortal::NoConnectivity,
     }
 }

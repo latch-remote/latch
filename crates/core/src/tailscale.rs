@@ -600,41 +600,89 @@ pub(crate) fn run_limited(cmd: &mut Command, limit: Duration) -> Result<String> 
     let mut child = cmd.spawn().context("run tailscale")?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
+    let deadline = Instant::now() + limit;
     let read = |mut pipe: Box<dyn Read + Send>| {
-        let mut bytes = Vec::new();
-        let _ = pipe.read_to_end(&mut bytes);
-        bytes
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+            let _ = tx.send(result);
+        });
+        rx
     };
-    let stdout = std::thread::spawn(move || read(Box::new(stdout)));
-    let stderr = std::thread::spawn(move || read(Box::new(stderr)));
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait().context("run tailscale")? {
-            Some(status) => break status,
-            None if start.elapsed() >= limit => {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("tailscale timed out");
+    let stdout = read(Box::new(stdout));
+    let stderr = read(Box::new(stderr));
+    let output = (|| -> Result<std::process::Output> {
+        let status = loop {
+            match child.try_wait().context("run tailscale")? {
+                Some(status) => break status,
+                None if Instant::now() >= deadline => bail!("tailscale timed out"),
+                None => std::thread::sleep(
+                    Duration::from_millis(20)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                ),
             }
-            None => std::thread::sleep(Duration::from_millis(20)),
-        }
-    };
-    let stdout = stdout
-        .join()
-        .map_err(|_| anyhow::anyhow!("tailscale stdout reader failed"))?;
-    let stderr = stderr
-        .join()
-        .map_err(|_| anyhow::anyhow!("tailscale stderr reader failed"))?;
-    finish(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
+        };
+        // A descendant may keep a pipe open after the direct child exits.
+        // Use the same deadline for both readers and the process itself.
+        let stdout = stdout
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .context("tailscale stdout timed out")??;
+        let stderr = stderr
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .context("tailscale stderr timed out")??;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })();
+    if output.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let output = output?;
+    finish(output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn limited_command_bounds_inherited_pipes_after_success() {
+        let start = Instant::now();
+        let result = run_limited(
+            Command::new("/bin/sh").args(["-c", "sleep 1 & printf done"]),
+            Duration::from_millis(80),
+        );
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_millis(700));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn limited_command_kills_and_reaps_a_stalled_child() {
+        let pid_file =
+            std::env::temp_dir().join(format!("latch-netenv-child-{}", std::process::id()));
+        let start = Instant::now();
+        let result = run_limited(
+            Command::new("/bin/sh")
+                .args(["-c", "printf '%s' $$ > \"$1\"; exec sleep 5", "netenv-test"])
+                .arg(&pid_file),
+            Duration::from_millis(200),
+        );
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        std::fs::remove_file(pid_file).unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child must be reaped");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
 
     /// The Windows machines in the list, as the tests below look at them.
     fn windows_peers(st: &Status) -> Vec<&Node> {

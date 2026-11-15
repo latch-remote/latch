@@ -55,6 +55,10 @@ pub(super) fn gsettings(text: &str, host: &str) -> Option<ProxyDiscovery> {
     if mode != "manual" {
         return None;
     }
+    let http_host = strings(get("org.gnome.system.proxy.http.host"))
+        .pop()
+        .unwrap_or_default();
+    let http_port = get("org.gnome.system.proxy.http.port");
     let mut proxy_host = strings(get("org.gnome.system.proxy.https.host"))
         .pop()
         .unwrap_or_default();
@@ -73,7 +77,10 @@ pub(super) fn gsettings(text: &str, host: &str) -> Option<ProxyDiscovery> {
         &format!("{}:{port}", bracket_host(&proxy_host)),
         ProxySource::Gnome,
     );
-    if get("org.gnome.system.proxy.http.use-authentication") == "true" {
+    if get("org.gnome.system.proxy.http.use-authentication") == "true"
+        && proxy_host.eq_ignore_ascii_case(&http_host)
+        && port.parse::<u16>().ok() == http_port.parse::<u16>().ok()
+    {
         let username = strings(get("org.gnome.system.proxy.http.authentication-user"))
             .pop()
             .unwrap_or_default();
@@ -96,7 +103,10 @@ fn bracket_host(host: &str) -> String {
     }
 }
 fn pac_unavailable() -> ProxyDiscovery {
-    ProxyDiscovery { candidates: Vec::new(), warnings: vec!["A PAC file or automatic proxy discovery is configured. Linux has no system PAC evaluator. Set an explicit HTTP proxy or direct connection in Latch.".into()] }
+    ProxyDiscovery {
+        candidates: Vec::new(),
+        warnings: vec![super::NetworkWarning::LinuxPacUnavailable],
+    }
 }
 
 pub(super) fn kioslaverc(
@@ -119,6 +129,19 @@ pub(super) fn kioslaverc(
     if mode == "0" {
         return Some(ProxyDiscovery::one(Proxy::Direct, ProxySource::Kde));
     }
+    if mode == "4" {
+        // KDE can name the environment variables to read in this mode.
+        let proxy_key = fields.get("httpsProxy").copied().unwrap_or("https_proxy");
+        let bypass_key = fields.get("NoProxyFor").copied().unwrap_or("no_proxy");
+        let mut selected = BTreeMap::new();
+        if let Some(value) = env.get(proxy_key) {
+            selected.insert("HTTPS_PROXY".into(), value.clone());
+        }
+        if let Some(value) = env.get(bypass_key) {
+            selected.insert("NO_PROXY".into(), value.clone());
+        }
+        return environment(&selected, host);
+    }
     let matched = bypass(
         fields.get("NoProxyFor").copied().unwrap_or(""),
         host,
@@ -133,19 +156,6 @@ pub(super) fn kioslaverc(
     }
     if mode == "2" || mode == "3" {
         return Some(pac_unavailable());
-    }
-    if mode == "4" {
-        // KDE can name the environment variables to read in this mode.
-        let proxy_key = fields.get("httpsProxy").copied().unwrap_or("https_proxy");
-        let bypass_key = fields.get("NoProxyFor").copied().unwrap_or("no_proxy");
-        let mut selected = BTreeMap::new();
-        if let Some(value) = env.get(proxy_key) {
-            selected.insert("HTTPS_PROXY".into(), value.clone());
-        }
-        if let Some(value) = env.get(bypass_key) {
-            selected.insert("NO_PROXY".into(), value.clone());
-        }
-        return environment(&selected, host);
     }
     if mode != "1" {
         return None;

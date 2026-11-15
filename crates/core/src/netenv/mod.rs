@@ -15,6 +15,7 @@ mod macos;
 mod portal;
 mod proxy;
 mod tailscale;
+mod warning;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -22,9 +23,10 @@ pub use ip::{IpAvailability, Nat64Prefix};
 pub use portal::{CaptivePortal, PortalUrl, ProbeTarget};
 pub use proxy::{Credentials, Proxy, ProxyCandidate, ProxyDiscovery, ProxySource};
 pub use tailscale::{TailscaleDiagnosis, TailscaleReason};
+pub use warning::{NetworkWarning, WarningSeverity};
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Inputs contain no implicit probe destinations. A caller may explicitly
@@ -63,7 +65,7 @@ pub struct NetworkDiagnosis {
     pub ip: IpAvailability,
     /// Fixed messages only. Raw OS settings, CLI errors and credentials never
     /// enter diagnostics. An incomplete check stays unknown.
-    pub warnings: Vec<String>,
+    pub warnings: Vec<NetworkWarning>,
 }
 
 impl Default for NetworkDiagnosis {
@@ -78,6 +80,7 @@ impl Default for NetworkDiagnosis {
     }
 }
 
+#[derive(Clone)]
 enum Observation {
     Proxy(ProxyDiscovery),
     Portal(CaptivePortal),
@@ -85,32 +88,98 @@ enum Observation {
     Ip(IpAvailability),
 }
 
-// Resolver and synchronous OS APIs cannot always be cancelled. Bound both
-// caller latency and process-wide outstanding work, including timed-out jobs.
-static JOBS: AtomicUsize = AtomicUsize::new(0);
-fn spawn_job(job: impl FnOnce() + Send + 'static) -> bool {
-    if JOBS
-        .try_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
-            (n < 8).then_some(n + 1)
-        })
-        .is_err()
-    {
-        return false;
-    }
-    struct Permit;
-    impl Drop for Permit {
-        fn drop(&mut self) {
-            JOBS.fetch_sub(1, Ordering::AcqRel);
+// A stalled resolver or synchronous OS call occupies only its own kind.
+// Identical inputs subscribe to the existing work. Different inputs remain
+// pending, because another host's proxy or probe result must never be reused.
+#[derive(Clone, Copy)]
+enum CheckKind {
+    Proxy,
+    Portal,
+    Tailscale,
+    Ip,
+}
+impl CheckKind {
+    fn same_inputs(self, left: &Options, right: &Options) -> bool {
+        match self {
+            Self::Proxy => {
+                left.destination_host == right.destination_host
+                    && left.proxy_override == right.proxy_override
+            }
+            Self::Portal => left.probes == right.probes,
+            Self::Tailscale => left.peer == right.peer,
+            Self::Ip => true,
         }
     }
-    let permit = Permit;
-    std::thread::Builder::new()
-        .name("latch-netenv".into())
-        .spawn(move || {
-            let _permit = permit;
-            job();
-        })
-        .is_ok()
+}
+struct Flight {
+    options: Options,
+    subscribers: Vec<(Instant, mpsc::Sender<Observation>)>,
+}
+#[derive(Default)]
+struct JobSlot(Mutex<Option<Flight>>);
+impl JobSlot {
+    fn subscribe(
+        self: &Arc<Self>,
+        kind: CheckKind,
+        options: &Options,
+        tx: mpsc::Sender<Observation>,
+        deadline: Instant,
+        job: impl FnOnce() -> Observation + Send + 'static,
+    ) -> bool {
+        let mut flight = self.0.lock().unwrap();
+        if let Some(running) = flight.as_mut() {
+            if kind.same_inputs(&running.options, options) {
+                running
+                    .subscribers
+                    .retain(|(until, _)| *until > Instant::now());
+                running.subscribers.push((deadline, tx));
+                return true;
+            }
+            return false;
+        }
+        *flight = Some(Flight {
+            options: options.clone(),
+            subscribers: vec![(deadline, tx)],
+        });
+        let slot = Arc::clone(self);
+        // The guard also releases the slot if an OS wrapper panics.
+        struct Completion {
+            slot: Arc<JobSlot>,
+            finished: bool,
+        }
+        impl Drop for Completion {
+            fn drop(&mut self) {
+                if !self.finished {
+                    self.slot.0.lock().unwrap().take();
+                }
+            }
+        }
+        if std::thread::Builder::new()
+            .name("latch-netenv".into())
+            .spawn(move || {
+                let mut completion = Completion {
+                    slot,
+                    finished: false,
+                };
+                let observation = job();
+                if let Some(flight) = completion.slot.0.lock().unwrap().take() {
+                    for (_, tx) in flight.subscribers {
+                        let _ = tx.send(observation.clone());
+                    }
+                }
+                completion.finished = true;
+            })
+            .is_err()
+        {
+            flight.take();
+            return false;
+        }
+        true
+    }
+}
+fn slots() -> &'static [Arc<JobSlot>; 4] {
+    static SLOTS: std::sync::OnceLock<[Arc<JobSlot>; 4]> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| std::array::from_fn(|_| Arc::new(JobSlot::default())))
 }
 
 /// Blocking worker entry point. Partial results are returned at the deadline.
@@ -123,17 +192,23 @@ pub fn discover(options: &Options) -> NetworkDiagnosis {
             .clamp(Duration::from_millis(100), Duration::from_secs(15));
     let (tx, rx) = mpsc::channel();
     let mut started = 0;
-    for kind in 0..4 {
-        let tx = tx.clone();
-        let options = options.clone();
-        if spawn_job(move || {
-            let observation = match kind {
-                0 => Observation::Proxy(proxy::discover(&options, deadline)),
-                1 => Observation::Portal(portal::detect(&options.probes, deadline)),
-                2 => Observation::Tailscale(tailscale::discover(options.peer.as_deref(), deadline)),
-                _ => Observation::Ip(ip::discover()),
-            };
-            let _ = tx.send(observation);
+    for (slot, kind) in slots().iter().zip([
+        CheckKind::Proxy,
+        CheckKind::Portal,
+        CheckKind::Tailscale,
+        CheckKind::Ip,
+    ]) {
+        let worker_options = options.clone();
+        if slot.subscribe(kind, options, tx.clone(), deadline, move || match kind {
+            CheckKind::Proxy => Observation::Proxy(proxy::discover(&worker_options, deadline)),
+            CheckKind::Portal => {
+                Observation::Portal(portal::detect(&worker_options.probes, deadline))
+            }
+            CheckKind::Tailscale => Observation::Tailscale(tailscale::discover(
+                worker_options.peer.as_deref(),
+                deadline,
+            )),
+            CheckKind::Ip => Observation::Ip(ip::discover()),
         }) {
             started += 1;
         }
@@ -156,43 +231,56 @@ fn collect(rx: Receiver<Observation>, started: usize, deadline: Instant) -> Netw
         }
     }
     if received != 4 {
-        result.warnings.push(
-            if started < 4 {
-                "Network discovery workers are busy. Try again shortly."
-            } else {
-                "Some network checks timed out. Try again after connecting to the network."
-            }
-            .into(),
-        );
+        result.warnings.push(if started < 4 {
+            NetworkWarning::ChecksPending
+        } else {
+            NetworkWarning::ChecksTimedOut
+        });
     }
     result
 }
 
 /// UI-safe cache. Call `request` and `poll` from the UI, or `discover` directly
 /// on an existing worker. Only one refresh runs per cache. Changed inputs also
-/// invalidate the cache. Call `request` again after a pending refresh finishes
-/// if the network changed during it. Dropping this cache never waits.
+/// invalidate the cache. The latest request received during a refresh starts
+/// automatically from `poll` after that refresh finishes. Dropping never waits.
 #[derive(Default)]
 pub struct NetworkEnvironment {
     cached: Option<(u64, Options, NetworkDiagnosis)>,
     pending: Option<(u64, Options, Receiver<NetworkDiagnosis>)>,
+    queued: Option<(u64, Options)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestStatus {
+    Cached,
+    Started,
+    Pending,
+    Unavailable,
 }
 
 impl NetworkEnvironment {
-    /// Starts a refresh if needed. Returns false while a refresh is running
-    /// or a worker could not be started. A cache hit is true.
-    pub fn request(&mut self, network_generation: u64, options: Options) -> bool {
+    /// Coalesces refreshes and remembers the latest generation and inputs.
+    pub fn request(&mut self, network_generation: u64, options: Options) -> RequestStatus {
+        // Remember the new request before poll can start a queued generation.
+        if self.pending.is_some() {
+            self.queued = Some((network_generation, options.clone()));
+        }
         self.poll();
         if self
             .cached
             .as_ref()
             .is_some_and(|(key, old, _)| *key == network_generation && *old == options)
         {
-            return true;
+            return RequestStatus::Cached;
         }
         if self.pending.is_some() {
-            return false;
+            return RequestStatus::Pending;
         }
+        self.start(network_generation, options)
+    }
+
+    fn start(&mut self, network_generation: u64, options: Options) -> RequestStatus {
         let (tx, rx) = mpsc::channel();
         let worker_options = options.clone();
         // The coordinator has a deadline and does not consume an OS-job slot.
@@ -203,26 +291,30 @@ impl NetworkEnvironment {
             })
             .is_err()
         {
-            return false;
+            return RequestStatus::Unavailable;
         }
         self.pending = Some((network_generation, options, rx));
-        true
+        RequestStatus::Started
     }
 
     pub fn poll(&mut self) {
-        let Some((_, _, rx)) = &self.pending else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(result) => {
-                if let Some((key, options, _)) = self.pending.take() {
-                    self.cached = Some((key, options, result));
+        if let Some((_, _, rx)) = &self.pending {
+            match rx.try_recv() {
+                Ok(result) => {
+                    if let Some((key, options, _)) = self.pending.take() {
+                        self.cached = Some((key, options, result));
+                    }
                 }
+                Err(mpsc::TryRecvError::Disconnected) => self.pending = None,
+                Err(mpsc::TryRecvError::Empty) => return,
             }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.pending = None;
+        }
+        if let Some((key, options)) = self.queued.take() {
+            if self.get(key, &options).is_none()
+                && self.start(key, options.clone()) == RequestStatus::Unavailable
+            {
+                self.queued = Some((key, options));
             }
-            Err(mpsc::TryRecvError::Empty) => {}
         }
     }
 
@@ -241,6 +333,13 @@ fn command(program: &str, args: &[&str], deadline: Instant) -> Option<String> {
     if remaining.is_zero() {
         return None;
     }
+    // Prefer the system executable over desktop/session PATH entries.
+    let system = std::path::Path::new("/usr/bin").join(program);
+    let program = if system.is_file() {
+        system.as_os_str()
+    } else {
+        std::ffi::OsStr::new(program)
+    };
     crate::tailscale::run_limited(std::process::Command::new(program).args(args), remaining).ok()
 }
 

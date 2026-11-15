@@ -44,12 +44,7 @@
       "c000:aa:c000:ab::c000:aa",
       "c000:aa:c000:ab::c000:ab"
     ],
-    "expected": [
-      [
-        "c000:aa::",
-        32
-      ]
-    ]
+    "expected": []
   },
   {
     "addresses": [
@@ -78,5 +73,49 @@
       "2001:db8::1"
     ],
     "expected": []
+  },
+  {
+    "addresses": [
+      "2001:db8:c0:0:aa::c000:aa"
+    ],
+    "expected": []
+  },
+  {
+    "addresses": [
+      "2001:db8:c0:0:aa::c000:ab"
+    ],
+    "expected": []
+  },
+  {
+    "addresses": [
+      "2001:db8:c0:0:aa::c000:aa",
+      "2001:db8:c0:0:aa::c000:ab"
+    ],
+    "expected": []
+  },
+  {
+    "addresses": [
+      "64:ff9b::c000:aa",
+      "2001:db8::c000:ab"
+    ],
+    "expected": []
+  },
+  {
+    "addresses": [
+      "2001:db8::c000:aa",
+      "64:ff9b::c000:ab",
+      "2001:db8::c000:ab",
+      "64:ff9b::c000:aa"
+    ],
+    "expected": [
+      [
+        "2001:db8::",
+        96
+      ],
+      [
+        "64:ff9b::",
+        96
+      ]
+    ]
   }
 ]
