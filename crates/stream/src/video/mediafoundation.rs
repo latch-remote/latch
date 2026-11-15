@@ -1321,7 +1321,13 @@ mod tests {
         // Read all returned sample times. This test retains delayed outputs
         // even on an MFT version that has learned to release old streams early.
         let observed: Vec<_> = before.iter().flatten().copied().collect();
-        assert!(observed.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            observed
+                .iter()
+                .enumerate()
+                .all(|(index, time)| *time == index as i64),
+            "drain lost or misordered buffered identities {observed:?}"
+        );
         let mut patched = State::new(Codec::H264Baseline, false, None, 160, 98, 8)?;
         let after = replay(&mut patched, true)?;
         assert_eq!(after, (0..24).map(|i| vec![i]).collect::<Vec<_>>());
