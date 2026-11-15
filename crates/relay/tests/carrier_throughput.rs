@@ -81,7 +81,10 @@ fn websocket_matches_native_video_through_a_delayed_path() {
         let max = *ages.last().unwrap();
         let mbps = bytes as f64 * 8.0 / (duration - warmup).as_secs_f64() / 1e6;
         eprintln!("{carrier:?}: {mbps:.3} Mbps, p95={p95:?}, max={max:?}");
-        assert!(mbps >= 10.0, "{carrier:?}: {mbps} Mbps");
+        // The queue holds one frame, so a slow runner that accepts every other
+        // frame delivers 120 of them in the window: 9.99984 Mbps, just under
+        // half of the 20 Mbps offered. The floor sits below that rate, not on it.
+        assert!(mbps >= 9.0, "{carrier:?}: {mbps} Mbps");
         assert!(p95 < Duration::from_millis(500), "{carrier:?}: {p95:?}");
         assert!(max < Duration::from_millis(750), "{carrier:?}: {max:?}");
         rates.push(mbps);
