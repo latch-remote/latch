@@ -852,10 +852,14 @@ fn warning_codes_are_stable_and_messages_are_credential_free() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn desktop_commands_prefer_the_system_executable() {
-    assert_eq!(
-        command_program("true"),
-        std::path::Path::new("/usr/bin/true")
-    );
+    // Sandboxed builders such as Nix have no /usr/bin; the bare name is then
+    // the documented fallback.
+    let system = std::path::Path::new("/usr/bin/true");
+    if system.is_file() {
+        assert_eq!(command_program("true"), system);
+    } else {
+        assert_eq!(command_program("true"), std::path::Path::new("true"));
+    }
     let missing = "latch-netenv-missing-executable";
     assert_eq!(command_program(missing), std::path::Path::new(missing));
     assert_eq!(
