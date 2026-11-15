@@ -294,61 +294,55 @@ sends a parity packet with `seq = 4k`: the XOR of the four packets'
 `u16 length | payload`, each zero-padded to the longest. It rebuilds any
 one lost packet of the four.
 
-The receiver delivers intact frames immediately. A gap becomes known when
-`pop` finds later data or its group's parity. Expected parity arrival is
-`last_group_arrival + (3 - position) * spacing`. Spacing is the maximum
-nonzero forward-arrival interval in the most recent eight groups, with the
-negotiated frame duration as its floor. Its initial seed is 20 ms. An
-interval of at least 60 ms clears that history and is excluded as a pause.
-A 64-packet discontinuity also resets timing history.
+The receiver's normal in-order release rule is unchanged. A gap is detected
+when `pop` finds later data or the group's parity. It releases concealment
+20 ms after that detection, or when the next group's second data packet
+arrives, whichever comes first. A consecutive missing run shares its timer
+until a real frame delivers. Without later data or parity there is no
+observed gap. Callers drain on arrivals and `next_deadline` timer wakeups.
 
-Desktop playback calls `set_playout_deadline` before each `pop`. The deadline
-is the minimum of estimated parity arrival plus 20 ms, the supplied output
-reserve, and detection plus 25 ms. A pending gap's supplied deadline can
-only tighten. The player derives its reserve from currently queued source
-frames. With 2.5 ms device pulls it allows up to 3 ms of additional grace
-so a near-due repair can avoid a full 5 ms concealment. For larger pulls,
-grace is `max(0, 3 ms - max(0, pull_duration - 2.5 ms))`. An already-empty
-queue starts no new wait during continuous playback. After a 100 ms pause,
-the first returning group has a fixed 25 ms startup window. The next group's
-second data packet retains the
-reference receiver's progress cutoff. Parity with an unrepaired gap
-releases concealment immediately in this playback policy.
+For evenly spaced 5 ms data at 0/5/10/15 ms, parity is emitted immediately
+after the fourth packet at 15 ms. Losing positions 1/2/3/4 detects the gap
+at 5/10/15/20 ms if parity is absent. Timer-only releases are 25/30/35/40 ms.
+Continued data triggers the progress cutoff at 25 ms for all four, giving
+20/15/10/5 ms holds. Ideal parity repairs the first three after 10/5/0 ms
+of holding and the fourth before later data detects its gap.
 
-Callers must drain on arrivals and timer wakeups using `next_deadline`.
-A consecutive missing run shares its timer until an actual frame delivers.
-Callers without a playback deadline use main's legacy policy, expiring
-20 ms after detection or when the next group's second data packet arrives,
-whichever comes first. Parity alone still allows reordered data within
-that bound. The host microphone uses this policy and services deadlines
-on arrivals or its 200 ms socket timeout. Its wall-clock release remains
-coarse.
+Desktop playback additionally retains a repair reservation after this
+release, through `min(release + 20 ms, missing_frame_play_deadline - 1 ms)`.
+The play deadline uses the queued source-sample prefix divided by the source
+rate and the unchanged controller's maximum 1.002 playback-speed factor.
+The existing faded concealment and all following frames are queued on the
+original schedule. A late original or parity reconstruction can replace
+only the complete reserved sample range. Under the queue lock, replacement
+requires the whole frame and at least 1 ms of preceding samples still queued,
+with matching decoded channel and sample counts. Device consumption or
+ordinary restart/cap trimming invalidates the range. Following samples do
+not extend the missing frame's deadline. There is no additional underrun
+allowance and no additional playback delay.
 
-A hold stalls every later intact packet. A short repair-induced underrun
-resumes its intact backlog and contributes no jitter sample or margin
-increase. When a dry spell exceeds 25 ms plus one device pull, playback
-treats it as a network stall. Restart is capped at the pre-outage cushion
-plus 2 ms and discards the older stall backlog. Genuine underruns add
-2–8 ms of margin, capped at 20 ms, decaying at 2 ms/s to the 2 ms floor.
-Recovered reserve is kept for three seconds after an underrun or subsequent
-observed sequence gaps, then catch-up removes it. The low-point tracker
-recovers at 2 ms/s. Playback never slows above planned current slack and
-can speed up by 0.4% to drain excess queue.
+This preserves the controller's queue lengths, arrival timestamps, jitter
+samples, fades used for subsequent concealments and all steering decisions.
+The low-point release remains 0.25 ms/s, trim remains ±0.2%, and an underrun
+adds 2 ms of margin, up to 40 ms, decaying at 0.1 ms/s toward 2 ms. Post-loss
+queue recovery remains main's existing behavior. The evaluation asserts
+exact queue/controller equality through 96 s, including +10/+30/+60 s after
+loss ends. Its damage summation tolerance is 1e-9 ms, with zero sample or
+queue-depth tolerance. See [ENGINE.md](ENGINE.md#audio) for modeled results.
 
-The receiver's 60 ms threshold excludes pauses from its cadence estimate.
-The player's 100 ms threshold starts a new audible epoch and tolerates
-shorter delivery stalls, so they serve different purposes.
+At most 64 encoded reservations are retained, each with four payloads of
+at most 1182 bytes and parity of at most 1184 bytes. Their payload storage
+is bounded to 378,368 bytes plus bounded metadata, and each expires within
+20 ms of normal release. The ordinary 64-packet resynchronization also
+clears this cache. Lost parity cannot delay playback or grow this cache
+without bound. The 120 ms playback queue cap stays unchanged.
 
-The evaluation reports actual queued audio separately from controller
-cushion. With loss from 1–12 s, both queue and margin return within 2 ms
-of their no-loss baseline by 22 s and stay there through 96 s, using
-one-second averages. No tested trace reaches the 120 ms queue cap. The
-isolated-loss sweep permits at most 20 ms additional damage over 114
-losses, with mean queue no higher than main. Its largest measured increase
-is 5.10 ms. These deterministic bounds cover the modeled cadences and
-traces. Physical audible results remain unmeasured. See the evaluation
-in [ENGINE.md](ENGINE.md#audio). Wire bytes and protocol-1 negotiation
-remain compatible with 6.0.0 peers in both directions.
+Unbudgeted `pop` callers retain main's exact 20 ms/progress rule, including
+the host microphone receiver's existing arrival/200 ms timeout servicing.
+Audio packet bytes, packetization and protocol-1 negotiation are unchanged,
+with the existing 6.0.0 compatibility in both directions. No additional
+physical capture, network parity or audible measurement was made for this
+revision.
 
 Each coded audio frame is at most `MAX_DATAGRAM - 18` (1 182) bytes,
 leaving room for the 16-byte audio header and the parity packet's two-byte

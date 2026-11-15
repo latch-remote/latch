@@ -320,3 +320,91 @@ fn audio_repair_pause_then_each_loss_position_with_and_without_parity() {
         }
     }
 }
+
+#[test]
+fn playback_reservations_expire_at_the_earlier_budget_or_twenty_ms_extension() {
+    for budget_ms in [0, 7, 20, 60] {
+        let start = Instant::now();
+        let mut receiver = AudioReceiver::with_format(1, 240, 48_000);
+        let packet = latch_proto::wire::AudioPacket {
+            parity: false,
+            seq: 1,
+            pts: 5000,
+            payload: &[1],
+        };
+        receiver.push(&packet, start);
+        assert_eq!(receiver.pop(start), None);
+        let release = start + Duration::from_millis(20);
+        assert_eq!(
+            receiver.pop_for_playback(release, release + Duration::from_millis(budget_ms)),
+            Some(AudioOut::Missing { seq: 0 })
+        );
+        assert_eq!(
+            receiver.pop(release),
+            Some(AudioOut::Frame {
+                seq: 1,
+                pts: 5000,
+                payload: vec![1]
+            })
+        );
+        assert_eq!(receiver.pop(release), None);
+        if budget_ms == 0 {
+            assert_eq!(receiver.stats(), (1, 0, 1));
+            assert_eq!(receiver.next_deadline(), None);
+        } else {
+            let bound = release + Duration::from_millis(budget_ms.min(20));
+            assert_eq!(receiver.next_deadline(), Some(bound));
+            assert_eq!(receiver.stats(), (1, 0, 0));
+            assert_eq!(receiver.pop(bound - Duration::from_nanos(1)), None);
+            assert_eq!(receiver.stats().2, 0);
+            assert_eq!(receiver.pop(bound), None);
+            assert_eq!(receiver.stats().2, 1);
+            assert_eq!(receiver.next_deadline(), None);
+        }
+    }
+}
+
+#[test]
+fn playback_reservation_cache_is_bounded_even_without_clock_progress() {
+    let now = Instant::now();
+    let mut receiver = AudioReceiver::with_format(1, 240, 48_000);
+    let mut missing = Vec::new();
+    for seq in 0..512 {
+        if seq % 4 == 0 {
+            continue;
+        }
+        receiver.push(
+            &latch_proto::wire::AudioPacket {
+                parity: false,
+                seq,
+                pts: seq * 5000,
+                payload: &[1],
+            },
+            now,
+        );
+        while let Some(out) = receiver.pop_for_playback(now, now + Duration::from_secs(3600)) {
+            if let AudioOut::Missing { seq } = out {
+                missing.push(seq);
+            }
+        }
+    }
+    assert_eq!(missing.len(), 127);
+    assert_eq!(
+        missing
+            .iter()
+            .filter(|&&seq| receiver.repair_deadline(seq).is_some())
+            .count(),
+        64
+    );
+    let bound = now + Duration::from_millis(20);
+    assert!(missing
+        .iter()
+        .filter_map(|&seq| receiver.repair_deadline(seq))
+        .all(|deadline| deadline == bound));
+    while receiver.pop(bound).is_some() {}
+    assert_eq!(receiver.stats().2, 128);
+    assert!(missing
+        .iter()
+        .all(|&seq| receiver.repair_deadline(seq).is_none()));
+    assert_eq!(receiver.next_deadline(), None);
+}

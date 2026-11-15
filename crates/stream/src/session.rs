@@ -2661,7 +2661,6 @@ fn receive(
                                 &mut out,
                                 &mut reassembler,
                                 &mut audio_rx,
-                                &mut player,
                                 &mut feedback,
                                 &mut rtt,
                                 &mut media_seen,
@@ -2743,7 +2742,6 @@ fn receive(
                             &mut out,
                             &mut reassembler,
                             &mut audio_rx,
-                            &mut player,
                             &mut feedback,
                             &mut rtt,
                             &mut media_seen,
@@ -2795,7 +2793,6 @@ fn receive(
                                 &mut out,
                                 &mut reassembler,
                                 &mut audio_rx,
-                                &mut player,
                                 &mut feedback,
                                 &mut rtt,
                                 &mut media_seen,
@@ -3158,7 +3155,6 @@ fn handle(
     out: &mut Vec<u8>,
     reassembler: &mut Reassembler,
     audio_rx: &mut AudioReceiver,
-    player: &mut Option<Player>,
     feedback: &mut LatestReceiver,
     rtt: &mut RttEstimator,
     media_seen: &mut bool,
@@ -3174,12 +3170,7 @@ fn handle(
             *media_seen = true;
             reassembler.push(shard, now);
         }
-        Datagram::Audio { packet, .. } => {
-            if let Some(player) = player.as_mut() {
-                player.observe_packet(packet, now);
-            }
-            audio_rx.push(packet, now);
-        }
+        Datagram::Audio { packet, .. } => audio_rx.push(packet, now),
         Datagram::InputAck { next, .. } => {
             if let Some(link) = inner.link.lock().as_mut() {
                 let before = link.sender.unacked();

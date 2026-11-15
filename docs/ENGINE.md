@@ -406,61 +406,50 @@ lets tests check audio bit for bit. Opus is gone.
   period holds it. WASAPI loopback runs at the endpoint's engine period
   (10 ms on most drivers, and low-latency `IAudioClient3` streams refuse
   the loopback flag), so a Windows host sends two packets every 10 ms.
-* **Repair uses the playback reserve.** Four packets share one parity
-  packet. The desktop receiver estimates when parity is due using the
-  group's position and the maximum forward-arrival interval from the last
-  eight groups. Intervals of at least 60 ms reset the estimate as a pause.
-  Before an interval is observed, the seed is 20 ms.
-  The player supplies a deadline from its queued audio, with up to 3 ms
-  of grace for a late repair and a 25 ms maximum wait from gap detection.
-  A 100 ms pause grants the first returning group the same startup window.
-  Larger device pulls reduce that grace. The next group's second packet
-  retains the previous progress cutoff. A group whose parity has arrived
-  with an unrepaired gap is concealed immediately. Intact frames deliver
-  immediately. [Deadline details](PROTOCOL.md#audio-3)
-* **Repair timing stays out of network jitter.** Arrival measurement uses
-  original datagrams and sequence distances. Buffered release and
-  concealment do not become arrival samples. A short repair-induced
-  underrun resumes intact backlog without raising the margin. An outage
-  longer than the 25 ms repair bound plus one pull rebuilds the normal
-  cushion. Its restart keeps at most the pre-outage target plus 2 ms,
-  preventing a late burst from preserving the whole stall as latency.
-* **The queue controller recovers after loss.** The remembered low point
-  recovers at 2 ms/s. Playback never slows while current slack meets its
-  plan, and a smoothed queue above the cushion requests catch-up. Ordinary
-  slowdown is bounded to 0.2%, with catch-up up to 0.4% (4 ms/s). After an
-  underrun, recovered reserve is kept for three seconds, refreshed by
-  observed sequence gaps, before catch-up removes it. A genuine network
-  underrun adds its observed shortage, bounded to 2–8 ms and a total margin
-  of 20 ms. The margin decays at 2 ms/s to its 2 ms floor. Larger device
-  pulls add `max(0, pull_ms - 2.5)` to planned slack for their wider callback
-  phase. The existing hour-long clock-drift tests retain zero gap samples
-  and zero cuts. This adaptation has no session-long loss flag. The
-  120 ms queue safety limit remains.
-* **Deterministic loss evaluation.** Tests compare the real receiver,
-  codec, queue and mixer with frozen main receiver and mixer behavior at
-  `fa8d6f1`. They use 2.5 ms pulls, seeded transit jitter up to 1 ms, and
-  either 5 ms packets or modeled 21.333 ms capture callbacks. Independent
-  1%, 5% and 15% loss includes parity. Burst loss drops 16 ms every 400 ms.
-  The original 23-second matrix has lower damage
-  (`silence + intact discard + 5 ms * concealments`), controller cushion
-  and actual mean queued audio in every scenario. Extended traces lose
-  packets from 1–12 s and continue clean until 96 s. During loss, mean
-  queued audio is below main in all eight traces. Within 10 s after loss
-  stops, every one-second queue and margin average is within 2 ms of its
-  same-trace no-loss baseline and stays there through 96 s. None reaches
-  the 120 ms cap. Sixteen isolated-loss cases cover all group positions,
-  with and without parity, at both cadences. Each loses 114 packets and
-  has lower mean queued audio. The largest damage increase is 5.10 ms
-  over those 114 events. A single-stall trace also recovers within 10 s.
-* **Capture cadence and measured limits.** A second no-loss replay uses
-  exact 1024-sample callback times at 48 kHz. Main's mean queued audio
-  grows from 18.00 ms at 1 s to 57.50 ms at 22 s, while the new controller
-  goes from 18.51 to 17.10 ms. Removing the rounded model's clock error
-  preserves main's growth, so the controller fix also resolves this
-  pre-existing behavior in simulation. Callback sample counts remain a
-  modeling assumption. Physical audibility, network parity timing and
-  output-device scheduling under loss remain unmeasured.
+* **Repair until queued samples need to play.** Four packets share parity.
+  The normal release rule stays at 20 ms from detecting a gap, or the next
+  group's second data packet, whichever comes first. At that cutoff the
+  desktop player queues its ordinary faded concealment and the following
+  audio on the original schedule. While the entire concealed frame remains
+  queued, late parity or an original can replace that reserved sample range.
+  The extra repair window is at most 20 ms, further limited by the queued
+  prefix's play deadline minus a 1 ms decode/handoff allowance. Replacement
+  rechecks the full range under the queue lock. This adds zero playback
+  delay, including under loss. Unbudgeted receivers use the original rule.
+  The encoded repair cache has at most 64 entries and 378,368 payload bytes.
+  [Deadline details](PROTOCOL.md#audio-3)
+* **Queue adaptation follows the existing controller.** Concealment and
+  intact packets enter the queue at their original release times, so repair
+  reservations supply exactly the queue lengths and arrival measurements
+  the controller would otherwise see. Replacing samples changes neither.
+  The low-point release remains 0.25 ms/s, underruns add 2 ms of margin,
+  and margin decays at 0.1 ms/s. Earlier experimental loss-recovery and
+  standing-latency reductions are outside this change.
+* **Deterministic repair evaluation.** The real receiver, codec, queue and
+  mixer are compared with frozen main behavior, identical at `ad9d0e1`.
+  Tests use 2.5/5/10/20 ms pulls, steady 5 ms packets, 10 ms and 21.333 ms
+  capture callbacks, independent 1/5/15% data and parity loss, burst loss,
+  isolated losses at all group positions, pauses, duplicates and stalls.
+  Ten-minute loss-free runs cover both callback cadences at ±15.625,
+  ±50 and ±100 ppm relative clock drift. Additional paths add 10–30 ms
+  jitter to 2% of callbacks, allowing reordering. Queue depth at every pull,
+  cushion, margin and controller underruns are exactly equal to main.
+  When no concealment reservation is created, emitted samples also match
+  exactly. Every scenario asserts concealment and underrun windows no
+  higher, and total damage no higher within a 1e-9 ms summation epsilon.
+  Damage is exact-zero output silence plus intact audio discarded plus
+  5 ms per finally concealed packet. With 21.333 ms capture, 2.5 ms pulls
+  and 23 measured seconds, damage falls from 84.604 to 44.604 ms at 1% loss,
+  396.896 to 286.896 ms at 5%, and 1856.729 to 1606.729 ms at 15%. Queue
+  means stay exactly 44.931, 50.718 and 47.197 ms respectively. Extended
+  traces stop loss at 12 s and remain equal to main through 96 s, including
+  +10/+30/+60 s queue and cushion measurements. The unchanged controller's
+  existing post-loss recovery time and queue growth remain visible.
+* **Measured capture and modeling limits.** The earlier non-invasive local
+  three-second capture sample observed 150 callbacks, with 21.321 ms median,
+  21.547 ms p95 and 21.673 ms maximum spacing. The 1024-sample callback size
+  is a modeling assumption. Physical audible improvement, real-network
+  parity timing and output-device scheduling under loss remain unmeasured.
 * **Surround when both ends have it.** A viewer whose output device has
   more than two channels asks for them (`StreamRequest.audio_channels`);
   the host captures the device's own layout up to that (WASAPI channel
@@ -493,11 +482,12 @@ lets tests check audio bit for bit. Opus is gone.
   falls back to cpal on any failure (`LATCH_AUDIO_OUTPUT=cpal` forces
   it).
 * **A jitter buffer that follows the path.** The viewer measures arrival
-  jitter and capture bursts and steers its reserve toward a 2 ms margin
-  plus the part of a burst the jitter does not already spread. Slowdown
-  is at most 0.2%, with catch-up at most 0.4%. A genuine network underrun
-  widens the margin by 2–8 ms, up to 20 ms total. It narrows by 2 ms/s.
-  Devices that state their range get a 2.5 ms buffer
+  jitter and capture bursts and steers the least audio left before each
+  device pull to a 2 ms margin plus whatever part of a burst the jitter
+  does not already spread, trimming playback speed by at most 0.2 % to
+  hold it. A real underrun (not the host going quiet: it sends nothing
+  for silence) widens the margin by 2 ms, which narrows again by 0.1 ms
+  a second. Devices that state their range get a 2.5 ms buffer
   (`LATCH_AUDIO_BUFFER` overrides it, in frames or `default`).
 * **The viewer's microphone, opt-in.** With **Send my microphone** on and
   a host that answers with `Accept.mic`, the default input is mixed to

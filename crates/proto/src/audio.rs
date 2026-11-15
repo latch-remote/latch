@@ -8,15 +8,20 @@ pub const GROUP: u32 = 4;
 /// Largest coded frame, leaving room for the audio header and parity's
 /// two-byte payload length.
 pub const MAX_PAYLOAD: usize = crate::MAX_DATAGRAM - 16 - 2;
-/// Reordering allowance after a group's estimated parity arrival.
+/// How long a missing packet may hold back the packets after it before it
+/// is given up on, when nothing else settles it first. Covers reordering,
+/// and a loss at the end of a sound after which the host sends nothing.
 pub const AUDIO_HOLD: Duration = Duration::from_millis(20);
-/// Legacy hold from gap detection for callers without a playback deadline.
-pub const AUDIO_MAX_HOLD: Duration = AUDIO_HOLD;
-/// Desktop playback never waits longer than a capture callback and one
-/// small device pull, even when its queue has more room.
-pub const AUDIO_PLAYBACK_HOLD: Duration = Duration::from_millis(25);
-const PAUSE: Duration = Duration::from_millis(60);
-const SPACING_GROUPS: usize = 8;
+/// Extra repair time after main's release, limited further by queued playback.
+pub const AUDIO_REPAIR_EXTENSION: Duration = Duration::from_millis(20);
+const MAX_PENDING_REPAIRS: usize = 64;
+
+struct PendingRepair {
+    deadline: Instant,
+    counted: bool,
+    frames: std::collections::HashMap<u32, (u32, Vec<u8>)>,
+    parity: Option<Vec<u8>>,
+}
 
 /// Numbers encoded audio frames and sends a parity packet after every
 /// [`GROUP`] of them.
@@ -99,15 +104,15 @@ pub enum AudioOut {
         pts: u32,
         payload: Vec<u8>,
     },
-    /// This packet is gone for good; the player conceals it.
+    /// The in-order release uses concealment for this packet.
     Missing { seq: u32 },
 }
 
 /// Puts audio packets in order and rebuilds a lost one from its group's
-/// parity. With an output deadline, missing packets wait for estimated
-/// parity within that reserve and [`AUDIO_PLAYBACK_HOLD`]. Other callers
-/// retain [`AUDIO_MAX_HOLD`] from detection and the later-group cutoff.
-/// Intact packets are delivered immediately. After a gap beyond
+/// parity. A missing packet is given up on when a packet two or more past
+/// the end of its group has arrived, or [`AUDIO_HOLD`] after a later packet
+/// or its group's parity showed it missing; parity alone does not, since
+/// the group's data may have been reordered behind it. After a gap beyond
 /// the 64-packet window, jumps to the arriving packet's group start and
 /// clears stale state, rather than playing a long backlog of concealment
 /// or stalling forever.
@@ -116,16 +121,12 @@ pub struct AudioReceiver {
     packet_us: u32,
     next: Option<u32>,
     frames: std::collections::HashMap<u32, (u32, Vec<u8>)>,
-    parity: std::collections::HashMap<u32, (Instant, Vec<u8>)>,
+    parity: std::collections::HashMap<u32, Vec<u8>>,
     latest: Option<u32>,
-    last_arrival: Option<Instant>,
-    spacing: [(u32, Duration); SPACING_GROUPS],
-    /// Last observed data position and arrival in each group.
-    group_arrival: std::collections::HashMap<u32, (u32, Instant)>,
     /// Since when `next` has been known missing.
     held: Option<Instant>,
-    playout_deadline: Option<Instant>,
     stats: (u64, u64, u64),
+    repairs: std::collections::HashMap<u32, PendingRepair>,
 }
 
 impl AudioReceiver {
@@ -135,27 +136,41 @@ impl AudioReceiver {
 
     /// Packet duration from Accept; the legacy constructor retains 10 ms.
     pub fn with_format(session: u32, samples: u32, rate: u32) -> Self {
-        let packet_us = (u64::from(samples) * 1_000_000 / u64::from(rate.max(1))) as u32;
         Self {
             session,
-            packet_us,
+            packet_us: (u64::from(samples) * 1_000_000 / u64::from(rate.max(1))) as u32,
             next: None,
             frames: Default::default(),
             parity: Default::default(),
             latest: None,
-            last_arrival: None,
-            spacing: [(0, Duration::ZERO); SPACING_GROUPS],
-            group_arrival: Default::default(),
             held: None,
-            playout_deadline: None,
             stats: (0, 0, 0),
+            repairs: Default::default(),
         }
     }
 
     pub fn push(&mut self, packet: &AudioPacket<'_>, now: Instant) {
-        let _ = self.session;
+        let _ = (now, self.session);
         if packet.parity && !packet.seq.is_multiple_of(GROUP) {
             return;
+        }
+        // Late originals/parity can fill a reserved, still-unplayed frame.
+        // This cache never changes the legacy in-order receiver's inputs.
+        if packet.payload.len() <= MAX_PAYLOAD + if packet.parity { 2 } else { 0 } {
+            let group = packet.seq - packet.seq % GROUP;
+            for (&seq, repair) in &mut self.repairs {
+                if seq - seq % GROUP != group || now >= repair.deadline {
+                    continue;
+                }
+                if packet.parity {
+                    repair.parity.get_or_insert_with(|| packet.payload.to_vec());
+                } else {
+                    repair
+                        .frames
+                        .entry(packet.seq)
+                        .or_insert_with(|| (packet.pts, packet.payload.to_vec()));
+                }
+            }
         }
         let mut next = *self.next.get_or_insert(packet.seq - packet.seq % GROUP);
         if crate::video::before(packet.seq, next.wrapping_sub(GROUP - 1)) {
@@ -166,18 +181,17 @@ impl AudioReceiver {
             self.stats.2 += group.wrapping_sub(next) as u64;
             next = group;
             self.next = Some(next);
+            self.stats.2 += self.repairs.len() as u64;
+            self.repairs.clear();
             self.frames.clear();
             self.parity.clear();
             self.latest = None;
-            self.last_arrival = None;
-            self.spacing.fill((0, Duration::ZERO));
-            self.group_arrival.clear();
             self.held = None;
         }
         if packet.parity {
             self.parity
                 .entry(packet.seq)
-                .or_insert_with(|| (now, packet.payload.to_vec()));
+                .or_insert_with(|| packet.payload.to_vec());
         } else {
             if crate::video::before(packet.seq, next) || packet.seq.wrapping_sub(next) > 64 {
                 return;
@@ -192,109 +206,114 @@ impl AudioReceiver {
                 .latest
                 .is_none_or(|n| crate::video::before(n, packet.seq))
             {
-                if let Some(arrival) = self.last_arrival {
-                    let spacing = now.saturating_duration_since(arrival);
-                    if spacing >= PAUSE {
-                        // Sequence numbers do not advance during silence.
-                        self.spacing.fill((0, Duration::ZERO));
-                    } else if !spacing.is_zero() {
-                        let group = packet.seq - packet.seq % GROUP;
-                        let entry = &mut self.spacing[(group / GROUP) as usize % SPACING_GROUPS];
-                        if entry.0 != group {
-                            *entry = (group, Duration::ZERO);
-                        }
-                        entry.1 = entry.1.max(spacing);
-                    }
-                }
-                self.last_arrival = Some(now);
                 self.latest = Some(packet.seq);
             }
-            let position = packet.seq % GROUP;
-            self.group_arrival
-                .insert(packet.seq - position, (position, now));
         }
         self.rebuild(packet.seq - packet.seq % GROUP);
     }
 
-    fn spacing(&self) -> Duration {
-        let latest = self.latest.unwrap_or(0);
-        let group = latest - latest % GROUP;
-        self.spacing
-            .iter()
-            .filter(|&&(n, interval)| {
-                group.wrapping_sub(n) < GROUP * SPACING_GROUPS as u32 && !interval.is_zero()
-            })
-            .map(|&(_, interval)| interval)
-            // Before the first callback interval, allow a capture burst.
-            .max()
-            .unwrap_or(AUDIO_HOLD)
-            .max(Duration::from_micros(u64::from(self.packet_us)))
-            .min(PAUSE)
-    }
-
-    /// The output queue's latest safe release time. Update before each
-    /// `pop`, including timer wakeups. A pending gap's deadline can only
-    /// move earlier. This enables the low-latency playback policy.
-    pub fn set_playout_deadline(&mut self, deadline: Instant) {
-        self.playout_deadline = Some(if self.held.is_some() {
-            self.playout_deadline
-                .map_or(deadline, |old| old.min(deadline))
-        } else {
-            deadline
-        });
-    }
-
     fn rebuild(&mut self, group: u32) {
-        let Some((_, parity)) = self.parity.get(&group) else {
+        let Some(parity) = self.parity.get(&group) else {
             return;
         };
-        let missing: Vec<_> = (0..GROUP)
-            .map(|i| group.wrapping_add(i))
-            .filter(|s| !self.frames.contains_key(s))
-            .collect();
-        if missing.len() != 1 {
-            return;
-        }
-        let mut data = parity.clone();
-        for i in 0..GROUP {
-            if let Some((_, payload)) = self.frames.get(&group.wrapping_add(i)) {
-                let mut coded = Vec::new();
-                coded.extend((payload.len() as u16).to_le_bytes());
-                coded.extend(payload);
-                for (a, b) in data.iter_mut().zip(coded) {
-                    *a ^= b;
-                }
+        if let Some(AudioOut::Frame { seq, pts, payload }) =
+            reconstruct(group, self.packet_us, &self.frames, parity)
+        {
+            self.frames.insert(seq, (pts, payload));
+            self.stats.1 += 1;
+            if let Some(repair) = self.repairs.get_mut(&seq) {
+                repair.counted = true;
             }
         }
-        if data.len() < 2 {
-            return;
-        }
-        let len = u16::from_le_bytes([data[0], data[1]]) as usize;
-        if len > data.len() - 2 {
-            return;
-        }
-        let seq = missing[0];
-        let pts = (0..GROUP)
-            .find_map(|i| {
-                let n = group.wrapping_add(i);
-                self.frames
-                    .get(&n)
-                    .map(|(p, _)| p.wrapping_add(seq.wrapping_sub(n).wrapping_mul(self.packet_us)))
-            })
-            .unwrap_or(0);
-        self.frames.insert(seq, (pts, data[2..2 + len].to_vec()));
-        self.stats.1 += 1;
     }
+
+    /// Main's release order, with a bounded repair reservation for a missing
+    /// frame that the caller will queue as concealment until its play deadline.
+    pub fn pop_for_playback(&mut self, now: Instant, deadline: Instant) -> Option<AudioOut> {
+        let out = self.pop(now)?;
+        if let AudioOut::Missing { seq } = out {
+            let deadline = deadline.min(now + AUDIO_REPAIR_EXTENSION);
+            if deadline > now && self.repairs.len() < MAX_PENDING_REPAIRS {
+                let group = seq - seq % GROUP;
+                let frames: std::collections::HashMap<_, _> = self
+                    .frames
+                    .iter()
+                    .filter(|(n, (_, payload))| {
+                        n.wrapping_sub(group) < GROUP && payload.len() <= MAX_PAYLOAD
+                    })
+                    .map(|(&n, frame)| (n, frame.clone()))
+                    .collect();
+                let parity = self
+                    .parity
+                    .get(&group)
+                    .filter(|p| p.len() <= MAX_PAYLOAD + 2)
+                    .cloned();
+                self.repairs.insert(
+                    seq,
+                    PendingRepair {
+                        deadline,
+                        counted: false,
+                        frames,
+                        parity,
+                    },
+                );
+                // Classification is deferred until repair or expiry. This
+                // decrement is internal to the opt-in call.
+                self.stats.2 -= 1;
+            }
+        }
+        Some(out)
+    }
+
+    pub fn repair_deadline(&self, seq: u32) -> Option<Instant> {
+        self.repairs.get(&seq).map(|r| r.deadline)
+    }
+
+    /// A late frame is usable only after the caller verifies its queued
+    /// sample range. Acknowledge that check with `finish_repair`.
+    pub fn repair(&self, seq: u32, now: Instant) -> Option<AudioOut> {
+        let repair = self.repairs.get(&seq)?;
+        if now >= repair.deadline {
+            return None;
+        }
+        if let Some((pts, payload)) = repair.frames.get(&seq) {
+            return Some(AudioOut::Frame {
+                seq,
+                pts: *pts,
+                payload: payload.clone(),
+            });
+        }
+        reconstruct(
+            seq - seq % GROUP,
+            self.packet_us,
+            &repair.frames,
+            repair.parity.as_deref()?,
+        )
+    }
+
+    pub fn finish_repair(&mut self, seq: u32, repaired: bool) {
+        if let Some(pending) = self.repairs.remove(&seq) {
+            if repaired {
+                if !pending.frames.contains_key(&seq) && !pending.counted {
+                    self.stats.1 += 1;
+                }
+            } else {
+                self.stats.2 += 1;
+            }
+        }
+    }
+
     /// The next packet in order, or the next one given up on. Call it on
     /// every wakeup, not only when audio arrives: the host sends nothing
     /// while the desktop is silent.
     pub fn pop(&mut self, now: Instant) -> Option<AudioOut> {
+        let before = self.repairs.len();
+        self.repairs.retain(|_, repair| now < repair.deadline);
+        self.stats.2 += (before - self.repairs.len()) as u64;
         let seq = self.next?;
         self.frames
             .retain(|&n, _| !crate::video::before(n, seq.wrapping_sub(GROUP)));
         self.parity
-            .retain(|&n, _| !crate::video::before(n, seq.wrapping_sub(GROUP)));
-        self.group_arrival
             .retain(|&n, _| !crate::video::before(n, seq.wrapping_sub(GROUP)));
         let group = seq - seq % GROUP;
         if let Some((pts, payload)) = self.frames.get(&seq).cloned() {
@@ -311,8 +330,12 @@ impl AudioReceiver {
         }
         // One timer for a run of missing packets: it restarts only once a
         // packet is delivered.
-        self.held.get_or_insert(now);
-        if self.next_deadline().is_some_and(|deadline| now >= deadline) {
+        let held = *self.held.get_or_insert(now);
+        if now.saturating_duration_since(held) >= AUDIO_HOLD
+            || self
+                .latest
+                .is_some_and(|n| !crate::video::before(n, group.wrapping_add(GROUP + 1)))
+        {
             self.next = Some(seq.wrapping_add(1));
             self.stats.2 += 1;
             return Some(AudioOut::Missing { seq });
@@ -322,35 +345,11 @@ impl AudioReceiver {
 
     /// When `pop` may give up on a missing packet even if nothing arrives.
     pub fn next_deadline(&self) -> Option<Instant> {
-        let held = self.held?;
-        let seq = self.next?;
-        let group = seq - seq % GROUP;
-        if self
-            .latest
-            .is_some_and(|n| !crate::video::before(n, group.wrapping_add(GROUP + 1)))
-        {
-            // Retain main's progress cutoff in playback. Extra waiting
-            // after two packets of the next group risks its intact audio.
-            return Some(held);
-        }
-        let Some(playout) = self.playout_deadline else {
-            // Preserve main's microphone/headless policy until the caller
-            // can supply its actual output reserve.
-            return Some(held + AUDIO_MAX_HOLD);
-        };
-        let cap = playout.min(held + AUDIO_PLAYBACK_HOLD);
-        if self.parity.contains_key(&group) {
-            // A single loss was already rebuilt by push. Playback
-            // conceals an unrepairable group immediately.
-            return Some(held);
-        }
-        let due = self
-            .group_arrival
-            .get(&group)
-            .map_or(held, |&(position, arrival)| {
-                arrival + self.spacing() * (GROUP - 1 - position)
-            });
-        Some((due + AUDIO_HOLD).min(cap))
+        self.held
+            .map(|t| t + AUDIO_HOLD)
+            .into_iter()
+            .chain(self.repairs.values().map(|r| r.deadline))
+            .min()
     }
 
     /// Counters: packets received, rebuilt from parity, given up on.
@@ -359,102 +358,49 @@ impl AudioReceiver {
     }
 }
 
-#[cfg(test)]
-mod timing_tests {
-    use super::*;
-
-    #[test]
-    fn spacing_shrinks_after_eight_groups_and_resets_after_resynchronization() {
-        let mut receiver = AudioReceiver::with_format(1, 240, 48_000);
-        let start = Instant::now();
-        for seq in 0..48 {
-            let ms = if seq < 4 {
-                seq * 30
-            } else {
-                90 + (seq - 3) * 5
-            };
-            receiver.push(
-                &AudioPacket {
-                    parity: false,
-                    seq,
-                    pts: seq * 5000,
-                    payload: &[0],
-                },
-                start + Duration::from_millis(u64::from(ms)),
-            );
-            if seq == 3 {
-                assert_eq!(receiver.spacing(), Duration::from_millis(30));
+fn reconstruct(
+    group: u32,
+    packet_us: u32,
+    frames: &std::collections::HashMap<u32, (u32, Vec<u8>)>,
+    parity: &[u8],
+) -> Option<AudioOut> {
+    let missing: Vec<_> = (0..GROUP)
+        .map(|i| group.wrapping_add(i))
+        .filter(|s| !frames.contains_key(s))
+        .collect();
+    if missing.len() != 1 {
+        return None;
+    }
+    let mut data = parity.to_vec();
+    for i in 0..GROUP {
+        if let Some((_, payload)) = frames.get(&group.wrapping_add(i)) {
+            let mut coded = Vec::new();
+            coded.extend((payload.len() as u16).to_le_bytes());
+            coded.extend(payload);
+            for (a, b) in data.iter_mut().zip(coded) {
+                *a ^= b;
             }
         }
-        assert_eq!(receiver.spacing(), Duration::from_millis(5));
-        receiver.push(
-            &AudioPacket {
-                parity: false,
-                seq: 200,
-                pts: 1_000_000,
-                payload: &[0],
-            },
-            start + Duration::from_secs(2),
-        );
-        assert_eq!(receiver.spacing(), AUDIO_HOLD);
     }
-
-    #[test]
-    fn playback_deadline_only_tightens_and_never_exceeds_twenty_five_ms() {
-        let start = Instant::now();
-        for reserve in [Duration::from_millis(13), Duration::from_secs(1)] {
-            let mut receiver = AudioReceiver::with_format(1, 240, 48_000);
-            receiver.set_playout_deadline(start + reserve);
-            receiver.push(
-                &AudioPacket {
-                    parity: false,
-                    seq: 1,
-                    pts: 5000,
-                    payload: &[1],
-                },
-                start,
-            );
-            assert_eq!(receiver.pop(start), None);
-            let deadline = start + reserve.min(AUDIO_PLAYBACK_HOLD);
-            assert_eq!(receiver.next_deadline(), Some(deadline));
-            receiver.set_playout_deadline(start + Duration::from_secs(2));
-            assert_eq!(receiver.next_deadline(), Some(deadline));
-            assert_eq!(receiver.pop(deadline - Duration::from_nanos(1)), None);
-            assert_eq!(receiver.pop(deadline), Some(AudioOut::Missing { seq: 0 }));
-        }
+    if data.len() < 2 {
+        return None;
     }
-
-    #[test]
-    fn playback_conceals_an_unrepairable_group_as_soon_as_parity_arrives() {
-        let start = Instant::now();
-        let mut packets = Vec::new();
-        let mut sender = AudioPacketizer::new(1);
-        for seq in 0..GROUP {
-            sender.packetize(seq * 5000, &[seq as u8], |bytes| {
-                packets.push(bytes.to_vec())
-            });
-        }
-        let mut receiver = AudioReceiver::with_format(1, 240, 48_000);
-        receiver.set_playout_deadline(start + AUDIO_PLAYBACK_HOLD);
-        for index in [0, 3, 4] {
-            let crate::wire::Datagram::Audio { packet, .. } =
-                crate::wire::parse(&packets[index]).unwrap()
-            else {
-                panic!()
-            };
-            receiver.push(&packet, start);
-        }
-        assert!(matches!(
-            receiver.pop(start),
-            Some(AudioOut::Frame { seq: 0, .. })
-        ));
-        assert_eq!(receiver.pop(start), Some(AudioOut::Missing { seq: 1 }));
-        assert_eq!(receiver.pop(start), Some(AudioOut::Missing { seq: 2 }));
-        assert!(matches!(
-            receiver.pop(start),
-            Some(AudioOut::Frame { seq: 3, .. })
-        ));
-        assert_eq!(receiver.pop(start), None);
-        assert_eq!(receiver.next_deadline(), None);
+    let len = u16::from_le_bytes([data[0], data[1]]) as usize;
+    if len > data.len() - 2 {
+        return None;
     }
+    let seq = missing[0];
+    let pts = (0..GROUP)
+        .find_map(|i| {
+            let n = group.wrapping_add(i);
+            frames
+                .get(&n)
+                .map(|(p, _)| p.wrapping_add(seq.wrapping_sub(n).wrapping_mul(packet_us)))
+        })
+        .unwrap_or(0);
+    Some(AudioOut::Frame {
+        seq,
+        pts,
+        payload: data[2..2 + len].to_vec(),
+    })
 }
