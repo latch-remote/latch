@@ -900,8 +900,10 @@ fn run_gateway_connection(
         GatewayMode::CachedNativeThenStall if changed => Duration::from_millis(140),
         _ => Duration::ZERO,
     };
-    // Delay the ClientHello already consumed for ALPN inspection as well.
-    thread::sleep(delay);
+    // Loopback TCP connect itself has no network latency. Charge one simulated
+    // TCP handshake RTT before forwarding TLS, plus the ClientHello's one-way
+    // delay. Subsequent bursts are scheduled independently in each direction.
+    thread::sleep(delay * 3);
     server.write_all(&hello)?;
     server.set_nonblocking(true)?;
     client.set_nonblocking(true)?;
@@ -1474,7 +1476,7 @@ fn stale_cached_native_recovers_with_full_ladder_at_280_ms_rtt() {
         .iter()
         .all(|a| a.failure == latch_relay::Failure::ConnectionBlocked));
     assert!(!recovered.reduced_mss);
-    assert!(started.elapsed() >= Duration::from_millis(2300));
+    assert!(started.elapsed() >= Duration::from_millis(2600));
     assert!(started.elapsed() < Duration::from_millis(3500));
 }
 
