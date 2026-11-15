@@ -1,8 +1,10 @@
 # latch-relay
 
-Native public TCP/TLS transport for Latch. Both peers connect outbound to a
-configured public hostname, normally port 443. ALPN is `latch-relay/1`.
-This requires a network that permits native TLS with this ALPN.
+Public TCP/TLS transport for Latch. Both peers connect outbound to a public
+hostname, normally port 443. Native ALPN `latch-relay/1` is attempted first.
+A bounded fallback uses RFC 6455 WebSocket over HTTPS at `/relay` on the same
+port, offering `h2, http/1.1` and normal relay SNI. The daemon selects HTTP/1.1.
+Its ordinary HTTPS response is `200 OK` with a small text body.
 
 ## Integration contract
 
@@ -12,7 +14,9 @@ This requires a network that permits native TLS with this ALPN.
    Production uses standard WebPKI roots, hostname verification, and rejects
    private, loopback and tailnet DNS results. Explicit
    `ClientConfig::with_roots` supports private PKI and loopback test certificates.
-3. Host calls `create_grant(&config, &cancel)` then `SessionKeys::generate()`.
+3. Host calls `create_grant_with_info(&config, &cancel)` then
+   `SessionKeys::generate()`. The result includes typed carrier diagnostics.
+   The existing `create_grant` entry point returns the grant alone.
    Send only `grant.viewer` and the fresh keys to the authorized viewer through
    existing Tailscale-authenticated control. Keep `grant.host` on the host.
    Attachment and keys implement serde for this existing control channel.
@@ -76,8 +80,66 @@ let host = Transport::connect(config, grant.host, keys.clone())?;
 // The viewer constructs its own ClientConfig and calls Transport::connect.
 ```
 
-Application wiring and automatic selection between direct UDP and relay belong
-to the engine/stream integration, which configures the public endpoint explicitly.
+Engine/stream integration configures the public endpoint and selects between
+direct UDP and relay. The next wiring change can supply proxy settings and use
+the diagnostics below.
+
+## Carrier and proxy API
+
+Set `config.proxy = Some(ProxyConfig::new(host, port)?)` for an explicit HTTP
+CONNECT proxy. Its endpoint accepts DNS names, IPv4 and unbracketed IPv6 literals.
+Set `proxy.credentials = Some(BasicCredentials::new(username, password)?)` for
+Basic authentication. All credential Debug output is redacted. The proxy
+connection uses plaintext HTTP. Relay TLS inside the tunnel verifies the relay
+hostname against the configured roots. Production uses public WebPKI roots.
+The caller supplies system/PAC discovery results.
+
+An explicit proxy is authoritative for both carriers. Each connection has a
+two-second ladder, with at most 750 ms for native DNS/TCP/TLS and the remainder
+for WebSocket DNS/TCP/TLS/upgrade. Refusal, reset, timeout and ALPN rejection
+advance the ladder. Untrusted-issuer, portal and proxy failures finish immediately.
+The caller's earlier setup deadline always wins. The ten-second default setup
+limit still covers relay request/pairing and end-to-end confirmation. Applications
+retain their six-second negotiation deadline and cancel expired attempts.
+
+`create_grant_with_info(&config, &cancel)` returns `(Grant, ConnectionInfo)`.
+`Transport::connection_info(Lane)` returns the chosen path once its connection
+is established. `ConnectionInfo` contains `carrier`, `via_proxy`, `reduced_mss`
+and `earlier_failures`. Each `AttemptFailure` contains its carrier, proxy use
+and `Failure`. `ConnectError::from_io(&error)` recovers typed failures from the
+existing `io::Result` API. `Transport::failure()` retains the terminal typed
+failure while `Event::Closed` keeps its existing shape.
+
+`Failure` distinguishes connection blocked/disconnected, timeout, TLS interception
+with bounded issuer text, probable captive portal, proxy authentication required,
+proxy refused with HTTP status, ALPN rejected, upgrade rejected with HTTP status,
+relay rejected, TLS rejected, invalid protocol, cancellation and unsupported CPU.
+A private-CA certificate fails verification. A different certificate name, plaintext
+HTTP at the TLS boundary or redirect/HTML at upgrade produces a probable captive
+portal failure. The daemon sends an explicit rejection record when it has TLS
+credit. Pre-handshake admission closes and network closes are observationally
+ambiguous and produce connection-blocked failures.
+
+IPv4 and IPv6 race with a 250 ms stagger. Production permits public DNS64 answers
+through the well-known /96 and RFC 8215 /48 translation prefixes. RFC 7050
+`ipv4only.arpa` discovery also permits ULA network-specific /32, /40, /48, /56,
+/64 and /96 prefixes with public embedded destinations. Ordinary private,
+loopback and tailnet destinations remain filtered. Explicit proxies may reside
+on those local networks.
+
+A native handshake timeout requests a 1200-byte MSS on the WebSocket retry on
+Unix. Linux applies it before connect. macOS applies it after connect and before
+TLS. Media timeouts retain the hint in cloned `ClientConfig` values for a fresh
+grant. Call `config.reduce_mss_after_stall()` to carry an externally detected
+stall into subsequent connections. Reuse cloned configurations across retries.
+`ConnectionInfo::reduced_mss` reports successful application. Windows uses its
+OS TCP behavior. Server TCP MTU probing covers the server's sending direction.
+
+WebSocket binary messages contain one existing length-prefixed record, at most
+16 KiB plus four bytes, including fragments. Masking, ping/pong and close follow
+RFC 6455. HTTP headers are bounded to 8 KiB and 32 fields. Native and WebSocket
+share byte quotas, session slots, bounded queues and deadlines. A peer can use
+a different carrier from its partner.
 
 ## Cryptography and CPU support
 
@@ -112,7 +174,9 @@ monthly_bytes)` builds a verified TLS identity with Graviola. Set
 operator overrides, then call `Daemon::bind(config)`. `local_addr()` supports
 loopback port-zero tests, `metrics()` returns fixed atomic counters, and
 `run(&Cancel)` owns the event loop until cancellation. The daemon adds no threads
-per connection. The CLI prints metrics on stdout every 30 s.
+per connection. An IPv6 wildcard listen address enables dual-stack IPv4/IPv6
+on one socket. Per-IP limits normalize IPv4-mapped and well-known NAT64 /96
+addresses. The CLI prints metrics on stdout every 30 s.
 
 ### Pilot defaults
 
@@ -148,7 +212,7 @@ mandatory. The default bind is loopback `127.0.0.1:8443`. A public bind is expli
 ```sh
 cargo build --release -p latch-relay
 # First start after the operator provides a public certificate and private key.
-target/release/latch-relay --listen 0.0.0.0:443 \
+target/release/latch-relay --listen '[::]:443' \
   --cert /etc/latch/relay-chain.pem --key /etc/latch/relay-key.pem \
   --quota-file /var/lib/latch/relay.quota --monthly-bytes 10737418240 \
   --initialize-quota
@@ -197,7 +261,9 @@ handling and sticky persistence failures. The published localhost private key
 under `tests/certs` is a test fixture. Regenerate fixtures with
 `sh crates/relay/tests/certs/generate.sh` when their ten-year certificates expire.
 
-The 23 tests execute on macOS AArch64, and the release daemon builds locally.
-All-target type checks also pass for Linux x86-64, Linux AArch64 and Windows
-x86-64 MSVC. Native execution on Linux, Windows and x86-64 hardware remains
-integration/CI validation work.
+Carrier tests also cover real-TLS WebSocket media, HTTP-ALPN-only middleboxes,
+a silent native handshake, CONNECT with and without Basic authentication, 407,
+403 and 5xx responses, private-CA interception, plaintext and HTTPS redirects,
+upgrade rejection, ordinary HTTPS responses, dual-stack admission, DNS64 address
+filtering, fragmented/masked frame bounds and receive-queue parity. Run the suite
+on each supported OS through CI.

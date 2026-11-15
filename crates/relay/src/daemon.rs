@@ -112,7 +112,7 @@ impl DaemonConfig {
         .with_no_client_auth()
         .with_single_cert(certificates, key)
         .map_err(|_| invalid("invalid relay TLS identity"))?;
-        tls.alpn_protocols = vec![wire::ALPN.to_vec()];
+        tls.alpn_protocols = vec![wire::ALPN.to_vec(), crate::carrier::HTTP_ALPN.to_vec()];
         // Explicitly bound sessions and disable TLS resumption state and tickets.
         tls.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
         tls.send_tls13_tickets = 0;
@@ -237,7 +237,19 @@ impl Daemon {
             config.monthly_bytes,
             config.initialize_quota,
         )?;
-        let listener = TcpListener::bind(config.listen)?;
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(config.listen),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        #[cfg(unix)]
+        socket.set_reuse_address(true)?;
+        if config.listen.is_ipv6() {
+            socket.set_only_v6(false)?;
+        }
+        socket.bind(&config.listen.into())?;
+        socket.listen(128)?;
+        let listener: TcpListener = socket.into();
         listener.set_nonblocking(true)?;
         let connections = (0..config.limits.max_connections).map(|_| None).collect();
         let sessions = (0..config.limits.max_sessions).map(|_| None).collect();
@@ -278,7 +290,18 @@ impl Daemon {
                     {
                         self.diagnose(Some(phase), &error);
                     }
-                    self.remove_connection(index);
+                    if error.kind() == io::ErrorKind::PermissionDenied
+                        && matches!(phase, Phase::Request)
+                        && self.connections[index]
+                            .as_ref()
+                            .is_some_and(|c| c.socket.ready())
+                    {
+                        let conn = self.connections[index].as_mut().unwrap();
+                        conn.socket.queue(&[0])?;
+                        conn.phase = Phase::ReplyAndClose;
+                    } else {
+                        self.remove_connection(index);
+                    }
                 }
             }
             self.quota.check()?;
@@ -412,6 +435,7 @@ impl Daemon {
             let tls = rustls::ServerConnection::new(self.config.tls.clone())
                 .map_err(|_| invalid("TLS server setup failed"))?;
             let mut socket = TlsSocket::new(tls.into(), tcp)?;
+            socket.carrier = crate::carrier::State::Detect;
             socket.credit = credit;
             socket.credit_epoch = credit_epoch;
             self.connections[slot.unwrap()] = Some(Connection {
@@ -690,12 +714,19 @@ fn error_category(error: &io::Error) -> &'static str {
         _ => "io_error",
     }
 }
-fn normalize_ip(ip: IpAddr) -> IpAddr {
+pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(ip) => ip
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(ip)),
+        IpAddr::V6(ip) => {
+            let bytes = ip.octets();
+            if bytes[..12] == [0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0] {
+                return IpAddr::V4(std::net::Ipv4Addr::new(
+                    bytes[12], bytes[13], bytes[14], bytes[15],
+                ));
+            }
+            ip.to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(ip))
+        }
         ip => ip,
     }
 }
@@ -827,5 +858,45 @@ mod tests {
         session.claim(&[3; 32], 1, 0).unwrap();
         session.attach_until = Instant::now();
         assert!(session.claim(&[5; 32], 1, 1).is_err());
+    }
+    #[test]
+    fn wildcard_ipv6_listener_accepts_both_families_and_normalizes_ip_limits() {
+        use rustls::pki_types::pem::PemObject;
+        use std::net::TcpStream;
+        let path = std::env::temp_dir().join(format!(
+            "latch-dual-{}-{}",
+            std::process::id(),
+            u64::from_be_bytes(random().unwrap())
+        ));
+        let mut config = DaemonConfig::new(
+            "[::]:0".parse().unwrap(),
+            vec![
+                CertificateDer::from_pem_slice(include_bytes!("../tests/certs/server.pem"))
+                    .unwrap(),
+            ],
+            PrivateKeyDer::from_pem_slice(include_bytes!("../tests/certs/server-key.pem")).unwrap(),
+            path.clone(),
+            1024 * 1024,
+        )
+        .unwrap();
+        config.initialize_quota = true;
+        let mut daemon = Daemon::bind(config).unwrap();
+        let port = daemon.local_addr().unwrap().port();
+        let v4 = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        let v6 = TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port)).unwrap();
+        daemon.accept().unwrap();
+        assert_eq!(daemon.connections.iter().flatten().count(), 2);
+        for ip in ["::ffff:192.0.2.1", "64:ff9b::c000:201"] {
+            assert_eq!(
+                normalize_ip(ip.parse().unwrap()),
+                "192.0.2.1".parse::<IpAddr>().unwrap()
+            );
+        }
+        assert!(daemon
+            .rates
+            .iter()
+            .any(|r| r.ip == "127.0.0.1".parse::<IpAddr>().unwrap()));
+        drop((v4, v6, daemon));
+        std::fs::remove_file(path).unwrap();
     }
 }

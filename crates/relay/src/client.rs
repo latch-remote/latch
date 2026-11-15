@@ -2,15 +2,20 @@ use crate::{
     crypto::{ensure_supported_cpu, Cipher},
     invalid, timeout,
     wire::{self, TlsSocket, CHUNK, TICK},
-    Attachment, Cancel, Grant, Lane, SessionKeys,
+    Attachment, AttemptFailure, Cancel, Carrier, ConnectError, ConnectionInfo, Failure, Grant,
+    Lane, ProxyConfig, SessionKeys,
 };
 use latch_proto::video::{InFrame, MAX_FRAME_LEN};
 use rustls::pki_types::ServerName;
 use std::{
     collections::VecDeque,
-    fmt, io,
+    fmt,
+    io::{self, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
-    sync::{mpsc, Arc, Condvar, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Condvar, Mutex, OnceLock,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -120,18 +125,27 @@ impl TransportLimits {
 pub struct ClientConfig {
     pub endpoint: Endpoint,
     pub limits: TransportLimits,
+    pub proxy: Option<ProxyConfig>,
     tls: Arc<rustls::ClientConfig>,
     public_only: bool,
+    verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    reduced_mss: Arc<AtomicBool>,
 }
 impl fmt::Debug for ClientConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClientConfig")
             .field("endpoint", &self.endpoint)
             .field("limits", &self.limits)
+            .field("proxy", &self.proxy)
             .finish()
     }
 }
 impl ClientConfig {
+    /// Apply a conservative 1200-byte MSS on subsequent sockets where supported.
+    /// Clones share this hint. Use after a path-MTU stall when starting a fresh grant.
+    pub fn reduce_mss_after_stall(&self) {
+        self.reduced_mss.store(true, Ordering::Relaxed);
+    }
     pub fn production(endpoint: Endpoint) -> io::Result<Self> {
         let mut config = Self::with_roots(
             endpoint,
@@ -145,19 +159,27 @@ impl ClientConfig {
     /// Explicit trust anchors for private PKI and tests. Hostname verification remains enabled.
     pub fn with_roots(endpoint: Endpoint, roots: rustls::RootCertStore) -> io::Result<Self> {
         ensure_supported_cpu()?;
-        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls_graviola::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|_| invalid("TLS versions unavailable"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let provider = Arc::new(rustls_graviola::default_provider());
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots.clone()),
+            provider.clone(),
+        )
+        .build()
+        .map_err(|_| invalid("invalid TLS roots"))?;
+        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|_| invalid("TLS versions unavailable"))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
         tls.alpn_protocols = vec![wire::ALPN.to_vec()];
         Ok(Self {
             endpoint,
             limits: TransportLimits::default(),
             tls: Arc::new(tls),
             public_only: false,
+            proxy: None,
+            verifier,
+            reduced_mss: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -188,7 +210,12 @@ fn enqueue_resolve(resolver: &mpsc::SyncSender<Resolve>, mut request: Resolve) -
         }
     }
 }
-fn resolve(endpoint: &Endpoint, cancel: &Cancel, deadline: Instant) -> io::Result<Vec<SocketAddr>> {
+fn resolve(
+    host: &str,
+    port: u16,
+    cancel: &Cancel,
+    deadline: Instant,
+) -> io::Result<Vec<SocketAddr>> {
     // ponytail: one process-wide resolver bounds stuck OS DNS to one worker.
     // Caller cancellation never joins this OS-owned blocking operation.
     static RESOLVER: OnceLock<io::Result<mpsc::SyncSender<Resolve>>> = OnceLock::new();
@@ -246,8 +273,8 @@ fn resolve(endpoint: &Endpoint, cancel: &Cancel, deadline: Instant) -> io::Resul
     enqueue_resolve(
         resolver,
         Resolve {
-            host: endpoint.host.clone(),
-            port: endpoint.port,
+            host: host.to_owned(),
+            port,
             cancel: cancel.clone(),
             deadline,
             reply,
@@ -282,6 +309,9 @@ fn public_address(ip: std::net::IpAddr) -> bool {
                 && !(a == 192 && b == 0 && c == 0)
         }
         std::net::IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return public_address(v4.into());
+            }
             let s = ip.segments();
             if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
                 // DNS64's well-known NAT64 prefix still targets this IPv4
@@ -290,13 +320,75 @@ fn public_address(ip: std::net::IpAddr) -> bool {
                     std::net::Ipv4Addr::from((u32::from(s[6]) << 16) | u32::from(s[7])).into(),
                 );
             }
+            if s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1 {
+                return public_address(translated_v4(ip, 48).into());
+            }
             s[0] & 0xe000 == 0x2000 && !(s[0] == 0x2001 && s[1] == 0x0db8)
         }
     }
 }
-fn connect_tcp(config: &ClientConfig, cancel: &Cancel, deadline: Instant) -> io::Result<TcpStream> {
-    let mut addresses = resolve(&config.endpoint, cancel, deadline)?;
-    addresses.retain(|addr| !config.public_only || public_address(addr.ip()));
+// RFC 6052 embeds IPv4 around the reserved u octet for /32 through /64.
+fn translated_v4(ip: std::net::Ipv6Addr, prefix_len: usize) -> std::net::Ipv4Addr {
+    let bytes = ip.octets();
+    let positions = match prefix_len {
+        32 => [4, 5, 6, 7],
+        40 => [5, 6, 7, 9],
+        48 => [6, 7, 9, 10],
+        56 => [7, 9, 10, 11],
+        64 => [9, 10, 11, 12],
+        96 => [12, 13, 14, 15],
+        _ => unreachable!(),
+    };
+    std::net::Ipv4Addr::new(
+        bytes[positions[0]],
+        bytes[positions[1]],
+        bytes[positions[2]],
+        bytes[positions[3]],
+    )
+}
+fn allowed_address(ip: std::net::IpAddr, discovery: &[SocketAddr]) -> bool {
+    let std::net::IpAddr::V6(v6) = ip else {
+        return public_address(ip);
+    };
+    for answer in discovery {
+        let std::net::IpAddr::V6(synthesized) = answer.ip() else {
+            continue;
+        };
+        for prefix_len in [32, 40, 48, 56, 64, 96] {
+            let test = translated_v4(synthesized, prefix_len).octets();
+            if matches!(test, [192, 0, 0, 170 | 171])
+                && v6.octets()[..prefix_len / 8] == synthesized.octets()[..prefix_len / 8]
+            {
+                return public_address(translated_v4(v6, prefix_len).into());
+            }
+        }
+    }
+    public_address(ip)
+}
+fn connect_tcp(
+    config: &ClientConfig,
+    cancel: &Cancel,
+    deadline: Instant,
+    reduced_mss: bool,
+) -> io::Result<(TcpStream, bool)> {
+    let (host, port) = config
+        .proxy
+        .as_ref()
+        .map_or((config.endpoint.host(), config.endpoint.port()), |p| {
+            (p.host(), p.port())
+        });
+    let mut addresses = resolve(host, port, cancel, deadline)?;
+    if config.proxy.is_none() && config.public_only {
+        // RFC 7050 discovery is needed only for otherwise filtered IPv6 answers.
+        // The process-wide resolver cache shares this lookup across lanes.
+        let needs_dns64 = addresses.iter().any(|a| matches!(a.ip(), std::net::IpAddr::V6(ip) if !public_address(ip.into()) && !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() && ip.segments()[0] & 0xfe00 == 0xfc00));
+        let discovery = if needs_dns64 {
+            resolve("ipv4only.arpa", 0, cancel, deadline).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        addresses.retain(|addr| allowed_address(addr.ip(), &discovery));
+    }
     if addresses.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -314,7 +406,7 @@ fn connect_tcp(config: &ClientConfig, cancel: &Cancel, deadline: Instant) -> io:
     let mut remaining = addresses.into_iter();
     let mut next = remaining.next();
     let mut start_next = Instant::now();
-    let mut pending: Vec<(TcpStream, Instant)> = Vec::new();
+    let mut pending: Vec<(TcpStream, Instant, bool)> = Vec::new();
     let mut last_error = io::Error::new(io::ErrorKind::NotFound, "relay has no reachable address");
     loop {
         cancel.check()?;
@@ -331,6 +423,13 @@ fn connect_tcp(config: &ClientConfig, cancel: &Cancel, deadline: Instant) -> io:
                     Some(socket2::Protocol::TCP),
                 )?;
                 socket.set_nonblocking(true)?;
+                #[cfg(unix)]
+                let mss_applied = reduced_mss && socket.set_tcp_mss(1200).is_ok();
+                #[cfg(not(unix))]
+                let mss_applied = {
+                    let _ = reduced_mss;
+                    false
+                };
                 match socket.connect(&addr.into()) {
                     Ok(()) => (),
                     Err(e)
@@ -341,10 +440,10 @@ fn connect_tcp(config: &ClientConfig, cancel: &Cancel, deadline: Instant) -> io:
                             ) => {}
                     Err(e) => return Err(e),
                 }
-                Ok::<TcpStream, io::Error>(socket.into())
+                Ok::<_, io::Error>((TcpStream::from(socket), mss_applied))
             })();
             match result {
-                Ok(tcp) => pending.push((tcp, now + Duration::from_secs(3))),
+                Ok((tcp, mss)) => pending.push((tcp, now + Duration::from_secs(3), mss)),
                 Err(error) => last_error = error,
             }
             next = remaining.next();
@@ -353,7 +452,18 @@ fn connect_tcp(config: &ClientConfig, cancel: &Cancel, deadline: Instant) -> io:
         let mut index = 0;
         while index < pending.len() {
             match latch_proto::transport::tcp_connect_ready(&pending[index].0, Duration::ZERO) {
-                Ok(true) => return Ok(pending.swap_remove(index).0),
+                Ok(true) => {
+                    let (tcp, _, mut mss) = pending.swap_remove(index);
+                    // Darwin accepts TCP_MAXSEG only after connect. Apply it
+                    // before CONNECT/TLS emits application bytes there.
+                    #[cfg(unix)]
+                    if reduced_mss && !mss {
+                        mss = socket2::SockRef::from(&tcp).set_tcp_mss(1200).is_ok();
+                    }
+                    #[cfg(not(unix))]
+                    let _ = &mut mss;
+                    return Ok((tcp, mss));
+                }
                 Ok(false) if now < pending[index].1 => {
                     index += 1;
                     continue;
@@ -370,23 +480,157 @@ fn connect_tcp(config: &ClientConfig, cancel: &Cancel, deadline: Instant) -> io:
     }
 }
 
-fn open(config: &ClientConfig, cancel: &Cancel, deadline: Instant) -> io::Result<TlsSocket> {
+/// Two bounded rungs. An explicit proxy is authoritative for both carriers.
+fn open(
+    config: &ClientConfig,
+    cancel: &Cancel,
+    deadline: Instant,
+) -> io::Result<(TlsSocket, ConnectionInfo)> {
     ensure_supported_cpu()?;
-    let tcp = connect_tcp(config, cancel, deadline)?;
-    let name = ServerName::try_from(config.endpoint.host.clone())
-        .map_err(|_| invalid("invalid TLS hostname"))?;
-    let conn = rustls::ClientConnection::new(config.tls.clone(), name)
-        .map_err(|_| invalid("TLS connection setup failed"))?;
-    let mut socket = TlsSocket::new(conn.into(), tcp)?;
-    while socket.conn.is_handshaking() || !socket.idle_write() {
+    let end = deadline.min(Instant::now() + Duration::from_secs(2));
+    let mut attempts = Vec::new();
+    for carrier in [Carrier::Native, Carrier::WebSocket] {
+        let rung_end = if carrier == Carrier::Native {
+            end.min(Instant::now() + Duration::from_millis(750))
+        } else {
+            end
+        };
+        let reduced_mss = config.reduced_mss.load(Ordering::Relaxed)
+            || attempts
+                .iter()
+                .any(|a: &AttemptFailure| a.failure == Failure::Timeout);
+        match open_carrier(config, cancel, rung_end, carrier, reduced_mss) {
+            Ok((socket, mss)) => {
+                return Ok((
+                    socket,
+                    ConnectionInfo {
+                        carrier,
+                        via_proxy: config.proxy.is_some(),
+                        reduced_mss: mss,
+                        earlier_failures: attempts,
+                    },
+                ))
+            }
+            Err(error) => {
+                let typed = ConnectError::from_io(&error);
+                let failure = typed.failure;
+                let terminal = matches!(
+                    failure,
+                    Failure::TlsInterception { .. }
+                        | Failure::CaptivePortal
+                        | Failure::ProxyAuthenticationRequired
+                        | Failure::ProxyRefused { .. }
+                        | Failure::Cancelled
+                        | Failure::Unsupported
+                );
+                attempts.push(AttemptFailure {
+                    carrier,
+                    via_proxy: config.proxy.is_some(),
+                    failure: failure.clone(),
+                });
+                if terminal || carrier == Carrier::WebSocket {
+                    // Preserve the original I/O kind for existing callers.
+                    return Err(io::Error::new(
+                        error.kind(),
+                        ConnectError { failure, attempts },
+                    ));
+                }
+            }
+        }
+    }
+    unreachable!()
+}
+fn proxy_connect(
+    tcp: &mut TcpStream,
+    config: &ClientConfig,
+    cancel: &Cancel,
+    deadline: Instant,
+) -> io::Result<()> {
+    let Some(proxy) = &config.proxy else {
+        return Ok(());
+    };
+    let authority = format!("{}:{}", config.endpoint.host(), config.endpoint.port());
+    let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+    if let Some(credentials) = &proxy.credentials {
+        request.push_str(&format!(
+            "Proxy-Authorization: Basic {}\r\n",
+            credentials.authorization()
+        ));
+    }
+    request.push_str("\r\n");
+    let mut written = 0;
+    let mut headers = crate::carrier::Headers::default();
+    let result = (|| loop {
         cancel.check()?;
         if Instant::now() >= deadline {
             return Err(timeout());
         }
-        socket.pump(None)?;
+        if written < request.len() {
+            match tcp.write(&request.as_bytes()[written..]) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => written += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+                Err(e) => return Err(e),
+            }
+        } else if let Some(bytes) = headers.read_response(tcp)? {
+            let (status, portal) = crate::carrier::response_status(&bytes)?;
+            return match status {
+                407 => Err(Failure::ProxyAuthenticationRequired.error()),
+                400..=599 => Err(Failure::ProxyRefused { status }.error()),
+                200..=299 if !portal => Ok(()),
+                _ if portal => Err(Failure::CaptivePortal.error()),
+                _ => Err(Failure::ProxyRefused { status }.error()),
+            };
+        }
+        thread::sleep(TICK);
+    })();
+    zeroize::Zeroize::zeroize(&mut request);
+    result
+}
+fn open_carrier(
+    config: &ClientConfig,
+    cancel: &Cancel,
+    deadline: Instant,
+    carrier: Carrier,
+    reduced_mss: bool,
+) -> io::Result<(TlsSocket, bool)> {
+    let (mut tcp, mss) = connect_tcp(config, cancel, deadline, reduced_mss)?;
+    proxy_connect(&mut tcp, config, cancel, deadline)?;
+    let name = ServerName::try_from(config.endpoint.host.clone())
+        .map_err(|_| invalid("invalid TLS hostname"))?;
+    let verification_failure = Arc::new(Mutex::new(None));
+    let mut tls = (*config.tls).clone();
+    tls.dangerous()
+        .set_certificate_verifier(Arc::new(crate::diagnostics::Verifier {
+            inner: config.verifier.clone(),
+            failure: verification_failure.clone(),
+        }));
+    if carrier == Carrier::WebSocket {
+        tls.alpn_protocols = vec![b"h2".to_vec(), crate::carrier::HTTP_ALPN.to_vec()];
+    }
+    let conn = rustls::ClientConnection::new(Arc::new(tls), name)
+        .map_err(|_| invalid("TLS connection setup failed"))?;
+    let mut socket = TlsSocket::new(conn.into(), tcp)?;
+    if carrier == Carrier::WebSocket {
+        let (state, request) =
+            crate::carrier::State::client(config.endpoint.host(), config.endpoint.port())?;
+        socket.carrier = state;
+        socket.set_pending(request);
+    }
+    while !socket.ready() {
+        cancel.check()?;
+        if Instant::now() >= deadline {
+            return Err(timeout());
+        }
+        if let Err(error) = socket.pump(None) {
+            if let Some(failure) = verification_failure.lock().unwrap().take() {
+                return Err(failure.error());
+            }
+            return Err(error);
+        }
         thread::sleep(TICK);
     }
-    Ok(socket)
+    Ok((socket, mss))
 }
 
 fn exchange(
@@ -410,10 +654,21 @@ fn exchange(
 }
 /// Cancellable create, including DNS, TCP connect and TLS handshake.
 pub fn create_grant(config: &ClientConfig, cancel: &Cancel) -> io::Result<Grant> {
+    create_grant_with_info(config, cancel).map(|(grant, _)| grant)
+}
+/// Create a grant and report the selected carrier and failed earlier rungs.
+pub fn create_grant_with_info(
+    config: &ClientConfig,
+    cancel: &Cancel,
+) -> io::Result<(Grant, ConnectionInfo)> {
     config.limits.validate()?;
     let deadline = Instant::now() + config.limits.setup_timeout;
-    let mut socket = open(config, cancel, deadline)?;
-    Grant::decode(&exchange(&mut socket, &[1], cancel, deadline)?)
+    let (mut socket, info) = open(config, cancel, deadline)?;
+    let reply = exchange(&mut socket, &[1], cancel, deadline)?;
+    if reply == [0] {
+        return Err(Failure::RelayRejected.error());
+    }
+    Ok((Grant::decode(&reply)?, info))
 }
 
 /// Incoming records contain application data. Debug output omits their contents.
@@ -466,6 +721,8 @@ struct State {
     closed: Option<(io::ErrorKind, String)>,
     closed_delivered: bool,
     frame_ack_elapsed: Option<Duration>,
+    connections: [Option<ConnectionInfo>; 2],
+    failure: Option<ConnectError>,
 }
 struct Shared {
     state: Mutex<State>,
@@ -474,12 +731,14 @@ struct Shared {
     limits: TransportLimits,
 }
 impl Shared {
-    fn close(&self, e: io::Error) {
-        self.cancel.cancel();
+    fn close(&self, e: io::Error, lane: Option<Lane>) {
         let mut state = self.state.lock().unwrap();
         if state.closed.is_none() {
-            state.closed = Some((e.kind(), e.to_string()));
+            state.failure = Some(ConnectError::from_io(&e));
+            let message = lane.map_or_else(|| e.to_string(), |lane| format!("relay {lane:?}: {e}"));
+            state.closed = Some((e.kind(), message));
         }
+        self.cancel.cancel();
         state.priority.clear();
         state.priority_bytes = 0;
         state.frame = None;
@@ -563,12 +822,25 @@ impl Transport {
                 .name(format!("relay-{lane:?}"))
                 .spawn(move || {
                     if let Err(e) = run_lane(&config, &attachment, &keys, lane, &shared) {
-                        shared.close(io::Error::new(e.kind(), format!("relay {lane:?}: {e}")));
+                        // Capabilities cannot be replayed after partial media. A fresh
+                        // application attempt using a cloned config learns this stall.
+                        if e.kind() == io::ErrorKind::TimedOut {
+                            config.reduced_mss.store(true, Ordering::Relaxed);
+                        }
+                        shared.close(e, Some(lane));
                     }
                 })?;
             result.workers.lock().unwrap().push(worker);
         }
         Ok(result)
+    }
+    /// Selected carrier and ladder diagnostics for a lane, available after setup.
+    pub fn connection_info(&self, lane: Lane) -> Option<ConnectionInfo> {
+        self.shared.state.lock().unwrap().connections[lane as usize].clone()
+    }
+    /// Typed terminal connection failure, including failed ladder attempts.
+    pub fn failure(&self) -> Option<ConnectError> {
+        self.shared.state.lock().unwrap().failure.clone()
     }
     pub fn try_send_datagram(&self, bytes: &[u8]) -> io::Result<()> {
         if bytes.is_empty() || bytes.len() > 1200 {
@@ -669,10 +941,10 @@ impl Transport {
     }
     /// Idempotent. Joins only bounded, cancellable network workers.
     pub fn shutdown(&self) {
-        self.shared.close(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "relay shut down",
-        ));
+        self.shared.close(
+            io::Error::new(io::ErrorKind::Interrupted, "relay shut down"),
+            None,
+        );
         for worker in self.workers.lock().unwrap().drain(..) {
             let _ = worker.join();
         }
@@ -765,7 +1037,8 @@ fn run_lane(
     shared: &Shared,
 ) -> io::Result<()> {
     let setup_deadline = Instant::now() + config.limits.setup_timeout;
-    let mut socket = open(config, &shared.cancel, setup_deadline)?;
+    let (mut socket, info) = open(config, &shared.cancel, setup_deadline)?;
+    shared.state.lock().unwrap().connections[lane as usize] = Some(info);
     if exchange(
         &mut socket,
         &attachment.request(lane),
@@ -773,7 +1046,7 @@ fn run_lane(
         setup_deadline,
     )? != [3]
     {
-        return Err(crate::denied());
+        return Err(Failure::RelayRejected.error());
     }
     while !socket.idle_write() {
         shared.cancel.check()?;
@@ -1046,8 +1319,13 @@ mod tests {
         let cancel = Cancel::new();
         for port in [12345, 23456, 34567] {
             let endpoint = Endpoint::new("localhost", port).unwrap();
-            let addresses =
-                resolve(&endpoint, &cancel, Instant::now() + Duration::from_secs(5)).unwrap();
+            let addresses = resolve(
+                endpoint.host(),
+                endpoint.port(),
+                &cancel,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
             assert!(!addresses.is_empty());
             assert!(addresses.iter().all(|address| address.port() == port));
         }
@@ -1183,7 +1461,6 @@ mod tests {
             "64:ff9b::a01:203",
             "64:ff9b::6440:1",
             "64:ff9b::7f00:1",
-            "64:ff9b:1::808:808",
         ] {
             assert!(!public_address(address.parse().unwrap()), "{address}");
         }
@@ -1192,6 +1469,8 @@ mod tests {
             "8.8.8.8",
             "2606:4700:4700::1111",
             "64:ff9b::808:808",
+            "64:ff9b:1:808:8:800::",
+            "2001:4860:64::808:808",
         ] {
             assert!(public_address(address.parse().unwrap()));
         }
@@ -1199,5 +1478,43 @@ mod tests {
             serde_json::from_str::<Endpoint>(r#"{"host":"https://relay.example","port":443}"#)
                 .is_err()
         );
+    }
+    #[test]
+    fn dns64_network_specific_prefixes_preserve_public_destination_filtering() {
+        use std::net::{IpAddr, Ipv6Addr};
+        for prefix_len in [32, 40, 48, 56, 64, 96] {
+            let synthesize = |v4: [u8; 4]| {
+                let mut bytes = "fd12:3456:789a:bcde::"
+                    .parse::<Ipv6Addr>()
+                    .unwrap()
+                    .octets();
+                bytes[prefix_len / 8..].fill(0);
+                let positions = match prefix_len {
+                    32 => [4, 5, 6, 7],
+                    40 => [5, 6, 7, 9],
+                    48 => [6, 7, 9, 10],
+                    56 => [7, 9, 10, 11],
+                    64 => [9, 10, 11, 12],
+                    96 => [12, 13, 14, 15],
+                    _ => unreachable!(),
+                };
+                for (position, value) in positions.into_iter().zip(v4) {
+                    bytes[position] = value;
+                }
+                Ipv6Addr::from(bytes)
+            };
+            let discovery = [SocketAddr::new(synthesize([192, 0, 0, 170]).into(), 0)];
+            assert!(allowed_address(synthesize([8, 8, 8, 8]).into(), &discovery));
+            for private in [[127, 0, 0, 1], [10, 1, 2, 3], [100, 64, 0, 1]] {
+                assert!(!allowed_address(synthesize(private).into(), &discovery));
+            }
+            assert!(!allowed_address(synthesize([8, 8, 8, 8]).into(), &[]));
+            assert!(!allowed_address(
+                "fd7a:115c:a1e0::1".parse::<IpAddr>().unwrap(),
+                &discovery
+            ));
+        }
+        assert!(public_address("::ffff:8.8.8.8".parse().unwrap()));
+        assert!(!public_address("::ffff:127.0.0.1".parse().unwrap()));
     }
 }

@@ -640,11 +640,67 @@ existing keyframe messages.
 
 ## Public TCP/TLS relay
 
-`crates/relay` provides native TLS with ALPN `latch-relay/1`. Production
-clients validate the hostname against WebPKI roots and reject private,
-loopback and tailnet DNS results. Each endpoint opens separate outbound
-priority and video connections. Native TLS requires a compatible network.
-HTTP-only proxies and TLS inspection may reject this ALPN.
+`crates/relay` provides two TLS carriers on the same public TCP port, normally
+443. ALPN `latch-relay/1` selects the native carrier with the 6.0.0 framing.
+ALPN `http/1.1` or an absent ALPN selects an HTTP/1.1 server. A WebSocket
+client offers `h2, http/1.1` with the relay hostname as SNI. The daemon
+selects HTTP/1.1 and upgrades `GET /relay` using RFC 6455 version 13.
+Ordinary HTTP requests receive a small `200 OK` text response and close.
+Each endpoint opens separate outbound priority and video connections.
+
+Production clients verify the relay hostname using public WebPKI roots.
+Private, loopback and tailnet destinations are filtered. IPv4-mapped
+addresses and `64:ff9b::/96` NAT64 answers receive the embedded IPv4 checks.
+RFC 8215 translation addresses and global network-specific DNS64 prefixes
+are accepted. ULA translation prefixes are discovered through RFC 7050
+`ipv4only.arpa`, supporting RFC 6052 /32, /40, /48, /56, /64 and /96 layouts
+and checking embedded public IPv4 destinations. IPv4 and IPv6 connections
+race with a 250 ms stagger and actual socket readiness checks on Windows.
+An unreachable address family shares the bounded connection deadline.
+The supplied systemd unit binds `[::]:443` with IPv4-mapped connections enabled.
+Admission keys normalize mapped IPv4 and the well-known NAT64 /96. NAT64
+translation normally presents its gateway's IPv4 source to the daemon.
+
+### Carrier ladder and diagnostics
+
+Each connection gets a two-second DNS/TCP/TLS/upgrade budget, bounded further
+by the caller's setup deadline. Native TLS gets at most 750 ms. Refusal,
+reset, timeout or ALPN rejection advances to WebSocket using the remaining
+budget. Grant creation precedes two concurrent lane connections, leaving
+room for pairing, key confirmation and control messages within the six-second
+application negotiation deadline. Carriers can differ between peers and lanes.
+The native carrier remains wire-compatible with 6.0.0 clients and daemons.
+
+`ClientConfig::proxy` accepts an explicit `ProxyConfig` with optional
+`BasicCredentials`. Both rungs use that proxy when supplied. The client sends
+HTTP CONNECT for the relay hostname and port, normally `host:443`, and then
+performs relay TLS inside the tunnel. Proxy DNS may resolve to a local or
+private address. Basic credentials and configuration Debug output are redacted.
+Proxy transport uses HTTP over TCP. System and PAC discovery belong to the
+caller.
+
+`create_grant_with_info` returns the grant and `ConnectionInfo` with the selected
+`Carrier`, proxy use, reduced-MSS status and typed `AttemptFailure` history.
+`Transport::connection_info(lane)` exposes the same per-lane data.
+`ConnectError::from_io` and `Transport::failure()` expose user-facing `Failure`
+variants for blocked/disconnected connections, timeout, untrusted certificate
+issuer, probable captive portal, proxy authentication (407), proxy refusal
+(including 403 and 5xx), ALPN/upgrade rejection, and relay admission rejection.
+Untrusted issuers include bounded certificate issuer text. Hostname mismatch,
+plaintext HTTP at the TLS boundary and redirect/HTML upgrade responses identify
+probable captive portals. Untrusted-issuer, portal and proxy failures end the ladder.
+Public-root verification stays enabled throughout. An abrupt pre-handshake
+close has the same observable result for exhausted daemon admission and a
+network filter, and is classified as connection blocked.
+
+On a timed-out native rung the WebSocket retry requests a 1200-byte TCP MSS
+on Unix. Linux applies this before connect and macOS before TLS after connect.
+A media timeout records the hint in cloned client configurations for the next
+fresh-grant attempt. `reduce_mss_after_stall()` lets callers retain that hint
+across their own retry policy. `ConnectionInfo::reduced_mss` records whether
+the socket accepted the clamp. Windows uses its platform TCP behavior.
+The Linux server enables `net.ipv4.tcp_mtu_probing=2` through the deployment
+network script, covering its IPv4 and IPv6 sending paths.
 
 ### Authorization and negotiation
 
@@ -683,7 +739,16 @@ TLS; campus measurements are recorded separately from these tests.
 ### Framing and cryptography
 
 Outer TLS application records use `u32 big-endian length | record`, with
-at most 16 KiB per record. The grant response contains a random rendezvous
+at most 16 KiB per record. WebSocket wraps exactly one complete length-prefixed
+record in each binary message. Client frames are masked and server frames
+are unmasked. Fragmented binary messages, ping/pong and close are supported.
+Extensions and compression are disabled. HTTP headers have an 8 KiB ceiling
+and 32-header parse bound. A WebSocket message is bounded to 16 KiB plus the
+four-byte length, including fragments. Both carriers use the same admission,
+durable encrypted-byte quota, queue backpressure and record/stall deadlines.
+An upgraded relay rejection is a length-prefixed one-byte zero record, which
+older clients already reject. Rejections before TLS credit is available close
+the socket. The grant response contains a random rendezvous
 ID, four independent lane tickets, an attachment expiry and session limits.
 An attach request binds the rendezvous ID, role, lane and corresponding
 ticket. The daemon pairs sockets and forwards bounded opaque records.

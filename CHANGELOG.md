@@ -4,6 +4,21 @@ The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
 `## X.Y.Z (date)`.
 
+## Unreleased
+
+### Relay connectivity
+
+- Add HTTPS WebSocket relay fallback on TCP 443 alongside native
+  `latch-relay/1` TLS, with shared admission, durable quotas and bounded queues.
+- Add explicit HTTP CONNECT proxies with redacted Basic credentials and a
+  bounded native-to-WebSocket connection ladder. Expose typed carrier and
+  failure diagnostics, including TLS interception, captive portals and proxy
+  authentication or refusal.
+- Listen on IPv4 and IPv6, accept DNS64/NAT64 destinations with public-address
+  filtering, and retain address racing and Windows connect readiness checks.
+  Retry stalled Unix paths with a reduced TCP MSS and enable Linux server
+  TCP MTU probing in the deployment kit.
+
 ## 6.0.0 (2026-11-14)
 
 ### Streaming and recovery

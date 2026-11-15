@@ -180,6 +180,9 @@ impl Framer {
 /// Owns the entire TLS state and a single pending framed write.
 pub(crate) struct TlsSocket {
     pub conn: rustls::Connection,
+    pub carrier: crate::carrier::State,
+    control: Option<Vec<u8>>,
+    closing: bool,
     pub tcp: TcpStream,
     pub framer: Framer,
     pending: Vec<u8>,
@@ -197,6 +200,9 @@ impl TlsSocket {
         tcp.set_nodelay(true)?;
         let mut result = Self {
             conn,
+            carrier: crate::carrier::State::Native,
+            control: None,
+            closing: false,
             tcp,
             framer: Framer::default(),
             pending: Vec::new(),
@@ -212,7 +218,7 @@ impl TlsSocket {
         Ok(result)
     }
     pub fn idle_write(&self) -> bool {
-        self.pending.is_empty() && !self.conn.wants_write()
+        self.pending.is_empty() && self.control.is_none() && !self.conn.wants_write()
     }
     pub fn queue(&mut self, record: &[u8]) -> io::Result<()> {
         if !self.idle_write() {
@@ -221,9 +227,7 @@ impl TlsSocket {
         if record.is_empty() || record.len() > RECORD_MAX {
             return Err(invalid("invalid outbound relay record"));
         }
-        self.pending
-            .extend_from_slice(&(record.len() as u32).to_be_bytes());
-        self.pending.extend_from_slice(record);
+        self.pending = self.carrier.encode(record)?;
         self.written = 0;
         self.sending = Some(Instant::now());
         Ok(())
@@ -260,7 +264,15 @@ impl TlsSocket {
                 Ok(_) => {
                     self.conn
                         .process_new_packets()
-                        .map_err(|_| invalid("TLS verification or protocol failed"))?;
+                        .map_err(|error| match error {
+                            rustls::Error::AlertReceived(
+                                rustls::AlertDescription::NoApplicationProtocol,
+                            ) => crate::Failure::AlpnRejected.error(),
+                            rustls::Error::InvalidMessage(
+                                rustls::InvalidMessage::InvalidContentType,
+                            ) => crate::Failure::CaptivePortal.error(),
+                            _ => crate::Failure::TlsRejected.error(),
+                        })?;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
                 Err(e) => return Err(e),
@@ -277,8 +289,19 @@ impl TlsSocket {
             }
         }
         if !self.conn.is_handshaking() {
-            if self.conn.alpn_protocol() != Some(ALPN) {
-                return Err(invalid("relay ALPN required"));
+            self.carrier.alpn(self.conn.alpn_protocol())?;
+            if matches!(self.carrier, crate::carrier::State::Closing) && self.idle_write() {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            if self.closing && self.idle_write() {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            if self.pending.is_empty() {
+                if let Some(control) = self.control.take() {
+                    self.set_pending(control);
+                } else if let Some(response) = self.carrier.negotiate(&mut self.conn.reader())? {
+                    self.set_pending(response);
+                }
             }
             if self.written < self.pending.len() {
                 match self.conn.writer().write(&self.pending[self.written..]) {
@@ -298,11 +321,28 @@ impl TlsSocket {
         }
         Ok(())
     }
+    pub fn set_pending(&mut self, bytes: Vec<u8>) {
+        self.pending = bytes;
+        self.written = 0;
+        self.sending = Some(Instant::now());
+    }
+    pub fn ready(&self) -> bool {
+        !self.conn.is_handshaking() && self.carrier.ready() && self.idle_write()
+    }
     pub fn read_record(&mut self) -> io::Result<Option<Vec<u8>>> {
-        if self.conn.is_handshaking() {
+        if self.conn.is_handshaking() || self.control.is_some() || self.closing {
             return Ok(None);
         }
-        self.framer.read(&mut self.conn.reader())
+        match &mut self.carrier {
+            crate::carrier::State::Native => self.framer.read(&mut self.conn.reader()),
+            crate::carrier::State::WebSocket(ws) => {
+                let result = ws.read(&mut self.conn.reader())?;
+                self.control = result.response;
+                self.closing = result.close;
+                Ok(result.record)
+            }
+            _ => Ok(None),
+        }
     }
     pub fn check_deadlines(&self, stall: Duration, idle: Duration) -> io::Result<()> {
         if self.sending.is_some_and(|t| t.elapsed() >= stall) {
@@ -311,7 +351,7 @@ impl TlsSocket {
                 "TLS write deadline expired",
             ));
         }
-        if self.framer.expired(stall) {
+        if self.framer.expired(stall) || self.carrier.expired(stall) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "TLS record deadline expired",

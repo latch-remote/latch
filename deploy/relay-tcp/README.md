@@ -1,4 +1,4 @@
-# Native TCP/TLS relay
+# TCP/TLS and HTTPS WebSocket relay
 
 This kit installs the `latch-relay` crate on a dedicated Linux machine with
 systemd. The public endpoint is `relay.latch.rune.foo:443` on the dedicated
@@ -24,7 +24,8 @@ python3 deploy/relay-tcp/selftest.py --binary target/release/latch-relay
 
 The binary selftest creates temporary loopback-only TLS identities and ledgers.
 It checks the shipped limits JSON, TLS/ALPN, ledger permissions and exclusive
-locking, missing/corrupt ledger rejection, preserved reservations on restart,
+locking, dual-stack IPv4/IPv6 acceptance, ordinary HTTP and WebSocket upgrade,
+missing/corrupt ledger rejection, preserved reservations on restart,
 initialization refusing an existing ledger, and budget exhaustion across restart.
 The crate tests exercise authenticated two-lane transport and whole frames.
 `python3 deploy/relay-tcp/selftest.py` checks the kit without starting a daemon.
@@ -38,14 +39,24 @@ crypto compatibility or sustainable throughput.
 ## TLS and network access
 
 Create the DNS A record after reserving and attaching the instance's static IP.
-The service binds IPv4 TCP 443. Publish an AAAA record only after explicitly
-configuring and testing an IPv6 listener and its firewall rules.
+The supplied service binds `[::]:443` with `IPV6_V6ONLY` disabled, accepting
+IPv4 and IPv6 on one listener. Publish an AAAA record after enabling the
+instance's public IPv6 route and its TCP 443 firewall rules. DNS64/NAT64 clients
+can also use the public A record. Mapped IPv4 and well-known NAT64 /96 addresses
+share the corresponding IPv4 admission key. Network-specific translation
+normally reaches the daemon through a translator's IPv4 source.
 
 Use a public WebPKI certificate whose SAN includes `relay.latch.rune.foo`.
 The deployed certificate uses Certbot standalone HTTP-01, with public TCP 80
 reserved for ACME. The enabled `certbot.timer` handles renewal. This daemon
-serves native TLS with ALPN `latch-relay/1`. It does not
-serve HTTP or terminate WebSockets. Networks must permit that TLS protocol.
+serves native TLS with ALPN `latch-relay/1` and HTTP/1.1 with `http/1.1` or
+absent ALPN on the same port. `GET /relay` supports RFC 6455 WebSocket upgrade.
+Other HTTP requests receive a small ordinary `200 OK` text response. Both
+carriers share admission limits, persistent transfer quota and deadlines.
+The client tries native TLS then WebSocket in a two-second connection ladder.
+An explicit HTTP CONNECT proxy carries both rungs when supplied by the caller.
+Production clients verify public WebPKI roots and report untrusted issuer,
+portal, proxy and upgrade failures to the caller.
 
 Keep certificate automation state root-only. `certbot-deploy.sh` validates the
 new hostname, expiry and matching key before stopping the relay, copies the
@@ -55,7 +66,8 @@ The `/etc/latch-relay` directory is `root:latch-relay` mode `0750`. The restart
 ends current relay sessions, which need a fresh grant and fresh session keys
 through the authenticated control channel.
 
-Expose TCP 443 publicly on the new dedicated instance. Restrict SSH TCP 22 to
+Expose TCP 443 publicly for both enabled address families on the dedicated
+instance. Restrict SSH TCP 22 to
 the operator's current `/32` or a verified private management route. Retain
 key-based SSH, disable password/root login, and verify a second login before
 closing the original session. Apply the same port policy in any enabled host
@@ -98,8 +110,12 @@ Linux machine under the intended stream count before selecting a smaller bundle.
 An OOM kill ends current sessions and systemd restarts the service with the same
 quota. Local `limits.json` changes survive reinstalling the kit.
 
-`network.sh` enables BBR and the `fq` default when the kernel supports both,
-persisting only those two settings. It retains the existing TCP buffer defaults.
+`network.sh` enables and persists `net.ipv4.tcp_mtu_probing=2`. Linux applies
+this TCP setting to both IPv4 and IPv6, starting with conservative segments and
+probing upward even when ICMP Packet Too Big messages vanish. This protects
+the daemon's sending path. Client Unix retries can request a 1200-byte MSS.
+The script also enables BBR and the `fq` default when the kernel supports both.
+It retains the existing TCP buffer defaults.
 Interface qdisc changes require interface recreation or a reboot. Check the
 effective qdisc and congestion control after reboot. Apply this script during
 setup of the dedicated relay.
