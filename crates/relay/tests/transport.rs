@@ -929,31 +929,36 @@ fn delayed_forward(
     pending: &mut VecDeque<(Instant, Vec<u8>)>,
     delay: Duration,
 ) -> io::Result<()> {
-    if pending.len() < 16 {
-        let mut bytes = vec![0; 16 * 1024];
+    // Move everything available on each pass. One chunk per pass made the
+    // shim's capacity depend on how often a busy runner scheduled this thread.
+    let mut buffered: usize = pending.iter().map(|(_, bytes)| bytes.len()).sum();
+    while buffered < 1 << 20 {
+        let mut bytes = vec![0; 64 * 1024];
         match source.read(&mut bytes) {
             Ok(0) if pending.is_empty() => return Err(io::ErrorKind::UnexpectedEof.into()),
-            Ok(0) => (),
+            Ok(0) => break,
             Ok(n) => {
                 bytes.truncate(n);
+                buffered += n;
                 pending.push_back((Instant::now() + delay, bytes));
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) => return Err(e),
         }
     }
-    if let Some((ready, bytes)) = pending.front_mut() {
-        if Instant::now() >= *ready {
-            match destination.write(bytes) {
-                Ok(n) => {
-                    bytes.drain(..n);
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
-                Err(e) => return Err(e),
+    while let Some((ready, bytes)) = pending.front_mut() {
+        if Instant::now() < *ready {
+            break;
+        }
+        match destination.write(bytes) {
+            Ok(n) => {
+                bytes.drain(..n);
             }
-            if bytes.is_empty() {
-                pending.pop_front();
-            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e),
+        }
+        if bytes.is_empty() {
+            pending.pop_front();
         }
     }
     Ok(())
