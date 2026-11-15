@@ -1,8 +1,10 @@
 //! A timed UDP impairment relay shared by the real session harnesses.
+use crate::listeners;
+
 use latch_proto::sim::{Impairment, Link};
 use parking_lot::Mutex;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,14 +26,7 @@ pub fn relay_with_bandwidth(
     queue_delay_ms: Arc<std::sync::atomic::AtomicU32>,
     kbps: u32,
 ) -> u16 {
-    let (listener, udp) = loop {
-        // UDP picks the port, as in `host`.
-        let u = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = u.local_addr().unwrap().port();
-        if let Ok(l) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
-            break (l, u);
-        }
-    };
+    let (udp, listener) = listeners::proxy();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for client in listener.incoming().flatten() {

@@ -15,4 +15,8 @@ rustls-graviola = "=0.4.0"
 graviola = "=0.4.5"
 webpki-roots = "1"
 zeroize = "1"
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
+base64 = "0.22"
+httparse = "1"
+sha1 = "0.10"
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
