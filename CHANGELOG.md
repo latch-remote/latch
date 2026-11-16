@@ -4,7 +4,21 @@ The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
 `## X.Y.Z (date)`.
 
-## Unreleased
+## 6.1.0 (2026-11-16)
+
+### Highlights
+
+- Streams on networks that block, throttle or inspect UDP. Latch negotiates
+  the media path with the host and moves to the relay, over native TLS or
+  HTTPS WebSocket on TCP 443 and through HTTP proxies, when UDP is blocked,
+  lossy or rate-limited, then returns to UDP when it recovers. TLS
+  interception and captive portals now show a clear error.
+- Linux hosts can share a Wayland desktop through the desktop portal.
+- The viewer can choose which of the host's displays to share.
+- Keyboard input keeps physical key positions between Windows, macOS and
+  Linux.
+- Windows and Mac hosts send the pointer separately from the video.
+- Latch 4.x and 5.x installs can update themselves to this release.
 
 - Add Linux Wayland screen sharing through the desktop portal and runtime-loaded PipeWire, with linear DMA-BUF capture, shared-memory fallback, RemoteDesktop input, and persisted portal approvals in Sharing setup.
 
