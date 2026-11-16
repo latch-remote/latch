@@ -4,6 +4,12 @@ The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
 `## X.Y.Z (date)`.
 
+## Unreleased
+
+- Keep Windows mouse and keyboard input responsive when a foreground game
+  denies cursor confinement, including through the elevated input helper.
+- Fix stretched letter spacing in wrapped menu help text.
+
 ## 6.1.1 (2026-11-16)
 
 ### Windows input

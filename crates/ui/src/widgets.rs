@@ -1369,7 +1369,9 @@ pub fn menu_note(ui: &mut Ui, note: &str) {
             bottom: space::XS as i8,
         })
         .show(ui, |ui| {
-            small_print(ui, note);
+            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                small_print(ui, note);
+            });
         });
 }
 
@@ -2279,6 +2281,37 @@ fn spinner_pace(focused: bool) -> std::time::Duration {
 mod tests {
     use super::*;
     use crate::theme::contrast;
+
+    #[test]
+    fn menu_help_wraps_without_stretching_letters() {
+        let ctx = context();
+        let note =
+            "Win/Super is Command on a Mac. Ctrl+Alt+Delete cannot open Windows secure attention.";
+        for width in [240.0, 320.0, 400.0] {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 400.0))),
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
+                        menu_note(ui, note);
+                    });
+                });
+            });
+            let galley = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == note => Some(&text.galley),
+                    _ => None,
+                })
+                .expect("menu help was drawn");
+            assert!(!galley.job.justify);
+            assert_eq!(galley.job.halign, Align::Min);
+            assert!(galley.rows.len() > 1);
+        }
+    }
 
     #[test]
     fn every_button_kind_keeps_its_label_readable() {
