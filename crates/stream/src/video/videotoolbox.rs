@@ -3,9 +3,10 @@
 //!
 //! Each access unit arrives in Annex B. Parameter sets go into a format
 //! description; the slices are re-framed with 4-byte lengths (AVCC/HVCC) into
-//! one sample buffer and decoded synchronously; `decode` also waits out any
-//! frame the decoder held back, so the output callback has always run before
-//! `decode` returns.
+//! one sample buffer. Decode flags are zero, so asynchronous decompression
+//! and temporal processing are disabled. Each callback carries that input's
+//! sourceFrameRefCon, and the worker waits for asynchronous work before
+//! releasing its per-input result storage.
 //!
 //! The decode calls run on a worker thread of the session, and `decode`
 //! waits for them at most [`DECODE_DEADLINE`]: Apple's H.264 decoder can

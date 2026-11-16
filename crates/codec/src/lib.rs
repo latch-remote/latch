@@ -15,6 +15,7 @@
 mod priority;
 
 pub mod audio;
+pub mod bitstream;
 pub mod color;
 pub mod h264;
 pub mod yuv;

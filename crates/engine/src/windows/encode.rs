@@ -286,6 +286,7 @@ const QUALITY_VS_SPEED_SOFTWARE: u32 = 20;
 
 pub(super) struct Encoder {
     transform: IMFTransform,
+    codec: Codec,
     api: ICodecAPI,
     events: Option<IMFMediaEventGenerator>,
     input_credit: u32,
@@ -580,6 +581,7 @@ impl Encoder {
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
             Ok(Self {
                 transform,
+                codec,
                 api,
                 events,
                 input_credit: 0,
@@ -833,7 +835,9 @@ impl Encoder {
                     )
                 };
                 buffer.Unlock()?;
-                return result.map(Some);
+                let (mut bytes, keyframe) = result?;
+                crate::bitstream::low_delay(self.codec, &mut bytes)?;
+                return Ok(Some((bytes, keyframe)));
             }
         }
         bail!("encoder exceeded bounded output retries")

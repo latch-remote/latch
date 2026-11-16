@@ -12,6 +12,9 @@ pub(crate) mod timer;
 pub use run_loop::with_main_queue;
 pub(crate) mod synthetic;
 
+#[cfg(test)]
+pub(crate) use capture::pair_pcm;
+
 use crate::audio::{AudioCapture, CHANNELS, FRAME};
 use crate::input::InputSink;
 use crate::video::{Codec, EncodedVideo, Limits, Pacer, VideoConfig, VideoInfo, VideoPipeline};

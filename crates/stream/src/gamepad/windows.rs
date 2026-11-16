@@ -301,3 +301,15 @@ fn raw_state(
         touch: None,
     }
 }
+
+#[cfg(test)]
+pub(super) fn pair_state() -> PadState {
+    let mut buttons = [false; 15];
+    buttons[1] = true;
+    raw_state(
+        true,
+        &buttons,
+        &[GameControllerSwitchPosition::Left],
+        &[0., 0., 0.5, 0.25, 0.75, 0.5],
+    )
+}

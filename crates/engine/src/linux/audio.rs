@@ -228,6 +228,32 @@ impl Drop for PulseCapture {
 }
 
 #[cfg(test)]
+pub(crate) fn pair_pcm(pcm: &[i16]) -> Vec<i16> {
+    use protocol::ChannelPosition::*;
+    assert!(
+        channel_map(6)
+            == protocol::ChannelMap::new([
+                FrontLeft,
+                FrontRight,
+                FrontCenter,
+                Lfe,
+                RearLeft,
+                RearRight,
+            ]),
+        "PulseAudio six-channel map must be WAVE order"
+    );
+    // The production PulseAudio stream requests S16LE with this exact map.
+    pcm.iter()
+        .flat_map(|s| s.to_le_bytes())
+        .collect::<Vec<_>>()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]

@@ -92,4 +92,8 @@ pub fn native_options() -> eframe::NativeOptions {
     }
 }
 
+#[cfg(test)]
+#[path = "../../../tests/pairs/format.rs"]
+pub(crate) mod pair_format;
+
 mod network;

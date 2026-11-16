@@ -656,14 +656,89 @@ fn monthly_cap_fails_closed_with_bounded_retry_and_direct_recovery() {
     // A depleted monthly ledger refuses TLS admission. Direct restoration still
     // recovers the existing session, and repeated failures remain rate bounded.
     let pilot = Pilot::with_limits(|config| config.monthly_bytes = 64 * 1024);
-    let running = Running::start(pilot.config.clone(), true);
+    // Spend the only credit lease before host/viewer startup can cancel a
+    // handshake and consume it without creating a grant.
+    let grant = latch_relay::create_grant(&pilot.config, &Cancel::new()).unwrap();
+    // Exercise the runtime's offered-grant path with this valid authorization,
+    // after setup has deterministically exhausted the connection credit.
+    let offered = latch_stream::session::RelayRoute::new(
+        7,
+        latch_relay::Role::Viewer,
+        Some(pilot.config.clone()),
+    );
+    assert!(offered.maintain(true, |_| true));
+    let offer = control::RelayPayload::new(
+        serde_json::json!({
+            "session": 7,
+            "attempt": offered.number(),
+            "endpoint": pilot.config.endpoint,
+            "viewer": grant.viewer,
+            "keys": latch_relay::SessionKeys::generate().unwrap(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert!(offered.handle(
+        RelayControl {
+            session: 7,
+            attempt: offered.number(),
+            action: RelayAction::Offer(offer),
+        },
+        |_| panic!("valid grant was rejected before attachment"),
+    ));
+    assert!(offered.pending());
+    // Count runtime grant opens while retaining direct connections.
+    let grant_attempts = Arc::new(AtomicU64::new(0));
+    let mut runtime_config = pilot.config.clone();
+    runtime_config.set_proxy_discovery_policy(
+        {
+            let attempts = grant_attempts.clone();
+            move || {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                (None, latch_relay::ProxyOrder::Automatic)
+            }
+        },
+        |_| {},
+    );
+    // Setting the policy samples it once before any runtime connection opens.
+    grant_attempts.store(0, Ordering::Relaxed);
+    let running = Running::start(runtime_config, true);
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(6) {
         assert!(!running.session.relay_active());
+        offered.poll();
+        assert!(!offered.active());
         thread::sleep(Duration::from_millis(10));
     }
+    assert_eq!(
+        offered.failure(),
+        Some(latch_relay::Failure::ClosedBeforeHandshake),
+        "offered grant never reached attachment denial"
+    );
+    let mut aborted = false;
+    assert!(offered.maintain(false, |message| {
+        aborted |= matches!(
+            message,
+            Message::Relay(RelayControl {
+                action: RelayAction::Abort,
+                ..
+            })
+        );
+        true
+    }));
+    assert!(aborted);
+    assert!(!offered.pending());
+    offered.shutdown();
+    // Each open has cached/native/WebSocket rungs and up to two Unix MSS
+    // recovery rungs. Two offered lanes plus at most three grant opens under
+    // the retry cooldown/circuit therefore allow at most 25 rejections.
+    assert!((1..=3).contains(&grant_attempts.load(Ordering::Relaxed)));
+    assert!((1..=25).contains(&pilot.metrics.rejected_connections.load(Ordering::Acquire)));
     assert_eq!(pilot.metrics.grants_created.load(Ordering::Acquire), 1);
-    assert!(pilot.metrics.accepted_connections.load(Ordering::Acquire) <= 3);
+    assert_eq!(
+        pilot.metrics.accepted_connections.load(Ordering::Acquire),
+        1
+    );
     assert_eq!(
         pilot.metrics.quota_reserved_bytes.load(Ordering::Acquire),
         64 * 1024

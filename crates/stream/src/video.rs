@@ -3,6 +3,8 @@
 
 #[cfg(windows)]
 pub mod mediafoundation;
+#[cfg(any(windows, test))]
+mod mf_output;
 use anyhow::Result;
 use latch_proto::control::Codec;
 use parking_lot::Mutex;
@@ -406,7 +408,45 @@ pub trait Decoder: Send {
     /// `spare` is a drawn frame whose buffers may be filled instead of
     /// allocating new ones.
     fn decode(&mut self, annexb: &[u8], idr: bool, spare: Option<Frame>) -> Result<Option<Frame>>;
+    /// Timestamped session interface. Synchronous backends complete the
+    /// current input before returning. Buffered backends override this and
+    /// return every picture with the identity supplied for its input.
+    fn decode_frames(
+        &mut self,
+        annexb: &[u8],
+        idr: bool,
+        time: i64,
+        spare: Option<Frame>,
+    ) -> Result<Vec<(i64, Frame)>> {
+        Ok(self
+            .decode(annexb, idr, spare)?
+            .into_iter()
+            .map(|frame| (time, frame))
+            .collect())
+    }
+    /// Changes whenever outstanding inputs are lost to a reset or backend switch.
+    fn generation(&self) -> u64 {
+        0
+    }
     fn name(&self) -> &'static str;
+}
+
+/// Test-only strict decoder selection. A native-cell failure cannot fall back.
+#[cfg(test)]
+pub(crate) fn pair_decoder(native: bool, _width: u32, _height: u32) -> Result<Box<dyn Decoder>> {
+    if !native {
+        return Ok(Box::new(software::Software::new()));
+    }
+    #[cfg(target_os = "macos")]
+    return Ok(Box::new(videotoolbox::VideoToolbox::new(
+        Codec::H264Baseline,
+    )?));
+    #[cfg(windows)]
+    return Ok(Box::new(MediaFoundation(
+        mediafoundation::MfDecoder::with_stream(Codec::H264Baseline, _width, _height, 8)?,
+    )));
+    #[cfg(not(any(target_os = "macos", windows)))]
+    anyhow::bail!("no native decoder on this runner OS")
 }
 
 /// Startup failures (e.g. unavailable OS extensions) retry less often than
@@ -685,6 +725,8 @@ pub struct Fallback {
     software: Option<software::Software>,
     proven: bool,
     tries: u32,
+    next_time: i64,
+    generation: u64,
 }
 
 impl Fallback {
@@ -694,19 +736,35 @@ impl Fallback {
             software: None,
             proven: false,
             tries: 0,
+            next_time: 0,
+            generation: 0,
         }
     }
 }
 
 impl Decoder for Fallback {
-    fn decode(
+    fn decode(&mut self, annexb: &[u8], idr: bool, spare: Option<Frame>) -> Result<Option<Frame>> {
+        let time = self.next_time;
+        self.next_time = self
+            .next_time
+            .checked_add(166667)
+            .ok_or_else(|| anyhow::anyhow!("sample time overflow"))?;
+        let mut pictures = self.decode_frames(annexb, idr, time, spare)?;
+        anyhow::ensure!(
+            pictures.len() <= 1 && pictures.first().is_none_or(|p| p.0 == time),
+            "decoder buffered pictures; use timestamped decode_frames"
+        );
+        Ok(pictures.pop().map(|(_, frame)| frame))
+    }
+    fn decode_frames(
         &mut self,
         annexb: &[u8],
         idr: bool,
+        time: i64,
         mut spare: Option<Frame>,
-    ) -> Result<Option<Frame>> {
+    ) -> Result<Vec<(i64, Frame)>> {
         if let Some(platform) = self.platform.as_mut() {
-            let result = platform.decode(annexb, idr, spare.take());
+            let result = platform.decode_frames(annexb, idr, time, spare.take());
             #[cfg(windows)]
             if result
                 .as_ref()
@@ -724,11 +782,11 @@ impl Decoder for Fallback {
                 return result;
             }
             match result {
-                Ok(Some(frame)) => {
+                Ok(ref pictures) if !pictures.is_empty() => {
                     self.proven = true;
-                    return Ok(Some(frame));
+                    return result;
                 }
-                Ok(None) | Err(_) => {
+                Ok(_) | Err(_) => {
                     self.tries += 1;
                     if self.tries < PROBATION {
                         return result;
@@ -738,6 +796,7 @@ impl Decoder for Fallback {
                         platform.name(),
                         self.tries
                     );
+                    self.generation += platform.generation() + 1;
                     self.platform = None;
                     self.software = Some(software::Software::new());
                     if !idr {
@@ -751,11 +810,14 @@ impl Decoder for Fallback {
         // Software fills the renderer's spare, once the platform has not
         // taken it on the way here.
         match self.software.as_mut() {
-            Some(software) => software.decode(annexb, idr, spare),
-            None => Ok(None),
+            Some(software) => software.decode_frames(annexb, idr, time, spare),
+            None => Ok(Vec::new()),
         }
     }
 
+    fn generation(&self) -> u64 {
+        self.generation + self.platform.as_ref().map_or(0, |p| p.generation())
+    }
     fn name(&self) -> &'static str {
         match &self.platform {
             Some(platform) => platform.name(),
@@ -800,6 +862,9 @@ impl Decoder for Broken {
         Ok(None)
     }
 
+    fn generation(&self) -> u64 {
+        self.decoder.generation()
+    }
     fn name(&self) -> &'static str {
         self.decoder.name()
     }
@@ -817,7 +882,33 @@ impl Decoder for MediaFoundation {
         _idr: bool,
         _spare: Option<Frame>,
     ) -> Result<Option<Frame>> {
-        Ok(self.0.decode(annexb)?.map(|d| Frame {
+        Ok(self.0.decode(annexb)?.map(Self::picture))
+    }
+    fn decode_frames(
+        &mut self,
+        annexb: &[u8],
+        _idr: bool,
+        time: i64,
+        _spare: Option<Frame>,
+    ) -> Result<Vec<(i64, Frame)>> {
+        Ok(self
+            .0
+            .decode_frames(annexb, time)?
+            .into_iter()
+            .map(|(time, picture)| (time, Self::picture(picture)))
+            .collect())
+    }
+    fn generation(&self) -> u64 {
+        self.0.generation()
+    }
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+}
+#[cfg(windows)]
+impl MediaFoundation {
+    fn picture(d: mediafoundation::DecodedNv12) -> Frame {
+        Frame {
             color: latch_proto::color::ColorDescription {
                 bit_depth: d.bit_depth,
                 ..Default::default()
@@ -838,11 +929,7 @@ impl Decoder for MediaFoundation {
             native: d
                 .shared
                 .map(|(surface, black)| NativeFrame { surface, black }),
-        }))
-    }
-
-    fn name(&self) -> &'static str {
-        self.0.name()
+        }
     }
 }
 
@@ -958,6 +1045,11 @@ mod tests {
         assert_eq!((frame.width, frame.height), (64, 64));
         assert!(frame.y[0].abs_diff(200) <= 2);
         assert_eq!(decoder.name(), "Latch H.264 (software)");
+        assert_eq!(
+            decoder.generation(),
+            1,
+            "fallback invalidates pending inputs"
+        );
         // From then on software fills the renderer's spare buffers.
         let spare = Frame {
             format: PixelFormat::P010,
@@ -990,6 +1082,11 @@ mod tests {
         }
         assert!(decoder.decode(&[0, 0, 1, 0x41], false, None).is_err());
         assert_eq!(decoder.name(), "Latch H.264 (software)");
+        assert_eq!(
+            decoder.generation(),
+            1,
+            "fallback invalidates pending inputs"
+        );
     }
 
     #[test]
@@ -1015,6 +1112,11 @@ mod tests {
             .expect("keyframe request");
         assert!(error.to_string().contains("waiting for a keyframe"));
         assert_eq!(decoder.name(), "Latch H.264 (software)");
+        assert_eq!(
+            decoder.generation(),
+            1,
+            "fallback invalidates pending inputs"
+        );
         let (idr, width, height) = vaapi::probe_baseline();
         let frame = decoder.decode(&idr, true, None).unwrap().unwrap();
         assert_eq!((frame.width, frame.height), (width, height));

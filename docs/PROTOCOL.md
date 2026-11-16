@@ -267,6 +267,18 @@ frame in units of 0.1 ms (saturating).
 | 26 | 2 | `recovery` — with flags bit 1: frame number minus the number of the frame it predicts from (≥ 1); otherwise 0 |
 | 28 | `shard_len` | shard bytes |
 
+Each video frame contains one access unit for one picture. Hosts encode
+in display order and declare zero reordering in the bitstream. H.264 SPS
+VUI includes `bitstream_restriction_flag = 1`, `max_num_reorder_frames = 0`
+and `max_dec_frame_buffering = max(1, max_num_ref_frames)`. HEVC VPS/SPS
+sublayer ordering declares `max_num_reorder_pics = 0` and
+`max_latency_increase_plus1 = 1`, retaining the reference-picture capacity.
+These are standard codec syntax and require no protocol negotiation.
+Windows viewers normalize older 6.0.0 hosts' parameter sets before Media
+Foundation decoding. Decoder output sample times identify submitted frames,
+including when several pictures emerge together. Viewer statistics count
+withheld pictures and unresolved inputs.
+
 The host cuts the frame into `D = ceil(frame_len / shard_len)` data shards,
 the last one padded with zeros, and splits them into
 `blocks = ceil(D / 64)` consecutive blocks of nearly equal size (the first

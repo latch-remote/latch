@@ -15,6 +15,8 @@ use crate::path::{
     RelayFailure, UdpPath,
 };
 use crate::video::{self, Decoder, FrameSlot};
+#[cfg(test)]
+use latch_proto::audio::AudioOut;
 use latch_proto::audio::AudioReceiver;
 use latch_proto::control::{self, Accept, Codec, Message, Report, StreamRequest};
 use latch_proto::gamepad::{Feedback, LatestReceiver, PadKind, PadSender, PadState};
@@ -25,13 +27,17 @@ use latch_proto::video::{
 };
 use latch_proto::wire::{self, Datagram};
 use parking_lot::{Condvar, Mutex};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+#[path = "../../../tests/pairs/replay.rs"]
+mod pair_interop;
 
 /// Builds the configured production relay with standard certificate validation.
 pub fn relay_config(settings: &control::RelaySettings) -> Option<latch_relay::ClientConfig> {
@@ -1806,6 +1812,12 @@ pub struct Stats {
     pub frame_budget_ms: f32,
     /// Sustained decoder throughput; zero until overload is detected.
     pub decode_capacity_fps: u32,
+    /// Successful submissions whose own picture was withheld by the decoder.
+    pub decoder_delayed_frames: u64,
+    /// Submitted pictures still awaiting an output, including unresolved errors.
+    pub decoder_pending_frames: u32,
+    /// Decoder outputs/identities discarded after route changes or the 64-input bound.
+    pub decoder_discarded_frames: u64,
     /// Capture to send on the host.
     pub host_ms: f32,
     /// First shard to whole frame.
@@ -2107,6 +2119,8 @@ impl Link {
 }
 
 struct Inner {
+    #[cfg(test)]
+    pair_probe: Option<Arc<pair_interop::Probe>>,
     configured_relay: Mutex<Option<latch_relay::ClientConfig>>,
     relay: Mutex<Arc<RelayRoute>>,
     relay_messages: Mutex<VecDeque<(u64, Message)>>,
@@ -2212,6 +2226,8 @@ impl Inner {
     ) -> Self {
         Self {
             configured_relay: Mutex::new(None),
+            #[cfg(test)]
+            pair_probe: None,
             relay: Mutex::new(Arc::new(RelayRoute::new(
                 0,
                 latch_relay::Role::Viewer,
@@ -2640,6 +2656,15 @@ fn run(inner: &Arc<Inner>, server: &Server, settings: &Settings) {
     }
 }
 
+fn session_decoder(inner: &Inner, accept: &control::Accept) -> anyhow::Result<Box<dyn Decoder>> {
+    #[cfg(test)]
+    if let Some(probe) = &inner.pair_probe {
+        return video::pair_decoder(probe.native, accept.width, accept.height);
+    }
+    let _ = inner;
+    video::new_decoder_for_color(accept.codec, accept.width, accept.height, accept.color)
+}
+
 /// One request for the stream, and the stream until it ends.
 fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &[Codec]) {
     if inner.stopping() {
@@ -2681,6 +2706,15 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
                 && video::decoder_available_for(SocketAddr::new(server.address, server.port), c)
         })
         .collect();
+    let audio_channels = match settings.audio.then(crate::audio::output_channels) {
+        Some(n) if n > 2 => n,
+        _ => 0,
+    };
+    #[cfg(test)]
+    let audio_channels = inner
+        .pair_probe
+        .as_ref()
+        .map_or(audio_channels, |probe| probe.channels);
     let color = video::decoder_color(settings.color, settings.width, settings.height);
     let request = StreamRequest {
         media_path_policy: true,
@@ -2706,10 +2740,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         display: settings.display.clone(),
         // 5.1 or 7.1 when this machine's speakers have them; stereo is the
         // field's absence, which every host understands.
-        audio_channels: match settings.audio.then(crate::audio::output_channels) {
-            Some(n) if n > 2 => n,
-            _ => 0,
-        },
+        audio_channels,
     };
     inner.trace_stage("codecs ready");
     let body = serde_json::to_vec(&request).unwrap_or_default();
@@ -2829,18 +2860,16 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         return fail("starting", "host selected unoffered colour format".into());
     }
     inner.trace_stage("opening decoder");
-    let decoder =
-        match video::new_decoder_for_color(accept.codec, accept.width, accept.height, accept.color)
-        {
-            Ok(d) => d,
-            Err(e) if accept.codec != Codec::H264Baseline => {
-                *inner.renegotiate.lock() =
-                    Some((accept.codec, format!("{e:#}"), video::FailureKind::Open));
-                let _ = tcp.shutdown(Shutdown::Both);
-                return;
-            }
-            Err(e) => return fail("decoding", format!("{e:#}")),
-        };
+    let decoder = match session_decoder(inner, &accept) {
+        Ok(d) => d,
+        Err(e) if accept.codec != Codec::H264Baseline => {
+            *inner.renegotiate.lock() =
+                Some((accept.codec, format!("{e:#}"), video::FailureKind::Open));
+            let _ = tcp.shutdown(Shutdown::Both);
+            return;
+        }
+        Err(e) => return fail("decoding", format!("{e:#}")),
+    };
     inner.trace_stage("decoder ready");
     {
         let mut stats = inner.stats.lock();
@@ -2863,6 +2892,10 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         .key_positions
         .store(accept.key_positions, Ordering::Release);
     let player = accept.audio.as_ref().and_then(|a| {
+        #[cfg(test)]
+        if inner.pair_probe.is_some() {
+            return None;
+        }
         match Player::with_gain(
             a.rate,
             a.channels as usize,
@@ -3912,7 +3945,12 @@ fn receive(
         if let Some(player) = player.as_mut() {
             player.receive(&mut audio_rx, now);
         } else {
-            while audio_rx.pop(now).is_some() {}
+            while let Some(_out) = audio_rx.pop(now) {
+                #[cfg(test)]
+                if let Some(probe) = &inner.pair_probe {
+                    probe.audio(&_out);
+                }
+            }
         }
         if route_revision != relay.revision() {
             route_restarts += 1;
@@ -4261,6 +4299,12 @@ fn handle(
         Datagram::Video { shard, .. } => {
             *media_seen = true;
             reassembler.push(shard, now);
+            #[cfg(test)]
+            if let Some(probe) = &inner.pair_probe {
+                probe
+                    .fec
+                    .store(reassembler.stats().shards_recovered, Ordering::Relaxed);
+            }
         }
         Datagram::Audio { packet, .. } => audio_rx.push(packet, now),
         Datagram::InputAck { next, .. } => {
@@ -4315,6 +4359,16 @@ fn handle(
     }
 }
 
+struct SubmittedFrame {
+    identity: u32,
+    keyframe: bool,
+    started: Instant,
+    ready: Instant,
+    host_delay: u16,
+    assembly: Duration,
+    route_revision: u64,
+}
+
 /// The decode thread: frames in order, newest picture out.
 fn decode(
     inner: &Arc<Inner>,
@@ -4334,6 +4388,12 @@ fn decode(
     let budget_ms = inner.stats.lock().frame_budget_ms.max(1.0);
     let max_age = decode_max_age((1000.0 / budget_ms) as u32);
     let mut load = DecodeLoad::default();
+    // Only metadata is retained. Output sample times identify inputs even
+    // when a decoder emits several pictures while accepting another one.
+    let mut pending = BTreeMap::new();
+    let mut sample_time = 0i64;
+    let mut last_published = i64::MIN;
+    let mut pending_warning: Option<Instant> = None;
     loop {
         let ((frame, ready), route_revision) = {
             let mut q = inner.queue.lock();
@@ -4366,12 +4426,74 @@ fn decode(
         };
         let start = Instant::now();
         let spare = inner.frames.spare();
-        let decoded = decoder.decode(&frame.data, frame.keyframe, spare);
+        sample_time += 166667;
+        if pending.len() == 64 {
+            pending.pop_first();
+            inner.stats.lock().decoder_discarded_frames += 1;
+            if pending_warning.is_none_or(|at| start.duration_since(at) >= Duration::from_secs(5)) {
+                tracing::warn!("decoder exceeded 64 unresolved inputs; discarding oldest identity");
+                pending_warning = Some(start);
+            }
+        }
+        pending.insert(
+            sample_time,
+            SubmittedFrame {
+                identity: frame.frame,
+                keyframe: frame.keyframe,
+                started: start,
+                ready,
+                host_delay: frame.host_delay,
+                assembly: frame.assembly,
+                route_revision,
+            },
+        );
+        let generation = decoder.generation();
+        let decoded = decoder.decode_frames(&frame.data, frame.keyframe, sample_time, spare);
+        if decoder.generation() != generation {
+            let before = pending.len();
+            pending.retain(|&time, _| time == sample_time);
+            inner.stats.lock().decoder_discarded_frames += (before - pending.len()) as u64;
+        }
+        let mut discarded_on_error = 1;
+        let decoded = decoded.and_then(|pictures| {
+            if !pictures.is_empty() && pictures.iter().all(|(time, _)| !pending.contains_key(time))
+            {
+                discarded_on_error = pictures.len() as u64;
+                anyhow::bail!("decoder returned pictures with no matching sample time");
+            }
+            Ok(pictures)
+        });
+        if decoded.is_err() {
+            pending.remove(&sample_time);
+            inner.stats.lock().decoder_discarded_frames += discarded_on_error;
+        }
+        #[cfg(test)]
+        if let Some(probe) = &inner.pair_probe {
+            probe.decode_call(frame.frame, &decoded, sample_time);
+        }
         if over() {
             // The session may have finished without waiting for this.
             return;
         }
         if inner.relay.lock().revision() != route_revision {
+            // A route committed during this call. Retire its returned
+            // identities and any older unresolved inputs.
+            if let Ok(pictures) = decoded {
+                let discarded = pictures.len() as u64;
+                let mut newest = None;
+                for (time, _) in pictures {
+                    if pending.remove(&time).is_some() {
+                        newest = Some(newest.map_or(time, |previous: i64| previous.max(time)));
+                    }
+                }
+                if let Some(time) = newest {
+                    let before = pending.len();
+                    pending = pending.split_off(&time);
+                    inner.stats.lock().decoder_discarded_frames += (before - pending.len()) as u64;
+                }
+                inner.stats.lock().decoder_discarded_frames += discarded;
+            }
+            inner.stats.lock().decoder_pending_frames = pending.len() as u32;
             continue;
         }
         let service = start.elapsed();
@@ -4380,9 +4502,15 @@ fn decode(
             inner.emit(Event::Notice(format!("This machine decodes about {fps} fps at this size. Lower the frame rate in Stream settings.")));
         }
         match &decoded {
-            Ok(Some(_)) => (tries, errors) = (0, 0),
-            Ok(None) => tries += 1,
+            Ok(pictures) if !pictures.is_empty() => (tries, errors) = (0, 0),
+            Ok(_) => tries += 1,
             Err(_) => (tries, errors) = (tries + 1, errors + 1),
+        }
+        if decoded
+            .as_ref()
+            .is_ok_and(|pictures| !pictures.iter().any(|(time, _)| *time == sample_time))
+        {
+            inner.stats.lock().decoder_delayed_frames += 1;
         }
         if codec != Codec::H264Baseline
             && (tries >= HARDWARE_PROBATION
@@ -4406,71 +4534,118 @@ fn decode(
             return;
         }
         match decoded {
-            Ok(Some(mut picture)) => {
-                // Serialize publication with the TCP owner's route commit.
-                let route = inner.relay.lock();
-                if route.revision() != route_revision {
-                    continue;
+            Ok(pictures) => {
+                let mut newest = None;
+                for (time, mut picture) in pictures {
+                    let Some(submitted) = pending.remove(&time) else {
+                        // Unknown and duplicate times affect only this output.
+                        inner.stats.lock().decoder_discarded_frames += 1;
+                        continue;
+                    };
+                    if newest.is_none_or(|(previous, _)| time > previous) {
+                        newest = Some((time, submitted.keyframe));
+                    }
+                    if time <= last_published {
+                        inner.stats.lock().decoder_discarded_frames += 1;
+                        continue;
+                    }
+                    // Serialize publication with the TCP owner's route commit.
+                    let route = inner.relay.lock();
+                    if route.revision() != submitted.route_revision {
+                        inner.stats.lock().decoder_discarded_frames += 1;
+                        continue;
+                    }
+                    if picture.color.bit_depth != color.bit_depth {
+                        // Pictures at another depth would be drawn wrongly;
+                        // the stream starts again without this codec.
+                        *inner.renegotiate.lock() = Some((
+                            codec,
+                            format!(
+                                "{} gave {}-bit pictures for a {}-bit stream",
+                                decoder.name(),
+                                picture.color.bit_depth,
+                                color.bit_depth
+                            ),
+                            video::FailureKind::Decode,
+                        ));
+                        inner.attempt_over.store(true, Ordering::Release);
+                        inner.queue_cv.notify_all();
+                        return;
+                    }
+                    picture.color = color;
+                    let decoded = Instant::now();
+                    picture.decoded_at = Some(decoded);
+                    if decoder.name() != named {
+                        named = decoder.name();
+                        inner.stats.lock().decoder = named;
+                    }
+                    if picture.width > 0 && picture.height > 0 {
+                        let mut st = inner.stats.lock();
+                        st.width = picture.width;
+                        st.height = picture.height;
+                    }
+                    let black = picture.is_black();
+                    tracing::trace!(
+                        frame = submitted.identity,
+                        sample_time = time,
+                        "decoded picture"
+                    );
+                    #[cfg(test)]
+                    if let Some(probe) = &inner.pair_probe {
+                        probe.picture(submitted.identity, &picture);
+                    }
+                    last_published = time;
+                    inner.frames.publish(picture);
+                    inner
+                        .published_us
+                        .store(inner.now_us().max(1), Ordering::Relaxed);
+                    (inner.wake)();
+                    {
+                        let mut health = inner.video_health.lock();
+                        health.connected_at.get_or_insert(decoded);
+                        health.frame(decoded, black);
+                    }
+                    inner.connected.store(true, Ordering::Release);
+                    if !inner.announced.swap(true, Ordering::AcqRel) {
+                        inner.emit(Event::Connected);
+                    }
+                    let mut w = inner.decode.lock();
+                    w.frames += 1;
+                    w.decode_us += (decoded - submitted.started).as_micros() as u64;
+                    w.samples_us
+                        .push((decoded - submitted.started).as_micros() as u64);
+                    w.queue_us += (submitted.started - submitted.ready).as_micros() as u64;
+                    w.host_tenths += u64::from(submitted.host_delay);
+                    w.assembly_us += submitted.assembly.as_micros() as u64;
                 }
-                if picture.color.bit_depth != color.bit_depth {
-                    // Pictures at another depth would be drawn wrongly;
-                    // the stream starts again without this codec.
-                    *inner.renegotiate.lock() = Some((
-                        codec,
-                        format!(
-                            "{} gave {}-bit pictures for a {}-bit stream",
-                            decoder.name(),
-                            picture.color.bit_depth,
-                            color.bit_depth
-                        ),
-                        video::FailureKind::Decode,
-                    ));
-                    inner.attempt_over.store(true, Ordering::Release);
-                    inner.queue_cv.notify_all();
-                    return;
+                // Retire only inputs absent from the entire batch. An older
+                // returned picture was already counted if publication dropped it.
+                if let Some((time, keyframe)) = newest {
+                    let before = pending.len();
+                    pending = pending.split_off(&time);
+                    let missing = before - pending.len();
+                    if missing > 0 {
+                        inner.stats.lock().decoder_discarded_frames += missing as u64;
+                        if !keyframe {
+                            inner.queue.lock().want_keyframe = true;
+                        }
+                    }
                 }
-                picture.color = color;
-                let decoded = Instant::now();
-                picture.decoded_at = Some(decoded);
-                if decoder.name() != named {
-                    named = decoder.name();
-                    inner.stats.lock().decoder = named;
-                }
-                if picture.width > 0 && picture.height > 0 {
-                    let mut st = inner.stats.lock();
-                    st.width = picture.width;
-                    st.height = picture.height;
-                }
-                let black = picture.is_black();
-                inner.frames.publish(picture);
-                inner
-                    .published_us
-                    .store(inner.now_us().max(1), Ordering::Relaxed);
-                (inner.wake)();
-                {
-                    let mut health = inner.video_health.lock();
-                    health.connected_at.get_or_insert(decoded);
-                    health.frame(decoded, black);
-                }
-                inner.connected.store(true, Ordering::Release);
-                if !inner.announced.swap(true, Ordering::AcqRel) {
-                    inner.emit(Event::Connected);
-                }
-                let mut w = inner.decode.lock();
-                w.frames += 1;
-                w.decode_us += (decoded - start).as_micros() as u64;
-                w.samples_us.push((decoded - start).as_micros() as u64);
-                w.queue_us += (start - ready).as_micros() as u64;
-                w.host_tenths += u64::from(frame.host_delay);
-                w.assembly_us += frame.assembly.as_micros() as u64;
             }
-            Ok(None) => {}
             Err(e) => {
                 tracing::debug!("decode: {e:#}");
+                #[cfg(test)]
+                if let Some(probe) = &inner.pair_probe {
+                    probe
+                        .decode_errors
+                        .lock()
+                        .push((frame.frame, format!("{e:#}")));
+                }
                 inner.video_health.lock().last_error = Some(format!("{e:#}"));
                 inner.queue.lock().want_keyframe = true;
             }
         }
+        inner.stats.lock().decoder_pending_frames = pending.len() as u32;
     }
 }
 
@@ -5933,12 +6108,87 @@ mod tests {
             Arc::new(FrameSlot::default()),
             Box::new(|| {}),
         ));
-        for frame in 0..frames {
+        // Exercise call-count probation with the frame budget of a 30 fps stream.
+        inner.stats.lock().frame_budget_ms = 1000.0 / 30.0;
+        let worker = {
+            let inner = inner.clone();
+            std::thread::spawn(move || {
+                // Keep thread startup outside the queued-frame age.
+                for frame in 0..frames {
+                    inner.queue.lock().frames.push_back((
+                        InFrame {
+                            frame,
+                            data: vec![0, 0, 0, 1],
+                            keyframe: true,
+                            recovery: false,
+                            host_delay: 0,
+                            assembly: Duration::ZERO,
+                        },
+                        Instant::now(),
+                    ));
+                }
+                decode(&inner, decoder, codec, Default::default());
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // An empty queue can still have a decode in progress. Completion or a
+        // waiter on the empty queue proves the last result has been handled.
+        while !worker.is_finished() && !inner.queue_cv.notify_one() {
+            assert!(
+                Instant::now() < deadline,
+                "decoder did not finish its inputs"
+            );
+            std::thread::yield_now();
+        }
+        inner.stop.store(true, Ordering::Release);
+        inner.queue_cv.notify_all();
+        worker.join().unwrap();
+        assert_eq!(inner.dropped.load(Ordering::Relaxed), 0);
+        let given_up = inner.renegotiate.lock().take().map(|(c, why, _)| (c, why));
+        given_up
+    }
+
+    #[test]
+    fn all_unmatched_batches_request_keyframes_and_renegotiate() {
+        struct OwnTimes(Arc<Mutex<Vec<u8>>>);
+        impl video::Decoder for OwnTimes {
+            fn decode(
+                &mut self,
+                _: &[u8],
+                _: bool,
+                _: Option<video::Frame>,
+            ) -> anyhow::Result<Option<video::Frame>> {
+                unreachable!("timestamped session interface")
+            }
+            fn decode_frames(
+                &mut self,
+                bytes: &[u8],
+                _: bool,
+                _: i64,
+                _: Option<video::Frame>,
+            ) -> anyhow::Result<Vec<(i64, video::Frame)>> {
+                let mut inputs = self.0.lock();
+                inputs.push(bytes[0]);
+                // A decoder deriving its own clock never echoes our input times.
+                let time = inputs.len() as i64 * 166666;
+                Ok(vec![(time, video::Frame::default())])
+            }
+            fn name(&self) -> &'static str {
+                "decoder with its own sample clock"
+            }
+        }
+        let (events, _) = mpsc::channel();
+        let inner = Arc::new(Inner::new(
+            events,
+            Arc::new(FrameSlot::default()),
+            Box::new(|| {}),
+        ));
+        for frame in 0..HARDWARE_ERRORS * 2 {
             inner.queue.lock().frames.push_back((
                 InFrame {
                     frame,
-                    data: vec![0, 0, 0, 1],
-                    keyframe: true,
+                    data: vec![frame as u8],
+                    keyframe: frame % 2 == 0,
                     recovery: false,
                     host_delay: 0,
                     assembly: Duration::ZERO,
@@ -5946,23 +6196,51 @@ mod tests {
                 Instant::now(),
             ));
         }
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let (done, finished) = mpsc::channel();
         let worker = {
             let inner = inner.clone();
-            std::thread::spawn(move || decode(&inner, decoder, codec, Default::default()))
+            let inputs = inputs.clone();
+            std::thread::spawn(move || {
+                decode(
+                    &inner,
+                    Box::new(OwnTimes(inputs)),
+                    Codec::Hevc,
+                    Default::default(),
+                );
+                let _ = done.send(());
+            })
         };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !inner.queue.lock().frames.is_empty()
-            && !inner.attempt_over.load(Ordering::Acquire)
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        std::thread::sleep(Duration::from_millis(20));
+        let recovered = finished.recv_timeout(Duration::from_secs(5));
         inner.stop.store(true, Ordering::Release);
         inner.queue_cv.notify_all();
         worker.join().unwrap();
-        let given_up = inner.renegotiate.lock().take().map(|(c, why, _)| (c, why));
-        given_up
+        recovered.expect("all-unmatched output must trigger decoder recovery");
+        let (codec, why, kind) = inner.renegotiate.lock().take().expect("renegotiation");
+        assert_eq!(codec, Codec::Hevc);
+        assert_eq!(kind, video::FailureKind::Decode);
+        assert!(
+            why.contains(&format!("failed {HARDWARE_ERRORS} times")),
+            "{why}"
+        );
+        assert!(why.contains("no matching sample time"), "{why}");
+        assert_eq!(
+            *inputs.lock(),
+            (0..HARDWARE_ERRORS)
+                .map(|i| (i * 2) as u8)
+                .collect::<Vec<_>>(),
+            "keyframe requests must skip the queued P pictures"
+        );
+        assert_eq!(
+            inner.dropped.load(Ordering::Relaxed),
+            u64::from(HARDWARE_ERRORS - 1)
+        );
+        assert_eq!(
+            inner.stats.lock().decoder_discarded_frames,
+            u64::from(HARDWARE_ERRORS)
+        );
+        assert_eq!(inner.stats.lock().decoder_pending_frames, 0);
+        assert_eq!(inner.frames.seq(), 0);
     }
 
     struct Failing(bool);
@@ -6015,6 +6293,22 @@ mod tests {
         assert!(give_up_on(Codec::H264High, Box::new(Failing(true)), 9).is_none());
         // Baseline has latch-codec behind it, not another codec.
         assert!(give_up_on(Codec::H264Baseline, Box::new(Failing(false)), 12).is_none());
+
+        struct Healthy;
+        impl video::Decoder for Healthy {
+            fn decode(
+                &mut self,
+                _: &[u8],
+                _: bool,
+                spare: Option<video::Frame>,
+            ) -> anyhow::Result<Option<video::Frame>> {
+                Ok(Some(spare.unwrap_or_default()))
+            }
+            fn name(&self) -> &'static str {
+                "healthy hardware"
+            }
+        }
+        assert!(give_up_on(Codec::Hevc, Box::new(Healthy), 12).is_none());
     }
 }
 

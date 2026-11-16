@@ -5,6 +5,25 @@ moonlight-common-c (C), OpenH264 (C++) and libopus (C). Since version 5, Latch d
 in Rust, inside the one `latch-host` executable that already runs the
 control service and the window.
 
+## Pair interoperability CI
+
+The `pairs` workflow exchanges versioned session artifacts among Windows
+x64, macOS arm64, Linux x64 and Linux arm64. Every consumer starts a real
+HTTP-upgraded viewer `Session`, receives the recorded datagrams on
+loopback, reassembles and decodes them, and compares visible pixels and
+audio against the producer's references. Clean and deterministic
+loss/reorder runs cover FEC and keyframe requests, forced IDRs, repeated
+parameter sets, SPS resizing, cursor control and termination.
+
+Viewer input recordings are consumed by each host's native adapter.
+Windows constructs `INPUT` records, macOS constructs CGEvents with posting
+disabled, and Linux posts XTest into an isolated Xvfb. Clipboard writes
+have a test-only interception before OS mutation. Gamepad recordings pass
+through OS reading conversion and the production input sender, then host
+report conversion. Hosted runners report native encoder, decoder, capture
+and virtual-device limits explicitly. The schema, tolerances and known
+input gaps live in `tests/pairs`.
+
 ## Boundary
 
 Everything Latch ships is Rust source compiled by `rustc`. Allowed below
@@ -249,6 +268,88 @@ interactive hardware qualification.
 | macOS | VideoToolbox (hardware-probed AV1, HEVC Main/Main10 or H.264), IOSurface → Metal; NV12, or P010 for a negotiated ten-bit stream (HDR drawn by the native EDR layer where available) |
 | Windows | Media Foundation + D3D11/DXVA for hardware-probed AV1, HEVC Main/Main10 and H.264 High; Baseline with `latch-codec` fallback. Shared NV12 D3D11 texture → D3D12/wgpu; staging readback when unavailable and for ten-bit P010 (drawn by the native HDR10 swapchain where available) |
 | Linux | Runtime-probed VA-API H.264 and HEVC Main/Main10, with software Baseline fallback. DMA-BUF planes → EGL/GLES where compatible, NV12/P010 readback otherwise |
+
+H.264/HEVC hosts declare zero output reordering. A shared Rust SPS rewriter
+adds H.264 VUI restrictions with zero reordered frames and the minimum
+buffer compatible with the SPS reference count. It sets HEVC VPS/SPS
+sublayer reorder counts to zero and latency-increase-plus-one to one while
+retaining reference storage. Explicit nonzero reordering and any parse or
+validation failure preserve the entire original access unit and emit a
+rate-limited warning with the reason. VideoToolbox, MF, AMF, NVENC and
+VA-API output passes through this normalization. The Rust encoder already writes the
+H.264 restriction. POC, colour, timing, crop and scaling lists are preserved.
+
+Media Foundation also normalizes incoming parameter sets for 6.0.0 hosts.
+It drains every output and reads the output sample time. For a successfully
+parsed, explicitly zero-reorder H.264/HEVC sequence, the worker tries to
+return the current picture before the next access unit is submitted. If
+`ProcessOutput` first reports `MF_E_TRANSFORM_NEED_MORE_INPUT`, it polls the
+same input within the existing one-second access-unit deadline, reserving
+20 ms for the worker reply, for the first picture after creation or output
+type reconfiguration. This includes allocator and MFT thread startup. Steady
+state uses a 50 ms wait. A missed picture retains its identity and keeps
+polling enabled. While it is unresolved, following inputs probe without
+adding any wait. Completion in a pre-input drain or a batch containing the
+current picture restores ordinary polling. Two consecutive inputs returning
+only the previous picture confirm retained pipeline delay and disable
+polling. The warning occurs once per decoder instance and includes the reason.
+A permanent one-picture delay therefore pays at most one approximately
+980 ms cold wait per configuration, or one 50 ms wait if it starts in steady
+state. Neither missing-picture expiry nor switch-off is a decode error, and
+the worker requests no keyframe. While the worker is blocked in a cold wait,
+the session's queue can exceed its age limit. The session then clears it,
+warns that the decoder fell behind and requests a keyframe, so a permanent
+one-picture delay also costs one keyframe round trip per configuration.
+Output-type stream changes re-arm cold-start handling.
+Initial negotiation that continues after a missed first picture retains that
+picture's pending identity and shares the original cold wait.
+The decoder still returns every ready picture under its original sample
+time, including on hardware. Ready pictures incur no polling wait. Sequences with unknown or
+nonzero ordering may require further inputs. The session keeps
+bounded submitted-frame metadata and matches each picture to its original
+identity, route and latency measurements. Held, pending and discarded
+pictures appear in viewer statistics. VideoToolbox disables asynchronous
+and temporal processing, passes per-input callback storage and waits for
+completion. VA-API submits one identified surface and synchronizes that
+surface before returning it according to code inspection. This VA-API
+behavior remains unverified on hardware. The Rust decoder reconstructs
+the current I/P access unit synchronously. Pair replay requires zero decoder delay
+on each submitted access unit for every available host/viewer combination.
+
+Returning every ready MF output fixes the intermittent picture loss with
+Linux-encoded streams. Windows CI subsequently observed intermittent first-picture
+withholding with the Linux capture fixture. Local short Windows repetitions
+have not reproduced it. Polling stress tests exercised only the software
+decoder. Two short 24-picture H.264 DXVA replays returned every picture on
+its own submission, with zero late deliveries and polling still enabled.
+Hardware retained-delay switch-off remains unverified. The 50 ms cold cap
+subsequently failed on a hosted software-MFT first IDR, so cold startup now
+shares the worker budget instead of permanently disabling polling. The strict
+per-call CI assertion still requires delivery before the following input.
+Software polls reuse one empty output sample until it produces a picture or
+the output type changes.
+
+The cold-start follow-up's software-MFT harness passed 600 iterations of each
+reported test, split evenly among serial, four-process and four-thread runs.
+First decode-call times had p50/p95/max of 0.696/0.986/1.556 ms for the
+software round trip and 0.679/0.784/1.166 ms for the Linux capture fixture.
+With four busy CPU threads for three seconds, 47 additional software samples
+passed, with maximum first-call time 0.756 ms. One short real-DXVA invocation
+opened ten decoders and replayed 24 H.264 pictures per decoder. Its first-call
+p50/p95/max were 12.484/12.926/12.926 ms. These times exclude decoder creation.
+No late-delivery counter or switch-off was observed. The hosted slow first
+picture remains unreproduced locally.
+
+A local 60-picture H.264 High recording with `LATCH_MAC_LTR=1` declares
+`max_num_ref_frames=15` and `max_dec_frame_buffering=15` both before and
+after rewriting. The original and rewritten SPS are both
+`27640015ac131410050669a80808083c20108420`.
+FFmpeg's live short-term plus long-term reference lists reach 15. The
+opt-in LTR pipeline test asserts that the rewritten buffering covers this
+measured reference use. A decode-only Windows run returned all 60 pictures
+on their own submission through both Media Foundation software and DXVA,
+with at least 40 dB PSNR between their visible pixels. H.264 low-latency settings read back
+as enabled through both APIs.
 
 The viewer lists what it decodes; the host picks the first it can encode,
 then fits the request to that encoder (`video::Limits`, reported to
@@ -1062,7 +1163,14 @@ failing events are then dropped so later input can proceed.
 
 Windows Media Foundation workers answer their caller within a deadline: one
 second for an access unit, five to open a decoder, twenty for the
-once-per-process probe of every codec. The GPU-copy fence keeps its
+once-per-process probe of every codec. Timeout diagnostics include the input
+identity, active COM phase and its elapsed time, the longest observed phase,
+operation elapsed time,
+the last 16 output HRESULT/status pairs and the cumulative count of access
+units delivered after polling. Every access unit shares a 2,048-call output
+budget across stream changes, event-only output and all drain passes, with
+at most 64 format/event transitions, 64 retained pictures and the same time
+deadline. The GPU-copy fence keeps its
 two-second bound. A decode that times out abandons that worker, reports an
 error (which requests a keyframe), and opens a fresh decoder on the next
 keyframe. At most three worker timeouts per ten minutes are allowed

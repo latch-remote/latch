@@ -14,6 +14,22 @@
 use anyhow::{bail, ensure, Context, Result};
 use std::borrow::Cow;
 
+/// Every H.264/HEVC host disables B pictures. Some encoders leave that
+/// implicit in their parameter sets, which lets viewers buffer whole GOPs.
+/// Apply the shared syntax fix after extracting OS-owned output buffers.
+pub(crate) fn low_delay(codec: crate::video::Codec, bytes: &mut Vec<u8>) -> Result<()> {
+    use latch_codec::bitstream::{low_delay, Format};
+    let format = match codec {
+        crate::video::Codec::H264Baseline | crate::video::Codec::H264High => Format::H264,
+        crate::video::Codec::Hevc => Format::Hevc,
+        crate::video::Codec::Av1 => return Ok(()),
+    };
+    if let Cow::Owned(fixed) = low_delay(bytes, format)? {
+        *bytes = fixed;
+    }
+    Ok(())
+}
+
 const START: [u8; 4] = [0, 0, 0, 1];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -325,6 +341,19 @@ mod tests {
 
     fn kinds(format: Format, data: &[u8]) -> Vec<u8> {
         nals(data).map(|n| format.nal_type(n)).collect()
+    }
+
+    #[test]
+    fn rejected_sps_does_not_fail_encoder_output() -> Result<()> {
+        let bytes = include_bytes!("../../../tests/pairs/mac-vt-rejected-sps.h264");
+        let mut decoder = latch_codec::h264::Decoder::new();
+        for unit in latch_codec::h264::nal::access_units(bytes) {
+            let mut output = unit.to_vec();
+            low_delay(crate::video::Codec::H264High, &mut output)?;
+            assert_eq!(output, unit);
+            assert!(decoder.decode(&output)?.is_some());
+        }
+        Ok(())
     }
 
     #[test]

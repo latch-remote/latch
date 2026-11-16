@@ -15,6 +15,9 @@ mod uinput;
 mod vaapi;
 pub mod wayland;
 
+#[cfg(test)]
+pub(crate) use audio::pair_pcm;
+
 use crate::audio::AudioCapture;
 use crate::input::InputSink;
 use crate::video::{VideoConfig, VideoPipeline};

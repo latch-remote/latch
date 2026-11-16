@@ -8,7 +8,6 @@
 //! [`pattern`] a synthetic desktop for tests and measurements.
 
 pub mod audio;
-#[cfg(any(windows, test))]
 mod bitstream;
 mod congestion;
 #[cfg(any(target_os = "macos", windows, test))]
@@ -37,6 +36,10 @@ pub mod windows;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "linux/x11.rs"]
 mod x11_bootstrap_tests;
+
+#[cfg(test)]
+#[path = "../../../tests/pairs/format.rs"]
+pub(crate) mod pair_format;
 
 /// The platform-free parts of the Wayland backend (backend choice, the
 /// PipeWire format negotiation, restore tokens, damage), tested on every

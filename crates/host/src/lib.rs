@@ -20,3 +20,7 @@ pub mod virtual_display;
 pub mod wake;
 
 mod local_control;
+
+#[cfg(test)]
+#[path = "../../../tests/pairs/format.rs"]
+pub(crate) mod pair_format;

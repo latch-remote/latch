@@ -1005,6 +1005,8 @@ impl View {
                         Kv::new("Encode on host", format!("{:.2} ms", stats.host_ms)),
                         Kv::new("Frame assembly", format!("{:.2} ms", stats.assembly_ms)),
                         Kv::new("Decoder queue", format!("{:.2} ms", stats.queue_ms)),
+                        Kv::new("Decoder held frames", format!("{} ({} pending)", stats.decoder_delayed_frames, stats.decoder_pending_frames)),
+                        Kv::new("Decoder discarded frames", stats.decoder_discarded_frames.to_string()),
                         Kv::new("Decode", format!("{:.2} ms", stats.decode_ms)),
                         Kv::new("Codec", stats.codec.to_string()),
                         Kv::new("Encoder on host", stats.encoder.clone()),
@@ -2911,6 +2913,14 @@ fn overlay_rows(live: &Live, s: &latch_stream::Stats, p: &Presented) -> Vec<Row>
                 s.decode_ms, s.decode_p95_ms, s.frame_budget_ms
             ),
             s.decode_capacity_fps > 0,
+        ),
+        row(
+            "Decoder held",
+            format!(
+                "{} total · {} pending · {} discarded",
+                s.decoder_delayed_frames, s.decoder_pending_frames, s.decoder_discarded_frames
+            ),
+            s.decoder_delayed_frames > 0 || s.decoder_pending_frames > 0,
         ),
         row(
             "Decode → UI",
@@ -4971,6 +4981,13 @@ pub(crate) mod tests {
     use egui::{Key, PointerButton};
     use latch_stream::input::{BUTTON_LEFT, MOD_CTRL, MOD_SHIFT};
     use std::rc::Rc;
+
+    mod pair_interop {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/pairs/viewer_input.rs"
+        ));
+    }
 
     const VK_T: i16 = 0x54;
     const VK_W: i16 = 0x57;

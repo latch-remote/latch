@@ -18,3 +18,7 @@ pub mod video;
 pub use latch_proto::control::Codec;
 pub use session::{Event, Input, LossEvent, RecoveryLog, Server, Session, Settings, Stats};
 pub use video::{Frame, FrameSlot};
+
+#[cfg(test)]
+#[path = "../../../tests/pairs/format.rs"]
+pub(crate) mod pair_format;

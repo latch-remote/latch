@@ -6,8 +6,8 @@
 //! cropping); other profiles' tools are refused with
 //! [`CodecError::Unsupported`], never mis-decoded.
 
-mod decode;
-mod encode;
+pub(crate) mod decode;
+pub(crate) mod encode;
 mod loopfilter;
 pub mod nal;
 

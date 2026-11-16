@@ -94,6 +94,98 @@ The release's `latch-host` executable embeds the `latch-client` GUI and
 | Updater | **partial** · local exe offer/install, digest + version checks. U-W/all update tests, N fresh installed GUI update measurement.[^update] | **partial** · bundled app replacement/relaunch. U-M installer/update scripts, ad-hoc signing can require privacy reapproval.[^update] | **partial** · user-owned unified binary updates through its local service when streams end, with a reopen-window prompt. Managed installs show update instructions. U-L fixture tests, N real Linux desktop relaunch.[^update] |
 | Wake sender / relay | **partial** · common WOL packet sender + CPU-gated relay. U/S-W, F-MW relay.[^wake][^relay] | **partial** · common WOL sender + CPU-gated relay. U/S-M, F-WM/MW relay.[^wake][^relay] | **partial** · common WOL sender + CPU-gated relay. U/S-L, N cross-OS public-relay field session.[^wake][^relay] |
 
+## Decoder buffering verification
+
+The 24-picture pre-fix Mac VideoToolbox recording was replayed through
+Windows Media Foundation software decoding and RX 6600 DXVA over a
+non-interactive SSH session. The original SPS withheld each six-picture
+GOP until the next IDR. Host-normalized output and viewer-normalized old
+host output returned each picture on its own submission, including the
+resize. `MF_LOW_LATENCY` and `CODECAPI_AVLowLatencyMode` share one GUID.
+That transform attribute read back as 1 and ICodecAPI as true even while
+the original stream buffered. With POC type 0 held fixed,
+a zero reorder limit produced zero delay with either one or nine DPB slots.
+A reorder limit of one produced one frame of delay with either capacity.
+Long-GOP recordings measured 16 frames of steady decoder delay at
+160×98/level 2.1 and four at 1920×1080/level 4.2, through both software
+and RX 6600 DXVA. Normalization reduced both to zero. The tiny-stream
+measurement exceeds the initial nine-frame estimate from the six-frame
+IDR tape. Mac HEVC VPS/SPS already declared zero reordered pictures and
+five reference-buffer slots, with latency-increase-plus-one zero. Host
+normalization makes the latency bound explicit as one and preserves those
+five slots.
+
+The opt-in Mac H.264 High LTR recording (`LATCH_MAC_LTR=1`, 60 synthetic
+pictures at 320×192) declares 15 reference frames and 15 decoder-buffer
+slots before and after rewriting. FFmpeg's live reference lists reach 15,
+including long-term references. The hardware pipeline assertion requires
+buffering to cover the measured total. A decode-only Windows run returned
+all 60 pictures at zero per-call delay through Media Foundation software
+and DXVA. Their visible pixels matched at 40 dB PSNR or better, and both low-latency settings read back as enabled.
+Intel and NVIDIA DXVA, Linux GPU encoding and VA-API decoding remain
+unverified on hardware.
+
+Optimizer compatibility tests also decode profile-id-144 H.264, reserved
+H.264 constraint bits, and 16400-pixel-wide or tall HEVC through FFmpeg
+after byte-identical pass-through. The invalid HEVC VPS reserved value
+`0xfffe` is preserved, but FFmpeg rejects it and MF software returns no
+picture. Successful decoding of that class and HEVC depths above 16 bits
+remains unverified with the available decoders.
+
+The separate Linux ARM64 capture → Windows MF failure at PR #107 head
+`d2e4d3c` lost identities 2–5 even though the Rust encoder's SPS already
+declares zero reordering. The shared output collector preserves every
+ready sample, independently of SPS rewriting. Its deterministic multi-output
+and partial-error/retry tests cover that loss mechanism, and the recorded
+Linux tape checks all 24 timestamps and picture contents. Returning every
+ready output fixes intermittent picture loss. Windows CI subsequently observed
+intermittent first-picture withholding with this Linux fixture. Short Windows
+repetitions have not reproduced that condition. For explicit zero-reorder
+sequences, the first picture after creation or output-type reconfiguration
+uses the existing one-second worker deadline with a 20 ms reply margin.
+A 50 ms steady-state miss keeps polling enabled and begins probes without
+further waits. Two consecutive inputs returning only the previous picture
+confirm retained delay and switch polling off, with one warning per decoder
+instance. A picture completing before another input or alongside the current
+picture restores ordinary polling. All original identities survive, and the
+decoder worker raises no decode error from this fallback. During a cold wait
+the session's queue can grow too old. The session then clears it, warns that
+the decoder fell behind and asks the host for a keyframe. Permanent
+one-picture delay therefore costs up to approximately 980 ms without a
+picture and one keyframe round trip per configuration, or one 50 ms wait if
+it begins mid-stream. The same rule applies on hardware.
+Polling stress tests exercised only the software decoder. Two short
+24-picture H.264 DXVA replays returned every picture immediately, with zero
+late deliveries and polling still enabled. Hardware retained-delay switch-off
+remains unverified. A hosted software-MFT first IDR subsequently exceeded the
+old 50 ms cold cap. Cold startup now uses the worker budget and a single
+slow picture keeps polling enabled.
+Software polls reuse an empty
+sample until a picture or type change. The strict per-call CI assertion
+still requires the picture before the next input is submitted. Iteration
+and time bounds cover repeated stream changes and event-only results, and
+timeout diagnostics identify the active phase and recent output HRESULT/status pairs.
+
+Decode-only Windows software H.264 repetitions completed 200 iterations of
+each reported test serially and another 200 with four concurrent processes,
+both before and after the changes, with zero failures and zero observed late
+outputs. Scripted tests cover late output and type negotiation. Recovery
+from these particular faults remains unverified against a real decoder failure.
+The cold-start follow-up repeated 600 software iterations per test, added
+47 software samples during a three-second/four-thread CPU load and ran ten
+24-picture real-DXVA replays in one short invocation. All passed with zero
+late-delivery counts and polling enabled. The hosted slow cold start and
+hardware retained-delay switch-off remain unreproduced.
+
+Mac VideoToolbox and the Rust decoder pass local zero-delay replay. Linux
+software, Windows software/MF and Mac VideoToolbox combinations run in the
+pair grid, including the committed 6.0.0 Mac tape. Linux NVENC/VA-API and
+Windows AMF encoding were inspected and normalized at their output
+boundaries. Linux GPU encoders and VA-API decode still require hardware
+qualification. The RX 6600 qualification covers decode and visible picture
+content. Desktop capture, rendering and physical scanout were outside that
+SSH test.
+
 ## Six host → viewer directions
 
 Every row uses the normal codec-intersection, colour and reconnect logic in

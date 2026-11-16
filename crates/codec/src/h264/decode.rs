@@ -9,11 +9,11 @@ mod cavlc;
 mod deblock;
 mod dpb;
 mod engine;
-pub(super) mod golomb;
+pub(crate) mod golomb;
 mod inter;
 mod intra;
 mod mb;
-pub(super) mod nal;
+pub(crate) mod nal;
 pub(super) mod pps;
 pub(super) mod slice;
 pub(super) mod sps;
@@ -26,7 +26,7 @@ use crate::Yuv420;
 type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Error {
+pub(crate) enum Error {
     BadValue(&'static str),
     Unsupported(&'static str),
     MissingReference,

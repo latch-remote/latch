@@ -232,27 +232,7 @@ impl Loopback {
                 for (i, sample) in samples.iter_mut().enumerate() {
                     let at = (i / self.channels) * self.block + (i % self.channels) * size;
                     let b = &bytes[at..at + size];
-                    *sample = if self.float {
-                        if self.bits == 32 {
-                            f32::from_le_bytes([b[0], b[1], b[2], b[3]])
-                        } else {
-                            f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-                                as f32
-                        }
-                    } else if self.bits == 8 {
-                        (b[0] as f32 - 128.0) / 128.0
-                    } else {
-                        let mut value = 0i32;
-                        for (k, byte) in b.iter().enumerate() {
-                            value |= i32::from(*byte) << (k * 8);
-                        }
-                        value = (value << (32 - self.bits)) >> (32 - self.bits);
-                        let valid = self.valid_bits.clamp(1, self.bits);
-                        (value >> (self.bits - valid)) as f32 / (1u64 << (valid - 1)) as f32
-                    };
-                    if !sample.is_finite() {
-                        *sample = 0.0;
-                    }
+                    *sample = pcm_sample(b, self.float, self.bits, self.valid_bits);
                 }
             }
             let released = self
@@ -423,6 +403,56 @@ pub(super) fn open(layout: Layout) -> Result<Box<dyn AudioCapture>> {
         channels,
     }))
 }
+fn pcm_sample(b: &[u8], float: bool, bits: u16, valid_bits: u16) -> f32 {
+    let mut sample = if float {
+        if bits == 32 {
+            f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        } else {
+            f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
+        }
+    } else if bits == 8 {
+        (b[0] as f32 - 128.0) / 128.0
+    } else {
+        let mut value = 0i32;
+        for (k, byte) in b.iter().enumerate() {
+            value |= i32::from(*byte) << (k * 8);
+        }
+        value = (value << (32 - bits)) >> (32 - bits);
+        let valid = valid_bits.clamp(1, bits);
+        (value >> (bits - valid)) as f32 / (1u64 << (valid - 1)) as f32
+    };
+    if !sample.is_finite() {
+        sample = 0.0;
+    }
+    sample
+}
+
+#[cfg(test)]
+pub(crate) fn pair_pcm(pcm: &[i16]) -> Vec<i16> {
+    let mut out = Vec::new();
+    for float in [false, true] {
+        let samples: Vec<_> = pcm
+            .iter()
+            .map(|&value| {
+                if float {
+                    pcm_sample(&(f32::from(value) / 32768.0).to_le_bytes(), true, 32, 32)
+                } else {
+                    pcm_sample(&(i32::from(value) << 8).to_le_bytes()[..3], false, 24, 24)
+                }
+            })
+            .collect();
+        let mut mixed = Vec::new();
+        Resampler::with_layout(48_000, 6, 0x60f, 6).push(&samples, &mut mixed);
+        out.resize(mixed.len(), 0);
+        f32_to_i16(&mixed, &mut out);
+        assert_eq!(
+            out, pcm,
+            "WASAPI Float32/PCM24 and side-surround mask conversion"
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
