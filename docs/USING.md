@@ -580,11 +580,13 @@ continuity across an update remain untested because no Linux desktop machine was
 4. Update both ends to use the new relay path. Older protocol 1 peers keep
    UDP streaming and do not negotiate this extension.
 
-Some compiled 5.x versions check the former private release endpoint, so
-they may never offer 6.0.0 automatically. They can also reject an update
-pushed by a new Mac because their independent verification still uses the
-old endpoint. A one-time installer or local/SSH handover gets those machines
-onto the public manifest updater.
+Latch 4.x and 5.x check the source repository's releases rather than the
+public releases page. From 6.1.0, each release is also published there,
+while that repository is public, so those versions offer it and update
+themselves, and a 5.x PC can check an update pushed by a new Mac. Older
+installs that were set up while the source repository was private, or that
+miss this window, need the one-time manual install above, or a local/SSH
+handover, to reach the manifest updater.
 [Public releases](https://github.com/latch-remote/latch-releases/releases/latest)
 
 ## Staying reachable

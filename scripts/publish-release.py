@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Prepare an allowlisted release, then publish a verified public draft.
 
-Preparation is offline. Only the publish command uses GH_TOKEN and GitHub's API.
+Preparation is offline. Only the publish commands use GH_TOKEN and GitHub's API.
 The distribution tag always refers to its own default-branch history.
+
+`publish-bridge` also puts the archives that Latch 4.x and 5.x updaters look
+for on the source repository's own release for the same tag. Those versions
+ask the source repository (through GitHub's rename redirects) for its latest
+release, so they find a new version only there, and only while it is public.
 """
 import argparse
 import gzip
@@ -21,6 +26,7 @@ import tomllib
 from urllib.parse import quote
 
 REPO = "latch-remote/latch-releases"
+SOURCE_REPO = "latch-remote/latch"
 MAX_ASSET = 512 * 1024 * 1024  # Same bound as the core updater.
 ARTIFACTS = {
     "latch-macos-arm64": ("latch-macos-arm64.tar.gz", "brolink-macos-arm64.tar.gz"),
@@ -34,6 +40,12 @@ ARTIFACTS = {
         "latch-host-linux-arm64.tar.gz", "latch-host-linux-arm64.tar.gz.sha256"
     ),
 }
+# Built only for 4.0 updaters, which know nothing of the distribution
+# repository: they go to the bridge release, never to latch-releases.
+LEGACY = ("brolink-macos-arm64.tar.gz", "brolink-windows-x64.zip")
+# What 4.1 to 5.x updaters download and verify by GitHub's asset digest.
+BRIDGED = ("latch-macos-arm64.tar.gz", "latch-windows-x64.zip", "latch-host.exe")
+BRIDGE_NAMES = frozenset(LEGACY + BRIDGED + ("SHA256SUMS",))
 VERSION = re.compile(
     r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
@@ -70,7 +82,7 @@ def version_info(version, tag):
 
 
 def expected_names(version):
-    return {name for names in ARTIFACTS.values() for name in names} | {
+    return {name for names in ARTIFACTS.values() for name in names if name not in LEGACY} | {
         f"latch-{version.replace('+', '-')}-source.tar.gz", "LICENSE", "NOTICE", "SHA256SUMS", "release.json"
     }
 
@@ -233,7 +245,25 @@ def validate_plan(directory, tag):
     return manifest
 
 
-def prepare(root, artifacts, output, tag=None):
+def sums_for(directory, names):
+    return "".join(f"{fingerprint(directory / name)[1][7:]}  {name}\n" for name in sorted(names))
+
+
+def validate_bridge(bridge, release, tag):
+    """The bridge holds the legacy archives and byte-identical copies of the
+    release's updater archives, with a SHA256SUMS covering exactly those."""
+    manifest = validate_plan(release, tag)
+    require(not bridge.is_symlink() and bridge.is_dir(), "bridge directory must be a real directory")
+    require({path.name for path in bridge.iterdir()} == BRIDGE_NAMES, "bridge asset allowlist mismatch")
+    for path in bridge.iterdir():
+        fingerprint(path)
+    for name in BRIDGED:
+        require(fingerprint(bridge / name) == fingerprint(release / name), f"bridge copy differs from release: {name}")
+    require((bridge / "SHA256SUMS").read_text() == sums_for(bridge, BRIDGE_NAMES - {"SHA256SUMS"}), "bridge SHA256SUMS does not match payloads")
+    return manifest
+
+
+def prepare(root, artifacts, output, tag=None, bridge=None):
     require(not root.is_symlink() and not artifacts.is_symlink(), "input directories must be real directories")
     version = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
     version_info(version, tag or f"v{version}")
@@ -252,10 +282,15 @@ def prepare(root, artifacts, output, tag=None):
             require(path.relative_to(artifacts).as_posix() in ARTIFACTS, "unexpected artifact directory")
     require(found == expected, f"input artifact allowlist mismatch, missing={sorted(expected - found)}, extra={sorted(found - expected)}")
     output.mkdir()  # Refuse reuse of a partial or contaminated output directory.
+    if bridge is not None:
+        bridge.mkdir()
     for name in sorted(expected):
         path = artifacts / name
         fingerprint(path)
-        shutil.copyfile(path, output / path.name)
+        if path.name not in LEGACY:
+            shutil.copyfile(path, output / path.name)
+        if bridge is not None and path.name in LEGACY + BRIDGED:
+            shutil.copyfile(path, bridge / path.name)
     for name in ("LICENSE", "NOTICE"):
         (output / name).write_bytes(git(root, "show", f"{revision}:{name}"))
     source_archive(root, revision, version, output / f"latch-{version.replace('+', '-')}-source.tar.gz")
@@ -263,11 +298,17 @@ def prepare(root, artifacts, output, tag=None):
     (output / "SHA256SUMS").write_text("".join(f"{fingerprint(path)[1][7:]}  {path.name}\n" for path in payloads))
     (output / "release.json").write_text(json.dumps(manifest_for(output, version), indent=2) + "\n")
     validate_plan(output, tag or f"v{version}")
+    if bridge is not None:
+        (bridge / "SHA256SUMS").write_text(sums_for(bridge, BRIDGE_NAMES - {"SHA256SUMS"}))
+        validate_bridge(bridge, output, tag or f"v{version}")
     return notes
 
 
 class GitHub:
     """Use the runner's gh client for authenticated API calls and asset streams."""
+    def __init__(self, repo=REPO):
+        self.repo = repo
+
     def request(self, method, path, body=None, upload=None, download=None, optional=False):
         command = ["gh", "api", "--method", method, path, "-H", "X-GitHub-Api-Version: 2022-11-28"]
         data = None
@@ -295,7 +336,7 @@ class GitHub:
         assets = []
         page = 1
         while True:
-            batch = self.request("GET", f"repos/{REPO}/releases/{release_id}/assets?per_page=100&page={page}")
+            batch = self.request("GET", f"repos/{self.repo}/releases/{release_id}/assets?per_page=100&page={page}")
             assets.extend(batch)
             if len(batch) < 100:
                 return assets
@@ -305,7 +346,7 @@ class GitHub:
         if asset.get("size") != local.stat().st_size or asset.get("state") != "uploaded":
             return False
         with tempfile.TemporaryFile() as download:
-            self.request("GET", f"repos/{REPO}/releases/assets/{asset['id']}", download=download)
+            self.request("GET", f"repos/{self.repo}/releases/assets/{asset['id']}", download=download)
             require(download.tell() <= MAX_ASSET, "remote asset exceeds size bound")
             size = download.tell()
             download.seek(0)
@@ -320,13 +361,51 @@ def asset_map(assets, allowed):
     return {asset["name"]: asset for asset in assets}
 
 
+def find_release(api, repo, tag):
+    """The release for `tag`, draft or not. GitHub's tag lookup answers 404
+    for drafts, so a resumed run lists releases to find its own draft."""
+    release = api.request("GET", f"repos/{repo}/releases/tags/{quote(tag, safe='')}", optional=True)
+    if release is not None:
+        return release
+    page = 1
+    while True:
+        batch = api.request("GET", f"repos/{repo}/releases?per_page=100&page={page}")
+        drafts = [entry for entry in batch if entry.get("draft") is True and entry.get("tag_name") == tag]
+        require(len(drafts) <= 1, "more than one draft for this tag, resolve by hand")
+        if drafts:
+            return drafts[0]
+        if len(batch) < 100:
+            return None
+        page += 1
+
+
+def sync_assets(api, repo, release_id, directory, allowed):
+    """Upload what is missing or different, then verify every remote byte."""
+    remote = asset_map(api.assets(release_id), allowed)
+    for name in sorted(allowed):
+        path = directory / name
+        if name in remote and api.matches(remote[name], path):
+            continue
+        if name in remote:
+            api.request("DELETE", f"repos/{repo}/releases/assets/{remote[name]['id']}")
+        api.request(
+            "POST",
+            f"https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={quote(name, safe='')}",
+            upload=path,
+        )
+    remote = asset_map(api.assets(release_id), allowed)
+    require(set(remote) == allowed, "remote release asset list is incomplete")
+    for name, asset in remote.items():
+        require(api.matches(asset, directory / name), f"remote checksum verification failed: {name}")
+
+
 def publish(directory, tag, notes, api=None):
     manifest = validate_plan(directory, tag)
     require(bool(notes.strip()), "publication requires nonempty release notes")
     api = api or GitHub()
     repository = api.request("GET", f"repos/{REPO}")
     require(repository["full_name"] == REPO and repository["private"] is False, "distribution repository must be the expected public repository")
-    release = api.request("GET", f"repos/{REPO}/releases/tags/{tag}", optional=True)
+    release = find_release(api, REPO, tag)
     require(release is None or release["draft"] is True, "published versions are immutable, refusing overwrite")
     branch = repository["default_branch"]
     base = api.request("GET", f"repos/{REPO}/git/ref/heads/{quote(branch, safe='')}")["object"]
@@ -350,23 +429,7 @@ def publish(directory, tag, notes, api=None):
         })
     require(release["tag_name"] == tag and release["draft"] is True, "release must be the requested draft")
     release_id = release["id"]
-    allowed = expected_names(manifest["version"])
-    remote = asset_map(api.assets(release_id), allowed)
-    for name in sorted(allowed):
-        path = directory / name
-        if name in remote and api.matches(remote[name], path):
-            continue
-        if name in remote:
-            api.request("DELETE", f"repos/{REPO}/releases/assets/{remote[name]['id']}")
-        api.request(
-            "POST",
-            f"https://uploads.github.com/repos/{REPO}/releases/{release_id}/assets?name={quote(name, safe='')}",
-            upload=path,
-        )
-    remote = asset_map(api.assets(release_id), allowed)
-    require(set(remote) == allowed, "remote release asset list is incomplete")
-    for name, asset in remote.items():
-        require(api.matches(asset, directory / name), f"remote checksum verification failed: {name}")
+    sync_assets(api, REPO, release_id, directory, expected_names(manifest["version"]))
     require(validate_plan(directory, tag) == manifest, "local release plan changed during publication")
     # Recheck both state and tag immediately before making the draft visible.
     current = api.request("GET", f"repos/{REPO}/releases/{release_id}")
@@ -382,6 +445,53 @@ def publish(directory, tag, notes, api=None):
     print(f"Published https://github.com/{REPO}/releases/tag/{tag}")
 
 
+def bridge_notes(notes, tag):
+    return (
+        f"{notes.strip()}\n\n---\n\n"
+        f"Download Latch from the [full release on latch-releases](https://github.com/{REPO}/releases/tag/{tag}), "
+        "which also has the Linux builds, the source and `SHA256SUMS` for every file. "
+        "This copy of the macOS and Windows archives is here so that Latch 4.x and 5.x, "
+        "which check this repository for updates, can update themselves.\n"
+    )
+
+
+def publish_bridge(bridge, release, tag, notes, repo=SOURCE_REPO, api=None):
+    manifest = validate_bridge(bridge, release, tag)
+    require(bool(notes.strip()), "publication requires nonempty release notes")
+    require(repo != REPO, "the bridge belongs on the source repository, not the distribution repository")
+    api = api or GitHub(repo)
+    repository = api.request("GET", f"repos/{repo}")
+    require(repository["full_name"] == repo and repository["private"] is False, "bridge repository must be the expected public repository")
+    # The tag push that runs this workflow created the tag; never move it.
+    ref = api.request("GET", f"repos/{repo}/git/ref/tags/{tag}")
+    require(ref["object"]["type"] in {"commit", "tag"}, "source tag must reference a commit or an annotated tag")
+    release_info = find_release(api, repo, tag)
+    details = {"name": f"Latch {tag}", "body": bridge_notes(notes, tag), "prerelease": manifest["prerelease"]}
+    if release_info is not None and release_info["draft"] is False:
+        # A rerun after success: accept it only if it is exactly this bridge.
+        remote = asset_map(api.assets(release_info["id"]), BRIDGE_NAMES)
+        require(set(remote) == BRIDGE_NAMES and all(api.matches(asset, bridge / name) for name, asset in remote.items()),
+                "published bridge differs from this release, refusing overwrite")
+        print(f"Bridge already published at https://github.com/{repo}/releases/tag/{tag}")
+        return
+    if release_info is None:
+        release_info = api.request("POST", f"repos/{repo}/releases", {**details, "tag_name": tag, "draft": True})
+    require(release_info["tag_name"] == tag and release_info["draft"] is True, "bridge release must be the requested draft")
+    release_id = release_info["id"]
+    sync_assets(api, repo, release_id, bridge, BRIDGE_NAMES)
+    require(validate_bridge(bridge, release, tag) == manifest, "local bridge plan changed during publication")
+    current = api.request("GET", f"repos/{repo}/releases/{release_id}")
+    require(current["draft"] is True and current["tag_name"] == tag, "bridge draft changed during publication")
+    require(api.request("GET", f"repos/{repo}/git/ref/tags/{tag}")["object"] == ref["object"], "source tag changed during publication")
+    published = api.request("PATCH", f"repos/{repo}/releases/{release_id}", {
+        **details,
+        "draft": False,
+        "make_latest": "false" if manifest["prerelease"] else "true",
+    })
+    require(published["draft"] is False and published["tag_name"] == tag, "bridge publication response does not match plan")
+    print(f"Published bridge https://github.com/{repo}/releases/tag/{tag}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -391,18 +501,28 @@ def main():
     build.add_argument("--output", type=Path, required=True)
     build.add_argument("--tag")
     build.add_argument("--notes", type=Path, required=True)
+    build.add_argument("--bridge-output", type=Path)
     send = subcommands.add_parser("publish")
     send.add_argument("--assets", type=Path, required=True)
     send.add_argument("--tag", required=True)
     send.add_argument("--notes", type=Path, required=True)
+    legacy = subcommands.add_parser("publish-bridge")
+    legacy.add_argument("--assets", type=Path, required=True)
+    legacy.add_argument("--release-assets", type=Path, required=True)
+    legacy.add_argument("--tag", required=True)
+    legacy.add_argument("--notes", type=Path, required=True)
+    legacy.add_argument("--repo", default=SOURCE_REPO)
     args = parser.parse_args()
     try:
         if args.command == "prepare":
-            notes = prepare(args.root.resolve(), args.artifacts, args.output, args.tag)
+            notes = prepare(args.root.resolve(), args.artifacts, args.output, args.tag, args.bridge_output)
             args.notes.write_text(notes + "\n")
-        else:
+        elif args.command == "publish":
             require(bool(os.environ.get("GH_TOKEN")), "GH_TOKEN is required for publication")
             publish(args.assets, args.tag, args.notes.read_text())
+        else:
+            require(bool(os.environ.get("GH_TOKEN")), "GH_TOKEN is required for publication")
+            publish_bridge(args.assets, args.release_assets, args.tag, args.notes.read_text(), args.repo)
     except (ValueError, KeyError, OSError, RuntimeError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"release validation failed: {error}\n")
 

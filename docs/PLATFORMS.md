@@ -333,8 +333,8 @@ keyboard/mouse/gamepad/clipboard/audio/HDR acceptance record.[^negotiation]
 
 | OS / architecture | Shipped artifact and release runner | Verification scope |
 |---|---|---|
-| macOS arm64 | `latch-macos-arm64.tar.gz`, containing `Latch.app`, `macos-15` builds `aarch64-apple-darwin`. Compatibility `brolink-macos-arm64.tar.gz` also ships. | Workspace tests, independent FFmpeg encoder tests, bundle version/codesign and manifest checks. Hardware-dependent tests may skip. Intel macOS artifact **missing**.[^release] |
-| Windows x64 | `latch-windows-x64.zip` + bare `latch-host.exe`, `windows-latest`. Compatibility `brolink-windows-x64.zip` also ships. | Workspace tests, setup/parser/protection/uninstall CI. Native ARM64 Windows artifact **missing**.[^release] |
+| macOS arm64 | `latch-macos-arm64.tar.gz`, containing `Latch.app`, `macos-15` builds `aarch64-apple-darwin`. Compatibility `brolink-macos-arm64.tar.gz` ships only on the source repository's bridge release. | Workspace tests, independent FFmpeg encoder tests, bundle version/codesign and manifest checks. Hardware-dependent tests may skip. Intel macOS artifact **missing**.[^release] |
+| Windows x64 | `latch-windows-x64.zip` + bare `latch-host.exe`, `windows-latest`. Compatibility `brolink-windows-x64.zip` ships only on the source repository's bridge release. | Workspace tests, setup/parser/protection/uninstall CI. Native ARM64 Windows artifact **missing**.[^release] |
 | Linux x64 / arm64 | `latch-host-linux-x64.tar.gz` / `latch-host-linux-arm64.tar.gz` + individual `.sha256` files, Ubuntu 24.04 x64 / arm64. | Both native architectures build/test the unified executable. Tarballs include the native kit. glibc ≥2.39 baseline, GPU and compositor sessions unqualified.[^release] |
 
 The publisher also assembles the versioned source archive, `LICENSE`, `NOTICE`,
