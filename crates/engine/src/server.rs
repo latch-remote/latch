@@ -869,10 +869,8 @@ impl Server {
             }
             let input_notice = session
                 .input
-                .lock()
-                .sink
-                .as_mut()
-                .and_then(|sink| sink.take_notice());
+                .try_lock()
+                .and_then(|mut input| input.sink.as_mut().and_then(|sink| sink.take_notice()));
             if let Some(message) = input_notice {
                 if !session.send_control(&Message::Notice(Notice {
                     kind: "input".into(),
