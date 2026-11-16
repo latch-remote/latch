@@ -1007,26 +1007,33 @@ fn daemon_websocket_ping_and_close_floods_have_bounded_responses_and_lifetime() 
     partial.extend_from_slice(&pings);
     let close = client_frame(8, true, &1000u16.to_be_bytes(), true).repeat(1000);
     for (index, flood) in [pings, partial, close].into_iter().enumerate() {
-        let opening = Instant::now();
-        let mut tls = match raw_websocket(&pilot) {
-            Ok(tls) => tls,
-            Err(error) => {
-                // Admission expires from TCP accept, including TLS/HTTP setup.
-                // A late client may observe that close before sending its flood.
-                assert!(
-                    matches!(
-                        error.kind(),
-                        io::ErrorKind::UnexpectedEof
-                            | io::ErrorKind::ConnectionReset
-                            | io::ErrorKind::ConnectionAborted
-                            | io::ErrorKind::BrokenPipe
-                    ) && opening.elapsed() >= handshake_timeout,
-                    "WebSocket setup closed before its deadline: {error}"
-                );
-                assert!(opening.elapsed() < Duration::from_secs(2));
-                continue;
+        let mut connected = None;
+        for _ in 0..3 {
+            let opening = Instant::now();
+            match raw_websocket(&pilot) {
+                Ok(tls) => {
+                    connected = Some(tls);
+                    break;
+                }
+                Err(error) => {
+                    // Admission expires from TCP accept, including TLS/HTTP setup.
+                    // Retry this case only when that deadline legitimately expired.
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            io::ErrorKind::UnexpectedEof
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::ConnectionAborted
+                                | io::ErrorKind::BrokenPipe
+                        ) && opening.elapsed() >= handshake_timeout,
+                        "WebSocket setup closed before its deadline: {error}"
+                    );
+                    assert!(opening.elapsed() < Duration::from_secs(2));
+                }
             }
-        };
+        }
+        let mut tls =
+            connected.unwrap_or_else(|| panic!("flood case {} never reached its flood", index + 1));
         let start = Instant::now();
         let _ = tls.write_all(&flood).and_then(|_| tls.flush());
         let responses = read_until_closed(&mut tls);

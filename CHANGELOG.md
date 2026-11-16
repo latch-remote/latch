@@ -228,7 +228,7 @@ GitHub release notes, so each version gets a heading of the form
   overran the header deadline before the headers were sent. Every attempt
   that sends its headers in time must be answered.
 
-- Synchronize shutdown, quota and decoder-probation fixtures, and accept WebSocket setup closure only after its admission deadline. Report every failing test binary in CI and release validation while retaining failure exit status.
+- Synchronize shutdown, quota and decoder-probation fixtures, and require every WebSocket flood case to complete after bounded admission retries. Cover exhausted quota at grant creation and offered-grant attachment, and report every failing test binary in CI and release validation while retaining failure exit status.
 
 ### Networking
 

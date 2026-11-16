@@ -4539,6 +4539,8 @@ mod tests {
             Arc::new(FrameSlot::default()),
             Box::new(|| {}),
         ));
+        // Exercise call-count probation with the frame budget of a 30 fps stream.
+        inner.stats.lock().frame_budget_ms = 1000.0 / 30.0;
         let worker = {
             let inner = inner.clone();
             std::thread::spawn(move || {
@@ -4627,5 +4629,21 @@ mod tests {
         assert!(give_up_on(Codec::H264High, Box::new(Failing(true)), 9).is_none());
         // Baseline has latch-codec behind it, not another codec.
         assert!(give_up_on(Codec::H264Baseline, Box::new(Failing(false)), 12).is_none());
+
+        struct Healthy;
+        impl video::Decoder for Healthy {
+            fn decode(
+                &mut self,
+                _: &[u8],
+                _: bool,
+                spare: Option<video::Frame>,
+            ) -> anyhow::Result<Option<video::Frame>> {
+                Ok(Some(spare.unwrap_or_default()))
+            }
+            fn name(&self) -> &'static str {
+                "healthy hardware"
+            }
+        }
+        assert!(give_up_on(Codec::Hevc, Box::new(Healthy), 12).is_none());
     }
 }
