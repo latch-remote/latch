@@ -147,10 +147,13 @@ A 50 ms steady-state miss keeps polling enabled and begins probes without
 further waits. Two consecutive inputs returning only the previous picture
 confirm retained delay and switch polling off, with one warning per decoder
 instance. A picture completing before another input or alongside the current
-picture restores ordinary polling. All original identities survive, with no
-decode error or keyframe request from this fallback. Permanent one-picture
-delay pays at most one approximately 980 ms cold wait per configuration, or
-one 50 ms wait if it begins mid-stream. The same rule applies on hardware.
+picture restores ordinary polling. All original identities survive, and the
+decoder worker raises no decode error from this fallback. During a cold wait
+the session's queue can grow too old. The session then clears it, warns that
+the decoder fell behind and asks the host for a keyframe. Permanent
+one-picture delay therefore costs up to approximately 980 ms without a
+picture and one keyframe round trip per configuration, or one 50 ms wait if
+it begins mid-stream. The same rule applies on hardware.
 Polling stress tests exercised only the software decoder. Two short
 24-picture H.264 DXVA replays returned every picture immediately, with zero
 late deliveries and polling still enabled. Hardware retained-delay switch-off

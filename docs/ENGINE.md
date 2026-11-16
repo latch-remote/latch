@@ -295,8 +295,12 @@ only the previous picture confirm retained pipeline delay and disable
 polling. The warning occurs once per decoder instance and includes the reason.
 A permanent one-picture delay therefore pays at most one approximately
 980 ms cold wait per configuration, or one 50 ms wait if it starts in steady
-state. Neither missing-picture expiry nor switch-off is a decode error or
-keyframe request. Output-type stream changes re-arm cold-start handling.
+state. Neither missing-picture expiry nor switch-off is a decode error, and
+the worker requests no keyframe. While the worker is blocked in a cold wait,
+the session's queue can exceed its age limit. The session then clears it,
+warns that the decoder fell behind and requests a keyframe, so a permanent
+one-picture delay also costs one keyframe round trip per configuration.
+Output-type stream changes re-arm cold-start handling.
 Initial negotiation that continues after a missed first picture retains that
 picture's pending identity and shares the original cold wait.
 The decoder still returns every ready picture under its original sample

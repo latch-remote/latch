@@ -182,7 +182,9 @@ GitHub release notes, so each version gets a heading of the form
   inputs returning only the previous picture confirm retained delay and
   disable polling with one warning per decoder instance. Keep each original
   sample identity and the decoder's pipeline latency, with no decode error
-  or keyframe request from this fallback.
+  from this fallback. A decoder that retains one picture can cost about one
+  second without a picture and one keyframe request when a stream starts
+  and after each reconfiguration.
   Polling stress tests used the software decoder. A short hardware H.264
   replay returned every picture immediately, so hardware polling and
   switch-off remain unverified. The same fallback applies to hardware decoders.
