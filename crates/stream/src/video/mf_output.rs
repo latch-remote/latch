@@ -740,7 +740,7 @@ mod tests {
         assert_eq!(
             submit(&mut wait, &clock, 1, &warnings, |_| Ok(outputs
                 .next()
-                .unwrap()))?,
+                .unwrap_or(Output::NeedInput)))?,
             [(0, 0)]
         );
         assert_eq!(clock.now() - started, Duration::from_millis(980));
@@ -750,7 +750,7 @@ mod tests {
         assert_eq!(
             submit(&mut wait, &clock, 2, &warnings, |_| Ok(outputs
                 .next()
-                .unwrap()))?,
+                .unwrap_or(Output::NeedInput)))?,
             [(1, 1)]
         );
         assert_eq!(clock.now() - started, Duration::from_millis(980));

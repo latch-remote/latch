@@ -327,8 +327,8 @@ the output type changes.
 
 The cold-start follow-up's software-MFT harness passed 600 iterations of each
 reported test, split evenly among serial, four-process and four-thread runs.
-First decode-call times had p50/p95/max of 0.689/0.865/1.576 ms for the
-software round trip and 0.681/0.770/1.012 ms for the Linux capture fixture.
+First decode-call times had p50/p95/max of 0.696/0.986/1.556 ms for the
+software round trip and 0.679/0.784/1.166 ms for the Linux capture fixture.
 With four busy CPU threads for three seconds, 47 additional software samples
 passed, with maximum first-call time 0.756 ms. One short real-DXVA invocation
 opened ten decoders and replayed 24 H.264 pictures per decoder. Its first-call
