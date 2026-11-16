@@ -2,7 +2,7 @@ use super::elevated::{self, Client};
 use crate::input::{DisplayRect, Event, Held, InputSink};
 use anyhow::{bail, Result};
 use std::sync::mpsc::{self, TryRecvError};
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{E_ACCESSDENIED, RECT};
 use windows::Win32::UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*};
 
 /// SendInput from this process. The elevated helper injects with one too.
@@ -195,6 +195,10 @@ fn post(inputs: &[INPUT]) -> Result<()> {
 }
 impl Local {
     fn confine(&mut self, display: DisplayRect) -> Result<()> {
+        allow_denied_confinement(self.try_confine(display))
+    }
+
+    fn try_confine(&mut self, display: DisplayRect) -> Result<()> {
         let _dpi = super::display::DpiAwareness::physical();
         // Keep SendInput relative, including Windows acceleration and raw game
         // input. The OS clips the resulting cursor position in physical pixels.
@@ -271,6 +275,22 @@ impl Local {
         }
     }
 }
+
+fn allow_denied_confinement(result: Result<()>) -> Result<()> {
+    match result {
+        Err(e)
+            if e.downcast_ref::<windows::core::Error>()
+                .is_some_and(|e| e.code() == E_ACCESSDENIED) =>
+        {
+            // Foreground games can own cursor confinement. Still deliver the
+            // event, including from the elevated helper, so input can advance.
+            tracing::debug!("cursor confinement denied by Windows: {e:#}");
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 impl Drop for Local {
     fn drop(&mut self) {
         self.release_all();
@@ -367,10 +387,11 @@ impl InputSink for Injector {
             let local = self.local.apply(event, display);
             return remote.and(local);
         }
-        if matches!(event, Event::MouseMove { .. } | Event::MousePosition { .. }) {
+        if matches!(event, Event::MouseMove { .. } | Event::MousePosition { .. })
+            && self.client().is_some()
+        {
             // Finish a helper handoff before acquiring the host's clip. The
             // host also confines input forwarded to an older installed helper.
-            let _ = self.client();
             self.local.confine(display)?;
         }
         if let Some(result) = self.remote(event, display) {
@@ -395,6 +416,16 @@ impl Drop for Injector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn denied_confinement_allows_input_and_other_errors_propagate() {
+        assert!(allow_denied_confinement(Ok(())).is_ok());
+        let denied = windows::core::Error::from_hresult(E_ACCESSDENIED);
+        assert!(allow_denied_confinement(Err(denied.into())).is_ok());
+        let invalid = windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG);
+        assert!(allow_denied_confinement(Err(invalid.into())).is_err());
+        assert!(allow_denied_confinement(Err(anyhow::anyhow!("empty input display"))).is_err());
+    }
     #[test]
     fn confinement_uses_the_full_physical_display_rectangle() -> Result<()> {
         for display in [
