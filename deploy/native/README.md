@@ -133,15 +133,40 @@ A release binary installed in a user-owned writable directory, such as
 while its local service runs. The updater waits for streams to end, verifies
 the matching public manifest/archive, replaces the resolved binary atomically
 and restarts its service with health-check rollback. A registered user unit
-uses a separate transient systemd user supervisor. Reopen the window after
-installation. AUR/Nix and container installs use their deployment tools.
+uses a separate transient systemd user supervisor. A definitive systemd failure
+rolls back promptly. A supervisor lost before the swap retries with bounded
+back-off. Manifest outages have a separate retry counter, and verified downloads
+reset archive failures. Owned regular updater locks restored with incorrect
+modes are repaired to `0600` through verified descriptors. Lock directories are
+created and descriptor-repaired to `0700`, including under umask `002`.
+`linux-update.json.lock` sits directly in the Latch data directory, so every
+journal access makes that directory `0700`, including an existing `LATCH_DATA_DIR`
+path. Missing parent directories are created as `0700`. This is private
+application storage, and the existing lock path provides a shared inode for
+installations made by 6.0.0 and main.
+User-owned ancestors allow owner-authorized group write. Ancestors must belong
+to root or the user, and world-writable ancestors require the sticky bit.
+Root-owned ancestors also require group write to be disabled or sticky-bit
+protection. Rollback attempts to persist Restoring before moving the old binary
+back. Journal-write errors are logged while restoration and restart proceed.
+The consumed previous link identifies a completed rollback for suppression,
+with missing pre-swap proof classified conservatively as failed. Recovery queues
+a restart across interrupted swap/restore boundaries. An already running
+original binary continues serving during persistent journal-write failures.
+Reopen the window after installation. AUR/Nix and container installs use their deployment tools.
 See [Linux update ownership and recovery](../../docs/USING.md#linux-installation-ownership-and-recovery).
 
 Updater tests use Docker locally and native x64/arm64 Linux CI. No Linux machine outside CI and containers is available for this work. CI covers systemd user-session restart, rollback and killed-supervisor recovery with a fixture service; an installed desktop update remains unverified.
 It also covers a replacement that crashes on start until the start limit, and
 recovery while the service keeps running. The fixture bypasses supervisor argv parsing, self-pinning, installation
-ownership checks and real GitHub manifest fetching. Real GUI reopening and stream
-continuity remain untested.
+ownership checks and real GitHub manifest fetching. The follow-up adds bounded
+assertion diagnostics, an assertion requiring rollback within 15 seconds and a real
+`latch-host --background` startup/status smoke check under systemd with isolated
+settings. Both x64 and arm64 systemd jobs passed at `18a36e9`, including rollback
+within 15 seconds and the production-host smoke check. Local Docker tests cover
+both umasks, five crash boundaries and injected ENOSPC/EIO journal-write failures.
+A full verified update of the production executable under systemd is untested.
+Real GUI reopening and stream continuity remain untested.
 
 `migrate-legacy.sh` is only for upgrades from pre-4.1 BroLink unit names or
 Latch 4's separate engine service. Install the runtime prerequisites and
