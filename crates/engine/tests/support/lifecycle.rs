@@ -576,6 +576,23 @@ fn viewer_stop_and_host_end_do_not_wait_for_in_flight_input() {
             "bitrate_kbps": 1000, "encoder": "test", "audio": null
         }))
         .unwrap();
+        let applying = {
+            let server = server.clone();
+            let session = session.clone();
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                wire::write_input(
+                    &mut bytes,
+                    session.id,
+                    0,
+                    &[input::Event::Text("abc".into())],
+                );
+                dispatch_datagram(&server, &session, &bytes, session.announced, false);
+            })
+        };
+        // Hold input before the first control turn so notice polling is
+        // guaranteed to encounter an in-flight transaction before Stop.
+        in_flight.recv_timeout(Duration::from_secs(1)).unwrap();
         let held = Arc::new(AtomicBool::new(true));
         let controlling = {
             let server = server.clone();
@@ -598,21 +615,6 @@ fn viewer_stop_and_host_end_do_not_wait_for_in_flight_input() {
             control::read_message(&mut peer).unwrap(),
             Message::Accept(_)
         ));
-        let applying = {
-            let server = server.clone();
-            let session = session.clone();
-            std::thread::spawn(move || {
-                let mut bytes = Vec::new();
-                wire::write_input(
-                    &mut bytes,
-                    session.id,
-                    0,
-                    &[input::Event::Text("abc".into())],
-                );
-                dispatch_datagram(&server, &session, &bytes, session.announced, false);
-            })
-        };
-        in_flight.recv_timeout(Duration::from_secs(1)).unwrap();
         let ending = if viewer_stop {
             control::write_message(
                 &mut peer,
@@ -648,7 +650,10 @@ fn viewer_stop_and_host_end_do_not_wait_for_in_flight_input() {
         } else {
             end::HOST_STOPPING
         };
-        assert!(matches!(ended, Ok(Message::End(e)) if e.code == expected));
+        assert!(
+            matches!(&ended, Ok(Message::End(e)) if e.code == expected),
+            "{ended:?}"
+        );
         assert!(capture_stopped);
         assert!(end_returned, "host end waited for in-flight input");
         assert_eq!(releases.load(Ordering::Relaxed), 1);

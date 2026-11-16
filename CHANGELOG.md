@@ -13,6 +13,7 @@ GitHub release notes, so each version gets a heading of the form
   administrator-window control in the host's Sharing settings and apply setup.
 - Wait for the elevated input helper to finish starting before showing the
   warning, and check again if the helper disconnects.
+- Keep stream stopping responsive while input injection is pending.
 
 ## 6.1.0 (2026-11-16)
 
