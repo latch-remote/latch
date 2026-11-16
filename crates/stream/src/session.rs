@@ -11,7 +11,9 @@
 
 use crate::audio::Player;
 use crate::video::{self, Decoder, FrameSlot};
-use latch_proto::audio::{AudioOut, AudioReceiver};
+#[cfg(test)]
+use latch_proto::audio::AudioOut;
+use latch_proto::audio::AudioReceiver;
 use latch_proto::control::{self, Accept, Codec, Message, Report, StreamRequest};
 use latch_proto::gamepad::{Feedback, LatestReceiver, PadKind, PadSender, PadState};
 use latch_proto::input::{Event as InputEvent, InputSender};
@@ -2848,15 +2850,13 @@ fn receive(
         let now = Instant::now();
         // Also when no audio arrived: a lost packet at the end of a sound
         // must not hold the rest of it until the next sound.
-        while let Some(out) = audio_rx.pop(now) {
-            #[cfg(test)]
-            if let Some(probe) = &inner.pair_probe {
-                probe.audio(&out);
-            }
-            if let Some(player) = player.as_mut() {
-                match out {
-                    AudioOut::Frame { payload, .. } => player.push(&payload),
-                    AudioOut::Missing { .. } => player.push(&[]),
+        if let Some(player) = player.as_mut() {
+            player.receive(&mut audio_rx, now);
+        } else {
+            while let Some(_out) = audio_rx.pop(now) {
+                #[cfg(test)]
+                if let Some(probe) = &inner.pair_probe {
+                    probe.audio(&_out);
                 }
             }
         }

@@ -196,6 +196,10 @@ GitHub release notes, so each version gets a heading of the form
   Intel and NVIDIA DXVA, and physical presentation unverified, and streams
   whose encoder declares frame reordering keep their decoder delay.
 
+- Repair late desktop audio packets while their samples are still queued
+  for playback, recovering more audio in deterministic burst-capture loss
+  tests with the existing playback latency and queue controller. Real-network
+  audible results remain unmeasured.
 - Choose which of a host's displays to share. Hosts list their displays in
   `/v1/status` (`streamer.displays`), and the viewer offers them in the
   machine's menu in the list and in the stream toolbar, remembered per

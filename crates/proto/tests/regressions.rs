@@ -428,6 +428,8 @@ fn audio_resynchronizes_across_sequence_wrap() {
             output = Some(out);
         }
         if seq == 5 {
+            // Unbudgeted callers retain main's progress cutoff across wrap.
+            assert_eq!(receiver.next_deadline(), None);
             assert!(matches!(output, Some(AudioOut::Frame { seq: 5, .. })));
         }
     }
