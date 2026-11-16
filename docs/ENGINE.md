@@ -406,6 +406,53 @@ lets tests check audio bit for bit. Opus is gone.
   period holds it. WASAPI loopback runs at the endpoint's engine period
   (10 ms on most drivers, and low-latency `IAudioClient3` streams refuse
   the loopback flag), so a Windows host sends two packets every 10 ms.
+* **Repair until queued samples need to play.** Four packets share parity.
+  The normal release rule stays at 20 ms from detecting a gap, or the next
+  group's second data packet, whichever comes first. At that cutoff the
+  desktop player queues its ordinary faded concealment and the following
+  audio on the original schedule. While the entire concealed frame remains
+  queued, late parity or an original can replace that reserved sample range.
+  The extra repair window is at most 20 ms, further limited by the queued
+  prefix's play deadline minus a 1 ms decode/handoff allowance. Replacement
+  rechecks the full range under the queue lock. This adds zero playback
+  delay, including under loss. Unbudgeted receivers use the original rule.
+  The encoded repair cache has at most 64 entries and 378,368 payload bytes.
+  Boundaries between repaired and neighbouring concealed frames are not
+  smoothed, so a step can occur as at main's own concealment edges.
+  Audible quality at these boundaries remains unmeasured.
+  [Deadline details](PROTOCOL.md#audio-3)
+* **Queue adaptation follows the existing controller.** Concealment and
+  intact packets enter the queue at their original release times, so repair
+  reservations supply exactly the queue lengths and arrival measurements
+  the controller would otherwise see. Replacing samples changes neither.
+  The low-point release remains 0.25 ms/s, underruns add 2 ms of margin,
+  and margin decays at 0.1 ms/s. Earlier experimental loss-recovery and
+  standing-latency reductions are outside this change.
+* **Deterministic repair evaluation.** The real receiver, codec, queue and
+  mixer are compared with frozen main behavior, identical at `ad9d0e1`.
+  Tests use 2.5/5/10/20 ms pulls, steady 5 ms packets, 10 ms and 21.333 ms
+  capture callbacks, independent 1/5/15% data and parity loss, burst loss,
+  isolated losses at all group positions, pauses, duplicates and stalls.
+  Ten-minute loss-free runs cover both callback cadences at ±15.625,
+  ±50 and ±100 ppm relative clock drift. Additional paths add 10–30 ms
+  jitter to 2% of callbacks, allowing reordering. Queue depth at every pull,
+  cushion, margin and controller underruns are exactly equal to main.
+  When no concealment reservation is created, emitted samples also match
+  exactly. Every scenario asserts concealment and underrun windows no
+  higher, and total damage no higher within a 1e-9 ms summation epsilon.
+  Damage is exact-zero output silence plus intact audio discarded plus
+  5 ms per finally concealed packet. With 21.333 ms capture, 2.5 ms pulls
+  and 23 measured seconds, damage falls from 84.604 to 44.604 ms at 1% loss,
+  396.896 to 286.896 ms at 5%, and 1856.729 to 1606.729 ms at 15%. Queue
+  means stay exactly 44.931, 50.718 and 47.197 ms respectively. Extended
+  traces stop loss at 12 s and remain equal to main through 96 s, including
+  +10/+30/+60 s queue and cushion measurements. The unchanged controller's
+  existing post-loss recovery time and queue growth remain visible.
+* **Measured capture and modeling limits.** The earlier non-invasive local
+  three-second capture sample observed 150 callbacks, with 21.321 ms median,
+  21.547 ms p95 and 21.673 ms maximum spacing. The 1024-sample callback size
+  is a modeling assumption. Physical audible improvement, real-network
+  parity timing and output-device scheduling under loss remain unmeasured.
 * **Surround when both ends have it.** A viewer whose output device has
   more than two channels asks for them (`StreamRequest.audio_channels`);
   the host captures the device's own layout up to that (WASAPI channel
