@@ -57,9 +57,19 @@ class FakeGitHub:
         if method == "PATCH":
             self.release.update(body)
             return self.release
+        if "/releases/tags/" in path:
+            # Like GitHub: the tag lookup never returns a draft.
+            if self.release is None or self.release.get("draft"):
+                return None if kwargs.get("optional") else self.fail_missing(path)
+            return copy.deepcopy(self.release)
+        if "/releases?" in path:
+            return [copy.deepcopy(self.release)] if self.release is not None else []
         if "/releases/" in path:
             return copy.deepcopy(self.release)
         raise AssertionError((method, path))
+
+    def fail_missing(self, path):
+        raise RuntimeError(f"404 {path}")
 
     def assets(self, release_id):
         return list(self.remote.values())
@@ -319,6 +329,21 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual({path.name for path in output.iterdir()}, publisher.expected_names(version))
         self.assertEqual({path.name for path in bridge.iterdir()}, set(publisher.BRIDGE_NAMES))
         self.assertNotIn("brolink", (output / "release.json").read_text())
+
+    def test_resumed_runs_find_their_draft_although_the_tag_lookup_hides_it(self):
+        bridge = self.make_bridge()
+        api = FakeGitHub({"draft": True, "tag_name": self.tag, "id": 17})
+        api.ref = {"object": {"type": "commit", "sha": "source-tag-commit"}}
+        publisher.publish_bridge(bridge, self.directory, self.tag, "Release notes", publisher.SOURCE_REPO, api)
+        self.assertFalse(any(call[0] == "POST" and call[1].endswith("/releases") for call in api.calls))
+        self.assertIs(api.release["draft"], False)
+        lookups = [call for call in api.calls if "/releases?" in call[1]]
+        self.assertTrue(lookups)
+        two = [{"draft": True, "tag_name": self.tag, "id": 1}, {"draft": True, "tag_name": self.tag, "id": 2}]
+        api = FakeGitHub()
+        api.request = lambda method, path, body=None, **kwargs: None if "/releases/tags/" in path else two
+        with self.assertRaisesRegex(ValueError, "more than one draft"):
+            publisher.find_release(api, publisher.SOURCE_REPO, self.tag)
 
     def test_source_scan_preserves_examples_and_rejects_obvious_secrets(self):
         publisher.check_source_file("deploy/relay/.env.example", b"TOKEN=replace-me")

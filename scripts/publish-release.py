@@ -361,6 +361,24 @@ def asset_map(assets, allowed):
     return {asset["name"]: asset for asset in assets}
 
 
+def find_release(api, repo, tag):
+    """The release for `tag`, draft or not. GitHub's tag lookup answers 404
+    for drafts, so a resumed run lists releases to find its own draft."""
+    release = api.request("GET", f"repos/{repo}/releases/tags/{quote(tag, safe='')}", optional=True)
+    if release is not None:
+        return release
+    page = 1
+    while True:
+        batch = api.request("GET", f"repos/{repo}/releases?per_page=100&page={page}")
+        drafts = [entry for entry in batch if entry.get("draft") is True and entry.get("tag_name") == tag]
+        require(len(drafts) <= 1, "more than one draft for this tag, resolve by hand")
+        if drafts:
+            return drafts[0]
+        if len(batch) < 100:
+            return None
+        page += 1
+
+
 def sync_assets(api, repo, release_id, directory, allowed):
     """Upload what is missing or different, then verify every remote byte."""
     remote = asset_map(api.assets(release_id), allowed)
@@ -387,7 +405,7 @@ def publish(directory, tag, notes, api=None):
     api = api or GitHub()
     repository = api.request("GET", f"repos/{REPO}")
     require(repository["full_name"] == REPO and repository["private"] is False, "distribution repository must be the expected public repository")
-    release = api.request("GET", f"repos/{REPO}/releases/tags/{tag}", optional=True)
+    release = find_release(api, REPO, tag)
     require(release is None or release["draft"] is True, "published versions are immutable, refusing overwrite")
     branch = repository["default_branch"]
     base = api.request("GET", f"repos/{REPO}/git/ref/heads/{quote(branch, safe='')}")["object"]
@@ -447,7 +465,7 @@ def publish_bridge(bridge, release, tag, notes, repo=SOURCE_REPO, api=None):
     # The tag push that runs this workflow created the tag; never move it.
     ref = api.request("GET", f"repos/{repo}/git/ref/tags/{tag}")
     require(ref["object"]["type"] in {"commit", "tag"}, "source tag must reference a commit or an annotated tag")
-    release_info = api.request("GET", f"repos/{repo}/releases/tags/{tag}", optional=True)
+    release_info = find_release(api, repo, tag)
     details = {"name": f"Latch {tag}", "body": bridge_notes(notes, tag), "prerelease": manifest["prerelease"]}
     if release_info is not None and release_info["draft"] is False:
         # A rerun after success: accept it only if it is exactly this bridge.
