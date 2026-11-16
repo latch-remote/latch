@@ -131,15 +131,17 @@ after an upgrade, run setup again from the **Sharing** tab.
 Each package installs `latch-host` with a desktop entry. For a headless
 server, follow the [native guide](deploy/native/README.md) instead.
 
-### Moving from 5.x
+### Moving from 4.x or 5.x
 
-Older binaries can still look for updates in the former repository. If
-**Check now** cannot find 6.0.0, install once from the public release page
-on each machine. On Windows, unzip the release and run its
-`install-host.ps1`. On macOS, replace the app as above. On Linux, replace
-the binary and restart the service using the native guide. Keep your
-settings folder. A 5.x Windows host may also reject an update pushed by a
-new Mac because it verifies against its old release endpoint.
+Latch 4.x and 5.x look for updates in this repository, which also carries
+each release's macOS and Windows archives while it is public. Use
+**Check now** to update; a 5.x Windows host accepts the update a new Mac
+pushes. Update before this repository becomes private: after that those
+versions no longer find new releases. If **Check now** cannot find 6.1.0,
+install once from the public release page on each machine. On Windows,
+unzip the release and run its `install-host.ps1`. On macOS, replace the
+app as above. On Linux, replace the binary and restart the service using
+the native guide. Keep your settings folder.
 
 ### Relay availability and privacy
 
