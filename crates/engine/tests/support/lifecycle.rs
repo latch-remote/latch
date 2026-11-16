@@ -102,6 +102,114 @@ fn sockets() -> (TcpStream, TcpStream) {
 }
 
 #[test]
+fn blocked_input_is_reported_to_the_viewer_without_stalling_input() {
+    struct BlockedInput {
+        notice: Option<String>,
+        applied: Arc<AtomicUsize>,
+    }
+    impl InputSink for BlockedInput {
+        fn apply(&mut self, _: &input::Event, _: DisplayRect) -> anyhow::Result<()> {
+            if self.applied.fetch_add(1, Ordering::Relaxed) == 0 {
+                self.notice = Some("Windows is blocking Latch's mouse and keyboard".into());
+            }
+            Ok(())
+        }
+        fn take_notice(&mut self) -> Option<String> {
+            self.notice.take()
+        }
+        fn release_all(&mut self) {}
+    }
+
+    let server = Server::bind(0, test_options::options()).unwrap();
+    let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let address = udp.local_addr().unwrap();
+    let session = session(address);
+    let applied = Arc::new(AtomicUsize::new(0));
+    session.input.lock().sink = Some(Box::new(BlockedInput {
+        notice: None,
+        applied: applied.clone(),
+    }));
+    let (host, mut client) = sockets();
+    let accept = Accept {
+        media_path_policy: false,
+        key_positions: false,
+        relay: false,
+        color: Default::default(),
+        cursor: false,
+        gamepads: 0,
+        gamepad_kinds: Vec::new(),
+        gamepad_problem: String::new(),
+        reference_invalidation: false,
+        session: session.id,
+        token: control::token_hex(&session.token),
+        codec: Codec::H264Baseline,
+        width: 64,
+        height: 64,
+        fps: 60,
+        bitrate_kbps: 1000,
+        encoder: "test".into(),
+        audio: None,
+        audio_problem: String::new(),
+        mic: None,
+        mic_problem: String::new(),
+    };
+    let worker = {
+        let server = server.clone();
+        let session = session.clone();
+        std::thread::spawn(move || server.control(&session, host, accept, None, || (None, None)))
+    };
+    assert!(matches!(
+        control::read_message(&mut client).unwrap(),
+        Message::Accept(_)
+    ));
+    for first in 0..2 {
+        let mut bytes = Vec::new();
+        wire::write_input(
+            &mut bytes,
+            session.id,
+            first,
+            &[input::Event::MouseMove { dx: 1, dy: -1 }],
+        );
+        dispatch_datagram(&server, &session, &bytes, address, false);
+        let mut ack = [0; 1500];
+        let length = udp.recv(&mut ack).unwrap();
+        assert!(matches!(
+            wire::parse(&ack[..length]).unwrap(),
+            Datagram::InputAck { next, .. } if next == first + 1
+        ));
+    }
+    assert_eq!(applied.load(Ordering::Relaxed), 2);
+    loop {
+        if let Message::Notice(notice) = control::read_message(&mut client).unwrap() {
+            assert_eq!(notice.kind, "input");
+            assert_eq!(
+                notice.message,
+                "Windows is blocking Latch's mouse and keyboard"
+            );
+            break;
+        }
+    }
+    assert!(session
+        .input
+        .lock()
+        .sink
+        .as_mut()
+        .unwrap()
+        .take_notice()
+        .is_none());
+    session.end(end::ENDED, "test finished");
+    loop {
+        match control::read_message(&mut client).unwrap() {
+            Message::End(_) => break,
+            Message::Notice(_) => panic!("input notice was repeated"),
+            _ => {}
+        }
+    }
+    worker.join().unwrap();
+}
+
+#[test]
 fn route_changes_finish_before_new_udp_pad_updates_are_acknowledged() {
     use latch_proto::gamepad::{PadKind, PadState, PadUpdate};
     let udp = UdpSocket::bind("127.0.0.1:0").unwrap();

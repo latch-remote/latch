@@ -2053,7 +2053,7 @@ dependencies = [
 
 [[package]]
 name = "latch-client"
-version = "6.1.0"
+version = "6.1.1"
 dependencies = [
  "anyhow",
  "eframe",
@@ -2090,14 +2090,14 @@ dependencies = [
 
 [[package]]
 name = "latch-codec"
-version = "6.1.0"
+version = "6.1.1"
 dependencies = [
  "tracing",
 ]
 
 [[package]]
 name = "latch-core"
-version = "6.1.0"
+version = "6.1.1"
 dependencies = [
  "anyhow",
  "directories",
@@ -2124,7 +2124,7 @@ dependencies = [
 
 [[package]]
 name = "latch-engine"
-version = "6.1.0"
+version = "6.1.1"
 dependencies = [
  "anyhow",
  "async-io",
@@ -2164,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "latch-host"
-version = "6.1.0"
+version = "6.1.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2194,7 +2194,7 @@ dependencies = [
 
 [[package]]
 name = "latch-proto"
-version = "6.1.0"
+version = "6.1.1"
 dependencies = [
  "libc",
  "serde",
@@ -2205,7 +2205,7 @@ dependencies = [
 
 [[package]]
 name = "latch-relay"
-version = "6.1.0"
+version = "6.1.1"
 dependencies = [
  "base64",
  "graviola",
@@ -2224,7 +2224,7 @@ dependencies = [
 
 [[package]]
 name = "latch-stream"
-version = "6.1.0"
+version = "6.1.1"
 dependencies = [
  "alsa",
  "anyhow",
@@ -2254,7 +2254,7 @@ dependencies = [
 
 [[package]]
 name = "latch-ui"
-version = "6.1.0"
+version = "6.1.1"
 dependencies = [
  "ab_glyph",
  "egui",

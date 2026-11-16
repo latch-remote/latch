@@ -4,6 +4,16 @@ The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
 `## X.Y.Z (date)`.
 
+## 6.1.1 (2026-11-16)
+
+### Windows input
+
+- Show a warning in the viewer when an administrator application blocks
+  mouse and keyboard input. Name the application and explain how to enable
+  administrator-window control in the host's Sharing settings and apply setup.
+- Wait for the elevated input helper to finish starting before showing the
+  warning, and check again if the helper disconnects.
+
 ## 6.1.0 (2026-11-16)
 
 ### Highlights

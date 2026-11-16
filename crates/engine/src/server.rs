@@ -867,6 +867,20 @@ impl Server {
             if let Some(e) = ended {
                 break e.message;
             }
+            let input_notice = session
+                .input
+                .lock()
+                .sink
+                .as_mut()
+                .and_then(|sink| sink.take_notice());
+            if let Some(message) = input_notice {
+                if !session.send_control(&Message::Notice(Notice {
+                    kind: "input".into(),
+                    message,
+                })) {
+                    break "the viewer's connection broke".to_string();
+                }
+            }
             let audio_notice = session.audio_notice.lock().take();
             if let Some(message) = audio_notice {
                 if !session.send_control(&Message::Notice(Notice {
