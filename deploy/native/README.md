@@ -139,11 +139,20 @@ back-off. Manifest outages have a separate retry counter, and verified downloads
 reset archive failures. Owned regular updater locks restored with incorrect
 modes are repaired to `0600` through verified descriptors. Lock directories are
 created and descriptor-repaired to `0700`, including under umask `002`.
+`linux-update.json.lock` sits directly in the Latch data directory, so every
+journal access makes that directory `0700`, including an existing `LATCH_DATA_DIR`
+path. Missing parent directories are created as `0700`. This is private
+application storage, and the existing lock path provides a shared inode for
+installations made by 6.0.0 and main.
 User-owned ancestors allow owner-authorized group write. Ancestors must belong
 to root or the user, and world-writable ancestors require the sticky bit.
 Root-owned ancestors also require group write to be disabled or sticky-bit
-protection. Rollback records and fsyncs Restoring before moving the old binary
-back, and recovery queues a restart across interrupted swap/restore boundaries.
+protection. Rollback attempts to persist Restoring before moving the old binary
+back. Journal-write errors are logged while restoration and restart proceed.
+The consumed previous link identifies a completed rollback for suppression,
+with missing pre-swap proof classified conservatively as failed. Recovery queues
+a restart across interrupted swap/restore boundaries. An already running
+original binary continues serving during persistent journal-write failures.
 Reopen the window after installation. AUR/Nix and container installs use their deployment tools.
 See [Linux update ownership and recovery](../../docs/USING.md#linux-installation-ownership-and-recovery).
 
@@ -153,12 +162,11 @@ recovery while the service keeps running. The fixture bypasses supervisor argv p
 ownership checks and real GitHub manifest fetching. The follow-up adds bounded
 assertion diagnostics, an assertion requiring rollback within 15 seconds and a real
 `latch-host --background` startup/status smoke check under systemd with isolated
-settings. Both initial follow-up systemd jobs failed at `4beb891` because of
-umask `002` lock-directory modes. Revised tests cover both umasks and five crash
-boundaries locally in Docker. The changed systemd cases require fresh CI
-verification. A full verified update of the production executable under systemd
-is untested. Real GUI reopening
-and stream continuity remain untested.
+settings. Both x64 and arm64 systemd jobs passed at `18a36e9`, including rollback
+within 15 seconds and the production-host smoke check. Local Docker tests cover
+both umasks, five crash boundaries and injected ENOSPC/EIO journal-write failures.
+A full verified update of the production executable under systemd is untested.
+Real GUI reopening and stream continuity remain untested.
 
 `migrate-legacy.sh` is only for upgrades from pre-4.1 BroLink unit names or
 Latch 4's separate engine service. Install the runtime prerequisites and

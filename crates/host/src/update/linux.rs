@@ -266,7 +266,14 @@ pub fn reconcile() -> Result<Option<linux::UpdateState>> {
                 return Err(e);
             }
         };
-        if (restored || needs_restart) && state.systemd {
+        use std::os::unix::fs::MetadataExt;
+        // A restored service can start before the recovery outcome is writable.
+        // Its own startup must not queue another restart on every retry.
+        let original_is_running = std::fs::metadata("/proc/self/exe")
+            .is_ok_and(|this| Some((this.dev(), this.ino())) == state.original)
+            && (!state.systemd || main_pid().is_ok_and(|pid| pid == std::process::id()));
+        let restart_needed = (restored || needs_restart) && !original_is_running;
+        if restart_needed && state.systemd {
             // Queue, so restarting our own cgroup cannot interrupt systemctl.
             ensure!(
                 Command::new("systemctl")
@@ -275,8 +282,7 @@ pub fn reconcile() -> Result<Option<linux::UpdateState>> {
                     .success(),
                 "restart restored Linux service failed"
             );
-        } else if restored || needs_restart {
-            use std::os::unix::fs::MetadataExt;
+        } else if restart_needed {
             let this = std::fs::metadata("/proc/self/exe")?;
             if Some((this.dev(), this.ino())) == state.replacement {
                 super::start_service(&state.exe, &["--replaces", &std::process::id().to_string()])?;

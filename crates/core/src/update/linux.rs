@@ -563,6 +563,10 @@ impl UpdateState {
     }
 
     fn write_unlocked(&mut self, path: &Path) -> Result<()> {
+        #[cfg(test)]
+        if let Some(error) = JOURNAL_WRITE_ERROR.with(Cell::get) {
+            return Err(std::io::Error::from_raw_os_error(error).into());
+        }
         let parent = path.parent().context("journal directory")?;
         self.revision += 1;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
@@ -692,7 +696,9 @@ impl UpdateState {
                 // Recovery can itself be interrupted between the restore and
                 // its service restart. Persist the intent before moving bytes.
                 self.phase = Phase::Restoring;
-                self.write_unlocked(path)?;
+                if let Err(error) = self.write_unlocked(path) {
+                    tracing::warn!("could not journal Linux recovery; restoring the previous binary: {error:#}");
+                }
                 fs::rename(previous, &self.exe)?;
                 File::open(self.exe.parent().context("installation directory")?)?.sync_all()?;
                 return Ok(true);
@@ -718,7 +724,12 @@ impl UpdateState {
             Err(error) => format!("Linux update recovery failed because {error:#}. Recovery copy retained at {}.",
                 self.stage.as_ref().map(|stage| stage.display().to_string()).unwrap_or_else(|| "an unavailable staging directory".into())),
         };
-        self.write_unlocked(path)?;
+        if let Err(error) = self.write_unlocked(path) {
+            tracing::warn!("could not persist Linux recovery outcome: {error:#}");
+            // Return the restoration result so the caller can restart. Retain
+            // the stage and upload until the outcome can be made durable.
+            return result;
+        }
         if let Err(error) = remove_upload(&self.upload) {
             tracing::warn!("Linux update upload cleanup failed: {error:#}");
         }
@@ -1201,10 +1212,15 @@ impl Transaction {
                 "installation changed during probation; recovery copy was preserved"
             );
             if let Some(path) = &self.journal {
-                let mut state = UpdateState::load(path)?.context("missing rollback journal")?;
-                state.phase = Phase::Restoring;
-                state.reason = "Restarting the previous Linux release after rollback".into();
-                state.save(path)?;
+                let saved = (|| {
+                    let mut state = UpdateState::load(path)?.context("missing rollback journal")?;
+                    state.phase = Phase::Restoring;
+                    state.reason = "Restarting the previous Linux release after rollback".into();
+                    state.save(path)
+                })();
+                if let Err(error) = saved {
+                    tracing::warn!("could not journal Linux rollback; restoring the previous binary: {error:#}");
+                }
             }
             #[cfg(test)]
             crash_at("restoring-before-rename");
@@ -1251,6 +1267,11 @@ impl Transaction {
         fs::remove_dir_all(self.stage.path())?;
         Ok(())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static JOURNAL_WRITE_ERROR: Cell<Option<i32>> = const { Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -2176,6 +2197,98 @@ mod tests {
         assert!(open_lock(&lock).is_err());
         fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o1777)).unwrap();
         drop(JournalLock::acquire(&journal).unwrap());
+    }
+
+    #[test]
+    fn journal_write_errors_preserve_the_old_binary_and_failed_release_suppression() {
+        struct RestoreJournalWrites;
+        impl Drop for RestoreJournalWrites {
+            fn drop(&mut self) {
+                JOURNAL_WRITE_ERROR.with(|error| error.set(None));
+            }
+        }
+        let _writes = RestoreJournalWrites;
+        for error in [libc::ENOSPC, libc::EIO] {
+            for forward in [true, false] {
+                let (dir, exe) = install();
+                let path = dir.path().join("linux-update.json");
+                let mut state =
+                    UpdateState::request(&exe, &semver::Version::new(999, 0, 0), b"archive", &path)
+                        .unwrap();
+                let mut tx = Transaction::begin_resolved(&exe).unwrap();
+                tx.record(&path, &mut state).unwrap();
+                stage(&tx, b"new");
+                let mut restarts = Vec::new();
+                if forward {
+                    JOURNAL_WRITE_ERROR.with(|fault| fault.set(Some(error)));
+                }
+                let result = tx.install(
+                    || {
+                        restarts.push(fs::read(&exe)?);
+                        Ok(())
+                    },
+                    || {
+                        JOURNAL_WRITE_ERROR.with(|fault| fault.set(Some(error)));
+                        bail!("replacement failed probation")
+                    },
+                );
+                assert!(result.is_err());
+                assert_eq!(fs::read(&exe).unwrap(), b"old");
+                if forward {
+                    assert!(restarts.is_empty());
+                    assert_eq!(
+                        UpdateState::load(&path).unwrap().unwrap().phase,
+                        Phase::Pending
+                    );
+                } else {
+                    assert_eq!(restarts, [b"new".to_vec(), b"old".to_vec()]);
+                    let mut pending = UpdateState::load(&path).unwrap().unwrap();
+                    assert_eq!(pending.phase, Phase::Swapping);
+                    assert!(!pending.stage.as_ref().unwrap().join("previous").exists());
+                    assert!(!pending.recover(&path).unwrap());
+                    assert_eq!(pending.failure, FailureKind::Recovery);
+                    let now = Instant::now();
+                    assert!(!automatic_update_due(
+                        &pending.version,
+                        &semver::Version::new(1, 0, 0),
+                        Some(&pending),
+                        false,
+                        now,
+                        now
+                    ));
+                    JOURNAL_WRITE_ERROR.with(|fault| fault.set(None));
+                    pending.recover(&path).unwrap();
+                    assert_eq!(
+                        UpdateState::load(&path).unwrap().unwrap().failure,
+                        FailureKind::Recovery
+                    );
+                }
+                JOURNAL_WRITE_ERROR.with(|fault| fault.set(None));
+            }
+            // Recovery must report a completed restore even while every journal
+            // write still fails, allowing its caller to restart the old service.
+            let (dir, exe) = install();
+            let path = dir.path().join("linux-update.json");
+            assert!(Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "update::linux::tests::crash_fixture"])
+                .env("LATCH_CRASH_FIXTURE", &path)
+                .env("LATCH_CRASH_EXE", &exe)
+                .status()
+                .unwrap()
+                .success());
+            let mut state = UpdateState::load(&path).unwrap().unwrap();
+            JOURNAL_WRITE_ERROR.with(|fault| fault.set(Some(error)));
+            assert!(state.recover(&path).unwrap());
+            assert_eq!(fs::read(&exe).unwrap(), b"old");
+            assert_eq!(state.failure, FailureKind::Recovery);
+            assert!(state.stage.as_ref().unwrap().exists());
+            JOURNAL_WRITE_ERROR.with(|fault| fault.set(None));
+            state.recover(&path).unwrap();
+            assert_eq!(
+                UpdateState::load(&path).unwrap().unwrap().failure,
+                FailureKind::Recovery
+            );
+        }
     }
 
     #[test]

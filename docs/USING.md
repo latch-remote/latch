@@ -432,29 +432,41 @@ during the failure check is logged at debug level while probation continues.
 The fsynced `linux-update.json` journal records progress, inode identities,
 staging location and outcome. On startup, a service detects an unfinished
 update whose supervisor died and restores the previous inode deterministically.
-A running service also monitors for this failure. Rollback fsyncs the Restoring
-journal entry and its directory before moving the old binary back. Recovery
-handles Restoring with either executable inode and queues a service restart for
-interrupted Swapping and Restoring states. An old Swapping journal whose restore
-already consumed the previous link is treated as recovery failure and suppressed.
-The original inode and its verified previous link prove a pre-rename
-interruption is eligible for retry. CI covers recovery both at the next service
-start and while the service keeps running. If restoration itself fails, the update becomes terminal Failed with the recovery copy retained
-and its path reported. The next update can proceed. A journal flock and phase
-compare-and-set serialize writers. Unsafe or unparsable journals are moved aside
-with at most three diagnostic copies, pruning the oldest modification times.
+A running service also monitors for this failure. Rollback attempts to fsync the
+Restoring journal entry and its directory before moving the old binary back.
+A journal-write error is logged while the old binary is restored and its service
+restarted. A consumed previous link identifies the failed release when the
+journal still says Swapping. Missing pre-swap proof is classified conservatively
+as a recovery failure. Recovery retains its staging evidence when its terminal
+outcome cannot be persisted. A service already running the original inode
+continues serving during a persistent journal-write failure. Recovery handles
+Restoring with either executable inode and queues a service restart for
+interrupted swap/restore states. The original inode and its verified previous
+link prove a pre-rename interruption is eligible for retry. CI covers recovery
+both at the next service start and while the service keeps running. If
+restoration itself fails, the update becomes terminal Failed with the recovery
+copy retained and its path reported. The next update can proceed. A journal
+flock and phase compare-and-set serialize writers. Unsafe or unparsable journals
+are moved aside with at most three diagnostic copies, pruning the oldest
+modification times.
 Owned regular lock files restored with incorrect modes are repaired to `0600`
 using pinned directory and file descriptors. Journal and transaction lock
 directories are created explicitly as `0700` under either umask `002` or `022`.
 Existing user-owned lock directories are repaired to `0700` through their open
-descriptors after ownership and type checks. Every resolved ancestor must belong
-to root or the user. Group write on user-owned ancestors follows the owner's
+descriptors after ownership and type checks. The journal lock is
+`linux-update.json.lock` directly in the Latch data directory. Every journal
+access makes that data directory `0700`, including an existing directory named
+by `LATCH_DATA_DIR`. Missing parent directories are created as `0700`. This path
+is private application storage. Using the existing lock path gives installations
+made by 6.0.0 and main a shared lock inode across upgrades. Every resolved
+ancestor must belong to root or the user. Group write on user-owned ancestors follows the owner's
 group-access policy, including Ubuntu private-user groups. Group members with
 that access are trusted for those ancestors. Root-owned ancestors require group
 write to be disabled or the sticky bit to be set. Every world-writable ancestor
 requires the sticky bit. The rule uses descriptor UID and mode checks. Lock
-symlinks, foreign owners, hard links and unsafe ancestors are refused with repair instructions. A journal read I/O error retains the
-journal for a later retry. Unknown fields and missing fields are
+symlinks, foreign owners, hard links and unsafe ancestors are refused with
+repair instructions. A journal read I/O error retains the journal for a later
+retry. Unknown fields and missing fields are
 tolerated, and unknown phases become terminal failures. Maintenance failures
 appear in service setup/status and logs while the service continues starting.
 
@@ -502,22 +514,20 @@ required for local Linux updates.
 Linux updater validation uses local HTTP manifest/artifact fixtures and
 compiled ELF programs on native x64 and arm64 CI. Local development uses
 Docker with Ubuntu 24.04/glibc 2.39. No Linux machine outside CI and containers is available for
-this work. The `Linux updater systemd` CI jobs passed at `5d2959f` on x64 and arm64 Ubuntu 24.04 runners. They install a fixture `latch.service`, launch the real supervisor from its control group, and check successful probation, wrong-version rollback and rollback after the supervisor is killed following the swap.
+this work. The `Linux updater systemd` CI jobs passed at `18a36e9` on x64 and arm64 Ubuntu 24.04 runners. They install a fixture `latch.service`, launch the real supervisor from its control group, and check successful probation, wrong-version rollback and rollback after the supervisor is killed following the swap.
 The fixture adds a replacement that crashes on start, including the start
 limit and `reset-failed`, and monitor recovery while the service keeps running.
-Both added cases passed at `5570388` on x64 and arm64. The fixture gates its crash
+Both cases passed at `18a36e9` on x64 and arm64. The fixture gates its crash
 on a new MainPID with ActiveState=active and SubState=running. The start-limit
 check requires a failed unit, at least three fixture starts, a stable restart
 counter and exit status 7. It accepts exit-code and start-limit-hit results.
 Any failing fixture assertion prints bounded service/supervisor state, recent
 journals and fixture history. Unit environments are excluded from diagnostics.
-The follow-up adds a crash-case assertion that rollback completes within 15
-seconds and a production `latch-host --background` systemd startup/status smoke
-check with isolated settings. These changed real-systemd cases await CI
-verification. The first follow-up jobs at `4beb891` failed on lock-directory
-permissions under umask `002`. Revised local Linux tests exercise both `002` and
-`022`, plus subprocess exits at five forward/rollback boundaries and fake-systemd
-restart requests. A real user-manager run of this revision still requires CI.
+At `18a36e9`, both x64 and arm64 jobs also passed the assertion that rollback
+completes within 15 seconds and the production `latch-host --background`
+systemd startup/status smoke check with isolated settings. Local Linux tests
+exercise both umasks `002` and `022`, five forward/rollback crash boundaries,
+fake-systemd restart requests and injected ENOSPC/EIO journal-write failures.
 The test is ignored during ordinary test runs and requires explicit opt-in
 through the dedicated script, which refuses an existing `latch.service`.
 The fixture bypasses supervisor argv parsing, self-pinning, installation ownership

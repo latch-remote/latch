@@ -1229,3 +1229,60 @@ fn interrupted_recovery_fixture_entry() {
         "--user --no-block restart latch.service\n"
     );
 }
+
+#[test]
+fn an_already_running_original_service_avoids_a_restart_while_the_cli_can_request_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let systemctl = dir.path().join("systemctl");
+    fs::write(&systemctl, "#!/bin/sh\ncase \"$*\" in\n*--property=MainPID*) /bin/cat \"$LATCH_DATA_DIR/main-pid\";;\n*) printf '%s\\n' \"$*\" >> \"$LATCH_DATA_DIR/restarts\";;\nesac\n").unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = helper("running_original_fixture_entry")
+        .env("LATCH_RUNNING_ORIGINAL", "1")
+        .env("LATCH_DATA_DIR", dir.path())
+        .env("PATH", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn running_original_fixture_entry() {
+    use std::os::unix::fs::MetadataExt;
+    if std::env::var_os("LATCH_RUNNING_ORIGINAL").is_none() {
+        return;
+    }
+    let path = linux::state_path().unwrap();
+    let root = path.parent().unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let original = fs::metadata(&exe).unwrap();
+    for main_pid in [std::process::id(), 0] {
+        fs::write(root.join("main-pid"), format!("{main_pid}\n")).unwrap();
+        let mut state =
+            linux::UpdateState::request(&exe, &Version::new(999, 0, 0), &[], &path).unwrap();
+        state.phase = linux::Phase::Swapping;
+        state.systemd = true;
+        state.supervisor = u32::MAX;
+        state.supervisor_start = Some("dead".into());
+        state.original = Some((original.dev(), original.ino()));
+        state.replacement = Some((original.dev(), 0));
+        state.save(&path).unwrap();
+        let recovered = reconcile().unwrap().unwrap();
+        assert_eq!(recovered.phase, linux::Phase::Failed);
+        assert_eq!(recovered.failure, linux::FailureKind::Recovery);
+        let restarts = fs::read_to_string(root.join("restarts")).unwrap_or_default();
+        assert_eq!(
+            restarts,
+            if main_pid == std::process::id() {
+                ""
+            } else {
+                "--user --no-block restart latch.service\n"
+            }
+        );
+    }
+}

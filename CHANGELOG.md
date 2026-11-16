@@ -249,13 +249,17 @@ GitHub release notes, so each version gets a heading of the form
   regular lock files to `0600` through verified descriptors, preserve original
   launch errors and share transfer-rate accounting across redirects.
   Add bounded diagnostics for fixture assertions, a 15-second rollback assertion
-  and a real `latch-host` systemd startup/status smoke check. The changed real
-  systemd cases await CI verification. Create lock directories explicitly as
-  `0700` and repair their modes through verified descriptors under umasks `002`
+  and a real `latch-host` systemd startup/status smoke check. Both cases passed
+  in the x64 and arm64 systemd jobs at `18a36e9`. Create lock directories
+  explicitly as `0700` and repair their modes through verified descriptors under umasks `002`
   and `022`. Accept owner-authorized group access on user-owned ancestors while
   refusing foreign owners and non-sticky world-writable ancestors. Persist
-  rollback intent before restoring the binary, recover interrupted restore
-  renames and queue service restarts for interrupted swaps. Persist legacy retry
+  rollback intent before restoring the binary, logging journal-write errors
+  while restoration and restart proceed. Recover interrupted restore renames
+  and suppress failed releases using the consumed previous link. Keep an
+  already running original service alive through persistent journal-write errors.
+  Document that journal access makes the Latch data directory `0700`, including
+  configured `LATCH_DATA_DIR` paths and newly created parents. Persist legacy retry
   resets immediately and debug-log systemctl failure-check errors.
 
 - Add verified Linux self-updates for user-owned release binaries, with
