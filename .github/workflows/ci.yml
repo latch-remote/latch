@@ -42,7 +42,7 @@ jobs:
       - name: clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: test
-        run: cargo test --locked --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets --no-fail-fast
       - name: relay carrier timing
         run: cargo test --locked -p latch-relay --test carrier_throughput -j 4 -- --nocapture
       # The setup script is generated, so only a dump of it can be parsed.
@@ -190,7 +190,7 @@ jobs:
       - name: clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: test
-        run: cargo test --locked --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets --no-fail-fast
       - name: release app
         run: cargo build --locked --release -p latch-host --target aarch64-apple-darwin
       - name: bundle
@@ -262,7 +262,7 @@ jobs:
       - name: clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: test
-        run: cargo test --locked --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets --no-fail-fast
       - name: Linux updater local-manifest fixture and rollback
         run: cargo test --locked -p latch-core -j 4 linux_release_fixture_updates_and_rolls_back -- --nocapture
       - name: X11 capture recovery and media replay

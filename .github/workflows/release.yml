@@ -38,7 +38,7 @@ jobs:
         run: HOMEBREW_NO_AUTO_UPDATE=1 brew install ffmpeg
       # Never ship a binary whose tests were not run.
       - name: test
-        run: cargo test --locked --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets --no-fail-fast
       - name: public manifest installer checks
         run: bash scripts/test-release-manifest.sh
       - name: build app
@@ -92,7 +92,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: test
-        run: cargo test --locked --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets --no-fail-fast
       - name: build
         run: cargo build --locked --release -p latch-host
       - name: package
@@ -157,7 +157,7 @@ jobs:
       - name: native deps
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - name: test
-        run: cargo test --locked --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets --no-fail-fast
       - name: build
         run: cargo build --locked --release -p latch-host
       - name: package

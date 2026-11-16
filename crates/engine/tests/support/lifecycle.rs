@@ -568,6 +568,7 @@ fn end_reaches_the_viewer_and_stops_capture_while_input_cleanup_is_pending() {
         "bitrate_kbps": 1000, "encoder": "test", "audio": null
     }))
     .unwrap();
+    let (resume, starting) = mpsc::channel();
     let held = Arc::new(AtomicBool::new(true));
     let worker = {
         let session = session.clone();
@@ -585,6 +586,9 @@ fn end_reaches_the_viewer_and_stops_capture_while_input_cleanup_is_pending() {
                         std::thread::sleep(Duration::from_millis(1));
                     }
                 });
+                // Keep relay maintenance from briefly owning input when end()
+                // tries to take the sink. This fixture exercises blocked cleanup.
+                starting.recv().unwrap();
                 (Some(video), None)
             })
         })
@@ -598,6 +602,7 @@ fn end_reaches_the_viewer_and_stops_capture_while_input_cleanup_is_pending() {
         std::thread::spawn(move || session.end(end::HOST_STOPPING, "stop"))
     };
     cleanup.recv_timeout(Duration::from_secs(1)).unwrap();
+    resume.send(()).unwrap();
     let ended = control::read_message(&mut peer);
     let deadline = Instant::now() + Duration::from_millis(500);
     while held.load(Ordering::Acquire) && Instant::now() < deadline {
