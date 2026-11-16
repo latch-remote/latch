@@ -297,6 +297,8 @@ A permanent one-picture delay therefore pays at most one approximately
 980 ms cold wait per configuration, or one 50 ms wait if it starts in steady
 state. Neither missing-picture expiry nor switch-off is a decode error or
 keyframe request. Output-type stream changes re-arm cold-start handling.
+Initial negotiation that continues after a missed first picture retains that
+picture's pending identity and shares the original cold wait.
 The decoder still returns every ready picture under its original sample
 time, including on hardware. Ready pictures incur no polling wait. Sequences with unknown or
 nonzero ordering may require further inputs. The session keeps

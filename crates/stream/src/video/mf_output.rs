@@ -52,6 +52,7 @@ impl OutputBudget {
 
 pub(super) struct PictureWait {
     cold: bool,
+    picture_seen: bool,
     pub(super) pending: Option<i64>,
     delayed_inputs: u8,
     pub(super) disabled_reason: Option<&'static str>,
@@ -61,6 +62,7 @@ impl Default for PictureWait {
     fn default() -> Self {
         Self {
             cold: true,
+            picture_seen: false,
             pending: None,
             delayed_inputs: 0,
             disabled_reason: None,
@@ -69,10 +71,16 @@ impl Default for PictureWait {
     }
 }
 impl PictureWait {
-    fn reconfigure(&mut self) {
+    fn reconfigure(&mut self) -> bool {
+        // The initial output type may become available only on another input.
+        // Keep that startup within its original cold wait until a picture exists.
+        if !self.picture_seen && self.pending.is_some() {
+            return false;
+        }
         let warned = self.warned;
         *self = Self::default();
         self.warned = warned;
+        true
     }
     fn before_input(&mut self, time: i64) {
         if self.pending == Some(time) {
@@ -145,6 +153,7 @@ pub(super) fn drain_output<T>(
                     "decoder produced too many outputs without needing input"
                 );
                 pictures.push((time, picture));
+                wait.picture_seen = true;
                 if expected == Some(time) {
                     waiting = false;
                 }
@@ -154,10 +163,11 @@ pub(super) fn drain_output<T>(
             }
             Output::StreamChange => {
                 budget.stream_changes += 1;
-                wait.reconfigure();
-                previous = None;
-                waiting = expected.is_some() && !contains_current(pictures);
-                wait_deadline = budget.deadline;
+                if wait.reconfigure() {
+                    previous = None;
+                    waiting = expected.is_some() && !contains_current(pictures);
+                    wait_deadline = budget.deadline;
+                }
             }
             Output::Events => budget.events += 1,
             Output::NeedInput => {
@@ -712,6 +722,40 @@ mod tests {
         // With that identity unresolved, another input probes without waiting.
         assert!(submit(&mut wait, &clock, 1, &warnings, |_| Ok(Output::NeedInput))?.is_empty());
         assert_eq!(clock.now() - started, Duration::from_millis(980));
+        Ok(())
+    }
+    #[test]
+    fn delayed_initial_type_negotiation_does_not_spend_a_second_cold_wait() -> Result<()> {
+        let clock = FakeClock::default();
+        let mut wait = PictureWait::default();
+        let warnings = Cell::new(0);
+        let started = clock.now();
+        assert!(submit(&mut wait, &clock, 0, &warnings, |_| Ok(Output::NeedInput))?.is_empty());
+        let mut outputs = [
+            Output::StreamChange,
+            Output::Picture(0, 0),
+            Output::NeedInput,
+        ]
+        .into_iter();
+        assert_eq!(
+            submit(&mut wait, &clock, 1, &warnings, |_| Ok(outputs
+                .next()
+                .unwrap()))?,
+            [(0, 0)]
+        );
+        assert_eq!(clock.now() - started, Duration::from_millis(980));
+        assert!(wait.disabled_reason.is_none());
+        assert_eq!(warnings.get(), 0);
+        let mut outputs = [Output::Picture(1, 1), Output::NeedInput].into_iter();
+        assert_eq!(
+            submit(&mut wait, &clock, 2, &warnings, |_| Ok(outputs
+                .next()
+                .unwrap()))?,
+            [(1, 1)]
+        );
+        assert_eq!(clock.now() - started, Duration::from_millis(980));
+        assert_eq!(wait.disabled_reason, Some(RETAINED_DELAY));
+        assert_eq!(warnings.get(), 1);
         Ok(())
     }
 }
