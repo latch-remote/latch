@@ -299,6 +299,56 @@ sends a parity packet with `seq = 4k`: the XOR of the four packets'
 `u16 length | payload`, each zero-padded to the longest. It rebuilds any
 one lost packet of the four.
 
+The receiver's normal in-order release rule is unchanged. A gap is detected
+when `pop` finds later data or the group's parity. It releases concealment
+20 ms after that detection, or when the next group's second data packet
+arrives, whichever comes first. A consecutive missing run shares its timer
+until a real frame delivers. Without later data or parity there is no
+observed gap. Callers drain on arrivals and `next_deadline` timer wakeups.
+
+For evenly spaced 5 ms data at 0/5/10/15 ms, parity is emitted immediately
+after the fourth packet at 15 ms. Losing positions 1/2/3/4 detects the gap
+at 5/10/15/20 ms if parity is absent. Timer-only releases are 25/30/35/40 ms.
+Continued data triggers the progress cutoff at 25 ms for all four, giving
+20/15/10/5 ms holds. Ideal parity repairs the first three after 10/5/0 ms
+of holding and the fourth before later data detects its gap.
+
+Desktop playback additionally retains a repair reservation after this
+release, through `min(release + 20 ms, missing_frame_play_deadline - 1 ms)`.
+The play deadline uses the queued source-sample prefix divided by the source
+rate and the unchanged controller's maximum 1.002 playback-speed factor.
+The existing faded concealment and all following frames are queued on the
+original schedule. A late original or parity reconstruction can replace
+only the complete reserved sample range. Under the queue lock, replacement
+requires the whole frame and at least 1 ms of preceding samples still queued,
+with matching decoded channel and sample counts. Device consumption or
+ordinary restart/cap trimming invalidates the range. Following samples do
+not extend the missing frame's deadline. There is no additional underrun
+allowance and no additional playback delay.
+
+This preserves the controller's queue lengths, arrival timestamps, jitter
+samples, fades used for subsequent concealments and all steering decisions.
+The low-point release remains 0.25 ms/s, trim remains ±0.2%, and an underrun
+adds 2 ms of margin, up to 40 ms, decaying at 0.1 ms/s toward 2 ms. Post-loss
+queue recovery remains main's existing behavior. The evaluation asserts
+exact queue/controller equality through 96 s, including +10/+30/+60 s after
+loss ends. Its damage summation tolerance is 1e-9 ms, with zero sample or
+queue-depth tolerance. See [ENGINE.md](ENGINE.md#audio) for modeled results.
+
+At most 64 encoded reservations are retained, each with four payloads of
+at most 1182 bytes and parity of at most 1184 bytes. Their payload storage
+is bounded to 378,368 bytes plus bounded metadata, and each expires within
+20 ms of normal release. The ordinary 64-packet resynchronization also
+clears this cache. Lost parity cannot delay playback or grow this cache
+without bound. The 120 ms playback queue cap stays unchanged.
+
+Unbudgeted `pop` callers retain main's exact 20 ms/progress rule, including
+the host microphone receiver's existing arrival/200 ms timeout servicing.
+Audio packet bytes, packetization and protocol-1 negotiation are unchanged,
+with the existing 6.0.0 compatibility in both directions. No additional
+physical capture, network parity or audible measurement was made for this
+revision.
+
 Each coded audio frame is at most `MAX_DATAGRAM - 18` (1 182) bytes,
 leaving room for the 16-byte audio header and the parity packet's two-byte
 length. The host picks `frame_samples` and announces it in `Accept`: 240
