@@ -445,13 +445,14 @@ def publish(directory, tag, notes, api=None):
     print(f"Published https://github.com/{REPO}/releases/tag/{tag}")
 
 
-def bridge_notes(notes, tag):
+def bridge_notes(tag):
     return (
-        f"{notes.strip()}\n\n---\n\n"
-        f"Download Latch from the [full release on latch-releases](https://github.com/{REPO}/releases/tag/{tag}), "
-        "which also has the Linux builds, the source and `SHA256SUMS` for every file. "
-        "This copy of the macOS and Windows archives is here so that Latch 4.x and 5.x, "
-        "which check this repository for updates, can update themselves.\n"
+        "This release supplies automatic updates for Latch 4.x and 5.x.\n\n"
+        "Find release notes and all downloads in the "
+        f"[canonical release on latch-releases](https://github.com/{REPO}/releases/tag/{tag}).\n\n"
+        "Update while this repository is public. If it becomes private, "
+        "4.x and 5.x installs lose automatic updates. Updated installs use "
+        "the public release manifest on latch-releases.\n"
     )
 
 
@@ -466,7 +467,7 @@ def publish_bridge(bridge, release, tag, notes, repo=SOURCE_REPO, api=None):
     ref = api.request("GET", f"repos/{repo}/git/ref/tags/{tag}")
     require(ref["object"]["type"] in {"commit", "tag"}, "source tag must reference a commit or an annotated tag")
     release_info = find_release(api, repo, tag)
-    details = {"name": f"Latch {tag}", "body": bridge_notes(notes, tag), "prerelease": manifest["prerelease"]}
+    details = {"name": f"Latch {tag}", "body": bridge_notes(tag), "prerelease": manifest["prerelease"]}
     if release_info is not None and release_info["draft"] is False:
         # A rerun after success: accept it only if it is exactly this bridge.
         remote = asset_map(api.assets(release_info["id"]), BRIDGE_NAMES)

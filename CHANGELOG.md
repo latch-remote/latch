@@ -4,6 +4,12 @@ The release workflow publishes the section that matches the tag as the
 GitHub release notes, so each version gets a heading of the form
 `## X.Y.Z (date)`.
 
+## Unreleased
+
+- Keep legacy update bridge notes short and link to the canonical release.
+  Tell Latch 4.x and 5.x users to update before the source repository becomes
+  private, when those versions lose automatic updates.
+
 ## 6.1.0 (2026-11-16)
 
 ### Highlights
