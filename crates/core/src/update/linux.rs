@@ -2,10 +2,11 @@
 //! stream admission and keeps the supervisor outside latch.service's cgroup.
 use super::{Asset, Release};
 use anyhow::{bail, ensure, Context, Result};
+use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -317,19 +318,8 @@ struct JournalLock {
 impl JournalLock {
     fn acquire(path: &Path) -> Result<Self> {
         let parent = path.parent().context("journal directory")?;
-        fs::create_dir_all(parent)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path.with_extension("json.lock"))?;
-        let meta = file.metadata()?;
-        ensure!(
-            meta.is_file() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0,
-            "unsafe Linux update journal lock"
-        );
+        create_lock_directory(parent)?;
+        let file = open_lock(&path.with_extension("json.lock"))?;
         ensure!(
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0,
             "lock Linux update journal"
@@ -573,6 +563,10 @@ impl UpdateState {
     }
 
     fn write_unlocked(&mut self, path: &Path) -> Result<()> {
+        #[cfg(test)]
+        if let Some(error) = JOURNAL_WRITE_ERROR.with(Cell::get) {
+            return Err(std::io::Error::from_raw_os_error(error).into());
+        }
         let parent = path.parent().context("journal directory")?;
         self.revision += 1;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
@@ -668,6 +662,18 @@ impl UpdateState {
             return Ok(false);
         }
         ensure!(!self.alive(), "update supervisor is still running");
+        let before_swap = matches!(self.phase, Phase::Pending | Phase::Started)
+            || self.phase == Phase::Swapping
+                && self.original.is_some()
+                && fs::symlink_metadata(&self.exe).is_ok_and(|meta| {
+                    meta.is_file() && Some((meta.dev(), meta.ino())) == self.original
+                })
+                && self.stage.as_ref().is_some_and(|stage| {
+                    validate_stage(stage, &self.exe).is_ok()
+                        && fs::symlink_metadata(stage.join("previous")).is_ok_and(|meta| {
+                            meta.is_file() && Some((meta.dev(), meta.ino())) == self.original
+                        })
+                });
         let result = (|| -> Result<bool> {
             let _lock = lock?;
             let installed = fs::symlink_metadata(&self.exe)?;
@@ -676,7 +682,9 @@ impl UpdateState {
                 "installation changed to a symlink during recovery"
             );
             let inode = (installed.dev(), installed.ino());
-            if self.phase == Phase::Swapping && Some(inode) == self.replacement {
+            if matches!(self.phase, Phase::Swapping | Phase::Restoring)
+                && Some(inode) == self.replacement
+            {
                 let stage = self.stage.as_ref().context("missing recovery directory")?;
                 validate_stage(stage, &self.exe)?;
                 let previous = stage.join("previous");
@@ -685,6 +693,12 @@ impl UpdateState {
                     meta.is_file() && Some((meta.dev(), meta.ino())) == self.original,
                     "recovery inode changed"
                 );
+                // Recovery can itself be interrupted between the restore and
+                // its service restart. Persist the intent before moving bytes.
+                self.phase = Phase::Restoring;
+                if let Err(error) = self.write_unlocked(path) {
+                    tracing::warn!("could not journal Linux recovery; restoring the previous binary: {error:#}");
+                }
                 fs::rename(previous, &self.exe)?;
                 File::open(self.exe.parent().context("installation directory")?)?.sync_all()?;
                 return Ok(true);
@@ -698,14 +712,24 @@ impl UpdateState {
             Ok(false)
         })();
         self.phase = Phase::Failed;
-        self.failure = FailureKind::Recovery;
+        self.failure = if before_swap && result.is_ok() {
+            FailureKind::Transient
+        } else {
+            FailureKind::Recovery
+        };
         self.preserve_recovery = result.is_err();
         self.reason = match &result {
+            Ok(_) if before_swap => "Linux update supervisor stopped before swapping. The release remains eligible for retry with back-off.".into(),
             Ok(_) => "Linux update supervisor stopped before completion. Recovery restored or retained the previous release.".into(),
             Err(error) => format!("Linux update recovery failed because {error:#}. Recovery copy retained at {}.",
                 self.stage.as_ref().map(|stage| stage.display().to_string()).unwrap_or_else(|| "an unavailable staging directory".into())),
         };
-        self.write_unlocked(path)?;
+        if let Err(error) = self.write_unlocked(path) {
+            tracing::warn!("could not persist Linux recovery outcome: {error:#}");
+            // Return the restoration result so the caller can restart. Retain
+            // the stage and upload until the outcome can be made durable.
+            return result;
+        }
         if let Err(error) = remove_upload(&self.upload) {
             tracing::warn!("Linux update upload cleanup failed: {error:#}");
         }
@@ -879,8 +903,112 @@ pub fn automatic_update_due(
 
 fn lock_path(exe: &Path) -> Result<PathBuf> {
     let dir = crate::config::data_dir()?.join("update-locks");
-    fs::create_dir_all(&dir)?;
+    create_lock_directory(&dir)?;
     Ok(dir.join(super::sha256_hex(exe.as_os_str().as_encoded_bytes())))
+}
+
+fn create_lock_directory(path: &Path) -> Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
+    Ok(())
+}
+
+/// Resolve directory aliases, then pin each directory before opening the next component.
+/// Permission repair acts only on the verified descriptor, never a pathname.
+fn open_lock(path: &Path) -> Result<File> {
+    open_lock_for_uid(path, unsafe { libc::geteuid() })
+}
+
+fn open_lock_for_uid(path: &Path, uid: u32) -> Result<File> {
+    use std::os::fd::FromRawFd;
+    let result = (|| -> Result<File> {
+        let parent = path.parent().context("lock directory")?.canonicalize()?;
+        let mut directory = File::open("/")?;
+        let components: Vec<_> = parent.components().skip(1).collect();
+        for (index, component) in components.iter().enumerate() {
+            let std::path::Component::Normal(name) = component else {
+                bail!("unsafe lock directory component");
+            };
+            let name = std::ffi::CString::new(name.as_encoded_bytes())?;
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            directory = unsafe { File::from_raw_fd(fd) };
+            let meta = directory.metadata()?;
+            ensure!(
+                meta.uid() == 0 || meta.uid() == uid,
+                "foreign-owned lock ancestor"
+            );
+            if index + 1 < components.len() {
+                // Group access on user-owned ancestors follows the owner's
+                // filesystem policy, including Ubuntu's private-user groups.
+                ensure!(
+                    (meta.mode() & 0o002 == 0 || meta.mode() & 0o1000 != 0)
+                        && (meta.uid() == uid
+                            || meta.mode() & 0o020 == 0
+                            || meta.mode() & 0o1000 != 0),
+                    "unsafe lock ancestor"
+                );
+            }
+        }
+        let meta = directory.metadata()?;
+        ensure!(
+            meta.is_dir() && meta.uid() == uid,
+            "unsafe lock directory owner or type"
+        );
+        if meta.mode() & 0o7777 != 0o700 {
+            directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+            directory.sync_all()?;
+        }
+        let name = std::ffi::CString::new(
+            path.file_name()
+                .context("lock filename")?
+                .as_encoded_bytes(),
+        )?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | libc::O_NONBLOCK,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let meta = file.metadata()?;
+        ensure!(
+            meta.is_file() && meta.uid() == uid && meta.nlink() == 1,
+            "unsafe lock owner or type"
+        );
+        if meta.mode() & 0o7777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.sync_all()?;
+        }
+        Ok(file)
+    })();
+    result.with_context(|| {
+        format!(
+            "unsafe Linux update lock {}. Stop Latch and any update supervisor, then have \
+             the installation owner replace it with a regular, user-owned 0600 file in a \
+             user-owned directory. Owned lock directories are repaired to 0700 automatically. Foreign-owned ancestors and non-sticky world-writable ancestors require repair",
+            path.display()
+        )
+    })
 }
 
 struct UpdateLock(File);
@@ -916,18 +1044,7 @@ impl Transaction {
     fn begin_resolved(exe: &Path) -> Result<Self> {
         let parent = exe.parent().context("installation has no parent")?;
 
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(lock_path(exe)?)?;
-        let meta = lock.metadata()?;
-        ensure!(
-            meta.is_file() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0,
-            "unsafe updater lock"
-        );
+        let lock = open_lock(&lock_path(exe)?)?;
         ensure!(
             unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
             "another updater is already running"
@@ -1077,7 +1194,11 @@ impl Transaction {
             state.save(path)?;
         }
         before_rename()?;
+        #[cfg(test)]
+        crash_at("before-swap-rename");
         fs::rename(self.stage.path().join("new"), &self.exe)?;
+        #[cfg(test)]
+        crash_at("after-swap-rename");
         self.swapped = true;
         File::open(self.exe.parent().unwrap())?.sync_all()?;
         Ok(())
@@ -1090,16 +1211,25 @@ impl Transaction {
                 meta.is_file() && Some((meta.dev(), meta.ino())) == self.replacement,
                 "installation changed during probation; recovery copy was preserved"
             );
+            if let Some(path) = &self.journal {
+                let saved = (|| {
+                    let mut state = UpdateState::load(path)?.context("missing rollback journal")?;
+                    state.phase = Phase::Restoring;
+                    state.reason = "Restarting the previous Linux release after rollback".into();
+                    state.save(path)
+                })();
+                if let Err(error) = saved {
+                    tracing::warn!("could not journal Linux rollback; restoring the previous binary: {error:#}");
+                }
+            }
+            #[cfg(test)]
+            crash_at("restoring-before-rename");
             fs::rename(self.stage.path().join("previous"), &self.exe)
                 .context("restore the previous binary")?;
+            #[cfg(test)]
+            crash_at("restored-before-completion");
             File::open(self.exe.parent().unwrap())?.sync_all()?;
             self.swapped = false;
-            if let Some(path) = &self.journal {
-                let mut state = UpdateState::load(path)?.context("missing rollback journal")?;
-                state.phase = Phase::Restoring;
-                state.reason = "Restarting the previous Linux release after rollback".into();
-                state.save(path)?;
-            }
         }
         Ok(())
     }
@@ -1113,6 +1243,8 @@ impl Transaction {
     ) -> Result<()> {
         self.swap()?;
         if let Err(why) = restart().and_then(|()| health()) {
+            #[cfg(test)]
+            crash_at("probation-failed-before-restoring");
             self.rollback()?;
             restart().context("restart the previous binary after rollback")?;
             let result = Err(why.context("the previous Linux release was restored and restarted"));
@@ -1134,6 +1266,19 @@ impl Transaction {
         self.swapped = false;
         fs::remove_dir_all(self.stage.path())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static JOURNAL_WRITE_ERROR: Cell<Option<i32>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+fn crash_at(point: &str) {
+    if std::env::var("LATCH_UPDATE_CRASH_POINT").as_deref() == Ok(point) {
+        // Simulate SIGKILL by exiting without running transaction destructors.
+        std::process::exit(0);
     }
 }
 
@@ -1315,12 +1460,14 @@ pub fn download_asset(asset: &Asset, dest: &Path) -> Result<()> {
 fn fetch(url: &str, accept: &str, size: u64, sink: &mut dyn Write) -> Result<u16> {
     let started = Instant::now();
     let deadline = transfer_deadline(size, ARCHIVE_MINIMUM_RATE);
+    let transport_read = Cell::new(0);
+    let read = Cell::new(0);
     super::fetch_with(url, None, accept, sink, |host| {
         let tls = super::connect_with(host, |tcp| TimedIo {
             inner: tcp,
             started,
             deadline,
-            read: 0,
+            read: &transport_read,
             minimum: 128,
             clock: Instant::now,
         })?;
@@ -1328,7 +1475,7 @@ fn fetch(url: &str, accept: &str, size: u64, sink: &mut dyn Write) -> Result<u16
             inner: tls,
             started,
             deadline,
-            read: 0,
+            read: &read,
             minimum: ARCHIVE_MINIMUM_RATE,
             clock: Instant::now,
         })
@@ -1341,11 +1488,11 @@ fn transfer_deadline(size: u64, minimum: u64) -> Duration {
     Duration::from_secs(size.min(super::MAX_DOWNLOAD).div_ceil(minimum) + 60)
 }
 
-struct TimedIo<T, C = fn() -> Instant> {
+struct TimedIo<'a, T, C = fn() -> Instant> {
     inner: T,
     started: Instant,
     deadline: Duration,
-    read: u64,
+    read: &'a Cell<u64>,
     minimum: u64,
     clock: C,
 }
@@ -1369,19 +1516,19 @@ fn transfer_budget(
     Ok(())
 }
 
-impl<T: Read, C: Fn() -> Instant> Read for TimedIo<T, C> {
+impl<T: Read, C: Fn() -> Instant> Read for TimedIo<'_, T, C> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         transfer_budget(
             (self.clock)().duration_since(self.started),
-            self.read,
+            self.read.get(),
             self.minimum,
             self.deadline,
         )?;
         let count = self.inner.read(buf)?;
-        self.read += count as u64;
+        self.read.set(self.read.get() + count as u64);
         transfer_budget(
             (self.clock)().duration_since(self.started),
-            self.read,
+            self.read.get(),
             self.minimum,
             self.deadline,
         )?;
@@ -1389,11 +1536,11 @@ impl<T: Read, C: Fn() -> Instant> Read for TimedIo<T, C> {
     }
 }
 
-impl<T: Write, C: Fn() -> Instant> Write for TimedIo<T, C> {
+impl<T: Write, C: Fn() -> Instant> Write for TimedIo<'_, T, C> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         transfer_budget(
             (self.clock)().duration_since(self.started),
-            self.read,
+            self.read.get(),
             self.minimum,
             self.deadline,
         )?;
@@ -1567,10 +1714,23 @@ mod tests {
             }
         }
         let size = 5 * 1024 * 1024;
-        for rate in [ARCHIVE_MINIMUM_RATE + 1024, ARCHIVE_MINIMUM_RATE - 1024] {
+        for (rate, redirect) in [
+            (ARCHIVE_MINIMUM_RATE + 1024, false),
+            (ARCHIVE_MINIMUM_RATE - 1024, false),
+            (ARCHIVE_MINIMUM_RATE + 1, true),
+            (ARCHIVE_MINIMUM_RATE - 1024, true),
+        ] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
+                if redirect {
+                    let (mut tcp, _) = listener.accept().unwrap();
+                    let mut request = [0; 4096];
+                    assert!(tcp.read(&mut request).unwrap() > 0);
+                    let headers = format!("X-Padding: {}\r\n", "p".repeat(4096));
+                    let response = format!("HTTP/1.1 302 Found\r\nLocation: https://objects.githubusercontent.com/asset\r\n{headers}\r\n");
+                    tcp.write_all(response.as_bytes()).unwrap();
+                }
                 let (mut tcp, _) = listener.accept().unwrap();
                 let mut request = [0; 4096];
                 assert!(tcp.read(&mut request).unwrap() > 0);
@@ -1581,6 +1741,7 @@ mod tests {
                 let _ = tcp.write_all(&vec![7; size as usize]);
             });
             let bytes = Cell::new(0);
+            let read = Cell::new(0);
             let start = Instant::now();
             let mut body = Vec::new();
             let result = super::super::fetch_with(
@@ -1596,7 +1757,7 @@ mod tests {
                         },
                         started: start,
                         deadline: transfer_deadline(size, ARCHIVE_MINIMUM_RATE),
-                        read: 0,
+                        read: &read,
                         minimum: ARCHIVE_MINIMUM_RATE,
                         clock: || start + Duration::from_secs_f64(bytes.get() as f64 / rate as f64),
                     })
@@ -1887,6 +2048,444 @@ mod tests {
     }
 
     #[test]
+    fn restored_lock_modes_are_repaired_without_replacing_the_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+        let lock = path.with_extension("json.lock");
+        fs::write(&lock, []).unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+        let inode = fs::metadata(&lock).unwrap().ino();
+        drop(JournalLock::acquire(&path).unwrap());
+        let meta = fs::metadata(&lock).unwrap();
+        assert_eq!(meta.mode() & 0o7777, 0o600);
+        assert_eq!(meta.ino(), inode);
+        // Installation locks use the same descriptor-based repair.
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).unwrap();
+        drop(open_lock(&lock).unwrap());
+        assert_eq!(fs::metadata(&lock).unwrap().mode() & 0o7777, 0o600);
+    }
+
+    #[test]
+    fn unsafe_locks_and_directories_are_refused_without_changing_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let target = dir.path().join("target");
+        fs::write(&target, b"keep").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(format!("{:#}", open_lock(&path).unwrap_err()).contains("0600"));
+        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o777, 0o644);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(open_lock(&path).is_err());
+        fs::remove_dir(&path).unwrap();
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        assert!(open_lock(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::hard_link(&target, &path).unwrap();
+        assert!(open_lock(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, []).unwrap();
+        assert!(open_lock_for_uid(&path, unsafe { libc::geteuid() } + 1).is_err());
+        // A foreign owner is tested on the opened file as well when privileged.
+        if unsafe { libc::geteuid() } == 0 {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(unsafe { libc::chown(cpath.as_ptr(), 65534, 65534) }, 0);
+            assert!(open_lock(&path).is_err());
+            assert_eq!(fs::metadata(&path).unwrap().uid(), 65534);
+            assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+            assert_eq!(unsafe { libc::chown(cpath.as_ptr(), 0, 0) }, 0);
+            let foreign = dir.path().join("foreign");
+            create_lock_directory(&foreign.join("private")).unwrap();
+            let cforeign = std::ffi::CString::new(foreign.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(cforeign.as_ptr(), 65534, 65534) }, 0);
+            assert!(open_lock(&foreign.join("private/lock")).is_err());
+            assert_eq!(fs::metadata(&foreign).unwrap().uid(), 65534);
+            assert_eq!(unsafe { libc::chown(cforeign.as_ptr(), 0, 0) }, 0);
+            fs::set_permissions(&foreign, fs::Permissions::from_mode(0o775)).unwrap();
+            let error = open_lock_for_uid(&foreign.join("private/lock"), 1).unwrap_err();
+            assert!(format!("{error:#}").contains("unsafe lock ancestor"));
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let nested = dir.path().join("nested");
+        create_lock_directory(&nested).unwrap();
+        fs::write(nested.join("lock"), []).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(open_lock(&nested.join("lock")).is_err());
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o777, 0o644);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let alias = dir.path().join("alias");
+        symlink(dir.path(), &alias).unwrap();
+        // Existing user-owned data-directory aliases keep using the same inode.
+        let inode = fs::metadata(&path).unwrap().ino();
+        drop(open_lock(&alias.join("lock")).unwrap());
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn lock_directories_are_private_under_both_supported_umasks() {
+        for mask in ["002", "022"] {
+            let root = tempfile::tempdir().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "update::linux::tests::lock_umask_fixture",
+                    "--nocapture",
+                ])
+                .env("LATCH_LOCK_UMASK", mask)
+                .env("LATCH_DATA_DIR", root.path().join("ancestor/data"))
+                .env("LATCH_LOCK_ROOT", root.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "umask {mask}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn lock_umask_fixture() {
+        let Ok(mask) = std::env::var("LATCH_LOCK_UMASK") else {
+            return;
+        };
+        struct RestoreUmask(libc::mode_t);
+        impl Drop for RestoreUmask {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::umask(self.0);
+                }
+            }
+        }
+        let _umask = RestoreUmask(unsafe { libc::umask(u32::from_str_radix(&mask, 8).unwrap()) });
+        let root = PathBuf::from(std::env::var_os("LATCH_LOCK_ROOT").unwrap());
+        let ancestor = root.join("ancestor");
+        fs::create_dir(&ancestor).unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o775)).unwrap();
+        let journal = ancestor.join("journals/linux-update.json");
+        drop(JournalLock::acquire(&journal).unwrap());
+        let directory = journal.parent().unwrap();
+        assert_eq!(fs::metadata(directory).unwrap().mode() & 0o777, 0o700);
+        let inode = fs::metadata(directory).unwrap().ino();
+        for mode in [0o775, 0o777] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(mode)).unwrap();
+            drop(JournalLock::acquire(&journal).unwrap());
+            assert_eq!(fs::metadata(directory).unwrap().mode() & 0o777, 0o700);
+            assert_eq!(fs::metadata(directory).unwrap().ino(), inode);
+        }
+        let exe = ancestor.join("latch-host");
+        fs::write(&exe, b"old").unwrap();
+        let lock = lock_path(&exe).unwrap();
+        let directory = lock.parent().unwrap();
+        assert_eq!(fs::metadata(directory).unwrap().mode() & 0o777, 0o700);
+        let inode = fs::metadata(directory).unwrap().ino();
+        for mode in [0o775, 0o777] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(mode)).unwrap();
+            drop(Transaction::begin_resolved(&exe).unwrap());
+            assert_eq!(fs::metadata(directory).unwrap().mode() & 0o777, 0o700);
+            assert_eq!(fs::metadata(directory).unwrap().ino(), inode);
+            assert_eq!(fs::metadata(&lock).unwrap().mode() & 0o777, 0o600);
+        }
+        assert_eq!(fs::metadata(&ancestor).unwrap().mode() & 0o777, 0o775);
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(JournalLock::acquire(&journal).is_err());
+        assert!(open_lock(&lock).is_err());
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o1777)).unwrap();
+        drop(JournalLock::acquire(&journal).unwrap());
+    }
+
+    #[test]
+    fn journal_write_errors_preserve_the_old_binary_and_failed_release_suppression() {
+        struct RestoreJournalWrites;
+        impl Drop for RestoreJournalWrites {
+            fn drop(&mut self) {
+                JOURNAL_WRITE_ERROR.with(|error| error.set(None));
+            }
+        }
+        let _writes = RestoreJournalWrites;
+        for error in [libc::ENOSPC, libc::EIO] {
+            for forward in [true, false] {
+                let (dir, exe) = install();
+                let path = dir.path().join("linux-update.json");
+                let mut state =
+                    UpdateState::request(&exe, &semver::Version::new(999, 0, 0), b"archive", &path)
+                        .unwrap();
+                let mut tx = Transaction::begin_resolved(&exe).unwrap();
+                tx.record(&path, &mut state).unwrap();
+                stage(&tx, b"new");
+                let mut restarts = Vec::new();
+                if forward {
+                    JOURNAL_WRITE_ERROR.with(|fault| fault.set(Some(error)));
+                }
+                let result = tx.install(
+                    || {
+                        restarts.push(fs::read(&exe)?);
+                        Ok(())
+                    },
+                    || {
+                        JOURNAL_WRITE_ERROR.with(|fault| fault.set(Some(error)));
+                        bail!("replacement failed probation")
+                    },
+                );
+                assert!(result.is_err());
+                assert_eq!(fs::read(&exe).unwrap(), b"old");
+                if forward {
+                    assert!(restarts.is_empty());
+                    assert_eq!(
+                        UpdateState::load(&path).unwrap().unwrap().phase,
+                        Phase::Pending
+                    );
+                } else {
+                    assert_eq!(restarts, [b"new".to_vec(), b"old".to_vec()]);
+                    let mut pending = UpdateState::load(&path).unwrap().unwrap();
+                    assert_eq!(pending.phase, Phase::Swapping);
+                    assert!(!pending.stage.as_ref().unwrap().join("previous").exists());
+                    assert!(!pending.recover(&path).unwrap());
+                    assert_eq!(pending.failure, FailureKind::Recovery);
+                    let now = Instant::now();
+                    assert!(!automatic_update_due(
+                        &pending.version,
+                        &semver::Version::new(1, 0, 0),
+                        Some(&pending),
+                        false,
+                        now,
+                        now
+                    ));
+                    JOURNAL_WRITE_ERROR.with(|fault| fault.set(None));
+                    pending.recover(&path).unwrap();
+                    assert_eq!(
+                        UpdateState::load(&path).unwrap().unwrap().failure,
+                        FailureKind::Recovery
+                    );
+                }
+                JOURNAL_WRITE_ERROR.with(|fault| fault.set(None));
+            }
+            // Recovery must report a completed restore even while every journal
+            // write still fails, allowing its caller to restart the old service.
+            let (dir, exe) = install();
+            let path = dir.path().join("linux-update.json");
+            assert!(Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "update::linux::tests::crash_fixture"])
+                .env("LATCH_CRASH_FIXTURE", &path)
+                .env("LATCH_CRASH_EXE", &exe)
+                .status()
+                .unwrap()
+                .success());
+            let mut state = UpdateState::load(&path).unwrap().unwrap();
+            JOURNAL_WRITE_ERROR.with(|fault| fault.set(Some(error)));
+            assert!(state.recover(&path).unwrap());
+            assert_eq!(fs::read(&exe).unwrap(), b"old");
+            assert_eq!(state.failure, FailureKind::Recovery);
+            assert!(state.stage.as_ref().unwrap().exists());
+            JOURNAL_WRITE_ERROR.with(|fault| fault.set(None));
+            state.recover(&path).unwrap();
+            assert_eq!(
+                UpdateState::load(&path).unwrap().unwrap().failure,
+                FailureKind::Recovery
+            );
+        }
+    }
+
+    #[test]
+    fn crashes_across_forward_and_rollback_renames_preserve_the_failure_kind() {
+        for point in [
+            "before-swap-rename",
+            "after-swap-rename",
+            "probation-failed-before-restoring",
+            "restoring-before-rename",
+            "restored-before-completion",
+        ] {
+            let (dir, exe) = install();
+            let path = dir.path().join("linux-update.json");
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "update::linux::tests::transaction_crash_fixture",
+                    "--nocapture",
+                ])
+                .env("LATCH_UPDATE_CRASH_POINT", point)
+                .env("LATCH_CRASH_ROOT", dir.path())
+                .env("LATCH_DATA_DIR", dir.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{point}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut state = UpdateState::load(&path).unwrap().unwrap();
+            let before_swap = point == "before-swap-rename";
+            let after_restore = point == "restored-before-completion";
+            assert_eq!(
+                fs::read(&exe).unwrap(),
+                if before_swap || after_restore {
+                    b"old"
+                } else {
+                    b"new"
+                },
+                "{point}"
+            );
+            assert_eq!(
+                state.phase,
+                if matches!(
+                    point,
+                    "restoring-before-rename" | "restored-before-completion"
+                ) {
+                    Phase::Restoring
+                } else {
+                    Phase::Swapping
+                },
+                "{point}"
+            );
+            let stage = state.stage.clone().unwrap();
+            assert_eq!(stage.join("previous").exists(), !after_restore, "{point}");
+            let restarted = fs::read_to_string(dir.path().join("restarts")).unwrap_or_default();
+            assert_eq!(
+                restarted,
+                if matches!(point, "before-swap-rename" | "after-swap-rename") {
+                    ""
+                } else {
+                    "new\n"
+                },
+                "{point}"
+            );
+            assert_eq!(
+                state.recover(&path).unwrap(),
+                !before_swap && !after_restore,
+                "{point}"
+            );
+            assert_eq!(fs::read(&exe).unwrap(), b"old", "{point}");
+            assert_eq!(state.phase, Phase::Failed);
+            assert_eq!(
+                state.failure,
+                if before_swap {
+                    FailureKind::Transient
+                } else {
+                    FailureKind::Recovery
+                },
+                "{point}"
+            );
+            let now = Instant::now();
+            assert_eq!(
+                automatic_update_due(
+                    &state.version,
+                    &semver::Version::new(1, 0, 0),
+                    Some(&state),
+                    false,
+                    now,
+                    now
+                ),
+                before_swap,
+                "{point}"
+            );
+            assert!(automatic_update_due(
+                &state.version,
+                &semver::Version::new(1, 0, 0),
+                Some(&state),
+                true,
+                now,
+                now
+            ));
+            assert!(!stage.exists(), "{point}");
+        }
+    }
+
+    #[test]
+    fn transaction_crash_fixture() {
+        let Some(root) = std::env::var_os("LATCH_CRASH_ROOT").map(PathBuf::from) else {
+            return;
+        };
+        let exe = root.join("latch-host");
+        let path = root.join("linux-update.json");
+        let mut state =
+            UpdateState::request(&exe, &semver::Version::new(999, 0, 0), b"archive", &path)
+                .unwrap();
+        let mut tx = Transaction::begin_resolved(&exe).unwrap();
+        tx.record(&path, &mut state).unwrap();
+        stage(&tx, b"new");
+        let _ = tx.install(
+            || {
+                let mut log = OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .mode(0o600)
+                    .open(root.join("restarts"))?;
+                log.write_all(&fs::read(&exe)?)?;
+                log.write_all(b"\n")?;
+                Ok(())
+            },
+            || bail!("fixture replacement failed probation"),
+        );
+        panic!("the requested crash point was not reached");
+    }
+
+    #[test]
+    fn supervisor_death_before_the_swap_keeps_the_release_retryable() {
+        for phase in [Phase::Pending, Phase::Started, Phase::Swapping] {
+            let (dir, exe) = install();
+            let path = dir.path().join("journal.json");
+            if phase == Phase::Swapping {
+                assert!(Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "update::linux::tests::crash_fixture",
+                        "--nocapture"
+                    ])
+                    .env("LATCH_CRASH_FIXTURE", &path)
+                    .env("LATCH_CRASH_EXE", &exe)
+                    .env("LATCH_CRASH_BEFORE_SWAP", "1")
+                    .status()
+                    .unwrap()
+                    .success());
+            } else {
+                let mut state =
+                    UpdateState::request(&exe, &Version::new(999, 0, 0), b"archive", &path)
+                        .unwrap();
+                state.phase = phase;
+                state.save(&path).unwrap();
+            }
+            let mut state = UpdateState::load(&path).unwrap().unwrap();
+            assert!(!state.recover(&path).unwrap());
+            assert_eq!(state.failure, FailureKind::Transient);
+            assert!(state.reason.contains("before swapping"));
+            assert_eq!(fs::read(&exe).unwrap(), b"old");
+            assert!(!state.upload.exists());
+            let now = Instant::now();
+            let retry_at = now + Duration::from_secs(900);
+            assert!(!automatic_update_due(
+                &state.version,
+                &Version::new(1, 0, 0),
+                Some(&state),
+                false,
+                now,
+                retry_at
+            ));
+            assert!(automatic_update_due(
+                &state.version,
+                &Version::new(1, 0, 0),
+                Some(&state),
+                false,
+                retry_at,
+                retry_at
+            ));
+            assert!(automatic_update_due(
+                &state.version,
+                &Version::new(1, 0, 0),
+                Some(&state),
+                true,
+                now,
+                retry_at
+            ));
+        }
+    }
+
+    #[test]
     fn slow_downloads_have_an_overall_deadline_and_minimum_rate() {
         assert!(transfer_budget(
             Duration::from_secs(29),
@@ -1994,6 +2593,9 @@ mod tests {
             );
             assert_eq!(fs::read(&exe)?, b"old");
             assert_eq!(fs::read(journal.stage.unwrap().join("previous"))?, b"old");
+            if std::env::var_os("LATCH_CRASH_BEFORE_SWAP").is_some() {
+                std::process::exit(0);
+            }
             Ok(())
         })
         .unwrap();

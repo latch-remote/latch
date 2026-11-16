@@ -404,8 +404,8 @@ a 30-second socket timeout, and a 32 KiB/s minimum average rate after 30 seconds
 Manifests use a 1 MiB size allowance. The 32 KiB/s floor also applies to
 manifests, so a stalled small manifest normally fails the first rate check after
 30 seconds. A blocked read can add the 30-second socket timeout. The size-derived
-92-second manifest deadline is an upper bound. Redirect hops have separate byte
-counts and share elapsed time. The underlying TLS transport additionally
+92-second manifest deadline is an upper bound. Redirect hops share cumulative
+byte counts and elapsed time for both rate floors and the overall deadline. The underlying TLS transport additionally
 checks a 128 B/s floor. Other downloads retain their existing transport behavior. Only the selected binary member is
 written, initially `0600`. After digest and ELF architecture verification,
 it becomes `0755` and must report the exact release version with `--version`.
@@ -424,27 +424,66 @@ session environment, without requiring a systemd user manager.
 The new service must report the expected version continuously for 15 seconds
 within 60 seconds. Its systemd MainPID, executable inode and ownership of the
 listening control socket are checked on both sides of each health request.
-A restart or health failure restores the previous binary and restarts it.
+A restart or health failure restores the previous binary and restarts it. A
+failed systemd unit with no MainPID and no queued job triggers rollback after
+one second of stable failure, including start-limit-hit. Activating units and
+automatic restart cycles continue through the health window. A systemctl error
+during the failure check is logged at debug level while probation continues.
 The fsynced `linux-update.json` journal records progress, inode identities,
 staging location and outcome. On startup, a service detects an unfinished
 update whose supervisor died and restores the previous inode deterministically.
-A running service also monitors for this failure. CI covers recovery both at
-the next service start and while the service keeps running. If restoration
-itself fails, the update becomes terminal Failed with the recovery copy retained
-and its path reported. The next update can proceed. A journal flock and phase
-compare-and-set serialize writers. Unsafe or unparsable journals are moved aside
-with at most three diagnostic copies, pruning the oldest modification times.
-A journal read I/O error retains the journal for a later retry. Unknown fields and missing fields are
+A running service also monitors for this failure. Rollback attempts to fsync the
+Restoring journal entry and its directory before moving the old binary back.
+A journal-write error is logged while the old binary is restored and its service
+restarted. A consumed previous link identifies the failed release when the
+journal still says Swapping. Missing pre-swap proof is classified conservatively
+as a recovery failure. Recovery retains its staging evidence when its terminal
+outcome cannot be persisted. A service already running the original inode
+continues serving during a persistent journal-write failure. Recovery handles
+Restoring with either executable inode and queues a service restart for
+interrupted swap/restore states. The original inode and its verified previous
+link prove a pre-rename interruption is eligible for retry. CI covers recovery
+both at the next service start and while the service keeps running. If
+restoration itself fails, the update becomes terminal Failed with the recovery
+copy retained and its path reported. The next update can proceed. A journal
+flock and phase compare-and-set serialize writers. Unsafe or unparsable journals
+are moved aside with at most three diagnostic copies, pruning the oldest
+modification times.
+Owned regular lock files restored with incorrect modes are repaired to `0600`
+using pinned directory and file descriptors. Journal and transaction lock
+directories are created explicitly as `0700` under either umask `002` or `022`.
+Existing user-owned lock directories are repaired to `0700` through their open
+descriptors after ownership and type checks. The journal lock is
+`linux-update.json.lock` directly in the Latch data directory. Every journal
+access makes that data directory `0700`, including an existing directory named
+by `LATCH_DATA_DIR`. Missing parent directories are created as `0700`. This path
+is private application storage. Using the existing lock path gives installations
+made by 6.0.0 and main a shared lock inode across upgrades. Every resolved
+ancestor must belong to root or the user. Group write on user-owned ancestors follows the owner's
+group-access policy, including Ubuntu private-user groups. Group members with
+that access are trusted for those ancestors. Root-owned ancestors require group
+write to be disabled or the sticky bit to be set. Every world-writable ancestor
+requires the sticky bit. The rule uses descriptor UID and mode checks. Lock
+symlinks, foreign owners, hard links and unsafe ancestors are refused with
+repair instructions. A journal read I/O error retains the journal for a later
+retry. Unknown fields and missing fields are
 tolerated, and unknown phases become terminal failures. Maintenance failures
 appear in service setup/status and logs while the service continues starting.
 
 The window reads the local service version before downloading. Supervisor
-installation and recovery failures persist with their reason and suppress only
-the exact failed version. A newer release remains eligible. Transport failures
-use persisted per-release exponential retry delays of 15 minutes, 30 minutes,
-1 hour, 2 hours, 4 hours, 8 hours, 16 hours and then a 24-hour ceiling. Successful
-installation, a newly offered release and **Check now** reset the delay. The
-window rechecks manifests at least every six hours while archive retries wait.
+installation and post-swap recovery failures persist with their reason and suppress
+only the exact failed version. A supervisor that dies before swapping keeps the
+release eligible for bounded automatic retry. A newer release remains eligible.
+Archive and installation retries use persisted per-release exponential delays
+of 15 minutes, 30 minutes, 1 hour, 2 hours, 4 hours, 8 hours, 16 hours and then
+a 24-hour ceiling. Successful
+installation, a newly offered release and **Check now** reset the delay. Manifest
+failures have their own counter and never advance archive or installation delays.
+A verified download resets archive failures while installation retries retain
+their own counter. The first successful manifest check after migrating older
+shared retry state clears that legacy delay once and persists the reset
+immediately. The window rechecks manifests at least every six hours while
+archive retries wait.
 Verified cached archives are rechecked and reused. Transient errors keep the
 release eligible. **Check now** or `latch-host --self-update`
 explicitly retries it. The window, service status and CLI report the outcome.
@@ -475,21 +514,26 @@ required for local Linux updates.
 Linux updater validation uses local HTTP manifest/artifact fixtures and
 compiled ELF programs on native x64 and arm64 CI. Local development uses
 Docker with Ubuntu 24.04/glibc 2.39. No Linux machine outside CI and containers is available for
-this work. The `Linux updater systemd` CI jobs passed at `5d2959f` on x64 and arm64 Ubuntu 24.04 runners. They install a fixture `latch.service`, launch the real supervisor from its control group, and check successful probation, wrong-version rollback and rollback after the supervisor is killed following the swap.
+this work. The `Linux updater systemd` CI jobs passed at `18a36e9` on x64 and arm64 Ubuntu 24.04 runners. They install a fixture `latch.service`, launch the real supervisor from its control group, and check successful probation, wrong-version rollback and rollback after the supervisor is killed following the swap.
 The fixture adds a replacement that crashes on start, including the start
 limit and `reset-failed`, and monitor recovery while the service keeps running.
-Both added cases passed at `5570388` on x64 and arm64. The fixture gates its crash
+Both cases passed at `18a36e9` on x64 and arm64. The fixture gates its crash
 on a new MainPID with ActiveState=active and SubState=running. The start-limit
 check requires a failed unit, at least three fixture starts, a stable restart
 counter and exit status 7. It accepts exit-code and start-limit-hit results.
-Timeouts print full service/supervisor unit state, recent journals and fixture
-history.
+Any failing fixture assertion prints bounded service/supervisor state, recent
+journals and fixture history. Unit environments are excluded from diagnostics.
+At `18a36e9`, both x64 and arm64 jobs also passed the assertion that rollback
+completes within 15 seconds and the production `latch-host --background`
+systemd startup/status smoke check with isolated settings. Local Linux tests
+exercise both umasks `002` and `022`, five forward/rollback crash boundaries,
+fake-systemd restart requests and injected ENOSPC/EIO journal-write failures.
 The test is ignored during ordinary test runs and requires explicit opt-in
 through the dedicated script, which refuses an existing `latch.service`.
 The fixture bypasses supervisor argv parsing, self-pinning, installation ownership
-checks and real GitHub manifest fetching. The real `latch-host` binary under
-systemd is untested. Real GUI reopening and stream continuity across an update
-remain untested because no Linux desktop machine was available.
+checks and real GitHub manifest fetching. A full verified update of the real
+`latch-host` binary under systemd remains untested. Real GUI reopening and stream
+continuity across an update remain untested because no Linux desktop machine was available.
 
 ### Moving from 5.x to 6.0.0
 
