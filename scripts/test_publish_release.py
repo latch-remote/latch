@@ -271,7 +271,8 @@ class ReleaseTests(unittest.TestCase):
         bridge = self.make_bridge()
         api = FakeGitHub()
         api.ref = {"object": {"type": "commit", "sha": "source-tag-commit"}}
-        publisher.publish_bridge(bridge, self.directory, self.tag, "Release notes", publisher.SOURCE_REPO, api)
+        notes = "Full release changelog\n" + "Detailed release entry.\n" * 100
+        publisher.publish_bridge(bridge, self.directory, self.tag, notes, publisher.SOURCE_REPO, api)
         self.assertEqual(set(api.remote), publisher.BRIDGE_NAMES)
         created = [call for call in api.calls if call[0] == "POST" and call[1].endswith("/releases")]
         self.assertEqual(len(created), 1)
@@ -282,6 +283,10 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(api.calls[-1], patches[0])
         self.assertEqual(patches[0][2]["make_latest"], "true")
         self.assertIn(f"{publisher.REPO}/releases/tag/{self.tag}", patches[0][2]["body"])
+        self.assertNotIn("Full release changelog", patches[0][2]["body"])
+        self.assertLess(len(patches[0][2]["body"].split()), 100)
+        self.assertIn("If it becomes private", patches[0][2]["body"])
+        self.assertIn("lose automatic updates", patches[0][2]["body"])
         # A rerun of the finished job changes nothing.
         api.calls.clear()
         publisher.publish_bridge(bridge, self.directory, self.tag, "Release notes", publisher.SOURCE_REPO, api)

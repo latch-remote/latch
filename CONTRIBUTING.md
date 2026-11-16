@@ -220,11 +220,14 @@ repository is public, the `bridge` job publishes the macOS and Windows
 archives they download (`latch-macos-arm64.tar.gz`, `latch-windows-x64.zip`,
 `latch-host.exe`, and the `brolink-*` pair that only 4.0 reads) as this
 repository's release for the same tag, marked latest, with a `SHA256SUMS`
-of its own. They are byte-identical to the distribution release's copies,
-which the publisher checks before uploading and again from GitHub. The
+of its own. The three `latch-*` assets are byte-identical to the distribution
+release's copies, which the publisher checks before uploading and again
+from GitHub. Short bridge notes link to the canonical release. The
 `brolink-*` pair is not published to `latch-releases`. When this repository
 is private, the job is skipped and 4.x and 5.x installs need a manual
 install to reach the manifest updater.
+Update those installs before the repository becomes private so they can
+continue updating through the public release manifest.
 
 The publisher uses `vars.RELEASE_APP_ID` and
 `secrets.RELEASE_APP_PRIVATE_KEY`, with the App installed only on
