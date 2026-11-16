@@ -20,6 +20,7 @@
 mod wasapi;
 use anyhow::{bail, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use latch_proto::audio::{AudioOut, AudioReceiver};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -88,6 +89,12 @@ struct Link {
     /// The margin the mixer keeps, µs.
     margin_us: AtomicU32,
     underruns: AtomicU64,
+    #[cfg(test)]
+    discarded_samples: AtomicU64,
+    #[cfg(test)]
+    queue_cap_hits: AtomicU64,
+    #[cfg(test)]
+    delivered: Mutex<Vec<u32>>,
 }
 
 impl Link {
@@ -134,7 +141,20 @@ pub struct Player {
     packets: u64,
     lost: u64,
     undecodable: u64,
+    /// Absolute tail position. Only appends advance it, so front trimming
+    /// by the unchanged mixer invalidates reservations automatically.
+    queued_end: u64,
+    reservations: std::collections::HashMap<u32, Reservation>,
 }
+
+struct Reservation {
+    start: u64,
+    end: u64,
+    deadline: Instant,
+}
+
+// Decode and queue handoff allowance, in addition to the atomic range check.
+const REPAIR_HANDOFF: Duration = Duration::from_millis(1);
 
 impl Player {
     pub fn new(sample_rate: u32, channels: usize, samples_per_frame: usize) -> Result<Self> {
@@ -225,6 +245,8 @@ impl Player {
             packets: 0,
             lost: 0,
             undecodable: 0,
+            queued_end: 0,
+            reservations: Default::default(),
         })
     }
 
@@ -299,8 +321,11 @@ impl Player {
     }
 
     fn queue_samples(&mut self) {
+        #[cfg(test)]
+        let mut discarded = None;
         let mut q = self.queue.lock();
         q.extend(&self.last);
+        self.queued_end += self.last.len() as u64;
         if q.len() > self.max_queued {
             // Back to the mixer's cushion, in whole frames: dropping half a
             // frame would swap the channels.
@@ -312,8 +337,103 @@ impl Player {
             };
             let keep = (target * self.rate as usize / 1_000_000).max(1) * self.channels;
             let drop = q.len().saturating_sub(keep);
+            #[cfg(test)]
+            {
+                discarded = Some(q.drain(..drop).collect::<Vec<_>>());
+            }
+            #[cfg(not(test))]
             q.drain(..drop);
         }
+        #[cfg(test)]
+        {
+            drop(q);
+            if let Some(discarded) = discarded {
+                self.link.queue_cap_hits.fetch_add(1, Ordering::Relaxed);
+                self.link.discarded_samples.fetch_add(
+                    discarded.iter().filter(|&&s| s == 0.5).count() as u64,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
+
+    /// Keep main's release timestamps and queue lengths. A missing frame is
+    /// queued as its ordinary concealment, reserving its samples for a late
+    /// repair only while the entire range is still safely ahead of playback.
+    pub(crate) fn receive(&mut self, receiver: &mut AudioReceiver, now: Instant) {
+        while let Some(out) = receiver.pop_for_playback(now, self.play_deadline(now)) {
+            match out {
+                AudioOut::Frame { seq, payload, .. } => {
+                    #[cfg(test)]
+                    self.link.delivered.lock().push(seq);
+                    let _ = seq;
+                    self.push_at(&payload, now);
+                }
+                AudioOut::Missing { seq } => {
+                    let start = self.queued_end;
+                    self.push_at(&[], now);
+                    if let Some(deadline) = receiver.repair_deadline(seq) {
+                        if self.queued_end > start {
+                            self.reservations.insert(
+                                seq,
+                                Reservation {
+                                    start,
+                                    end: self.queued_end,
+                                    deadline,
+                                },
+                            );
+                        } else {
+                            receiver.finish_repair(seq, false);
+                        }
+                    }
+                }
+            }
+        }
+        self.reservations.retain(|&seq, reserved| {
+            if now >= reserved.deadline || receiver.repair_deadline(seq).is_none() {
+                receiver.finish_repair(seq, false);
+                return false;
+            }
+            let Some(AudioOut::Frame { payload, .. }) = receiver.repair(seq, now) else {
+                return true;
+            };
+            let channels = latch_codec::audio::decode_channels(&payload, &mut self.pcm);
+            let valid = matches!(channels, Ok(c) if c == self.channels)
+                && self.pcm.len() as u64 == reserved.end - reserved.start;
+            let mut queue = self.queue.lock();
+            let front = self.queued_end - queue.len() as u64;
+            // Recheck under the same lock as replacement. A device pull or
+            // main's restart/cap trimming may have consumed this reservation.
+            let safety = (self.rate as f64
+                * self.channels as f64
+                * REPAIR_HANDOFF.as_secs_f64()
+                * (1.0 + MAX_TRIM))
+                .ceil() as u64;
+            let usable =
+                valid && reserved.start >= front + safety && reserved.end <= self.queued_end;
+            if usable {
+                let start = (reserved.start - front) as usize;
+                for (sample, &pcm) in queue.iter_mut().skip(start).zip(&self.pcm) {
+                    *sample = f32::from(pcm) / 32768.0;
+                }
+                self.lost -= 1;
+            }
+            #[cfg(test)]
+            {
+                drop(queue);
+                if usable {
+                    self.link.delivered.lock().push(seq);
+                }
+            }
+            receiver.finish_repair(seq, usable);
+            false
+        });
+    }
+
+    fn play_deadline(&self, now: Instant) -> Instant {
+        let queued = self.queue.lock().len();
+        let seconds = queued as f64 / (self.rate as f64 * self.channels as f64 * (1.0 + MAX_TRIM));
+        now + Duration::from_secs_f64(seconds).saturating_sub(REPAIR_HANDOFF)
     }
 
     /// Where the delay after arrival goes.
@@ -1007,6 +1127,8 @@ impl Mixer {
         if steer {
             self.margin_ms = (self.margin_ms - MARGIN_DECAY_MS_PER_S * dt).max(MARGIN_MS);
         }
+        #[cfg(test)]
+        let mut discarded = Vec::new();
         let mut q = self.queue.lock();
         if !self.started {
             if let Some(dry) = self.dry_at.filter(|_| !q.is_empty()) {
@@ -1030,6 +1152,9 @@ impl Mixer {
                 // Out of silence, start from the newest cushion's worth: a
                 // backlog a stall left behind would stay as added delay.
                 let excess = (q.len() - cushion) / self.src_channels * self.src_channels;
+                #[cfg(test)]
+                discarded.extend(q.drain(..excess));
+                #[cfg(not(test))]
                 q.drain(..excess);
             }
             self.low = q.len() as f64 - need as f64;
@@ -1098,6 +1223,14 @@ impl Mixer {
             }
             self.pos += step;
             frames += 1;
+        }
+        #[cfg(test)]
+        {
+            drop(q);
+            self.link.discarded_samples.fetch_add(
+                discarded.iter().filter(|&&s| s == 0.5).count() as u64,
+                Ordering::Relaxed,
+            );
         }
         self.pulled.fetch_add(frames, Ordering::Relaxed);
     }
@@ -1589,3 +1722,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "audio_repair_evaluation.rs"]
+mod repair_evaluation;
