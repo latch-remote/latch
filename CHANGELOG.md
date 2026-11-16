@@ -90,7 +90,6 @@ GitHub release notes, so each version gets a heading of the form
   and publish a DNS-only AAAA while preserving the existing A record.
 - Add explicit carrier and CONNECT proxy options to the bounded paired probe,
   with per-lane diagnostics and carrier-selection regression tests.
-
 - Consolidate the Seoul native TCP/TLS and Tailscale UDP peer relays on the
   existing Lightsail instance. Add reproducible socket, queue, forwarding
   offload, descriptor and memory tuning, with bounded before/after measurements,
@@ -164,8 +163,6 @@ GitHub release notes, so each version gets a heading of the form
   ladder with fresh DNS after stale cached paths, invalidate shortcuts on local
   source changes, and require large-segment loss evidence for automatic MSS hints.
   Cover 280 ms RTT recovery and retry non-blocking test accepts with deadlines.
-
-
 
 ### Streaming
 
@@ -241,6 +238,10 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Testing
 
+- Report host frame production, capture/conversion/encode timing, send progress
+  and pacing lateness on relay runtime failures. Give the UDP forwarder full
+  socket buffers, retry temporary send backpressure, and drive delayed TCP
+  forwarding with socket readiness and delivery deadlines.
 - Add a Linux network-namespace harness and privileged Docker runner for
   real headless streams through blocked, lossy, proxy, TLS-inspecting,
   captive-portal and MTU-limited networks. Record decoded video, sound,
@@ -340,6 +341,43 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Streaming and recovery
 
+- Prevent legacy-session feedback and statistics locks from blocking startup,
+  decode-starvation and media-stall watchdogs.
+
+- Preserve elapsed UDP pacing credit when recent waiting wakes establish a
+  coarse clock, bounded to 30 ms. Update that history only after pacing
+  waits. Keep isolated hiccups and long stalls at the ordinary one-ms burst
+  and apply rate cuts immediately.
+- Prevent macOS timer coalescing from delaying live frame production and
+  video pacing, even when the host process is backgrounded. Report
+  individual production-stage waits and CPU work in failure diagnostics.
+- Weight reduced-offer UDP loss evidence by covered receive time so coarse
+  feedback windows across at least two reports can qualify a damaged path for
+  relay recovery. Retain relay preparation while damage evidence is active
+  and bitrate or FEC still limits a busy picture after loss clears. Release
+  the retained damage reason on clean slow UDP after that evidence expires.
+  Let an already-requested, quality-limited preparation finish within its
+  six-second negotiation bound, then withdraw a clean UDP path's offer.
+- Preserve the 100 ms idle-picture repeat phase across late wakes and restart
+  the phase after a long stall.
+- Prepare relay recovery after 350 ms without UDP. Distinguish persistent
+  UDP damage from shared-uplink congestion and use RTT-relative recovery
+  timers. Detect silent relay ACK stalls before the hard transport deadline.
+- Reassess UDP after five seconds using paced, ramped checks sized from
+  actual relay delivery and sharing its congestion budget. Start returned UDP
+  at its measured rate. Preserve held input, gamepads and sound.
+- Negotiate datagram-size tests and reduce video and input packet sizes for
+  path-MTU black holes. Shorten audio packets only after measuring a smaller
+  MTU, preserving the previous packet rate on healthy paths.
+- Shorten active-relay retry and grant-renewal cooldowns to 100 ms. Recover
+  priority backpressure through UDP and fresh relay authorization.
+- Show the media path, reason and elapsed time in Stream performance, with
+  a brief notice when the path changes. Preserve protocol-1 compatibility
+  with 6.0.0 hosts and viewers, including their original timers and handoffs.
+- Cancel cleared preparation triggers, reuse prepared grants within their
+  lifetime, back off repeated cancellations and cap grant starts at sixty
+  per session-hour. Coalesce path notices and expose typed carrier and reason
+  values for network-environment wiring.
 - Move relay quota persistence off the network loop and batch durable byte
   reservations so credited video and priority lanes keep running during disk flushes.
 

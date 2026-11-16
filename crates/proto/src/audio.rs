@@ -149,6 +149,12 @@ impl AudioReceiver {
         }
     }
 
+    /// Negotiated path policy may shorten subsequent self-describing PCM
+    /// frames. Sequence numbers and parity state survive the size change.
+    pub fn set_packet_samples(&mut self, samples: u32, rate: u32) {
+        self.packet_us = (u64::from(samples) * 1_000_000 / u64::from(rate.max(1))) as u32;
+    }
+
     pub fn push(&mut self, packet: &AudioPacket<'_>, now: Instant) {
         let _ = (now, self.session);
         if packet.parity && !packet.seq.is_multiple_of(GROUP) {

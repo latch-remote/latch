@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "options.rs"]
+mod test_options;
+
 // Runtime-only operations in this shared fixture are used by relay_runtime.rs.
 #[allow(dead_code)]
 #[path = "relay_pilot.rs"]
@@ -73,6 +76,7 @@ fn session(addr: SocketAddr) -> Arc<Session> {
         fec: AtomicU8::new(DEFAULT_FEC_PERCENT),
         heard_us: AtomicU64::new(0),
         frames: AtomicU64::new(0),
+        video: Mutex::default(),
         bytes: AtomicU64::new(0),
         transport: TransportState::new(1000),
         keyframe_requests: Mutex::default(),
@@ -106,7 +110,7 @@ fn route_changes_finish_before_new_udp_pad_updates_are_acknowledged() {
     let address = udp.local_addr().unwrap();
     let session = session(address);
     session.pads.lock().slots = 1;
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let (started, entered) = mpsc::channel();
     let mut worker = None;
     assert!(session.update_relay(|_| {
@@ -129,7 +133,7 @@ fn route_changes_finish_before_new_udp_pad_updates_are_acknowledged() {
         }));
         entered.recv_timeout(Duration::from_secs(1)).unwrap();
         // The new route may already be visible, but delivery must wait until
-        // its transition has released the previous route's virtual devices.
+        // the input lock has ordered the transition with device updates.
         let error = udp.recv(&mut [0; 1500]).unwrap_err();
         assert!(matches!(
             error.kind(),
@@ -172,7 +176,7 @@ impl VideoPipeline for Video {
 
 #[test]
 fn a_viewer_that_does_not_read_cannot_block_the_control_writer() {
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let session = session("127.0.0.1:9".parse().unwrap());
     let (mut host, _client) = sockets();
     // Windows grows a loopback send backlog on demand, so without a fixed
@@ -196,6 +200,7 @@ fn a_viewer_that_does_not_read_cannot_block_the_control_writer() {
     }
     host.set_nonblocking(false).unwrap();
     let accept = Accept {
+        media_path_policy: false,
         key_positions: false,
         relay: false,
         color: Default::default(),
@@ -233,7 +238,7 @@ fn a_viewer_that_does_not_read_cannot_block_the_control_writer() {
 
 #[test]
 fn an_opening_reservation_is_busy_before_a_viewer_is_installed() {
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     assert!(!server.busy());
     let guard = server.opening.lock(Duration::ZERO).unwrap();
     assert!(server.busy());
@@ -286,7 +291,7 @@ fn priority_failure_keeps_its_end_code_when_the_sender_is_preempted() {
     let mut pilot = relay::Pilot::start();
     pilot.config.limits.priority_queue_bytes = 1280;
     for explicit_stop in [false, true] {
-        let server = Server::bind(0, Options::default()).unwrap();
+        let server = Server::bind(0, test_options::options()).unwrap();
         let mut session = session("127.0.0.1:9".parse().unwrap());
         Arc::get_mut(&mut session).unwrap().relay =
             RelayRoute::new(7, latch_relay::Role::Host, Some(pilot.config.clone()));
@@ -383,7 +388,7 @@ fn priority_failure_keeps_its_end_code_when_the_sender_is_preempted() {
 
 #[test]
 fn an_explicit_viewer_end_keeps_normal_completion() {
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let session = session("127.0.0.1:9".parse().unwrap());
     let (host, mut peer) = sockets();
     let accept: Accept = serde_json::from_value(serde_json::json!({
@@ -447,7 +452,7 @@ fn viewer_stop_and_host_end_do_not_wait_for_in_flight_input() {
         }
     }
     for viewer_stop in [true, false] {
-        let server = Server::bind(0, Options::default()).unwrap();
+        let server = Server::bind(0, test_options::options()).unwrap();
         let session = session("127.0.0.1:9".parse().unwrap());
         let (entered, in_flight) = mpsc::channel();
         let (release, blocked) = mpsc::channel();
@@ -554,7 +559,7 @@ fn end_reaches_the_viewer_and_stops_capture_while_input_cleanup_is_pending() {
             let _ = self.1.recv_timeout(Duration::from_secs(5));
         }
     }
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let session = session("127.0.0.1:9".parse().unwrap());
     let (entered, cleanup) = mpsc::channel();
     let (release, blocked) = mpsc::channel();
@@ -619,7 +624,7 @@ fn end_reaches_the_viewer_and_stops_capture_while_input_cleanup_is_pending() {
 
 #[test]
 fn video_reopen_failure_uses_remaining_budget() {
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let session = session("127.0.0.1:9".parse().unwrap());
     let mut attempts = 0;
     let pipeline = || {
@@ -645,7 +650,7 @@ fn video_reopen_failure_uses_remaining_budget() {
 /// capture failure.
 #[test]
 fn a_codec_that_cannot_go_on_ends_the_session_for_a_new_negotiation() {
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     for during_reopen in [false, true] {
         let session = session("127.0.0.1:9".parse().unwrap());
         let mut attempts = 0;
@@ -675,7 +680,7 @@ fn a_codec_that_cannot_go_on_ends_the_session_for_a_new_negotiation() {
 
 #[test]
 fn repeated_video_errors_release_exclusive_capture_and_have_a_retry_budget() {
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let session = session("127.0.0.1:9".parse().unwrap());
     let held = Arc::new(AtomicBool::new(false));
     let attempts = AtomicUsize::new(0);
@@ -727,7 +732,7 @@ fn idle_requests_are_prompt_and_each_encoded_frame_updates_mapping_and_is_sent()
         }
         fn release_all(&mut self) {}
     }
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     udp.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
     let session = session(udp.local_addr().unwrap());
@@ -878,7 +883,7 @@ impl AudioCapture for Sound {
 
 #[test]
 fn audio_reports_failure_retries_with_backoff_clears_notice_and_fits_the_mtu() {
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     udp.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
     let session = session(udp.local_addr().unwrap());
@@ -891,6 +896,7 @@ fn audio_reports_failure_retries_with_backoff_clears_notice_and_fits_the_mtu() {
     };
     let (host, mut client) = sockets();
     let accept = Accept {
+        media_path_policy: false,
         key_positions: false,
         relay: false,
         color: Default::default(),
@@ -1005,8 +1011,18 @@ fn audio_reports_failure_retries_with_backoff_clears_notice_and_fits_the_mtu() {
 
 #[test]
 fn audio_packets_split_the_frame_evenly_and_always_fit() {
+    for channels in [1, 2, 6, 8] {
+        let samples = audio_packet_samples_with_limit(channels, 576);
+        assert_eq!(audio::FRAME % samples, 0);
+        assert!(latch_codec::audio::max_coded_len(channels, samples) + 18 <= 576);
+    }
     for (channels, samples) in [(1, 240), (2, 240), (6, 80), (8, 60)] {
         assert_eq!(audio_packet_samples(channels), samples, "{channels} ch");
+        assert_eq!(
+            audio_packet_samples_with_limit(channels, 1000),
+            samples,
+            "policy doubled the {channels}-channel packet rate"
+        );
         assert_eq!(audio::FRAME % samples, 0);
         assert!(
             latch_codec::audio::max_coded_len(channels, samples) <= latch_proto::audio::MAX_PAYLOAD
@@ -1092,7 +1108,7 @@ fn reopen_refuses_an_old_picture_held_in_the_send_queue() {
             self.pipeline.recover_from(picture)
         }
     }
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
     let mut session = session(receiver.local_addr().unwrap());
     Arc::get_mut(&mut session).unwrap().recovery.enabled = true;
@@ -1207,7 +1223,7 @@ fn paced_socket_measurement() {
         },
         Ordering::Relaxed,
     );
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let (tx, rx) = mpsc::sync_channel(2);
     let start = Instant::now();
     let stop_at = start + Duration::from_secs(seconds);
@@ -1405,7 +1421,7 @@ fn idle_probes_share_sender_accounting_and_stop_under_pressure() {
     for pressure in [false, true] {
         let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
         let session = session(udp.local_addr().unwrap());
-        let server = Server::bind(0, Options::default()).unwrap();
+        let server = Server::bind(0, test_options::options()).unwrap();
         session
             .transport
             .probe_pressure
@@ -1436,7 +1452,7 @@ fn fallback_refits_geometry_and_prepares_the_final_mode() {
                 seen.lock().push((r.width, r.height, r.fps));
                 Ok(None)
             })),
-            ..Options::default()
+            ..test_options::options()
         },
     )
     .unwrap();
@@ -1488,7 +1504,7 @@ fn portal_shutdown_ends_video_and_releases_input_without_reopening_capture() {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
     }
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let session = session("127.0.0.1:9".parse().unwrap());
     let releases = Arc::new(AtomicUsize::new(0));
     session.input.lock().sink = Some(Box::new(Sink(releases.clone())));
@@ -1623,14 +1639,7 @@ fn synthetic_dxgi_session_delivers_cursor_while_video_waits() {
             anyhow::bail!("synthetic video stopped before producing a frame")
         }
     }
-    let server = Server::bind(
-        0,
-        Options {
-            relay: None,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let mut session = session("127.0.0.1:9".parse().unwrap());
     let state = Arc::get_mut(&mut session).unwrap();
     state.cursor_supported = true;
@@ -1684,7 +1693,7 @@ fn synthetic_dxgi_session_delivers_cursor_while_video_waits() {
 
 #[test]
 fn compatible_display_offer_probes_before_takeover_and_opens_after_cleanup() {
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let old = session("127.0.0.1:9".parse().unwrap());
     *server.current.lock() = Some(old.clone());
     let cleanup = {
@@ -1732,7 +1741,7 @@ fn compatible_display_offer_probes_before_takeover_and_opens_after_cleanup() {
 
 #[test]
 fn an_unsupported_display_codec_preserves_the_current_capture() {
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let old = session("127.0.0.1:9".parse().unwrap());
     *server.current.lock() = Some(old.clone());
     let req: StreamRequest = serde_json::from_value(serde_json::json!({
@@ -1768,7 +1777,7 @@ fn an_unsupported_display_codec_preserves_the_current_capture() {
 
 #[test]
 fn an_offer_containing_only_future_codecs_preserves_the_current_capture() {
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let old = session("127.0.0.1:9".parse().unwrap());
     *server.current.lock() = Some(old.clone());
     let req: StreamRequest = serde_json::from_value(serde_json::json!({
@@ -1803,7 +1812,7 @@ fn startup_refusals_preserve_transient_statuses_and_terminal_permission_denial()
             retry
         );
     }
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     for denied in [false, true] {
         let req: StreamRequest = serde_json::from_value(serde_json::json!({
             "protocol": latch_proto::PROTOCOL, "width": 64, "height": 64, "fps": 30,
@@ -1833,7 +1842,7 @@ fn startup_refusals_preserve_transient_statuses_and_terminal_permission_denial()
 
 #[test]
 fn stop_waits_for_a_preparation_that_is_being_dropped() {
-    let server = Server::bind(0, Options::default()).unwrap();
+    let server = Server::bind(0, test_options::options()).unwrap();
     let reservation = server.opening.lock(Duration::ZERO).unwrap();
     let (tx, result) = mpsc::channel();
     let stopping = {

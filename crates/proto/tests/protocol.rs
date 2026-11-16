@@ -765,6 +765,7 @@ fn test_5_wire_fuzz_random_and_mutations() {
 fn test_6_control_messages_roundtrip_and_errors() {
     let messages = vec![
         Message::Accept(Accept {
+            media_path_policy: false,
             key_positions: false,
             relay: false,
             color: Default::default(),
@@ -1119,6 +1120,7 @@ fn microphone_packets_are_kind_13_and_older_fields_stay_off_the_wire() {
         "{json}"
     );
     let surround = StreamRequest {
+        media_path_policy: false,
         key_positions: false,
         audio_channels: 6,
         mic: true,
@@ -1132,6 +1134,7 @@ fn microphone_packets_are_kind_13_and_older_fields_stay_off_the_wire() {
 fn av1_offer_is_additive_and_unknown_codecs_still_fall_through() {
     use latch_proto::control::StreamRequest;
     let mut request: serde_json::Value = serde_json::to_value(StreamRequest {
+        media_path_policy: false,
         key_positions: false,
         startup_timeout_secs: 0,
         relay: false,
@@ -1166,6 +1169,98 @@ fn av1_offer_is_additive_and_unknown_codecs_still_fall_through() {
         decoded.codecs,
         [Codec::Av1, Codec::Hevc, Codec::H264Baseline]
     );
+}
+
+#[test]
+fn media_policy_is_additive_and_sized_video_uses_existing_reassembly() {
+    use latch_proto::control::{self, PathAction, PathControl, StreamRequest};
+    let legacy: StreamRequest = serde_json::from_value(serde_json::json!({
+        "protocol": 1, "width": 128, "height": 128, "fps": 30,
+        "bitrate_kbps": 2000, "codecs": ["h264-baseline"], "udp_port": 1, "audio": false
+    }))
+    .unwrap();
+    assert!(!legacy.media_path_policy);
+    assert!(serde_json::to_value(&legacy)
+        .unwrap()
+        .get("media_path_policy")
+        .is_none());
+    let message = Message::Path(PathControl {
+        session: 7,
+        action: PathAction::MtuResult {
+            serial: 15,
+            received: [0, 0, 3, 3],
+        },
+    });
+    let mut bytes = Vec::new();
+    control::write_message(&mut bytes, &message).unwrap();
+    assert_eq!(control::read_message(&mut &bytes[..]).unwrap(), message);
+    for action in [
+        control::RelayAction::UdpProbeSized {
+            first: 512,
+            kbps: 75_000,
+            datagram_size: 800,
+        },
+        control::RelayAction::UdpProbeReady { first: 512 },
+    ] {
+        let message = Message::Relay(control::RelayControl {
+            session: 7,
+            attempt: 1,
+            action,
+        });
+        bytes.clear();
+        control::write_message(&mut bytes, &message).unwrap();
+        assert_eq!(control::read_message(&mut &bytes[..]).unwrap(), message);
+    }
+    for size in [576, 800, 1000, 1200] {
+        let mut packetizer = latch_proto::video::Packetizer::new(7);
+        packetizer.set_datagram_size(size);
+        let payload = vec![42; 12_345];
+        let mut receiver = latch_proto::video::Reassembler::new(7);
+        packetizer
+            .packetize(
+                &latch_proto::video::OutFrame {
+                    data: &payload,
+                    keyframe: true,
+                    host_delay: 0,
+                },
+                |bytes| {
+                    assert!(bytes.len() <= size);
+                    if let latch_proto::wire::Datagram::Video { shard, .. } =
+                        latch_proto::wire::parse(bytes).unwrap()
+                    {
+                        receiver.push(&shard, std::time::Instant::now());
+                    }
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(receiver.poll(std::time::Instant::now()), Some(latch_proto::video::Reassembled::Frame(frame)) if frame.data == payload)
+        );
+    }
+}
+
+#[test]
+fn smaller_input_batches_keep_queued_sequences_and_text() {
+    let mut sender = InputSender::new(7);
+    sender.push(Event::Text("a".repeat(4096)));
+    sender.set_datagram_size(576);
+    let mut receiver = InputReceiver::new();
+    let mut text = String::new();
+    let mut bytes = Vec::new();
+    while sender.unacked() > 0 {
+        assert!(sender.poll(Instant::now(), &mut bytes));
+        assert!(bytes.len() <= 576);
+        let Datagram::Input { first, events, .. } = wire::parse(&bytes).unwrap() else {
+            panic!("input");
+        };
+        let next = receiver.receive(first, events.iter(), |event| {
+            if let Event::Text(part) = event {
+                text.push_str(&part);
+            }
+        });
+        sender.ack(next);
+    }
+    assert_eq!(text, "a".repeat(4096));
 }
 
 #[test]

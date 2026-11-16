@@ -14,9 +14,10 @@ pub enum Motion {
     Still,
     /// A bar sweeps across every frame.
     Sweep,
-    /// Everything changes every frame (noise): the worst case for an
-    /// encoder.
+    /// A small grayscale patch changes every frame.
     Noise,
+    /// Independent grayscale noise covers every frame, except the input square.
+    Entropy,
 }
 
 pub struct Pattern {
@@ -109,6 +110,7 @@ impl Pattern {
                         }
                     }
                 }
+                Motion::Entropy => add(0, 0, w, h),
                 Motion::Noise => {
                     let patch_w = (w / 3).clamp(64, 256);
                     let patch_h = (h / 4).clamp(64, 256);
@@ -239,6 +241,7 @@ impl Pattern {
             Motion::Still => "STILL",
             Motion::Sweep => "SWEEP",
             Motion::Noise => "NOISE",
+            Motion::Entropy => "ENTROPY",
         };
         let line1 = format!("RESOLUTION: {}x{}", self.width, self.height);
         let line2 = format!("FPS: {}", self.fps);
@@ -293,12 +296,21 @@ impl Pattern {
                     }
                 }
             }
-            Motion::Noise => {
-                // Noise patch seeded per frame via xorshift
-                let patch_w = (w / 3).clamp(64, 256);
-                let patch_h = (h / 4).clamp(64, 256);
-                let patch_x = (w / 2).saturating_sub(patch_w / 2);
-                let patch_y = (top_h + 20).min(h.saturating_sub(patch_h));
+            Motion::Noise | Motion::Entropy => {
+                // Independent pixels prevent the rate check becoming content-limited.
+                // Keep the small patch for existing noise fixtures.
+                let (patch_x, patch_y, patch_w, patch_h) = if self.motion == Motion::Entropy {
+                    (0, 0, w, h)
+                } else {
+                    let patch_w = (w / 3).clamp(64, 256);
+                    let patch_h = (h / 4).clamp(64, 256);
+                    (
+                        (w / 2).saturating_sub(patch_w / 2),
+                        (top_h + 20).min(h.saturating_sub(patch_h)),
+                        patch_w,
+                        patch_h,
+                    )
+                };
 
                 let mut rng = (self.frame_count ^ 0x9e3779b97f4a7c15).max(1);
                 for y in patch_y..(patch_y + patch_h).min(h) {
@@ -446,7 +458,7 @@ impl CpuCapture for Pattern {
                     false
                 }
             }
-            Motion::Sweep | Motion::Noise => true,
+            Motion::Sweep | Motion::Noise | Motion::Entropy => true,
         };
 
         if changed {
@@ -708,6 +720,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn entropy_changes_the_whole_picture_and_preserves_input_square() {
+        let mut pattern = Pattern::new(320, 192, 30, Motion::Entropy);
+        let mut first = Bgra::default();
+        pattern.grab(&mut first, Duration::ZERO).unwrap();
+        let mut second = Bgra::default();
+        pattern.grab(&mut second, Duration::ZERO).unwrap();
+        assert!(pattern.damage().unwrap().contains(&Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 192,
+        }));
+        let changed = first
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(second.data.as_chunks::<4>().0)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(changed > (320 * 192 - 64 * 64) * 9 / 10);
+        assert_eq!(&second.data[..4], &[0, 0, 0, 255]);
+        pattern.input(&Event::Key {
+            vk: 0x41,
+            down: true,
+            modifiers: 0,
+        });
+        pattern.grab(&mut second, Duration::ZERO).unwrap();
+        assert_eq!(&second.data[..4], &[255, 255, 255, 255]);
     }
 
     #[test]

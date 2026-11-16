@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 fn request(name: &str) -> StreamRequest {
     StreamRequest {
+        media_path_policy: false,
         key_positions: false,
         startup_timeout_secs: 0,
         relay: false,
@@ -45,6 +46,7 @@ fn preparation_stays_reserved_until_run_or_drop_and_takeover_waits_for_slow_undo
     let server = Server::bind(
         0,
         Options {
+            relay: None,
             prepare: Some(Box::new({
                 let active = active.clone();
                 move |req| {
@@ -141,6 +143,7 @@ fn post_accept_end_close_and_missing_media_are_reported_as_failures() {
             control::write_message(
                 &mut tcp,
                 &Message::Accept(Accept {
+                    media_path_policy: false,
                     key_positions: false,
                     relay: false,
                     color: Default::default(),
@@ -262,6 +265,7 @@ fn impaired_host(mode: &'static str) -> (u16, std::thread::JoinHandle<()>) {
         control::write_message(
             &mut tcp,
             &Message::Accept(Accept {
+                media_path_policy: false,
                 key_positions: false,
                 relay: false,
                 color: Default::default(),
@@ -351,6 +355,13 @@ fn impaired_host(mode: &'static str) -> (u16, std::thread::JoinHandle<()>) {
 }
 
 fn impaired_session(port: u16) -> (Session, Arc<FrameSlot>, mpsc::Receiver<Event>) {
+    static LOGGING: std::sync::Once = std::sync::Once::new();
+    LOGGING.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .try_init();
+    });
     let frames = Arc::new(FrameSlot::default());
     let (tx, rx) = mpsc::channel();
     let session = Session::start(
@@ -382,17 +393,22 @@ fn impaired_session(port: u16) -> (Session, Arc<FrameSlot>, mpsc::Receiver<Event
 }
 
 fn next_boundary(rx: &mpsc::Receiver<Event>) -> Event {
-    let deadline = Instant::now() + Duration::from_secs(12);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(12);
+    let mut progress = Vec::new();
     loop {
         let event = rx
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .expect("session boundary deadline");
+            .unwrap_or_else(|error| {
+                panic!("session boundary deadline: {error:?}, prior events {progress:?}")
+            });
         if matches!(
             event,
             Event::Connected | Event::Failed { .. } | Event::Terminated { .. }
         ) {
             return event;
         }
+        progress.push((started.elapsed(), event));
     }
 }
 

@@ -1226,6 +1226,7 @@ struct State {
     closed: Option<(io::ErrorKind, String)>,
     closed_delivered: bool,
     frame_ack_elapsed: Option<Duration>,
+    setup_rtt: [Option<Duration>; 2],
     connections: [Option<ConnectionInfo>; 2],
     failure: Option<ConnectError>,
 }
@@ -1361,6 +1362,20 @@ impl Transport {
     /// Selected carrier and ladder diagnostics for a lane, available after setup.
     pub fn connection_info(&self, lane: Lane) -> Option<ConnectionInfo> {
         self.shared.state.lock().unwrap().connections[lane as usize].clone()
+    }
+    /// Conservative initial RTT estimate from TLS, attachment and key setup.
+    /// Includes peer setup waits, allowing for slow start on fresh lanes.
+    /// Available after Ready, before the first video acknowledgment.
+    pub fn setup_rtt(&self) -> Option<Duration> {
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .setup_rtt
+            .iter()
+            .flatten()
+            .copied()
+            .max()
     }
     /// Typed terminal connection failure, including failed ladder attempts.
     pub fn failure(&self) -> Option<ConnectError> {
@@ -1562,7 +1577,8 @@ fn run_lane(
     lane: Lane,
     shared: &Shared,
 ) -> io::Result<()> {
-    let setup_deadline = Instant::now() + config.limits.setup_timeout;
+    let setup_started = Instant::now();
+    let setup_deadline = setup_started + config.limits.setup_timeout;
     let (mut socket, info) = open(config, &shared.cancel, setup_deadline)?;
     shared.state.lock().unwrap().connections[lane as usize] = Some(info);
     if exchange(
@@ -1597,6 +1613,7 @@ fn run_lane(
     let mut pending_acks: VecDeque<u32> = VecDeque::new();
     let mut last_sent = Instant::now();
     let mut last_peer = Instant::now();
+    let mut last_video_ack = Instant::now();
     let lifetime = Instant::now() + Duration::from_secs(attachment.session_seconds as u64);
     loop {
         shared.cancel.check()?;
@@ -1620,6 +1637,9 @@ fn run_lane(
                     return Err(invalid("relay key confirmation required"));
                 }
                 confirmed = true;
+                let setup_rtt = setup_started.elapsed();
+                shared.state.lock().unwrap().setup_rtt[lane as usize] = Some(setup_rtt);
+                video_rtt.sample(setup_rtt);
                 shared.ready(lane)?;
             } else if lane == Lane::Video && plaintext[0] == 6 {
                 if plaintext.len() != 5 {
@@ -1633,6 +1653,7 @@ fn run_lane(
                     return Err(invalid("unexpected video acknowledgment"));
                 }
                 let elapsed = queued.elapsed();
+                last_video_ack = Instant::now();
                 video_rtt.sample(elapsed);
                 let mut state = shared.state.lock().unwrap();
                 state.frame_ack_elapsed = Some(
@@ -1650,7 +1671,13 @@ fn run_lane(
             }
         }
         if unacked.front().is_some_and(|(_, queued)| {
-            queued.elapsed() >= video_ack_deadline(&video_rtt, config.limits.stall_timeout)
+            video_ack_stalled(
+                &video_rtt,
+                config.limits.stall_timeout,
+                *queued,
+                last_video_ack,
+                Instant::now(),
+            )
         }) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1766,6 +1793,18 @@ fn run_lane(
     }
 }
 
+fn video_ack_stalled(
+    rtt: &latch_proto::rtt::RttEstimator,
+    floor: Duration,
+    queued: Instant,
+    progress: Instant,
+    now: Instant,
+) -> bool {
+    // ACKs are ordered. Recent authenticated progress proves the lane is
+    // delivering, even when earlier queueing has aged the next pending frame.
+    now.saturating_duration_since(queued.max(progress)) >= video_ack_deadline(rtt, floor)
+}
+
 fn video_ack_deadline(rtt: &latch_proto::rtt::RttEstimator, floor: Duration) -> Duration {
     // An authenticated ACK proves that the frame arrived. Use that lane's
     // measured round trip and variation for later ACKs, rather than closing a
@@ -1792,6 +1831,35 @@ mod tests {
             reply,
             refresh: false,
         }
+    }
+
+    #[test]
+    fn ordered_video_ack_progress_keeps_an_aged_frame_alive_until_progress_stops() {
+        let start = Instant::now();
+        let rtt = latch_proto::rtt::RttEstimator::new();
+        let floor = Duration::from_millis(750);
+        let progress = start + Duration::from_secs(1);
+        assert!(!video_ack_stalled(
+            &rtt,
+            floor,
+            start,
+            progress,
+            progress + Duration::from_millis(10)
+        ));
+        assert!(video_ack_stalled(
+            &rtt,
+            floor,
+            start,
+            progress,
+            progress + floor
+        ));
+        assert!(!video_ack_stalled(
+            &rtt,
+            floor,
+            progress,
+            start,
+            progress + Duration::from_millis(10)
+        ));
     }
 
     #[test]

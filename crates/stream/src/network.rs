@@ -372,6 +372,20 @@ pub struct NetworkStatus {
 }
 
 impl NetworkStatus {
+    /// Whether the visible diagnosis already explains this path notice.
+    pub fn covers_path_notice(&self, path: &crate::path::MediaPathState) -> bool {
+        use crate::path::PathReason;
+        self.messages.iter().any(|message| match path.reason {
+            PathReason::CaptivePortal => self.needs_sign_in,
+            PathReason::TlsInterception => {
+                message.starts_with("This network inspects encrypted traffic.")
+            }
+            PathReason::ProxyAuth => message.starts_with("Proxy authentication required."),
+            PathReason::ProxyRequired => message.starts_with("Proxy required."),
+            _ => false,
+        })
+    }
+
     pub(crate) fn recovered_from(&self, previous: &Self) -> bool {
         (previous.needs_sign_in && !self.needs_sign_in)
             || (!previous.proxy_available && self.proxy_available)

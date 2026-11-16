@@ -1,5 +1,8 @@
 //! Reserve the real host media socket and its control listener together.
 use latch_engine::server::{Options, Server};
+
+#[path = "options.rs"]
+pub mod options;
 use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::sync::Arc;
 
@@ -23,5 +26,5 @@ pub fn host() -> (Arc<Server>, TcpListener) {
 #[allow(dead_code)]
 pub fn options() -> Options {
     std::env::set_var("LATCH_NETENV_PROBE", "0");
-    Options::default()
+    options::options()
 }

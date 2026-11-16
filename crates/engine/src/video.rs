@@ -119,6 +119,11 @@ pub trait VideoPipeline: Send {
         false
     }
 
+    /// Last completed CPU capture, conversion and encode timings, when available.
+    fn software_timings(&self) -> Option<crate::software::SoftwareTimings> {
+        None
+    }
+
     /// Returns any pending cursor visibility or shape update to send to the viewer.
     fn take_cursor(&mut self) -> Option<CursorUpdate> {
         None
@@ -162,7 +167,7 @@ impl Pacer {
             .due
             .and_then(|due| due.checked_duration_since(Instant::now()))
         {
-            std::thread::sleep(wait);
+            sleep(wait);
         }
     }
 
@@ -173,6 +178,14 @@ impl Pacer {
             _ => at + self.interval,
         });
     }
+}
+
+/// Wait for a live media deadline without discretionary timer coalescing.
+pub(crate) fn sleep(wait: Duration) {
+    #[cfg(target_os = "macos")]
+    crate::mac::timer::sleep(wait);
+    #[cfg(not(target_os = "macos"))]
+    std::thread::sleep(wait);
 }
 
 /// The grid runs this much of a nominal interval per frame: 1% fast.

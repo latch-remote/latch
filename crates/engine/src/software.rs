@@ -56,12 +56,17 @@ pub trait CpuCapture: Send {
 }
 
 /// Time spent in each stage of the last frame. Capture includes waiting
-/// for damage; frame pacing happens outside these measurements.
-#[derive(Debug, Clone, Copy, Default)]
+/// for damage. Pacing and idle waits are reported separately from CPU work.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SoftwareTimings {
+    pub pace: Duration,
+    pub pace_lateness: Duration,
     pub capture: Duration,
+    pub capture_calls: u32,
+    pub idle: Duration,
     pub convert: Duration,
     pub encode: Duration,
+    pub padding: Duration,
 }
 
 /// Turns converted pictures into access units.
@@ -176,7 +181,11 @@ fn available_workers() -> usize {
 }
 
 /// `latch-codec`'s H.264 Constrained Baseline encoder.
-pub struct LatchEncoder(Encoder, (u64, Option<u64>));
+pub struct LatchEncoder {
+    encoder: Encoder,
+    last_picture: (u64, Option<u64>),
+    target_kbps: u32,
+}
 
 impl LatchEncoder {
     pub fn open(width: u32, height: u32, config: &VideoConfig) -> anyhow::Result<Self> {
@@ -202,11 +211,21 @@ impl LatchEncoder {
             threads: workers,
         })?;
         encoder.set_recovery_depth(recovery_depth(width, height, config.fps));
-        Ok(Self(encoder, (0, None)))
+        Ok(Self {
+            encoder,
+            last_picture: (0, None),
+            target_kbps: config.bitrate_kbps,
+        })
     }
 
     fn keep(&mut self, info: latch_codec::h264::EncodedInfo) -> bool {
-        self.1 = (info.picture, info.recovery);
+        self.last_picture = (info.picture, info.recovery);
+        tracing::debug!(
+            qp = info.qp,
+            bytes = info.bytes,
+            target_kbps = self.target_kbps,
+            "software encoder output"
+        );
         info.keyframe
     }
 }
@@ -237,7 +256,7 @@ impl PictureEncoder for LatchEncoder {
         keyframe: bool,
         out: &mut Vec<u8>,
     ) -> anyhow::Result<bool> {
-        let info = self.0.encode(picture, keyframe, out)?;
+        let info = self.encoder.encode(picture, keyframe, out)?;
         Ok(self.keep(info))
     }
     fn encode_changed(
@@ -247,20 +266,23 @@ impl PictureEncoder for LatchEncoder {
         keyframe: bool,
         out: &mut Vec<u8>,
     ) -> anyhow::Result<bool> {
-        let info = self.0.encode_changed(picture, changed, keyframe, out)?;
+        let info = self
+            .encoder
+            .encode_changed(picture, changed, keyframe, out)?;
         Ok(self.keep(info))
     }
     fn set_bitrate(&mut self, kbps: u32) {
-        self.0.set_bitrate(kbps);
+        self.target_kbps = kbps.max(1);
+        self.encoder.set_bitrate(kbps);
     }
     fn recovers(&self) -> bool {
         true
     }
     fn recover_from(&mut self, picture: u64) -> bool {
-        self.0.recover_from(picture)
+        self.encoder.recover_from(picture)
     }
     fn last_picture(&self) -> (u64, Option<u64>) {
-        self.1
+        self.last_picture
     }
 }
 
@@ -411,12 +433,21 @@ impl<C: CpuCapture> SoftwarePipeline<C> {
 
     fn acquire(&mut self, keyframe: bool, idle: Duration) -> anyhow::Result<bool> {
         let interval = self.pacer.interval();
+        self.timings = SoftwareTimings::default();
+        let started = Instant::now();
+        let requested = self
+            .pacer
+            .due()
+            .map_or(Duration::ZERO, |due| due.saturating_duration_since(started));
         self.pacer.wait();
+        self.timings.pace = started.elapsed();
+        self.timings.pace_lateness = self.timings.pace.saturating_sub(requested);
         let deadline = self.last_sent.unwrap_or_else(Instant::now) + idle.max(interval);
         loop {
             let started = Instant::now();
             let changed = self.capture.grab(&mut self.frame, Duration::ZERO)?;
-            self.timings.capture = started.elapsed();
+            self.timings.capture += started.elapsed();
+            self.timings.capture_calls += 1;
             if changed {
                 validate_frame(&self.frame)?;
                 self.captured = Instant::now();
@@ -435,15 +466,31 @@ impl<C: CpuCapture> SoftwarePipeline<C> {
             // Polling also lets a source without damage notifications honour the deadline.
             let wait = interval.min(deadline.saturating_duration_since(now));
             let started = Instant::now();
-            if self.capture.grab(&mut self.frame, wait)? {
-                self.timings.capture = started.elapsed();
+            let changed = self.capture.grab(&mut self.frame, wait)?;
+            self.timings.capture += started.elapsed();
+            self.timings.capture_calls += 1;
+            if changed {
                 validate_frame(&self.frame)?;
                 self.captured = Instant::now();
                 self.pacer.taken(self.captured);
                 return Ok(true);
             }
-            std::thread::sleep(wait.saturating_sub(started.elapsed()));
+            let remaining = wait.saturating_sub(started.elapsed());
+            let started = Instant::now();
+            crate::video::sleep(remaining);
+            self.timings.idle += started.elapsed();
         }
+    }
+}
+
+// Preserve idle-repeat phase across late wakes. A long stall starts a new
+// phase, so capture resumes without a catch-up burst.
+fn repeat_anchor(previous: Option<Instant>, captured: Instant, interval: Duration) -> Instant {
+    match previous {
+        Some(previous) if captured >= previous + interval && captured < previous + interval * 2 => {
+            previous + interval
+        }
+        _ => captured,
     }
 }
 
@@ -599,6 +646,10 @@ impl<C: CpuCapture> VideoPipeline for SoftwarePipeline<C> {
         }
     }
 
+    fn software_timings(&self) -> Option<SoftwareTimings> {
+        Some(self.timings)
+    }
+
     fn next(&mut self, keyframe: bool, idle: Duration) -> anyhow::Result<EncodedVideo> {
         let changed = self.acquire(keyframe || self.recovering, idle)?;
         self.recovering = false;
@@ -730,7 +781,15 @@ impl<C: CpuCapture> VideoPipeline for SoftwarePipeline<C> {
                 }
                 Err(error) => return Err(error),
             };
-            self.last_sent = Some(self.captured);
+            self.last_sent = Some(if changed || sent_keyframe {
+                self.captured
+            } else {
+                repeat_anchor(
+                    self.last_sent,
+                    self.captured,
+                    idle.max(self.pacer.interval()),
+                )
+            });
             let (picture, recovery) = self
                 .encoder
                 .as_ref()
@@ -1023,6 +1082,31 @@ mod tests {
         assert!(!p.recover_from(1), "a picture of the old encoder");
         assert!(p.recover_from(6));
         assert_eq!(p.next(false, Duration::ZERO).unwrap().recovery, Some(6));
+    }
+
+    #[test]
+    fn idle_repeats_preserve_phase_on_coarse_clocks() {
+        let start = Instant::now();
+        // The load fixture repeats every 33 ms. Ordinary idle capture repeats
+        // every 100 ms. Both must retain their phase after late wakes.
+        for interval in [Duration::from_millis(33), Duration::from_millis(100)] {
+            for tick_ms in [16, 30] {
+                let tick = Duration::from_millis(tick_ms);
+                let mut anchor = start;
+                for frame in 1..=20 {
+                    let due = anchor + interval;
+                    let ticks = due
+                        .duration_since(start)
+                        .as_nanos()
+                        .div_ceil(tick.as_nanos());
+                    let captured = start + tick * ticks as u32;
+                    anchor = repeat_anchor(Some(anchor), captured, interval);
+                    assert_eq!(anchor, start + interval * frame);
+                }
+                let stalled = anchor + Duration::from_secs(1);
+                assert_eq!(repeat_anchor(Some(anchor), stalled, interval), stalled);
+            }
+        }
     }
 
     #[test]

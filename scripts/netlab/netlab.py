@@ -2,6 +2,7 @@
 """Exercise real Latch binaries in disposable Linux network namespaces."""
 import argparse
 import concurrent.futures
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -53,6 +54,27 @@ def read_events(path):
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def encoder_tail(log, started, duration):
+    """Use host wall timestamps so qualification frames cannot enter the tail."""
+    frames = []
+    for line in re.sub(r"\x1b\[[0-9;]*m", "", log).splitlines():
+        match = re.search(r"^(\S+) .*software encoder output qp=(\d+) bytes=(\d+) target_kbps=(\d+)", line)
+        if match:
+            timestamp, qp, size, target = match.groups()
+            elapsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp() - started
+            if duration - 6 <= elapsed <= duration:
+                frames.append((int(qp), int(size), int(target)))
+    if not frames:
+        return {}
+    return {
+        "tail_encoder_frames": len(frames),
+        "tail_encoder_qp_min": min(frame[0] for frame in frames),
+        "tail_encoder_qp_mean": sum(frame[0] for frame in frames) / len(frames),
+        "tail_encoder_target_mbps": sum(frame[2] for frame in frames) / len(frames) / 1000,
+        "tail_encoded_video_mbps": sum(frame[1] for frame in frames) * 8 / 6 / 1e6,
+    }
 
 
 def police_statistics(filters):
@@ -469,6 +491,27 @@ add rule inet lab impairment iifname "viewer" drop''')
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=3)
 
+    def qualify_udp_loss(self):
+        # Fast relay recovery ends UDP exposure before a representative loss
+        # sample exists. Qualify the same qdisc with a real decoded UDP stream.
+        duration = SCENARIOS["d1"][1]
+        viewer = self.spawn("v", "loss-qualification", [
+            ROOT / "target/debug/examples/view", "100.64.0.1", "--no-relay",
+            "--width", "640", "--height", "360", "--fps", "30", "--kbps", "6000",
+            "--seconds", duration, "--events", self.output / "loss-qualification.jsonl"],
+            {"RUST_LOG": "warn"})
+        if viewer.wait(timeout=duration + 12):
+            raise RuntimeError("UDP loss qualification stream failed")
+        events = read_events(self.output / "loss-qualification.jsonl")
+        if not any(event.get("kind") == "sample" and event.get("decoded_seq", 0) > 0 for event in events):
+            raise RuntimeError("UDP loss qualification decoded no real media")
+        # Path/relay evidence and quality timings belong to the fresh session.
+        # Keep qdisc counters, including the qualified real media sample.
+        for role in ("c", "i"):
+            self.ns(role, "nft", "reset", "counters", "table", "inet", "lab")
+        for role in ("h", "v"):
+            self.ns(role, "nft", "reset", "counters", "table", "inet", "media")
+
     def execute(self):
         self.topology()
         self.certificate("relay", "relay.netlab.test")
@@ -507,10 +550,13 @@ add rule inet lab impairment iifname "viewer" drop''')
         alsa.write_text(f'pcm.!default {{ type pulse server "unix:{pulse}" }}\nctl.!default {{ type pulse server "unix:{pulse}" }}\n')
         common = ["--relay-host", "relay.netlab.test", "--relay-ca", self.output / "relay-ca.pem"]
         self.spawn("h", "host", [ROOT / "target/debug/examples/serve", "--bind", "100.64.0.1", "--telemetry", *common],
-                   {"LATCH_TEST_PATTERN": "noise" if self.scenario in ("d1", "d2") else "sweep", "LATCH_TEST_AUDIO": "clicks", "LATCH_LINUX_ENCODER": "software", "RUST_LOG": "info"})
+                   {"LATCH_TEST_PATTERN": "entropy", "LATCH_TEST_AUDIO": "clicks", "LATCH_LINUX_ENCODER": "software", "RUST_LOG": "info,latch_engine::software=debug"})
         self.ready("host", "serving on")
+        if self.scenario == "d1":
+            self.qualify_udp_loss()
         duration = SCENARIOS[self.scenario][1]
         self.started = time.monotonic()
+        started_wall = time.time()
         viewer = self.spawn("v", "viewer", [ROOT / "target/debug/examples/view", "100.64.0.1",
             "--width", "640" if self.scenario in ("d1", "d2") else "320",
             "--height", "360" if self.scenario in ("d1", "d2") else "192",
@@ -557,6 +603,7 @@ add rule inet lab impairment iifname "viewer" drop''')
         relay_connections = sum(item["counter"].get("packets", 0) for item in counters["nftables"]
                                 if "counter" in item and item["counter"].get("name") == "relay_dials")
         result = evaluate(self.scenario, read_events(self.output / "events.jsonl"), duration, relay_connections)
+        result.update(encoder_tail(self.measured_log("host.log"), started_wall, duration))
         self.verify_evidence(result, duration)
         result["actions"] = self.actions
         return result
@@ -727,15 +774,18 @@ def run_scenario(scenario, output, expected):
 
 
 def summary(results):
-    lines = ["| Scenario | Result | First ms | Tail fps | Tail stalls >500ms | Tail freeze ms | Video/request Mbps | Input max ms | Clicks | Tail path | Loss % | Police drops |",
-             "|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|"]
+    lines = ["| Scenario | Result | First ms | Tail fps | Tail stalls >500ms | Tail freeze ms | Video/request Mbps | Encoder target Mbps | QP min/mean | Input max ms | Clicks | Tail path | Loss % | Police drops |",
+             "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|"]
     for r in results:
         first = r.get("first_decoded_frame_ms", "—")
         input_ms = r.get("tail_input_max_ms")
         loss = r.get("measured_loss_pct")
+        target = r.get("tail_encoder_target_mbps")
+        qp = f"{r['tail_encoder_qp_min']}/{r['tail_encoder_qp_mean']:.1f}" if "tail_encoder_qp_min" in r else "—"
         lines.append(f"| {r['scenario']} {r['name']} | {r['status']} | {first if first is not None else '—'} | "
                      f"{r.get('tail_decoded_fps', 0):.1f} | {r.get('tail_decoded_stall_count', '—')} | "
                      f"{r.get('tail_max_decoded_stall_ms', '—')} | {r.get('tail_video_mbps', 0):.2f}/6 | "
+                     f"{f'{target:.2f}' if target is not None else '—'} | {qp} | "
                      f"{f'{input_ms:.0f}' if input_ms is not None else '—'} | {r.get('tail_audio_clicks', '—')} | "
                      f"{r.get('tail_path', '—')} | {f'{loss:.2f}' if loss is not None else '—'} | {r.get('policer_drops', '—')} |")
     return "\n".join(lines) + "\n"

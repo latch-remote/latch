@@ -781,6 +781,17 @@ impl ClientApp {
                             error: error.then_some(message),
                         };
                     }
+                    Event::PathChanged(state) => {
+                        // The persistent diagnosis surface already presents
+                        // network restrictions and the selected fallback carrier.
+                        if !live.session.network_status().covers_path_notice(&state) {
+                            let route = live.path.media_label(&state);
+                            self.view.toast(
+                                Tone::Info,
+                                format!("{route}. {}", state.reason.description()),
+                            );
+                        }
+                    }
                     Event::Notice(text) => self.view.toast(Tone::Warning, text),
                     // The persistent network surface reads current facts and clears
                     // immediately on recovery, including after a backgrounded window.
@@ -4046,6 +4057,70 @@ pub(crate) mod snapshots {
         assert!(h.query_by_label("Session with Gaming-PC ended").is_none());
         assert!(h.query_by_label("Sleep Gaming-PC").is_none());
         assert!(h.state().offer_sleep.is_none());
+    }
+
+    #[test]
+    fn derp_diagnosis_keeps_both_path_notices_and_matching_diagnoses_cover_their_own() {
+        use latch_stream::network::NetworkStatus;
+        use latch_stream::path::{MediaPath, MediaPathState, PathReason, UdpPath};
+        let derp = NetworkStatus {
+            messages: vec![
+                "Tailscale is using DERP only. This network blocks direct Tailscale connections."
+                    .into(),
+            ],
+            ..Default::default()
+        };
+        let mut state = MediaPathState::default();
+        state.path = MediaPath::LatchRelay;
+        state.reason = PathReason::UdpLoss { percent: 17 };
+        assert!(!derp.covers_path_notice(&state));
+        state.path = MediaPath::TailscaleUdp(UdpPath::Derp);
+        state.reason = PathReason::UdpRecovered;
+        assert!(!derp.covers_path_notice(&state));
+        for (reason, message, needs_sign_in) in [
+            (
+                PathReason::CaptivePortal,
+                "This network needs a sign-in.",
+                true,
+            ),
+            (
+                PathReason::TlsInterception,
+                "This network inspects encrypted traffic.",
+                false,
+            ),
+            (
+                PathReason::ProxyAuth,
+                "Proxy authentication required.",
+                false,
+            ),
+        ] {
+            state.reason = reason;
+            let diagnosis = NetworkStatus {
+                messages: vec![message.into()],
+                needs_sign_in,
+                ..Default::default()
+            };
+            assert!(diagnosis.covers_path_notice(&state));
+            assert!(!derp.covers_path_notice(&state));
+        }
+        state.path = MediaPath::LatchRelay;
+        state.reason = PathReason::UdpBlocked;
+        state.via_proxy = true;
+        let proxy = NetworkStatus {
+            messages: vec!["Proxy required. Using a CONNECT tunnel via proxy.".into()],
+            ..Default::default()
+        };
+        assert!(
+            !proxy.covers_path_notice(&state),
+            "the UDP failure is a separate condition"
+        );
+        state.reason = PathReason::ProxyRequired;
+        assert!(proxy.covers_path_notice(&state));
+        assert!(!derp.covers_path_notice(&state));
+        state.path = MediaPath::TailscaleUdp(UdpPath::Direct);
+        state.reason = PathReason::UdpRecovered;
+        state.via_proxy = false;
+        assert!(!proxy.covers_path_notice(&state));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! `LATCH_TEST_PATTERN=still|sweep|noise` makes the engine stream the
+//! `LATCH_TEST_PATTERN=still|sweep|noise|entropy|load` makes the engine stream the
 //! synthetic desktop of [`crate::pattern`] instead of the screen, and feed
 //! it the viewer's input. A host in this mode needs no screen, permission
 //! or GPU, so a whole session can be checked anywhere: known pixels arrive,
@@ -17,6 +17,13 @@ use std::time::{Duration, Instant};
 /// One per process: the session that opened last takes all test-mode
 /// input, so tests that stream in parallel must take turns.
 static CURRENT: Mutex<Option<Arc<Mutex<Pattern>>>> = Mutex::new(None);
+static HELD_KEYS: Mutex<std::collections::BTreeSet<u16>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+/// Keys currently held by the synthetic input sink, for transport regressions.
+pub fn held_keys() -> Vec<u16> {
+    HELD_KEYS.lock().iter().copied().collect()
+}
 
 #[cfg(target_os = "macos")]
 pub fn native_encoder() -> bool {
@@ -41,6 +48,8 @@ pub fn motion() -> Option<Motion> {
         "still" => Some(Motion::Still),
         "sweep" => Some(Motion::Sweep),
         "noise" => Some(Motion::Noise),
+        "entropy" => Some(Motion::Entropy),
+        "load" => Some(Motion::Still),
         _ => None,
     }
 }
@@ -76,10 +85,84 @@ pub fn open_video(config: &VideoConfig, motion: Motion) -> anyhow::Result<Box<dy
             }),
         )?));
     }
-    Ok(Box::new(SoftwarePipeline::new(shared, config)?))
+    let pipeline = Box::new(SoftwarePipeline::new(shared, config)?);
+    if std::env::var("LATCH_TEST_PATTERN").is_ok_and(|value| value == "load") {
+        return Ok(Box::new(LoadPattern {
+            pipeline,
+            kbps: config.bitrate_kbps,
+            fps: config.fps,
+            last_frame: None,
+            padding: Duration::ZERO,
+        }));
+    }
+    Ok(pipeline)
+}
+
+/// A cheap real H.264 picture plus standards-defined filler NAL units fills
+/// the encoder target. Network capacity tests stay independent of CPU speed.
+struct LoadPattern {
+    pipeline: Box<dyn VideoPipeline>,
+    kbps: u32,
+    fps: u32,
+    last_frame: Option<Instant>,
+    padding: Duration,
+}
+impl VideoPipeline for LoadPattern {
+    fn info(&self) -> crate::video::VideoInfo {
+        self.pipeline.info()
+    }
+    fn next(
+        &mut self,
+        keyframe: bool,
+        _idle: Duration,
+    ) -> anyhow::Result<crate::video::EncodedVideo> {
+        // Repeat at frame cadence. Filler establishes the wire load while
+        // unchanged pictures keep capture and encoding cheap on CI runners.
+        let mut frame = self.pipeline.next(keyframe, Duration::ZERO)?;
+        let padding_started = Instant::now();
+        let now = Instant::now();
+        let interval = Duration::from_secs(1) / self.fps.max(1);
+        // Preserve the offered bitrate when capture wakes late. Bound credit
+        // after a long stall, with the normal video pacer controlling egress.
+        let elapsed = self.last_frame.map_or(interval, |last| {
+            now.saturating_duration_since(last).min(interval * 2)
+        });
+        self.last_frame = Some(now);
+        let bytes = (f64::from(self.kbps) * 1000.0 / 8.0 * elapsed.as_secs_f64()) as usize;
+        if frame.data.len() + 6 < bytes {
+            frame.data.extend_from_slice(&[0, 0, 0, 1, 12]);
+            frame.data.resize(bytes - 1, 0xff);
+            frame.data.push(0x80);
+        }
+        self.padding = padding_started.elapsed();
+        Ok(frame)
+    }
+    fn software_timings(&self) -> Option<crate::software::SoftwareTimings> {
+        self.pipeline.software_timings().map(|mut timings| {
+            timings.padding = self.padding;
+            timings
+        })
+    }
+    fn set_bitrate(&mut self, kbps: u32) {
+        self.kbps = kbps;
+        self.pipeline.set_bitrate(kbps);
+    }
+    fn recovers(&self) -> bool {
+        self.pipeline.recovers()
+    }
+    fn recover_from(&mut self, picture: u64) -> bool {
+        self.pipeline.recover_from(picture)
+    }
+    fn set_cursor_drawn(&mut self, drawn: bool) -> bool {
+        self.pipeline.set_cursor_drawn(drawn)
+    }
+    fn take_cursor(&mut self) -> Option<crate::video::CursorUpdate> {
+        self.pipeline.take_cursor()
+    }
 }
 
 pub fn open_input() -> anyhow::Result<Box<dyn InputSink>> {
+    HELD_KEYS.lock().clear();
     Ok(Box::new(PatternInput))
 }
 
@@ -118,7 +201,7 @@ impl CpuCapture for Shared {
             if now >= deadline {
                 return Ok(false);
             }
-            std::thread::sleep((self.next.min(deadline) - now).min(Duration::from_millis(2)));
+            crate::video::sleep((self.next.min(deadline) - now).min(Duration::from_millis(2)));
         }
     }
 
@@ -143,6 +226,18 @@ struct PatternInput;
 
 impl InputSink for PatternInput {
     fn apply(&mut self, event: &Event, _display: DisplayRect) -> anyhow::Result<()> {
+        match event {
+            Event::Key { vk, down: true, .. } => {
+                HELD_KEYS.lock().insert(*vk);
+            }
+            Event::Key {
+                vk, down: false, ..
+            } => {
+                HELD_KEYS.lock().remove(vk);
+            }
+            Event::ReleaseAll => HELD_KEYS.lock().clear(),
+            _ => {}
+        }
         if let Some(p) = CURRENT.lock().as_ref() {
             let mut pattern = p.lock();
             if let Event::MousePosition {
@@ -167,7 +262,9 @@ impl InputSink for PatternInput {
         Ok(())
     }
 
-    fn release_all(&mut self) {}
+    fn release_all(&mut self) {
+        HELD_KEYS.lock().clear();
+    }
 }
 
 /// `LATCH_TEST_AUDIO=clicks` (or `clicks:<ms>` for a device period other

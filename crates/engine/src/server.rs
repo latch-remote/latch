@@ -70,7 +70,11 @@ fn surround_kbps(channels: usize) -> u32 {
 }
 
 fn audio_packet_samples(channels: usize) -> usize {
-    let fits = latch_codec::audio::frame_samples_within(channels, latch_proto::audio::MAX_PAYLOAD);
+    audio_packet_samples_with_limit(channels, latch_proto::MAX_DATAGRAM)
+}
+
+fn audio_packet_samples_with_limit(channels: usize, datagram_size: usize) -> usize {
+    let fits = latch_codec::audio::frame_samples_within(channels, datagram_size - 18);
     audio::FRAME / audio::FRAME.div_ceil(fits.max(1))
 }
 
@@ -102,6 +106,22 @@ impl Default for Options {
     }
 }
 
+/// Host-side video progress, independent of the viewer receiving a complete frame.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VideoDiagnostics {
+    pub frames_produced: u64,
+    pub frames_sent: u64,
+    pub encoded_bytes: u64,
+    pub produce_time: Duration,
+    pub total_produce_time: Duration,
+    pub max_produce_time: Duration,
+    pub software: Option<crate::software::SoftwareTimings>,
+    pub pacing_waits: u64,
+    pub pacing_wait: Duration,
+    pub pacing_max_lateness: Duration,
+    producing_since: Option<Instant>,
+}
+
 /// What `/v1/status` says about streaming.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ServerStatus {
@@ -120,6 +140,7 @@ pub struct ServerStatus {
     pub send_retries: u64,
     pub socket_send_bytes: usize,
     pub socket_receive_bytes: usize,
+    pub video: VideoDiagnostics,
 }
 
 /// Why a stream request was turned down, as an HTTP status and a sentence.
@@ -198,6 +219,11 @@ impl Server {
                 session.transport.queue_us.load(Ordering::Relaxed) as f32 / 1000.0;
             status.send_errors = session.transport.errors.load(Ordering::Relaxed);
             status.send_retries = session.transport.retries.load(Ordering::Relaxed);
+            status.video = session.video.lock().clone();
+            status.video.frames_sent = session.frames.load(Ordering::Relaxed);
+            if let Some(since) = status.video.producing_since {
+                status.video.produce_time = since.elapsed();
+            }
         }
         status
     }
@@ -528,6 +554,11 @@ impl Server {
         let feedback = prepared.feedback.clone();
         feedback.start(id);
         let relay_enabled = prepared.req.relay && self.options.relay.is_some();
+        let initial_budget = if prepared.req.media_path_policy && relay_enabled {
+            config.bitrate_kbps.min(8000)
+        } else {
+            config.bitrate_kbps
+        };
         let stop = Arc::new(AtomicBool::new(false));
         if let Some(sink) = prepared.input.as_mut() {
             sink.set_stopping(stop.clone());
@@ -565,13 +596,14 @@ impl Server {
             rtt_low: Mutex::new(None),
             train_ping: AtomicU64::new(0),
             train_rtt: Mutex::new(None),
-            pace_kbps: AtomicU32::new(config.bitrate_kbps),
+            pace_kbps: AtomicU32::new(initial_budget),
             fec: AtomicU8::new(DEFAULT_FEC_PERCENT),
             fec_burst: AtomicU8::new(0),
             heard_us: AtomicU64::new(self.now_us()),
             frames: AtomicU64::new(0),
+            video: Mutex::new(VideoDiagnostics::default()),
             bytes: AtomicU64::new(0),
-            transport: TransportState::new(config.bitrate_kbps),
+            transport: TransportState::new(initial_budget),
             keyframe_requests: Mutex::default(),
             recovery: RecoveryState::new(recovery),
             audio_enabled: prepared.audio.is_some(),
@@ -591,6 +623,7 @@ impl Server {
             draw_cursor: AtomicBool::new(!cursor_supported),
             control_writer: Mutex::new(None),
         });
+        session.relay.enable_policy(prepared.req.media_path_policy);
         // prepare owns the reservation until installation, so a second
         // prepare must see this session and wait for its undo before opening.
         *self.current.lock() = Some(session.clone());
@@ -614,6 +647,7 @@ impl Server {
         }
         let audio = prepared.audio.take();
         let accept = Accept {
+            media_path_policy: prepared.req.media_path_policy,
             key_positions: prepared.req.key_positions,
             relay: relay_enabled,
             color: info.color,
@@ -628,7 +662,11 @@ impl Server {
             audio: audio.as_ref().map(|capture| AudioFormat {
                 rate: audio::RATE,
                 channels: capture.channels() as u32,
-                frame_samples: audio_packet_samples(capture.channels()) as u32,
+                frame_samples: if prepared.req.media_path_policy {
+                    audio_packet_samples_with_limit(capture.channels(), 1000)
+                } else {
+                    audio_packet_samples(capture.channels())
+                } as u32,
                 codec: "lpcm-rice".into(),
             }),
             audio_problem: prepared.audio_problem.clone(),
@@ -746,6 +784,11 @@ impl Server {
             Option<std::thread::JoinHandle<()>>,
         ),
     ) -> String {
+        // This owner also paces UDP reassessment. Keep it on the same scheduling
+        // class as media so a busy machine can produce the requested probe rate.
+        if accept.media_path_policy {
+            crate::priority::media_thread();
+        }
         if let Err(e) = tcp.set_write_timeout(Some(Duration::from_secs(2))) {
             return format!("cannot bound control writes: {e}");
         }
@@ -793,10 +836,18 @@ impl Server {
         }
         *session.control_writer.lock() = Some(writer);
         let (video, audio) = start_media();
-        let mut relay_controller =
-            crate::congestion::RelayController::new(accept.bitrate_kbps, Instant::now());
+        let mut relay_controller = crate::congestion::RelayController::at_rate(
+            accept.bitrate_kbps,
+            if accept.media_path_policy {
+                8000
+            } else {
+                accept.bitrate_kbps
+            },
+            Instant::now(),
+        );
         let mut controller =
             crate::congestion::Controller::new(accept.bitrate_kbps, Instant::now());
+        controller.enable_media_policy(accept.media_path_policy && accept.relay);
         let requested_bitrate = accept.bitrate_kbps;
         let mut fec_policy = crate::congestion::FecPolicy::default();
         let mut last_keepalive = Instant::now();
@@ -807,6 +858,8 @@ impl Server {
         let mut sent_mark = (Instant::now(), session.bytes.load(Ordering::Relaxed));
         let mut route_revision = session.relay.revision();
         let mut relay_messages = VecDeque::new();
+        let mut mtu = latch_stream::path::MtuProbe::new(Instant::now());
+        let mut mtu_settle_until = Instant::now();
         let mut network_status = latch_stream::network::NetworkStatus::default();
         let mut network_notice = None;
         let reason = loop {
@@ -880,9 +933,30 @@ impl Server {
             }
             if route_revision != session.relay.revision() {
                 route_revision = session.relay.revision();
-                controller = crate::congestion::Controller::new(requested_bitrate, Instant::now());
-                relay_controller =
-                    crate::congestion::RelayController::new(requested_bitrate, Instant::now());
+                let returned = session
+                    .relay
+                    .take_return_kbps()
+                    .filter(|_| accept.media_path_policy);
+                controller = returned.map_or_else(
+                    || crate::congestion::Controller::new(requested_bitrate, Instant::now()),
+                    |rate| {
+                        crate::congestion::Controller::at_rate(
+                            requested_bitrate,
+                            rate.min(requested_bitrate),
+                            Instant::now(),
+                        )
+                    },
+                );
+                controller.enable_media_policy(accept.media_path_policy && accept.relay);
+                relay_controller = crate::congestion::RelayController::at_rate(
+                    requested_bitrate,
+                    if accept.media_path_policy {
+                        8000
+                    } else {
+                        requested_bitrate
+                    },
+                    Instant::now(),
+                );
                 fec_policy = crate::congestion::FecPolicy::default();
                 *session.rtt.lock() = RttEstimator::new();
                 *session.keyframe_requests.lock() = KeyframeAnswers::new();
@@ -893,7 +967,7 @@ impl Server {
                 session
                     .transport
                     .budget
-                    .store(requested_bitrate, Ordering::Relaxed);
+                    .store(controller.budget(), Ordering::Relaxed);
                 session.pace_kbps.store(0, Ordering::Relaxed);
                 session.keyframe.store(true, Ordering::Release);
                 sent_mark = (Instant::now(), session.bytes.load(Ordering::Relaxed));
@@ -907,9 +981,64 @@ impl Server {
                         (revision == session.relay.revision()).then_some(message)
                     })
                     .map(Ok)
-                    .unwrap_or_else(|| inbox.recv_timeout(Duration::from_millis(5))),
+                    .unwrap_or_else(|| {
+                        let wait = if session.relay.pacing_udp_probe() {
+                            1
+                        } else {
+                            5
+                        };
+                        inbox.recv_timeout(Duration::from_millis(wait))
+                    }),
             };
             match incoming {
+                Ok(Message::Path(message))
+                    if accept.media_path_policy && message.session == session.id =>
+                {
+                    if let control::PathAction::MtuResult { serial, received } = message.action {
+                        if let Some(bytes) = mtu.result(serial, received) {
+                            if bytes != session.relay.datagram_size() {
+                                session.relay.set_datagram_size(bytes);
+                                tracing::debug!(
+                                    datagram_size = bytes,
+                                    "measured UDP datagram size"
+                                );
+                                // Loss accounted for the old shard size must
+                                // not constrain a newly measured safe path.
+                                let now = Instant::now();
+                                mtu_settle_until = now
+                                    + Duration::from_secs(1)
+                                        .max(controller.base_rtt().unwrap_or_default() * 2);
+                                if !session.relay.active() {
+                                    controller = crate::congestion::Controller::at_rate(
+                                        requested_bitrate,
+                                        requested_bitrate.min(8000),
+                                        now,
+                                    );
+                                    controller.enable_media_policy(
+                                        accept.media_path_policy && accept.relay,
+                                    );
+                                    fec_policy = crate::congestion::FecPolicy::default();
+                                    session
+                                        .transport
+                                        .budget
+                                        .store(controller.budget(), Ordering::Relaxed);
+                                    session
+                                        .pace_kbps
+                                        .store(controller.pace_kbps(), Ordering::Relaxed);
+                                    sent_mark = (now, session.bytes.load(Ordering::Relaxed));
+                                }
+                                if !session.send_tcp(&Message::Path(control::PathControl {
+                                    session: session.id,
+                                    action: control::PathAction::MtuApplied {
+                                        datagram_size: bytes as u16,
+                                    },
+                                })) {
+                                    break "the viewer's connection broke".to_string();
+                                }
+                            }
+                        }
+                    }
+                }
                 Ok(Message::Relay(message)) if accept.relay => {
                     if !session.update_relay(|relay| {
                         relay.handle(message, |message| session.send_tcp(message))
@@ -953,10 +1082,27 @@ impl Server {
                         .relay
                         .take_frame_ack_elapsed()
                         .map(|elapsed| elapsed.as_secs_f32() * 1000.0);
-                    let queue_ms =
-                        queue_ms.max(session.relay.queued_frame_age().as_secs_f32() * 1000.0);
+                    let queue_ms = queue_ms
+                        .max(session.relay.queued_frame_age().as_secs_f32() * 1000.0)
+                        .max(
+                            if accept.media_path_policy && session.relay.video_backpressured() {
+                                100.0
+                            } else {
+                                0.0
+                            },
+                        );
                     if let Some(rtt) = session.train_rtt.lock().take() {
                         controller.observe_train_rtt(rtt.as_secs_f32() * 1000.0, now);
+                    }
+                    if session.relay.active() {
+                        session.relay.observe_relay_delivery(now, r.received_kbps);
+                    }
+                    let mut observed = r.clone();
+                    if now < mtu_settle_until {
+                        observed.loss_pct = 0.0;
+                        observed.unrecovered_loss_pct = Some(0.0);
+                        observed.frames_lost = 0;
+                        observed.loss_burst_packets = 0;
                     }
                     let changed = if session.relay.active() {
                         let changed = relay_controller.update(
@@ -966,13 +1112,13 @@ impl Server {
                             sent_kbps.unwrap_or(0),
                             r.received_kbps,
                         );
-                        session
-                            .transport
-                            .budget
-                            .store(relay_controller.budget(), Ordering::Relaxed);
+                        session.transport.budget.store(
+                            session.relay.relay_media_budget(relay_controller.budget()),
+                            Ordering::Relaxed,
+                        );
                         changed
                     } else {
-                        controller.update(now, &r, host_rtt, queue_ms)
+                        controller.update(now, &observed, host_rtt, queue_ms)
                     };
                     session
                         .transport
@@ -995,6 +1141,8 @@ impl Server {
                             sent_kbps,
                             received_kbps = r.received_kbps,
                             decoder_queue_ms = r.queue_ms,
+                            udp_damage = controller.udp_damage(),
+                            application_limited = controller.application_limited(),
                             relay = session.relay.active(),
                             loss = r.loss_pct,
                             "bitrate controller decision"
@@ -1008,7 +1156,7 @@ impl Server {
                         },
                         Ordering::Relaxed,
                     );
-                    let (fec, fec_burst) = fec_policy.update(&r, &controller, now - then);
+                    let (fec, fec_burst) = fec_policy.update(&observed, &controller, now - then);
                     session.fec_burst.store(fec_burst, Ordering::Relaxed);
                     session.fec.store(
                         if session.relay.active() { 0 } else { fec },
@@ -1018,6 +1166,7 @@ impl Server {
                     let report = control::Report {
                         requested_bitrate_kbps: requested_bitrate,
                         wire_budget_kbps: session.transport.budget.load(Ordering::Relaxed),
+                        udp_damage: accept.media_path_policy && controller.udp_damage(),
                         application_limited: if session.relay.active() {
                             sent_kbps.is_some_and(|sent| sent < relay_controller.budget() * 4 / 5)
                         } else {
@@ -1042,6 +1191,25 @@ impl Server {
                 }
             }
             let now = Instant::now();
+            if accept.media_path_policy
+                && !mtu.send(
+                    now,
+                    session.id,
+                    |action| {
+                        session.send_tcp(&Message::Path(control::PathControl {
+                            session: session.id,
+                            action,
+                        }))
+                    },
+                    |bytes| {
+                        let _ = self
+                            .udp
+                            .send_to(bytes, (*session.addr.lock()).unwrap_or(session.announced));
+                    },
+                )
+            {
+                break "the viewer's connection broke".to_string();
+            }
             if now - last_keepalive >= KEEPALIVE {
                 if !session.send_control(&Message::Keepalive)
                     || (session.relay.active() && !session.send_tcp(&Message::Keepalive))
@@ -1069,7 +1237,8 @@ impl Server {
                 }
                 _ => {}
             }
-            if let Some(addr) = *session.addr.lock() {
+            let probe_addr = *session.addr.lock();
+            if let Some(addr) = probe_addr {
                 if !session
                     .relay
                     .reassess_udp(&self.udp, addr, requested_bitrate, |message| {
@@ -1078,6 +1247,12 @@ impl Server {
                 {
                     break "the viewer's connection broke".to_string();
                 }
+            }
+            if session.relay.active() {
+                session.transport.budget.store(
+                    session.relay.relay_media_budget(relay_controller.budget()),
+                    Ordering::Relaxed,
+                );
             }
             // The video sender owns the ordinary idle probe trains.
             if addr.is_some() && session.probe_trains && !session.relay.active() {
@@ -1282,6 +1457,7 @@ struct Session {
     /// When the viewer was last heard from, on the server's clock.
     heard_us: AtomicU64,
     frames: AtomicU64,
+    video: Mutex<VideoDiagnostics>,
     bytes: AtomicU64,
     transport: TransportState,
     /// Which keyframe requests ask for a keyframe not already sent.
@@ -1433,9 +1609,12 @@ impl TransportState {
 
 impl Session {
     fn update_relay(&self, update: impl FnOnce(&RelayRoute) -> bool) -> bool {
-        // Stop old input before the first packet on the new route can be
-        // applied and acknowledged. Cleaning up on the next control-loop turn
-        // could unplug a pad whose replacement snapshot was already ACKed.
+        // Both routes belong to the same authorized session. Keep held keys
+        // and virtual devices alive, with input ordered across the transition.
+        // Wait for in-flight input before applying and acknowledging the new
+        // route. Deferred legacy cleanup could otherwise unplug a gamepad after
+        // its replacement snapshot was already acknowledged. Check shutdown
+        // between waits so input cleanup cannot hold the control owner forever.
         let mut input = loop {
             if self.stopping() {
                 return true;
@@ -1447,7 +1626,7 @@ impl Session {
         let mut pads = self.pads.lock();
         let was_active = self.relay.active();
         let ok = update(&self.relay);
-        if was_active && !self.relay.active() {
+        if !self.relay.policy_enabled() && was_active && !self.relay.active() {
             if let Some(sink) = input.sink.as_mut() {
                 sink.release_all();
             }
@@ -1907,22 +2086,39 @@ fn encode_video(
             if session.stopping() {
                 return;
             }
-            std::thread::sleep(Duration::from_micros(200));
+            video::sleep(Duration::from_micros(200));
         }
         let protected =
             session.keyframe.load(Ordering::Relaxed) || session.recovery.asked.lock().is_some();
-        let target = crate::congestion::video_budget(
-            session
-                .transport
-                .budget
-                .load(Ordering::Relaxed)
-                .saturating_sub(session.surround_kbps),
-            session.fec.load(Ordering::Relaxed),
-            session.fec_burst.load(Ordering::Relaxed),
-            config.fps,
-            audio,
-            protected,
-        );
+        let wire_budget = session
+            .transport
+            .budget
+            .load(Ordering::Relaxed)
+            .saturating_sub(session.surround_kbps);
+        let target = if session.relay.policy_enabled() && session.relay.active() {
+            let priority = if audio {
+                session
+                    .relay
+                    .priority_budget_kbps(Instant::now())
+                    .unwrap_or(1200 + session.surround_kbps)
+            } else {
+                0
+            };
+            crate::congestion::relay_video_budget(
+                session.transport.budget.load(Ordering::Relaxed),
+                priority,
+            )
+        } else {
+            crate::congestion::video_budget_sized(
+                wire_budget,
+                session.fec.load(Ordering::Relaxed),
+                session.fec_burst.load(Ordering::Relaxed),
+                config.fps,
+                audio,
+                protected,
+                session.relay.datagram_size(),
+            )
+        };
         if applied == 0 || target.abs_diff(applied) >= (applied / 20).max(1) {
             pipeline.set_bitrate(target);
             config.bitrate_kbps = target;
@@ -1940,7 +2136,31 @@ fn encode_video(
         // Short idle repeats bound how long a request arriving inside next
         // waits. Send every returned frame: discarding an encoded repeat
         // would discard a reference needed by subsequent P-frames.
-        let mut frame = match pipeline.next(keyframe, IDLE_REPEAT) {
+        let producing = Instant::now();
+        session.video.lock().producing_since = Some(producing);
+        let produced = pipeline.next(keyframe, IDLE_REPEAT);
+        {
+            let mut diagnostics = session.video.lock();
+            diagnostics.producing_since = None;
+            let elapsed = producing.elapsed();
+            diagnostics.produce_time = elapsed;
+            diagnostics.total_produce_time += elapsed;
+            diagnostics.max_produce_time =
+                diagnostics.max_produce_time.max(diagnostics.produce_time);
+            diagnostics.software = pipeline.software_timings();
+            if diagnostics.produce_time >= Duration::from_millis(50) {
+                tracing::debug!(
+                    produce_ms = diagnostics.produce_time.as_secs_f64() * 1000.0,
+                    software = ?diagnostics.software,
+                    "slow video frame production"
+                );
+            }
+            if let Ok(frame) = &produced {
+                diagnostics.frames_produced += 1;
+                diagnostics.encoded_bytes += frame.data.len() as u64;
+            }
+        }
+        let mut frame = match produced {
             Ok(f) => f,
             Err(e) => {
                 if session.stopping() {
@@ -2077,6 +2297,7 @@ fn paced_video(
     crate::priority::media_thread();
     let mut packetizer = Packetizer::new(session.id);
     let mut sender = latch_proto::transport::SendBatch::default();
+    let mut datagram_size = latch_proto::MAX_DATAGRAM;
     let mut pacer = crate::pacing::Pacer::new(Instant::now());
     let mut lost_reference = false;
     let mut relay_frame = 0u32;
@@ -2087,6 +2308,7 @@ fn paced_video(
         let probe = session.transport.probe.lock().take();
         let probe_addr = *session.addr.lock();
         if let (Some((train, count)), Some(addr)) = (probe, probe_addr) {
+            pacer.begin_frame(Instant::now(), session.pace_kbps.load(Ordering::Relaxed));
             let mut packets = Vec::with_capacity(usize::from(count));
             for index in 0..count {
                 let mut buf = Vec::with_capacity(latch_proto::MAX_DATAGRAM);
@@ -2200,6 +2422,19 @@ fn paced_video(
                 }
             }
             continue;
+        }
+        pacer.begin_frame(Instant::now(), session.pace_kbps.load(Ordering::Relaxed));
+        let measured_size = session.relay.datagram_size();
+        if measured_size != datagram_size {
+            datagram_size = measured_size;
+            packetizer.set_datagram_size(datagram_size);
+            // Software tunnels and firewalls can inspect a GSO aggregate
+            // before segmentation. Preserve the measured size at that hop too.
+            sender = if datagram_size < latch_proto::MAX_DATAGRAM {
+                latch_proto::transport::SendBatch::with_offload(false)
+            } else {
+                latch_proto::transport::SendBatch::default()
+            };
         }
         packetizer.set_fec_percent(session.fec.load(Ordering::Relaxed));
         packetizer.set_fec_burst(session.fec_burst.load(Ordering::Relaxed));
@@ -2316,7 +2551,15 @@ fn send_paced_batch(
         let (count, wait) = pacer.batch(Instant::now(), &batch[sent..], rate);
         if count == 0 {
             let deadline = Instant::now() + wait;
-            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            let started = Instant::now();
+            video::sleep(deadline.saturating_duration_since(started));
+            let now = Instant::now();
+            let mut diagnostics = session.video.lock();
+            diagnostics.pacing_waits += 1;
+            diagnostics.pacing_wait += now.saturating_duration_since(started);
+            diagnostics.pacing_max_lateness = diagnostics
+                .pacing_max_lateness
+                .max(now.saturating_duration_since(deadline));
             continue;
         }
         if let Some(queued) = queued {
@@ -2346,8 +2589,6 @@ fn send_audio(
     crate::priority::media_thread();
     let mut packetizer = AudioPacketizer::new(session.id);
     let channels = capture.channels();
-    let samples = audio_packet_samples(channels);
-    let packet_us = (samples as u64 * 1_000_000 / u64::from(audio::RATE)) as u32;
     let mut pcm = Vec::with_capacity(audio::FRAME * channels);
     let mut coded = Vec::with_capacity(2048);
     let mut capture = Some(capture);
@@ -2407,6 +2648,12 @@ fn send_audio(
             continue;
         }
         let pts = server.now_us() as u32;
+        let samples = if session.relay.policy_enabled() {
+            audio_packet_samples_with_limit(channels, session.relay.audio_datagram_size())
+        } else {
+            audio_packet_samples(channels)
+        };
+        let packet_us = (samples as u64 * 1_000_000 / u64::from(audio::RATE)) as u32;
         for (i, part) in pcm.chunks(samples * channels).enumerate() {
             coded.clear();
             latch_codec::audio::encode_channels(part, channels, &mut coded);

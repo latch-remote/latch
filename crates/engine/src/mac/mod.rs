@@ -8,6 +8,7 @@ mod ffi;
 pub mod gamepad;
 mod input;
 mod run_loop;
+pub(crate) mod timer;
 pub use run_loop::with_main_queue;
 pub(crate) mod synthetic;
 

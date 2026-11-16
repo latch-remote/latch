@@ -58,6 +58,8 @@ Content-Length: <n>
 | `probe_trains` | bool | optional, default false; the viewer times probe trains (datagram kind 16) and reports their rate |
 | `key_positions` | bool | optional, default false; offers additional physical keyboard positions in input kind 8 |
 | `relay` | bool | optional, default false; the viewer supports the two-lane authenticated relay extension |
+| `media_path_policy` | bool | optional, default false, omitted when false, offers sized probes and path controls |
+
 | `display` | string | optional; the host display to share, by an `id` from its status `streamer.displays` (see [Choosing a display](#choosing-a-display-additive)); absent leaves the choice to the host |
 
 A request is taken within 64 to 16384 pixels a side, 1 to 500 fps and
@@ -94,6 +96,7 @@ type byte and the payload and is at most 65 536. Payloads are JSON objects.
 | 6 | `Cursor` | host → viewer | `{"visible": bool, "shape": null \| {"serial": u32, "width": u32, "height": u32, "hot_x": u32, "hot_y": u32, "rgba": "<base64>"}}`; only after an `Accept` with `cursor` true; sent when visibility or shape changes (`shape` null: unchanged); straight-alpha sRGB RGBA, at most 96×96 |
 | 7 | `DrawCursor` | viewer → host | `{"draw": bool}`; tells host whether to composite pointer into video |
 | 8 | `Relay` | either | `{"session": u32, "attempt": u64, "action": RelayAction}`; negotiated only when request and accept both set `relay` |
+| 9 | `Path` | either | negotiated `media_path_policy` controls described below |
 
 Host network notices retain the version-1 type-4 `{"kind", "message"}` shape.
 Each control session emits the active notice once, then emits only changed
@@ -163,6 +166,7 @@ brightness and live Windows capture of the separate plane remain unverified.
 | --- | --- | --- |
 | `session` | u32 | session id, in every datagram |
 | `relay` | bool | optional, default false; host and viewer can negotiate the public relay |
+| `media_path_policy` | bool | optional, default false, accepts the viewer's sized-probe and path-control offer |
 | `token` | string | 32 hex digits (16 random bytes); proves a datagram's sender is this viewer |
 | `codec` | string | one of the viewer's `codecs` |
 | `width`, `height`, `fps` | u32 | what will actually be sent |
@@ -804,8 +808,8 @@ been gone for a second; an idle one (or an underfilled one at the floor)
 regrows by time a second after a cut, never past the last trains. While
 pacing, the pacer's own local queue is not sender pressure. Data shards precede parity computation and transmission; a
 completed frame is handed to decode immediately, including mid-receive-batch.
-Protocol 1 datagrams remain at most 1200 bytes. No MTU or socket-offload
-capability is advertised by this change.
+Protocol 1 datagrams remain at most 1200 bytes. Negotiated media path policy
+can select smaller video and input datagrams as described below.
 
 ## AV1 and decoder precision
 
@@ -994,20 +998,76 @@ keys. Capability and key debug formatting is redacted.
 After both lanes complete end-to-end key confirmation, the viewer sends
 `Ready`. The host sends `Commit`, the viewer activates and replies
 `Committed`, and the host activates. `Abort` resets the current attempt.
-Negotiation has a six-second application deadline. Failed attempts cool
-down for two seconds, increasing to thirty seconds after repeated failures.
+Negotiation has a six-second application deadline. Failed setup attempts cool
+down for two seconds. Active failures wait two seconds with older peers and
+100 ms with `media_path_policy` negotiated.
+Three failures increase the cooldown to thirty seconds.
 A single cancellable grant worker prevents preparation work accumulating.
 
-The current switch-back implementation adds `UdpProbe { first, kbps }`,
-`UdpProbeResult { first, received, span_us }`, `Direct` and `DirectReady`.
-The host probes UDP after a relay dwell period while media stays on relay.
-A qualifying report triggers an authorized handover back to UDP. Route
-revisions invalidate queued frames from the previous path and restart video
-recovery. Loopback TLS integration tests cover recovered UDP, relay
-restart, and repeated lifetime/byte grant renewal. Reassessment uses at
-most 50 Mbps of padding, so requested rates above 40 Mbps currently stay
-on relay until it fails or the session ends. The AWS endpoint has public
-TLS; campus measurements are recorded separately from these tests.
+UDP reassessment with an older peer uses `UdpProbe { first, kbps }`,
+`UdpProbeResult { first, received, span_us }`, `Direct` and `DirectReady`,
+with its original sixty-second dwell, one-second padding, 50 Mbps ceiling
+and two-second handoff cooldown.
+
+With `media_path_policy` negotiated, `UdpProbeSized { first, kbps,
+datagram_size }` accepts 2,000–1,250,000 kbps and 576–1,200-byte datagrams.
+The host sizes it from 110% of actual relay delivery, capped at 125% of the
+request.
+The receiver responds with `UdpProbeReady { first }`. After 100 ms settle,
+padding ramps from 25% to 100% over 200 ms and holds for 400 ms. Both peers
+round `kbps × 525 / 8 / (datagram_size + 80)` packets to whole sixteen-packet
+trains. Scheduling slack may extend transmission by 250 ms. Sized train
+identifiers occupy a wholly reserved range below `0x8000`. The existing
+result shape counts every unique position and measures first-to-last arrival.
+Its report window is two seconds from first arrival, with a three-second
+host expiry. `UdpProbeCancel { first }` cancels a current test on loss or
+relay pressure. Media and padding share the measured congestion budget.
+Qualification and retry numbers are specified in ENGINE.md.
+
+`Pause` withdraws a preparation trigger before an offer. The host can retain
+the prepared grant for at most twenty seconds within its lifetime and reuse
+it with a new attempt number. Active grant renewal retains `Renew`.
+`Pause`, sized probes, readiness and cancellation controls require negotiation.
+Host `Report.udp_damage` is an optional boolean, omitted when false and
+emitted only under this capability. It indicates queue-free damage surviving
+an actual rate reduction or confirmed policing. A reduced budget by itself
+supplies no such evidence.
+
+### Negotiated path controls
+
+Control kind 9 is `Path { session, action }`, carried only over the original
+authorized Tailscale TCP connection when both request and accept set
+`media_path_policy`. Session mismatches and actions for the other role are
+ignored. The capability works independently of public-relay opt-out.
+Missing capabilities preserve the 6.0.0 media timers, fallback triggers,
+controller behavior and held-input cleanup in either peer role. Local path
+indicators and coalesced notices remain available with older peers because
+they describe the transport already carrying media and require no wire change.
+
+- `MtuProbe { serial }` announces a host size test. Three rounds 100 ms apart
+  send existing kind-16 Probe datagrams at 1,200, 1,000, 800 and 576 bytes.
+  `train` equals `serial` with its high bit set, `count` is 12 and `index`
+  is `size_index * 3 + round`. These positions are consumed separately from
+  ordinary throughput probes and relay reassessment.
+- `MtuResult { serial, received }` is the viewer's response after 600 ms.
+  `received` is four unique-position counts in size order, each from zero
+  through three. The viewer retains early UDP positions for the next serial
+  for up to one second, applying them after its TCP announcement. The host
+  accepts only the pending serial after sending all
+  three rounds. A smaller size qualifies with two or three deliveries and
+  zero deliveries at every larger size. Tests repeat every ten seconds.
+- `MtuApplied { datagram_size }` tells the viewer the selected size for input
+  batching and path diagnosis. Sizes outside 576–1,200 are ignored. Existing
+  per-frame video shard lengths remain authoritative for reassembly. Audio
+  initially fit 1,000 bytes and use shorter self-describing PCM frames only
+  after a smaller MTU is measured, down to the 576-byte floor including parity.
+  Relay audio retains the 1,000-byte framing independently of UDP MTU.
+  Audio sequence numbers and parity survive a size change. Microphone frames
+  retain their existing size below the floor.
+
+`PathChanged` is a local stream-session event, with no new on-wire user-facing
+reason strings. Environment and carrier diagnostics can extend the local
+state without changing existing control message meanings.
 
 ### Framing and cryptography
 
@@ -1054,18 +1114,29 @@ frame plus one in flight, 256 KiB queued priority bytes, and 9 MiB delivered
 event bytes. Setup defaults to ten seconds at the transport layer. Frame
 and send deadlines default to 750 ms. Video ACKs use that lane's measured
 RTT plus four times its variation, bounded between the stall deadline and
-five seconds. Peer idle defaults to thirty seconds. Priority queue exhaustion
-ends the session to release held input. A closed attempt invalidates queued events. Session media
+five seconds. Peer idle defaults to thirty seconds. With media path policy negotiated, priority queue exhaustion resets routing
+to UDP and permits a bounded fresh relay attempt. Older peers retain session
+teardown on exhaustion. A closed attempt invalidates queued events. Session media
 watchdogs remain independent of control keepalives.
 
-Missing decoded video for one second or sustained UDP damage for about
-two seconds can request relay recovery. Busy video with a wire budget
-below 60% of its requested rate for five seconds can also request recovery;
-video must fill at least 75% of its reduced encoder target. Quiet content
-does not allocate relay capacity for this reason. A failed relay returns routing to
-UDP. Continued media or input failure can end the session and trigger the
-viewer's reconnect policy. The original authorized control connection
-remains required throughout.
+The viewer requests recovery after 250 ms with no UDP arrival, after 700 ms
+without a complete encoded picture, or after a trailing window establishes
+UDP damage or busy bitrate limitation. The window needs at least 800 ms of
+samples. Complete encoded frames suppress transport recovery for decoder-only
+stalls. Video grace allows at least two frame intervals. Damage must affect at least 25% of sampled time, or three lost frames
+must account for at least 10% of delivered-plus-lost frames with 10% mean raw
+loss and repeated damage spanning 250 ms. Damage remains fresh for 250 ms.
+Busy video must
+meet the reduced-budget gate for 75%. Busy useful video below 60% of request
+also qualifies when at least 75% of the window shows that deficit and mean
+raw loss is at least 10%, accounting for high FEC cost. Repaired loss that
+preserves requested quality keeps UDP.
+Failed attempts restore UDP. Established routes retry after 100 ms, and
+setup failures retain a two-second cooldown. Three failures
+retain the thirty-second circuit breaker. Grant renewals also wait 100 ms.
+The six-second application setup deadline and independent session media and
+input watchdogs continue to apply. Full policy and the pre-change code audit
+are in ENGINE.md.
 
 Daemon defaults bound admission to four sessions globally and two per
 creator source key. IPv6 keys cover /64, while mapped/well-known translated

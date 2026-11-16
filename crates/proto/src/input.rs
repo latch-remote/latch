@@ -229,6 +229,7 @@ impl Event {
 /// The viewer's side: numbers events and sends every unacknowledged one
 /// until the host acknowledges it.
 pub struct InputSender {
+    datagram_size: usize,
     key_positions: bool,
     session: u32,
     next: u32,
@@ -242,11 +243,16 @@ impl InputSender {
         Self {
             key_positions: false,
             session,
+            datagram_size: crate::MAX_DATAGRAM,
             next: 0,
             queue: Default::default(),
             last_send: None,
             changed: false,
         }
+    }
+
+    pub fn set_datagram_size(&mut self, bytes: usize) {
+        self.datagram_size = bytes.clamp(576, crate::MAX_DATAGRAM);
     }
 
     /// Enable kind 8 only after the host accepted the viewer's offer.
@@ -348,7 +354,13 @@ impl InputSender {
             return false;
         }
         let events: Vec<Event> = self.queue.iter().take(255).map(|x| x.1.clone()).collect();
-        let count = crate::wire::write_input(out, self.session, self.queue[0].0, &events);
+        let count = crate::wire::write_input_with_limit(
+            out,
+            self.session,
+            self.queue[0].0,
+            &events,
+            self.datagram_size,
+        );
         for entry in self.queue.iter_mut().take(count) {
             entry.2 = true;
         }

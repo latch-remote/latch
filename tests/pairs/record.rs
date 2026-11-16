@@ -217,6 +217,7 @@ fn request(port: u16) -> StreamRequest {
         startup_timeout_secs: 0,
         key_positions: false,
         relay: false,
+        media_path_policy: true,
         prefer_color: false,
         color: Default::default(),
         protocol: latch_proto::PROTOCOL,

@@ -51,6 +51,41 @@ pub fn path_kind(path: &Path) -> Option<PathKind> {
 }
 
 impl Path {
+    pub fn udp_path(&self) -> latch_stream::path::UdpPath {
+        use latch_stream::path::UdpPath;
+        match path_kind(self) {
+            Some(PathKind::Direct) => UdpPath::Direct,
+            Some(PathKind::PeerRelay) => UdpPath::PeerRelay,
+            Some(PathKind::Derp) => UdpPath::Derp,
+            None => UdpPath::Unknown,
+        }
+    }
+
+    pub fn media_tone(&self, state: &latch_stream::path::MediaPathState) -> Tone {
+        match state.path {
+            latch_stream::path::MediaPath::LatchRelay => Tone::Neutral,
+            latch_stream::path::MediaPath::TailscaleUdp(_) => self.tone(),
+            _ => Tone::Neutral,
+        }
+    }
+
+    pub fn media_label(&self, state: &latch_stream::path::MediaPathState) -> String {
+        match state.path {
+            latch_stream::path::MediaPath::LatchRelay => {
+                let carrier = state
+                    .carrier
+                    .map(|carrier| format!(" · {carrier}"))
+                    .unwrap_or_default();
+                let proxy = if state.via_proxy { " via proxy" } else { "" };
+                format!("Latch relay{carrier}{proxy}")
+            }
+            latch_stream::path::MediaPath::TailscaleUdp(_) => {
+                format!("Tailscale UDP · {}", self.label())
+            }
+            _ => "Media path".into(),
+        }
+    }
+
     pub fn relayed(&self) -> bool {
         matches!(path_kind(self), Some(PathKind::PeerRelay | PathKind::Derp))
     }
@@ -464,5 +499,46 @@ mod tests {
         assert!(t.contains("UPnP"), "{t}");
         // Nothing here is a wall of text.
         assert!(t.len() < 600, "{}", t.len());
+    }
+}
+
+#[cfg(test)]
+mod media_path_tests {
+    use super::*;
+    use latch_stream::path::{MediaPath, MediaPathState, PathReason};
+
+    #[test]
+    fn relay_labels_distinguish_websocket_and_connect_proxy() {
+        let path = Path::default();
+        let mut state = MediaPathState::default();
+        state.path = MediaPath::LatchRelay;
+        state.carrier = Some(latch_stream::path::Carrier::WebSocket);
+        assert_eq!(path.media_label(&state), "Latch relay · WebSocket");
+        state.via_proxy = true;
+        assert_eq!(
+            path.media_label(&state),
+            "Latch relay · WebSocket via proxy"
+        );
+        state.carrier = Some(latch_stream::path::Carrier::Tls);
+        assert_eq!(path.media_label(&state), "Latch relay · TLS via proxy");
+    }
+
+    #[test]
+    fn media_transport_labels_preserve_tailscale_wording_and_name_the_latch_relay() {
+        let tailscale = Path {
+            direct: Some(false),
+            peer_relay: "100.64.0.40".into(),
+            ..Default::default()
+        };
+        let mut state = MediaPathState::default();
+        assert_eq!(
+            tailscale.media_label(&state),
+            "Tailscale UDP · Via your relay"
+        );
+        state.path = MediaPath::LatchRelay;
+        state.carrier = Some(latch_stream::path::Carrier::Tls);
+        state.reason = PathReason::UdpLoss { percent: 17 };
+        assert_eq!(tailscale.media_label(&state), "Latch relay · TLS");
+        assert_eq!(state.reason.description(), "UDP is losing 17% of packets");
     }
 }

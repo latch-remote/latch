@@ -266,7 +266,7 @@ the requested rate for five seconds can also trigger recovery, even when
 error correction repairs the lost packets. Quiet desktops do not trigger
 this bandwidth check. This can help when UDP media
 is unusable and the authorized Tailscale control connection still works.
-The toolbar shows **Latch native** or **Latch WebSocket** when that route is active,
+The toolbar shows **Latch relay · TLS** or **Latch relay · WebSocket** when that route is active,
 with **via proxy** when a CONNECT tunnel carries it.
 
 Open **Settings → Stream relay** to change **Recover automatically through
@@ -315,17 +315,47 @@ different bounded limits. These are implementation defaults, with deployed
 limits set by the operator. Quota exhaustion or admission rejection prevents
 a new relay route. The monthly ledger survives daemon restarts.
 
-Relay setup and frame stalls have deadlines and retries have cooldowns.
-A failed relay attempt leaves or returns routing to UDP. If that path
-still cannot deliver usable video, the media watchdog ends the session and
-the reconnect overlay appears. After a minute on relay, a bounded UDP load
-probe can return the stream to a healthy direct path. This probe currently
-covers requests up to 40 Mbps. At the relay's time or traffic limit, Latch
-returns briefly to UDP and starts a fresh relay connection. On a network
-where UDP is blocked, video can pause for several seconds during renewal.
-Priority queue exhaustion ends the
-session to release held keys and buttons. Local acceptance of a packet
-into a queue does not guarantee remote delivery.
+The toolbar names the current media transport. “Tailscale UDP” uses Tailscale's
+reported path, shown as Direct, Via your relay, or Relayed via a DERP city.
+“Latch relay” uses the public relay for video, sound and input. Open
+Stream performance for its Tailscale route or relay carrier, the reason, and how long that media path has been in
+use. A brief notice appears when the path changes, for example “UDP is losing
+17% of packets”, “UDP is blocked on this network”, or “UDP recovered”.
+The persistent network diagnosis replaces a notice for the same sign-in,
+TLS-interception or proxy condition. An unrelated DERP diagnosis keeps the
+UDP/relay transition notice. Path changes keep the session and held input alive.
+
+With media path policy negotiated, Latch prepares the relay after 350 ms
+without UDP. It lets congestion control adapt to a shared uplink limit.
+Persistent loss after reducing the actual UDP rate or queue-free policing
+can select the relay. Complete-frame stall and post-relay recovery timers
+allow for round-trip latency. A healthy distant path keeps UDP.
+
+After at least five seconds on relay, Latch tests UDP at a rate based on what
+the relay is delivering. The paced check shares the media budget, stops on
+loss or relay pressure, and uses under 2.9% duty. Further tests wait thirty
+and then sixty seconds after successful handoffs. Failed or cancelled checks
+wait sixty seconds. Three measured returns per rolling minute bound
+flapping. A return begins at the proven rate and adapts upward.
+
+For size-dependent UDP black holes, video and input use a measured smaller
+size. Audio shortens packets only when that measurement requires it. Stream
+performance reports the selected size. Route notices are coalesced, with
+initial classification, size changes, failed setup and grant renewal silent.
+
+A silently stalled relay is detected from video ACK progress. Before the
+first video ACK, Latch uses the connection setup timing and a floor of at
+least 750 ms. Later ACKs set the estimate with a 350 ms floor. Both deadlines
+also allow for the pending frame's size at the current relay send rate.
+The complete first-ACK deadline is capped at three seconds.
+Fresh authorization or usable UDP restores media. Active failures have a 100 ms retry cooldown, recovery
+allows a UDP keyframe round trip, and three consecutive failures wait thirty
+seconds. Setup failures wait two seconds. A grant reaching its time or
+traffic allowance renews authorization. A session starts at most sixty
+relay grant attempts per rolling hour. If neither
+path can deliver usable video within the session's eight-second watchdog,
+the reconnect overlay appears. Local queue acceptance alone cannot establish
+remote delivery.
 
 The network must allow native TLS with ALPN `latch-relay/1`. HTTP-only
 proxies, TLS inspection and captive portals may prevent it. This path
@@ -670,7 +700,7 @@ probes. An in-flight check can take up to six seconds.
   Ask the network administrator to allow CONNECT to the configured relay host
   on port 443.
 - **Using the WebSocket carrier** means native relay TLS was blocked. The path
-  indicator says **Latch WebSocket**, with **via proxy** when applicable.
+  indicator says **Latch relay · WebSocket**, with **via proxy** when applicable.
 - **Tailscale is blocked** or **Tailscale is using DERP only** describes the
   network evidence reported by Tailscale. Check that Tailscale is signed in and
   allowed by this network. DERP adds latency.

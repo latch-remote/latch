@@ -8,6 +8,7 @@ pub mod gamepad;
 pub mod input;
 pub mod mic;
 pub mod network;
+pub mod path;
 #[path = "../../engine/src/priority.rs"]
 mod priority;
 pub mod session;
