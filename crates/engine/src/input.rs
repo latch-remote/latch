@@ -93,6 +93,11 @@ pub trait InputSink: Send {
     /// Applies one event, keeping absolute and relative positions in `display`.
     fn apply(&mut self, event: &Event, display: DisplayRect) -> anyhow::Result<()>;
 
+    /// Takes a diagnostic for the viewer when input cannot reach the desktop.
+    fn take_notice(&mut self) -> Option<String> {
+        None
+    }
+
     /// Releases every key and button this sink pressed and has not
     /// released (the viewer left, or asked).
     fn release_all(&mut self);

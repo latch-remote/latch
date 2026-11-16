@@ -23,6 +23,7 @@ pub(super) struct Injector {
     /// compared with it, to say once why a window ignores the viewer.
     level: u32,
     checked: Option<isize>,
+    notice: Option<String>,
 }
 enum Helper {
     Connecting(mpsc::Receiver<Client>),
@@ -283,6 +284,7 @@ impl Injector {
             helper: Helper::Connecting(elevated::connect()),
             level: elevated::own_integrity(),
             checked: None,
+            notice: None,
         }
     }
     fn client(&mut self) -> Option<&mut Client> {
@@ -292,6 +294,7 @@ impl Injector {
                     self.local.restore_clip();
                     tracing::info!("input goes through the elevated helper, so windows that run as administrator follow the viewer too");
                     self.helper = Helper::Connected(client);
+                    self.notice = None;
                 }
                 Err(TryRecvError::Disconnected) => self.helper = Helper::Gone,
                 Err(TryRecvError::Empty) => {}
@@ -311,6 +314,7 @@ impl Injector {
                     "the elevated input helper stopped ({e}); Latch injects input by itself again"
                 );
                 self.helper = Helper::Gone;
+                self.checked = None;
                 None
             }
         }
@@ -318,15 +322,22 @@ impl Injector {
     /// Windows drops this process's input to a window of a higher
     /// integrity level and reports it as sent: say so, once per window.
     fn warn_if_ignored(&mut self) {
+        // Let the helper finish starting before asking the viewer to set it up.
+        if matches!(self.helper, Helper::Connecting(_)) {
+            return;
+        }
         // SAFETY: Reads the foreground window's handle.
         let window = unsafe { GetForegroundWindow() };
         if self.checked == Some(window.0 as isize) {
             return;
         }
         self.checked = Some(window.0 as isize);
+        self.notice = None;
         if let Some((name, level)) = elevated::window_owner(window) {
             if level > self.level {
-                tracing::warn!("{name} runs as administrator, so Windows ignores the viewer's mouse and keyboard while it is in front; run setup again (Set up as administrator) to allow it");
+                let message = format!("{name} runs as administrator, so Windows is blocking Latch's mouse and keyboard. On the Windows PC, enable \"Control windows that run as administrator\" in Latch's Sharing tab, then choose \"Set up as administrator\".");
+                tracing::warn!("{message}");
+                self.notice = Some(message);
             }
         }
     }
@@ -345,6 +356,10 @@ fn clip_rect(display: DisplayRect) -> Result<RECT> {
     })
 }
 impl InputSink for Injector {
+    fn take_notice(&mut self) -> Option<String> {
+        self.notice.take()
+    }
+
     fn apply(&mut self, event: &Event, display: DisplayRect) -> Result<()> {
         if matches!(event, Event::ReleaseAll) {
             // Each side lets go of what it pressed.
