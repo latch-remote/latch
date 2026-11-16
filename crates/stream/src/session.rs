@@ -2261,6 +2261,15 @@ impl Inner {
         }
     }
 
+    fn trace_stage(&self, stage: &'static str) {
+        tracing::debug!(
+            stream = ?self.epoch,
+            elapsed_ms = self.epoch.elapsed().as_millis(),
+            stage,
+            "stream lifecycle progress"
+        );
+    }
+
     fn emit(&self, e: Event) {
         let _ = self.events.send(e);
         (self.wake)();
@@ -2664,6 +2673,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
         Err(e) => return fail("connecting", format!("cannot configure media buffers: {e}")),
     }
     let udp_port = udp.local_addr().map(|a| a.port()).unwrap_or(0);
+    inner.trace_stage("querying codecs");
     let codecs: Vec<_> = offer(settings)
         .into_iter()
         .filter(|&c| {
@@ -2701,6 +2711,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
             _ => 0,
         },
     };
+    inner.trace_stage("codecs ready");
     let body = serde_json::to_vec(&request).unwrap_or_default();
     let host = SocketAddr::new(server.address, server.port);
     let mut tcp = match latch_core::http::upgrade_cancellable(
@@ -2737,6 +2748,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
             return fail("connecting", format!("{e:#}"));
         }
     };
+    inner.trace_stage("control upgraded");
     let _ = tcp.set_nodelay(true);
     let _ = tcp.set_read_timeout(Some(START_TIMEOUT));
     let _ = tcp.set_write_timeout(Some(CONTROL_WRITE_TIMEOUT));
@@ -2770,6 +2782,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
             )
         }
     };
+    inner.trace_stage("accept received");
     *inner.relay.lock() = Arc::new(RelayRoute::new(
         accept.session,
         latch_relay::Role::Viewer,
@@ -2815,6 +2828,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
     {
         return fail("starting", "host selected unoffered colour format".into());
     }
+    inner.trace_stage("opening decoder");
     let decoder =
         match video::new_decoder_for_color(accept.codec, accept.width, accept.height, accept.color)
         {
@@ -2827,6 +2841,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
             }
             Err(e) => return fail("decoding", format!("{e:#}")),
         };
+    inner.trace_stage("decoder ready");
     {
         let mut stats = inner.stats.lock();
         stats.width = accept.width;
@@ -2924,7 +2939,14 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
             decode(&inner, decoder, codec, color)
         })
     };
+    inner.trace_stage("workers started");
     let outcome = control_loop(inner, &mut tcp, &accept);
+    tracing::debug!(
+        stream = ?inner.epoch,
+        elapsed_ms = inner.epoch.elapsed().as_millis(),
+        ?outcome,
+        "stream control ended"
+    );
     inner.mic.lock().take();
     inner.relay.lock().shutdown();
     inner.attempt_over.store(true, Ordering::Release);
@@ -2936,6 +2958,7 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
     *inner.control_writer.lock() = None;
     inner.tcp.lock().take();
     drop(tcp);
+    inner.trace_stage("joining receiver");
     if let Ok(r) = receiver {
         if !r.join_within(RECEIVER_STOP) {
             tracing::warn!(
@@ -2943,12 +2966,14 @@ fn attempt(inner: &Arc<Inner>, server: &Server, settings: &Settings, excluded: &
             );
         }
     }
+    inner.trace_stage("joining decoder");
     if let Ok(d) = decoding {
         if !d.join_within(DECODER_STOP) {
             tracing::warn!("the decoder did not return within {DECODER_STOP:?}; leaving it behind");
         }
     }
     *inner.link.lock() = None;
+    inner.trace_stage("publishing boundary");
     if let Some(event) = outcome.event() {
         inner.emit(event);
     }
@@ -2984,6 +3009,7 @@ impl Worker {
     }
 }
 
+#[derive(Debug)]
 enum Outcome {
     /// This side stopped.
     Stopped,
@@ -3095,7 +3121,17 @@ fn control_loop_at(
     inner: &Arc<Inner>,
     tcp: &mut TcpStream,
     accept: &Accept,
+    clock: impl FnMut() -> Instant,
+) -> Outcome {
+    control_loop_observed(inner, tcp, accept, clock, || {})
+}
+
+fn control_loop_observed(
+    inner: &Arc<Inner>,
+    tcp: &mut TcpStream,
+    accept: &Accept,
     mut clock: impl FnMut() -> Instant,
+    mut before_legacy_stats: impl FnMut(),
 ) -> Outcome {
     let (messages, inbox) = mpsc::sync_channel(128);
     if let Ok(mut reader) = tcp.try_clone() {
@@ -3114,6 +3150,9 @@ fn control_loop_at(
             });
     }
     let accepted = clock();
+    inner.trace_stage("control watchdogs armed");
+    let mut last_diagnostic = accepted;
+    let mut turns = 0u64;
     let mut startup_wait_started = accepted;
     let mut portal_since = None;
     let mut last_report = accepted;
@@ -3126,6 +3165,7 @@ fn control_loop_at(
     let mut legacy = LegacyFallback::default();
     let mut last_network_status = crate::network::NetworkStatus::default();
     loop {
+        turns += 1;
         if inner.stopping() {
             if let Some(w) = inner.control_writer.lock().as_mut() {
                 let _ = control::write_message(
@@ -3249,6 +3289,18 @@ fn control_loop_at(
             }
         }
         let now = clock();
+        if now.saturating_duration_since(last_diagnostic) >= Duration::from_secs(1) {
+            last_diagnostic = now;
+            let health = inner.video_health.lock();
+            tracing::debug!(stream = ?inner.epoch, turns,
+                control_ms = now.saturating_duration_since(accepted).as_millis(),
+                startup_remaining_ms = MEDIA_TIMEOUT.saturating_sub(now.saturating_duration_since(startup_wait_started)).as_millis(),
+                stall_remaining_ms = ?health.last_frame.map(|at| MEDIA_STALL_TIMEOUT.saturating_sub(now.saturating_duration_since(at)).as_millis()),
+                encoded_age_ms = ?health.last_encoded.map(|at| now.saturating_duration_since(at).as_millis()),
+                connected = inner.connected.load(Ordering::Acquire),
+                policy = accept.media_path_policy,
+                "stream control watchdog progress");
+        }
         let published = inner.published_us.load(Ordering::Relaxed);
         let relay = inner.relay.lock().clone();
         let wanted = if relay.policy_enabled() {
@@ -3347,11 +3399,17 @@ fn control_loop_at(
             } else {
                 Duration::from_micros(inner.now_us().saturating_sub(published))
             };
+            // The receiver holds stats while publishing feedback. Release
+            // this snapshot before acquiring stats to avoid the reverse order.
+            let report = inner.feedback.lock().clone();
             legacy.wanted(
                 now,
                 picture_age,
-                &inner.feedback.lock(),
+                &report,
                 !relay.active() && {
+                    // The test observer controls the competing receive-side
+                    // stats lock without depending on scheduler timing.
+                    before_legacy_stats();
                     let stats = inner.stats.lock();
                     relay_bandwidth_limited(&stats)
                         && stats.mbps * 1000.0 >= stats.applied_bitrate_kbps as f32 * 0.75
@@ -3587,7 +3645,13 @@ fn receive(
     let mut relay_report_frames = 0u64;
     let mut last_relay_frame = None;
     let mut drained = false;
+    let mut turns = 0u64;
+    let mut route_changes = 0u64;
+    let mut route_restarts = 0u64;
+    let mut last_diagnostic = accepted;
+    tracing::debug!(stream = ?inner.epoch, audio_player = player.is_some(), "stream receiver started");
     while !inner.stopping() {
+        turns += 1;
         if accept.media_path_policy && audio_datagram_size != relay.audio_datagram_size() {
             audio_datagram_size = relay.audio_datagram_size();
             if let Some(format) = &accept.audio {
@@ -3601,6 +3665,7 @@ fn receive(
             }
         }
         if route_revision != relay.revision() {
+            route_changes += 1;
             route_revision = relay.revision();
             // Restore the UDP address immediately after relay teardown, even
             // when this session has never delivered a UDP Hello before.
@@ -3835,6 +3900,13 @@ fn receive(
             }
         }
         let now = Instant::now();
+        if now.saturating_duration_since(last_diagnostic) >= Duration::from_secs(1) {
+            last_diagnostic = now;
+            tracing::debug!(stream = ?inner.epoch, turns, route_changes, route_restarts,
+                audio_player = player.is_some(), audio_stats = ?audio_rx.stats(),
+                audio_wait_ms = ?audio_rx.next_deadline().map(|at| at.saturating_duration_since(now).as_millis()),
+                "stream receiver progress");
+        }
         // Also when no audio arrived: a lost packet at the end of a sound
         // must not hold the rest of it until the next sound.
         if let Some(player) = player.as_mut() {
@@ -3843,6 +3915,7 @@ fn receive(
             while audio_rx.pop(now).is_some() {}
         }
         if route_revision != relay.revision() {
+            route_restarts += 1;
             continue;
         }
         hand_off_video(
@@ -4992,6 +5065,43 @@ mod tests {
         assert!(!status.needs_sign_in);
         assert!(status.messages.is_empty());
         assert!(health.stalled(now + MEDIA_STALL_TIMEOUT));
+    }
+
+    #[test]
+    fn legacy_control_releases_feedback_before_waiting_for_receive_stats() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let (events, _received) = mpsc::channel();
+        let inner = Arc::new(Inner::new(events, Arc::default(), Box::new(|| {})));
+        *inner.control_writer.lock() = Some(tcp.try_clone().unwrap());
+        let accept: Accept = serde_json::from_value(serde_json::json!({
+            "session": 7, "token": "00000000000000000000000000000000",
+            "codec": "h264-baseline", "width": 64, "height": 64, "fps": 60,
+            "bitrate_kbps": 1000, "encoder": "test", "audio": null,
+            "relay": false, "media_path_policy": false
+        }))
+        .unwrap();
+        // Model the receiver building feedback while it owns stats. It must
+        // be able to publish that feedback before releasing the stats guard.
+        let stats = inner.stats.lock();
+        let (observed, observation) = mpsc::channel();
+        let worker_inner = inner.clone();
+        let worker = std::thread::spawn(move || {
+            control_loop_observed(&worker_inner, &mut tcp, &accept, Instant::now, || {
+                let _ = observed.send(worker_inner.feedback.try_lock().is_some());
+            })
+        });
+        let feedback_free = observation.recv_timeout(Duration::from_secs(2));
+        // Finish both sides before asserting, including with the old order.
+        inner.stop.store(true, Ordering::Release);
+        drop(stats);
+        let _ = peer.shutdown(Shutdown::Both);
+        assert!(matches!(worker.join().unwrap(), Outcome::Stopped));
+        assert!(
+            feedback_free.expect("control reached the legacy statistics read"),
+            "control held feedback while waiting for receive-side stats"
+        );
     }
 
     #[test]

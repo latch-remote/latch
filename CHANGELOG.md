@@ -286,6 +286,9 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Streaming and recovery
 
+- Prevent legacy-session feedback and statistics locks from blocking startup,
+  decode-starvation and media-stall watchdogs.
+
 - Preserve elapsed UDP pacing credit when recent waiting wakes establish a
   coarse clock, bounded to 30 ms. Update that history only after pacing
   waits. Keep isolated hiccups and long stalls at the ordinary one-ms burst

@@ -355,6 +355,13 @@ fn impaired_host(mode: &'static str) -> (u16, std::thread::JoinHandle<()>) {
 }
 
 fn impaired_session(port: u16) -> (Session, Arc<FrameSlot>, mpsc::Receiver<Event>) {
+    static LOGGING: std::sync::Once = std::sync::Once::new();
+    LOGGING.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .try_init();
+    });
     let frames = Arc::new(FrameSlot::default());
     let (tx, rx) = mpsc::channel();
     let session = Session::start(
@@ -386,17 +393,22 @@ fn impaired_session(port: u16) -> (Session, Arc<FrameSlot>, mpsc::Receiver<Event
 }
 
 fn next_boundary(rx: &mpsc::Receiver<Event>) -> Event {
-    let deadline = Instant::now() + Duration::from_secs(12);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(12);
+    let mut progress = Vec::new();
     loop {
         let event = rx
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .expect("session boundary deadline");
+            .unwrap_or_else(|error| {
+                panic!("session boundary deadline: {error:?}, prior events {progress:?}")
+            });
         if matches!(
             event,
             Event::Connected | Event::Failed { .. } | Event::Terminated { .. }
         ) {
             return event;
         }
+        progress.push((started.elapsed(), event));
     }
 }
 
