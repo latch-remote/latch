@@ -117,12 +117,18 @@ pub(crate) fn start_with(
 ) -> Result<()> {
     let result = launch(command, state, path);
     if let Err(error) = &result {
-        if !state.fail_pending(path, &format!("{error:#}"))? {
-            let current = linux::UpdateState::load(path)?.context("missing startup outcome")?;
-            if current.unit == state.unit && current.alive() && !current.terminal() {
-                return Ok(());
+        match state.fail_pending(path, &format!("{error:#}")) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Ok(Some(current)) = linux::UpdateState::load(path) {
+                    if current.unit == state.unit && current.alive() && !current.terminal() {
+                        return Ok(());
+                    }
+                }
             }
-            anyhow::bail!("{}", current.reason);
+            Err(record_error) => {
+                tracing::warn!("could not record supervisor launch failure: {record_error:#}");
+            }
         }
     }
     result
@@ -260,7 +266,14 @@ pub fn reconcile() -> Result<Option<linux::UpdateState>> {
                 return Err(e);
             }
         };
-        if (restored || needs_restart) && state.systemd {
+        use std::os::unix::fs::MetadataExt;
+        // A restored service can start before the recovery outcome is writable.
+        // Its own startup must not queue another restart on every retry.
+        let original_is_running = std::fs::metadata("/proc/self/exe")
+            .is_ok_and(|this| Some((this.dev(), this.ino())) == state.original)
+            && (!state.systemd || main_pid().is_ok_and(|pid| pid == std::process::id()));
+        let restart_needed = (restored || needs_restart) && !original_is_running;
+        if restart_needed && state.systemd {
             // Queue, so restarting our own cgroup cannot interrupt systemctl.
             ensure!(
                 Command::new("systemctl")
@@ -269,8 +282,7 @@ pub fn reconcile() -> Result<Option<linux::UpdateState>> {
                     .success(),
                 "restart restored Linux service failed"
             );
-        } else if restored || needs_restart {
-            use std::os::unix::fs::MetadataExt;
+        } else if restart_needed {
             let this = std::fs::metadata("/proc/self/exe")?;
             if Some((this.dev(), this.ino())) == state.replacement {
                 super::start_service(&state.exe, &["--replaces", &std::process::id().to_string()])?;
@@ -374,28 +386,7 @@ fn supervise_with(
                 }
                 Ok(())
             },
-            || {
-                super::watch(
-                    || {
-                        let pid = if systemd {
-                            main_pid().ok()?
-                        } else {
-                            linux::listener_pid(exe, latch_core::CONTROL_PORT).ok()?
-                        };
-                        answering_process(
-                            pid,
-                            exe,
-                            latch_core::CONTROL_PORT,
-                            super::answering_version,
-                        )
-                    },
-                    &version.to_string(),
-                    super::PROBATION,
-                    super::HEALTHY_FOR,
-                    Duration::from_millis(500),
-                )
-                .map_err(anyhow::Error::msg)
-            },
+            || watch_replacement(exe, version, systemd),
         )
     })();
     // commit() has already persisted success before deleting recovery files.
@@ -415,6 +406,46 @@ fn supervise_with(
         }
     }
     result
+}
+
+fn watch_replacement(exe: &Path, version: &Version, systemd: bool) -> Result<()> {
+    let mut failed_since = None;
+    super::watch_checked(
+        || {
+            if systemd {
+                if let Some(reason) = service_failure()
+                    .inspect_err(|error| {
+                        tracing::debug!("could not read latch.service failure state: {error:#}")
+                    })
+                    .ok()
+                    .flatten()
+                {
+                    if failed_since
+                        .get_or_insert_with(std::time::Instant::now)
+                        .elapsed()
+                        >= Duration::from_secs(1)
+                    {
+                        return Err(reason);
+                    }
+                } else {
+                    failed_since = None;
+                }
+            }
+            Ok((|| {
+                let pid = if systemd {
+                    main_pid().ok()?
+                } else {
+                    linux::listener_pid(exe, latch_core::CONTROL_PORT).ok()?
+                };
+                answering_process(pid, exe, latch_core::CONTROL_PORT, super::answering_version)
+            })())
+        },
+        &version.to_string(),
+        super::PROBATION,
+        super::HEALTHY_FOR,
+        Duration::from_millis(500),
+    )
+    .map_err(anyhow::Error::msg)
 }
 
 fn answering_process(
@@ -443,6 +474,41 @@ fn restart() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn service_failure() -> Result<Option<String>> {
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "--property=ActiveState,SubState,Result,MainPID,Job",
+            "latch.service",
+        ])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "could not read latch.service state"
+    );
+    definitive_failure(&String::from_utf8(output.stdout)?)
+}
+
+fn definitive_failure(text: &str) -> Result<Option<String>> {
+    let properties: std::collections::BTreeMap<_, _> = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    let value = |name| {
+        properties
+            .get(name)
+            .copied()
+            .with_context(|| format!("missing unit property {name}"))
+    };
+    let result = value("Result")?;
+    let failed = value("ActiveState")? == "failed"
+        && value("SubState")? == "failed"
+        && value("MainPID")? == "0"
+        && value("Job")?.is_empty();
+    Ok(failed.then(|| format!("replacement latch.service definitively failed (Result={result})")))
 }
 
 fn main_pid() -> Result<u32> {
