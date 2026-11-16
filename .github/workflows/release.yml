@@ -2,7 +2,10 @@ name: release
 
 # Two ways in:
 #   * workflow_dispatch: build the binaries and leave them on the run page.
-#   * a v* tag: verified assets published to latch-remote/latch-releases.
+#   * a v* tag: verified assets published to latch-remote/latch-releases,
+#     then, while this repository is public, the macOS and Windows archives
+#     that Latch 4.x and 5.x updaters look for, on this repository's release
+#     for the same tag.
 #     The tag must match Cargo.toml and a nonempty CHANGELOG.md section.
 on:
   workflow_dispatch:
@@ -58,7 +61,8 @@ jobs:
           cp docs/MACOS.md dist.noindex/README-MACOS.md
           cp LICENSE NOTICE dist.noindex/
           cd dist.noindex && tar czf latch-macos-arm64.tar.gz Latch.app README-MACOS.md LICENSE NOTICE
-      # A 4.0 updater downloads only its original archive and app names.
+      # A 4.0 updater downloads only its original archive and app names, from
+      # this repository's releases (the bridge job), never from latch-releases.
       # The same app under that folder name lets it update at all; on its
       # first run it moves itself to Latch.app
       # and takes over the launch agent (crates/host/src/unix_setup.rs,
@@ -224,7 +228,8 @@ jobs:
           tag=()
           if [ "$TAG_BUILD" = true ]; then tag=(--tag "$GITHUB_REF_NAME"); fi
           python3 scripts/publish-release.py prepare \
-            --artifacts artifacts --output release-assets --notes notes.md "${tag[@]}"
+            --artifacts artifacts --output release-assets --bridge-output bridge-assets \
+            --notes notes.md "${tag[@]}"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         # Private-repository attestations require an eligible GitHub plan.
         # Enabled failures block publication.
@@ -234,6 +239,7 @@ jobs:
             release-assets/*.tar.gz
             release-assets/*.zip
             release-assets/latch-host.exe
+            bridge-assets/brolink-*
       - name: report unavailable provenance
         if: github.event.repository.private && vars.RELEASE_ATTESTATIONS_ENABLED != 'true'
         run: echo 'Provenance is disabled for this private repository. Set RELEASE_ATTESTATIONS_ENABLED=true after verifying plan entitlement. Asset checksums were generated.' >> "$GITHUB_STEP_SUMMARY"
@@ -243,6 +249,7 @@ jobs:
           overwrite: true
           path: |
             release-assets/
+            bridge-assets/
             notes.md
           if-no-files-found: error
           retention-days: 7
@@ -281,3 +288,36 @@ jobs:
         run: |
           python3 scripts/publish-release.py publish \
             --assets publication/release-assets --notes publication/notes.md --tag "$GITHUB_REF_NAME"
+
+  # Latch 4.x and 5.x check this repository for updates (through GitHub's
+  # rename redirects from MrBeldum/brolink and MrBeldum/latch), not
+  # latch-releases. Publishing their archives here, as the latest release,
+  # lets them update themselves. It works only while this repository is
+  # public; once it is private they need a manual install.
+  bridge:
+    if: >-
+      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      && github.event.repository.private == false
+    needs: publish
+    runs-on: ${{ vars.LINUX_X64_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-bundle
+          path: publication
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+      - name: verify bridge assets and publish them on this repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/publish-release.py publish-bridge \
+            --assets publication/bridge-assets --release-assets publication/release-assets \
+            --notes publication/notes.md --tag "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"

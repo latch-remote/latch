@@ -214,9 +214,23 @@ anonymous. Installed Mac and Windows copies update from this manifest.
 User-owned Linux release binaries update through the local service, while
 package-managed and image installs show deployment-specific instructions.
 
+Latch 4.x and 5.x check this source repository for updates instead, through
+GitHub's redirects from `MrBeldum/brolink` and `MrBeldum/latch`. While this
+repository is public, the `bridge` job publishes the macOS and Windows
+archives they download (`latch-macos-arm64.tar.gz`, `latch-windows-x64.zip`,
+`latch-host.exe`, and the `brolink-*` pair that only 4.0 reads) as this
+repository's release for the same tag, marked latest, with a `SHA256SUMS`
+of its own. They are byte-identical to the distribution release's copies,
+which the publisher checks before uploading and again from GitHub. The
+`brolink-*` pair is not published to `latch-releases`. When this repository
+is private, the job is skipped and 4.x and 5.x installs need a manual
+install to reach the manifest updater.
+
 The publisher uses `vars.RELEASE_APP_ID` and
 `secrets.RELEASE_APP_PRIVATE_KEY`, with the App installed only on
 `latch-remote/latch-releases`. Keep that installation scoped to distribution.
+The bridge job uses the workflow's own token with `contents: write` on this
+repository only.
 Linux jobs default to GitHub-hosted runners. Optional `LINUX_X64_RUNNER`
 and `LINUX_ARM64_RUNNER` variables select verified alternative runners.
 Blacksmith dashboard verification and capacity remain unconfirmed.

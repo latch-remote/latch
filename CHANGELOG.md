@@ -275,6 +275,11 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Packaging
 
+- Publish each release's macOS and Windows archives on the source
+  repository too, as its latest release, while that repository is public.
+  Latch 4.x and 5.x check there for updates, so they now find new versions
+  and update themselves. The `brolink-*` archives that only 4.0 reads move
+  there and no longer appear on `latch-releases`.
 - Separate Linux manifest, archive and installation retry back-off so returning
   online can download a known release at the next ordinary check. Reset archive
   retries after verified download and preserve bounded retries when a supervisor

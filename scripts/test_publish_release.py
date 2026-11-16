@@ -25,6 +25,7 @@ class FakeGitHub:
         self.corrupt = False
         self.comparison = "identical"
         self.next_id = 1
+        self.source_private = False
 
     def request(self, method, path, body=None, upload=None, **kwargs):
         self.calls.append((method, path, body))
@@ -39,6 +40,8 @@ class FakeGitHub:
             return None
         if path == f"repos/{publisher.REPO}":
             return {"full_name": publisher.REPO, "private": False, "default_branch": "main"}
+        if path == f"repos/{publisher.SOURCE_REPO}":
+            return {"full_name": publisher.SOURCE_REPO, "private": self.source_private, "default_branch": "main"}
         if "/git/ref/heads/" in path:
             return {"object": {"type": "commit", "sha": "distribution-commit"}}
         if "/git/ref/tags/" in path:
@@ -216,6 +219,106 @@ class ReleaseTests(unittest.TestCase):
                 publisher.publish(self.directory, self.tag, "Release notes", api)
             self.assertIs(api.release["draft"], True)
             self.assertFalse(any(call[0] == "PATCH" for call in api.calls))
+
+    def make_bridge(self):
+        bridge = Path(self.temp.name) / "bridge"
+        bridge.mkdir()
+        for name in publisher.BRIDGED:
+            (bridge / name).write_bytes((self.directory / name).read_bytes())
+        for name in publisher.LEGACY:
+            (bridge / name).write_bytes(f"legacy {name}".encode())
+        (bridge / "SHA256SUMS").write_text(publisher.sums_for(bridge, publisher.BRIDGE_NAMES - {"SHA256SUMS"}))
+        return bridge
+
+    def test_legacy_archives_stay_out_of_the_distribution_release(self):
+        names = publisher.expected_names(self.version)
+        self.assertFalse(names & set(publisher.LEGACY))
+        self.assertLessEqual(set(publisher.BRIDGED), names)
+        for name in publisher.LEGACY:
+            (self.directory / name).write_bytes(b"legacy")
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "allowlist"):
+                publisher.validate_plan(self.directory, self.tag)
+            (self.directory / name).unlink()
+
+    def test_bridge_copies_must_match_the_release_and_their_sums(self):
+        bridge = self.make_bridge()
+        publisher.validate_bridge(bridge, self.directory, self.tag)
+        path = bridge / "latch-host.exe"
+        path.write_bytes(b"different host")
+        (bridge / "SHA256SUMS").write_text(publisher.sums_for(bridge, publisher.BRIDGE_NAMES - {"SHA256SUMS"}))
+        with self.assertRaisesRegex(ValueError, "differs from release"):
+            publisher.validate_bridge(bridge, self.directory, self.tag)
+        path.write_bytes((self.directory / "latch-host.exe").read_bytes())
+        (bridge / "brolink-windows-x64.zip").write_bytes(b"swapped after summing")
+        with self.assertRaisesRegex(ValueError, "SHA256SUMS"):
+            publisher.validate_bridge(bridge, self.directory, self.tag)
+        (bridge / "SHA256SUMS").write_text(publisher.sums_for(bridge, publisher.BRIDGE_NAMES - {"SHA256SUMS"}))
+        (bridge / "latch-host-linux-x64.tar.gz").write_bytes(b"not for old updaters")
+        with self.assertRaisesRegex(ValueError, "allowlist"):
+            publisher.validate_bridge(bridge, self.directory, self.tag)
+
+    def test_bridge_publishes_verified_latest_release_on_the_source_tag(self):
+        bridge = self.make_bridge()
+        api = FakeGitHub()
+        api.ref = {"object": {"type": "commit", "sha": "source-tag-commit"}}
+        publisher.publish_bridge(bridge, self.directory, self.tag, "Release notes", publisher.SOURCE_REPO, api)
+        self.assertEqual(set(api.remote), publisher.BRIDGE_NAMES)
+        created = [call for call in api.calls if call[0] == "POST" and call[1].endswith("/releases")]
+        self.assertEqual(len(created), 1)
+        self.assertNotIn("target_commitish", created[0][2])
+        self.assertTrue(all(publisher.SOURCE_REPO in call[1] for call in api.calls if not call[1].startswith("https://")))
+        patches = [call for call in api.calls if call[0] == "PATCH"]
+        self.assertEqual(len(patches), 1)
+        self.assertEqual(api.calls[-1], patches[0])
+        self.assertEqual(patches[0][2]["make_latest"], "true")
+        self.assertIn(f"{publisher.REPO}/releases/tag/{self.tag}", patches[0][2]["body"])
+        # A rerun of the finished job changes nothing.
+        api.calls.clear()
+        publisher.publish_bridge(bridge, self.directory, self.tag, "Release notes", publisher.SOURCE_REPO, api)
+        self.assertTrue(all(call[0] == "GET" for call in api.calls))
+        # A published bridge with other bytes is never overwritten.
+        api.remote["latch-host.exe"]["bytes"] = b"another build"
+        api.calls.clear()
+        with self.assertRaisesRegex(ValueError, "refusing overwrite"):
+            publisher.publish_bridge(bridge, self.directory, self.tag, "Release notes", publisher.SOURCE_REPO, api)
+        self.assertTrue(all(call[0] == "GET" for call in api.calls))
+
+    def test_bridge_refuses_private_or_distribution_repository_before_writing(self):
+        bridge = self.make_bridge()
+        api = FakeGitHub()
+        api.ref = {"object": {"type": "commit", "sha": "source-tag-commit"}}
+        api.source_private = True
+        with self.assertRaisesRegex(ValueError, "public"):
+            publisher.publish_bridge(bridge, self.directory, self.tag, "Release notes", publisher.SOURCE_REPO, api)
+        with self.assertRaisesRegex(ValueError, "source repository"):
+            publisher.publish_bridge(bridge, self.directory, self.tag, "Release notes", publisher.REPO, api)
+        self.assertTrue(all(call[0] == "GET" for call in api.calls))
+
+    def test_prepare_splits_legacy_archives_into_the_bridge(self):
+        root = Path(__file__).resolve().parent.parent
+        version = publisher.tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+        artifacts = Path(self.temp.name) / "artifacts"
+        artifacts.mkdir()
+        for artifact, names in publisher.ARTIFACTS.items():
+            (artifacts / artifact).mkdir()
+            for name in names:
+                (artifacts / artifact / name).write_bytes(f"payload {name}".encode())
+        for arch in ("x64", "arm64"):
+            name = f"latch-host-linux-{arch}.tar.gz"
+            digest = publisher.fingerprint(artifacts / f"latch-host-linux-{arch}" / name)[1][7:]
+            (artifacts / f"latch-host-linux-{arch}" / f"{name}.sha256").write_text(f"{digest}  {name}\n")
+        def git(_root, *args):
+            if args[0] == "rev-parse":
+                return b"revision"
+            return (root / args[1].split(":", 1)[1]).read_bytes()
+        def export(_root, _revision, _version, destination):
+            destination.write_bytes(b"source archive")
+        output, bridge = Path(self.temp.name) / "output", Path(self.temp.name) / "bridge-out"
+        with patch.object(publisher, "git", side_effect=git), patch.object(publisher, "source_archive", side_effect=export):
+            publisher.prepare(root, artifacts, output, None, bridge)
+        self.assertEqual({path.name for path in output.iterdir()}, publisher.expected_names(version))
+        self.assertEqual({path.name for path in bridge.iterdir()}, set(publisher.BRIDGE_NAMES))
+        self.assertNotIn("brolink", (output / "release.json").read_text())
 
     def test_source_scan_preserves_examples_and_rejects_obvious_secrets(self):
         publisher.check_source_file("deploy/relay/.env.example", b"TOKEN=replace-me")
