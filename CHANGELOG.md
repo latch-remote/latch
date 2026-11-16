@@ -175,9 +175,14 @@ GitHub release notes, so each version gets a heading of the form
   expose held-picture counters in stream statistics. Returning every ready
   output fixes intermittent picture loss with Linux-encoded streams. Windows
   CI also exposed intermittent first-picture withholding. For explicit
-  zero-reorder sequences, poll temporarily empty output for at most 50 ms.
-  On expiry, warn once and disable polling for that decoder instance,
-  preserving timestamped delayed pictures and the decoder's pipeline latency.
+  zero-reorder sequences, allow cold-start and reconfigured first pictures
+  the existing one-second decode deadline with a 20 ms reply margin. Use a
+  50 ms steady-state wait, preserving polling after a single slow picture.
+  After a missed picture, probe without further waits. Two consecutive
+  inputs returning only the previous picture confirm retained delay and
+  disable polling with one warning per decoder instance. Keep each original
+  sample identity and the decoder's pipeline latency, with no decode error
+  or keyframe request from this fallback.
   Polling stress tests used the software decoder. A short hardware H.264
   replay returned every picture immediately, so hardware polling and
   switch-off remain unverified. The same fallback applies to hardware decoders.

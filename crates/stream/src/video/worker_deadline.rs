@@ -35,7 +35,8 @@ struct Operation {
     outputs: u32,
     recent_output: VecDeque<(i32, u32)>,
     late_access_units: u64,
-    picture_wait_disabled: bool,
+    picture_wait_reason: Option<&'static str>,
+    picture_wait_pending: Option<i64>,
 }
 impl Progress {
     pub(super) fn new(phase: &'static str) -> Self {
@@ -49,7 +50,8 @@ impl Progress {
             outputs: 0,
             recent_output: VecDeque::new(),
             late_access_units: 0,
-            picture_wait_disabled: false,
+            picture_wait_reason: None,
+            picture_wait_pending: None,
         }))
     }
     pub(super) fn begin(&self, phase: &'static str) {
@@ -91,11 +93,10 @@ impl Progress {
             .unwrap_or_else(|e| e.into_inner())
             .late_access_units += 1;
     }
-    pub(super) fn disable_picture_wait(&self) {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .picture_wait_disabled = true;
+    pub(super) fn picture_wait(&self, reason: Option<&'static str>, pending: Option<i64>) {
+        let mut operation = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        operation.picture_wait_reason = reason;
+        operation.picture_wait_pending = pending;
     }
     pub(super) fn describe(&self) -> String {
         let operation = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -106,7 +107,7 @@ impl Progress {
             operation.longest
         };
         format!(
-            "phase={} phase_elapsed={:?} operation_elapsed={:?} longest_phase={} longest_elapsed={:?} output_calls={} recent_output={:?} late_access_units={} picture_wait_disabled={} {}",
+            "phase={} phase_elapsed={:?} operation_elapsed={:?} longest_phase={} longest_elapsed={:?} output_calls={} recent_output={:?} late_access_units={} picture_wait_disabled={} picture_wait_reason={:?} picture_wait_pending={:?} {}",
             operation.phase,
             elapsed,
             operation.started.elapsed(),
@@ -115,7 +116,9 @@ impl Progress {
             operation.outputs,
             operation.recent_output.iter().map(|&(code, flags)| (format!("0x{:08x}", code as u32), flags)).collect::<Vec<_>>(),
             operation.late_access_units,
-            operation.picture_wait_disabled,
+            operation.picture_wait_reason.is_some(),
+            operation.picture_wait_reason,
+            operation.picture_wait_pending,
             operation.configuration,
         )
     }
@@ -206,7 +209,7 @@ mod tests {
         progress.begin("queued decode");
         progress.output(-1, 256);
         progress.late_output();
-        progress.disable_picture_wait();
+        progress.picture_wait(Some("retained delay"), Some(42));
         progress.phase("ProcessOutput");
         let error = progress.describe();
         assert!(error.contains("phase=ProcessOutput"), "{error}");
@@ -216,6 +219,8 @@ mod tests {
         assert!(error.contains("0xffffffff"), "{error}");
         assert!(error.contains("late_access_units=1"), "{error}");
         assert!(error.contains("picture_wait_disabled=true"), "{error}");
+        assert!(error.contains("retained delay"), "{error}");
+        assert!(error.contains("picture_wait_pending=Some(42)"), "{error}");
         assert!(error.contains("software H.264"), "{error}");
         for code in 0..20 {
             progress.output(code, 0);

@@ -959,18 +959,30 @@ mod tests {
                         );
                     }
                 }
+                let first_call = std::time::Instant::now();
                 let decoded = decoder.decode(&annexb).with_context(|| {
                     format!("MF round trip input {i}: {}", decoder.diagnostics())
                 })?;
                 if i == 0 {
+                    eprintln!(
+                        "FIRST_PICTURE case=A elapsed_us={} {}",
+                        first_call.elapsed().as_micros(),
+                        decoder.diagnostics()
+                    );
                     assert!(
                         decoded.is_some(),
-                        "first IDR must decode immediately in low-latency mode"
+                        "first IDR must decode immediately in low-latency mode: {}",
+                        decoder.diagnostics()
                     );
                 }
                 if let Some(decoded) = decoded {
-                    assert_eq!(decoded.bit_depth, 8);
-                    assert_eq!((decoded.width, decoded.height), (160, 98));
+                    assert_eq!(decoded.bit_depth, 8, "input {i}: {}", decoder.diagnostics());
+                    assert_eq!(
+                        (decoded.width, decoded.height),
+                        (160, 98),
+                        "input {i}: {}",
+                        decoder.diagnostics()
+                    );
                     let mut error = 0f64;
                     let mut count = 0;
                     for y in 0..98 {
@@ -990,7 +1002,11 @@ mod tests {
                     }
                     let psnr =
                         10.0 * (255.0f64.powi(2) / (error / count as f64).max(1e-12)).log10();
-                    assert!(psnr > 35.0, "PSNR {psnr}");
+                    assert!(
+                        psnr > 35.0,
+                        "PSNR {psnr}, input {i}: {}",
+                        decoder.diagnostics()
+                    );
                     pictures += 1;
                     if pictures >= 8 {
                         eprintln!("decoder diagnostics: {}", decoder.diagnostics());
@@ -999,6 +1015,9 @@ mod tests {
                 }
             }
         }
-        bail!("MF round trip produced only {pictures} decoded pictures")
+        bail!(
+            "MF round trip produced only {pictures} decoded pictures: {}",
+            decoder.diagnostics()
+        )
     }
 }

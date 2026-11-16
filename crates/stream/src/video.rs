@@ -3,6 +3,8 @@
 
 #[cfg(windows)]
 pub mod mediafoundation;
+#[cfg(any(windows, test))]
+mod mf_output;
 use anyhow::Result;
 use latch_proto::control::Codec;
 use parking_lot::Mutex;

@@ -950,7 +950,8 @@ fn decoder_retains_one_picture_delayed_identities_without_recovery() {
             DecoderStep::Hold,
             DecoderStep::Output(vec![-1]),
             DecoderStep::Output(vec![-1]),
-            // Drain the final two pictures at end-of-stream.
+            // Return both pictures on the last scripted input. Shutdown
+            // does not drain output and discards a decoder's held picture.
             DecoderStep::Output(vec![-1, 0]),
         ],
         &[0, 1, 2, 3],

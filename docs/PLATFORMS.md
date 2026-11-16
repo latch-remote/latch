@@ -141,13 +141,22 @@ Linux tape checks all 24 timestamps and picture contents. Returning every
 ready output fixes intermittent picture loss. Windows CI subsequently observed
 intermittent first-picture withholding with this Linux fixture. Short Windows
 repetitions have not reproduced that condition. For explicit zero-reorder
-sequences, the wrapper polls temporarily empty output for at most 50 ms,
-including output type negotiation. On expiry it warns once, disables polling
-for that decoder instance and preserves timestamped delayed output with the
-decoder's normal pipeline latency. The same fallback applies on hardware.
-Polling stress tests exercised only the software decoder. A short 24-picture
-H.264 DXVA replay returned every picture immediately, with zero late deliveries
-and polling still enabled. Hardware polling and switch-off remain unverified.
+sequences, the first picture after creation or output-type reconfiguration
+uses the existing one-second worker deadline with a 20 ms reply margin.
+A 50 ms steady-state miss keeps polling enabled and begins probes without
+further waits. Two consecutive inputs returning only the previous picture
+confirm retained delay and switch polling off, with one warning per decoder
+instance. A picture completing before another input or alongside the current
+picture restores ordinary polling. All original identities survive, with no
+decode error or keyframe request from this fallback. Permanent one-picture
+delay pays at most one approximately 980 ms cold wait per configuration, or
+one 50 ms wait if it begins mid-stream. The same rule applies on hardware.
+Polling stress tests exercised only the software decoder. Two short
+24-picture H.264 DXVA replays returned every picture immediately, with zero
+late deliveries and polling still enabled. Hardware retained-delay switch-off
+remains unverified. A hosted software-MFT first IDR subsequently exceeded the
+old 50 ms cold cap. Cold startup now uses the worker budget and a single
+slow picture keeps polling enabled.
 Software polls reuse an empty
 sample until a picture or type change. The strict per-call CI assertion
 still requires the picture before the next input is submitted. Iteration
@@ -159,6 +168,11 @@ each reported test serially and another 200 with four concurrent processes,
 both before and after the changes, with zero failures and zero observed late
 outputs. Scripted tests cover late output and type negotiation. Recovery
 from these particular faults remains unverified against a real decoder failure.
+The cold-start follow-up repeated 600 software iterations per test, added
+47 software samples during a three-second/four-thread CPU load and ran ten
+24-picture real-DXVA replays in one short invocation. All passed with zero
+late-delivery counts and polling enabled. The hosted slow cold start and
+hardware retained-delay switch-off remain unreproduced.
 
 Mac VideoToolbox and the Rust decoder pass local zero-delay replay. Linux
 software, Windows software/MF and Mac VideoToolbox combinations run in the

@@ -284,12 +284,21 @@ It drains every output and reads the output sample time. For a successfully
 parsed, explicitly zero-reorder H.264/HEVC sequence, the worker tries to
 return the current picture before the next access unit is submitted. If
 `ProcessOutput` first reports `MF_E_TRANSFORM_NEED_MORE_INPUT`, it polls the
-same input for at most 50 ms, including output type negotiation. Expiry logs
-one warning and disables this wait for the decoder instance's remaining life.
-The decoder then retains its pipeline delay and returns every ready picture
-under its original sample time, including on hardware decoders. Expiry
-succeeds with any pictures already drained and needs no keyframe or codec
-recovery. Ready pictures incur no polling wait. Sequences with unknown or
+same input within the existing one-second access-unit deadline, reserving
+20 ms for the worker reply, for the first picture after creation or output
+type reconfiguration. This includes allocator and MFT thread startup. Steady
+state uses a 50 ms wait. A missed picture retains its identity and keeps
+polling enabled. While it is unresolved, following inputs probe without
+adding any wait. Completion in a pre-input drain or a batch containing the
+current picture restores ordinary polling. Two consecutive inputs returning
+only the previous picture confirm retained pipeline delay and disable
+polling. The warning occurs once per decoder instance and includes the reason.
+A permanent one-picture delay therefore pays at most one approximately
+980 ms cold wait per configuration, or one 50 ms wait if it starts in steady
+state. Neither missing-picture expiry nor switch-off is a decode error or
+keyframe request. Output-type stream changes re-arm cold-start handling.
+The decoder still returns every ready picture under its original sample
+time, including on hardware. Ready pictures incur no polling wait. Sequences with unknown or
 nonzero ordering may require further inputs. The session keeps
 bounded submitted-frame metadata and matches each picture to its original
 identity, route and latency measurements. Held, pending and discarded
@@ -305,14 +314,25 @@ Returning every ready MF output fixes the intermittent picture loss with
 Linux-encoded streams. Windows CI subsequently observed intermittent first-picture
 withholding with the Linux capture fixture. Local short Windows repetitions
 have not reproduced it. Polling stress tests exercised only the software
-decoder. A short 24-picture H.264 DXVA replay returned every picture on its
-own submission, with zero late deliveries and polling still enabled. Its
-hardware wait and switch-off remain unverified.
-The 50 ms cap is the smallest chosen allowance for a scheduling delay because
-600 iterations of each software test recorded no late deliveries. The strict
+decoder. Two short 24-picture H.264 DXVA replays returned every picture on
+its own submission, with zero late deliveries and polling still enabled.
+Hardware retained-delay switch-off remains unverified. The 50 ms cold cap
+subsequently failed on a hosted software-MFT first IDR, so cold startup now
+shares the worker budget instead of permanently disabling polling. The strict
 per-call CI assertion still requires delivery before the following input.
 Software polls reuse one empty output sample until it produces a picture or
 the output type changes.
+
+The cold-start follow-up's software-MFT harness passed 600 iterations of each
+reported test, split evenly among serial, four-process and four-thread runs.
+First decode-call times had p50/p95/max of 0.689/0.865/1.576 ms for the
+software round trip and 0.681/0.770/1.012 ms for the Linux capture fixture.
+With four busy CPU threads for three seconds, 47 additional software samples
+passed, with maximum first-call time 0.756 ms. One short real-DXVA invocation
+opened ten decoders and replayed 24 H.264 pictures per decoder. Its first-call
+p50/p95/max were 12.484/12.926/12.926 ms. These times exclude decoder creation.
+No late-delivery counter or switch-off was observed. The hosted slow first
+picture remains unreproduced locally.
 
 A local 60-picture H.264 High recording with `LATCH_MAC_LTR=1` declares
 `max_num_ref_frames=15` and `max_dec_frame_buffering=15` both before and
