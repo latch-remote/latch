@@ -82,7 +82,13 @@ pub(super) type X11 = RustConnection<Bounded>;
 /// One deadline covers DNS, socket connect, authority lookup and X11 setup.
 pub(super) fn connect(silence: Duration) -> anyhow::Result<(X11, usize)> {
     let deadline = Instant::now() + silence;
-    let mut command = std::process::Command::new(std::env::current_exe()?);
+    let executable = std::env::current_exe()?;
+    // libtest owns a unit-test binary's main. Pair tests use the existing
+    // example's dispatcher while retaining the production bounded bootstrap.
+    #[cfg(test)]
+    let executable =
+        std::env::var_os("LATCH_PAIR_X11_HELPER").map_or(executable, std::path::PathBuf::from);
+    let mut command = std::process::Command::new(executable);
     command.arg(HELPER);
     connect_with(command, silence, deadline)
 }

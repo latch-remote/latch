@@ -1,5 +1,5 @@
 #[derive(Clone, Default)]
-pub(super) struct Bits {
+pub(crate) struct Bits {
     pub bytes: Vec<u8>,
     pub len: usize,
 }

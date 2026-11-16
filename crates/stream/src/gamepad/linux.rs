@@ -204,66 +204,7 @@ fn read(mut dev: Device, shared: &Shared, effects: &Mutex<HashMap<u8, FFEffect>>
         };
         let mut report = false;
         for e in events {
-            match e.destructure() {
-                EventSummary::Key(_, code, value) => {
-                    if let Some((_, bit)) = KEYS.iter().find(|(k, _)| *k == code) {
-                        if value != 0 {
-                            state.buttons |= bit;
-                        } else {
-                            state.buttons &= !bit;
-                        }
-                    }
-                }
-                EventSummary::AbsoluteAxis(_, code, value) => {
-                    let Some(&range) = ranges.get(&code.0) else {
-                        continue;
-                    };
-                    match code {
-                        AbsoluteAxisCode::ABS_X => {
-                            state.left_x = super::stick(range.centred(value))
-                        }
-                        AbsoluteAxisCode::ABS_Y => {
-                            state.left_y = super::stick(-range.centred(value))
-                        }
-                        AbsoluteAxisCode::ABS_RX => {
-                            state.right_x = super::stick(range.centred(value))
-                        }
-                        AbsoluteAxisCode::ABS_RY => {
-                            state.right_y = super::stick(-range.centred(value))
-                        }
-                        AbsoluteAxisCode::ABS_Z | AbsoluteAxisCode::ABS_BRAKE => {
-                            state.left_trigger = super::trigger(range.unit(value))
-                        }
-                        AbsoluteAxisCode::ABS_RZ | AbsoluteAxisCode::ABS_GAS => {
-                            state.right_trigger = super::trigger(range.unit(value))
-                        }
-                        AbsoluteAxisCode::ABS_HAT0X => hat.0 = value.signum(),
-                        AbsoluteAxisCode::ABS_HAT0Y => hat.1 = value.signum(),
-                        _ => {}
-                    }
-                    if matches!(
-                        code,
-                        AbsoluteAxisCode::ABS_HAT0X | AbsoluteAxisCode::ABS_HAT0Y
-                    ) {
-                        state.buttons &= !(button::DPAD_UP
-                            | button::DPAD_DOWN
-                            | button::DPAD_LEFT
-                            | button::DPAD_RIGHT);
-                        for (on, bit) in [
-                            (hat.0 < 0, button::DPAD_LEFT),
-                            (hat.0 > 0, button::DPAD_RIGHT),
-                            (hat.1 < 0, button::DPAD_UP),
-                            (hat.1 > 0, button::DPAD_DOWN),
-                        ] {
-                            if on {
-                                state.buttons |= bit;
-                            }
-                        }
-                    }
-                }
-                EventSummary::Synchronization(..) => report = true,
-                _ => {}
-            }
+            report |= apply_event(&mut state, &mut hat, &ranges, e.destructure());
         }
         if report {
             shared.update(slot, state);
@@ -271,4 +212,89 @@ fn read(mut dev: Device, shared: &Shared, effects: &Mutex<HashMap<u8, FFEffect>>
     }
     effects.lock().remove(&slot);
     shared.disconnect(slot);
+}
+
+fn apply_event(
+    state: &mut PadState,
+    hat: &mut (i32, i32),
+    ranges: &HashMap<u16, Range>,
+    event: EventSummary,
+) -> bool {
+    match event {
+        EventSummary::Key(_, code, value) => {
+            if let Some((_, bit)) = KEYS.iter().find(|(k, _)| *k == code) {
+                if value != 0 {
+                    state.buttons |= bit;
+                } else {
+                    state.buttons &= !bit;
+                }
+            }
+        }
+        EventSummary::AbsoluteAxis(_, code, value) => {
+            let Some(&range) = ranges.get(&code.0) else {
+                return false;
+            };
+            match code {
+                AbsoluteAxisCode::ABS_X => state.left_x = super::stick(range.centred(value)),
+                AbsoluteAxisCode::ABS_Y => state.left_y = super::stick(-range.centred(value)),
+                AbsoluteAxisCode::ABS_RX => state.right_x = super::stick(range.centred(value)),
+                AbsoluteAxisCode::ABS_RY => state.right_y = super::stick(-range.centred(value)),
+                AbsoluteAxisCode::ABS_Z | AbsoluteAxisCode::ABS_BRAKE => {
+                    state.left_trigger = super::trigger(range.unit(value))
+                }
+                AbsoluteAxisCode::ABS_RZ | AbsoluteAxisCode::ABS_GAS => {
+                    state.right_trigger = super::trigger(range.unit(value))
+                }
+                AbsoluteAxisCode::ABS_HAT0X => hat.0 = value.signum(),
+                AbsoluteAxisCode::ABS_HAT0Y => hat.1 = value.signum(),
+                _ => {}
+            }
+            if matches!(
+                code,
+                AbsoluteAxisCode::ABS_HAT0X | AbsoluteAxisCode::ABS_HAT0Y
+            ) {
+                state.buttons &=
+                    !(button::DPAD_UP | button::DPAD_DOWN | button::DPAD_LEFT | button::DPAD_RIGHT);
+                for (on, bit) in [
+                    (hat.0 < 0, button::DPAD_LEFT),
+                    (hat.0 > 0, button::DPAD_RIGHT),
+                    (hat.1 < 0, button::DPAD_UP),
+                    (hat.1 > 0, button::DPAD_DOWN),
+                ] {
+                    if on {
+                        state.buttons |= bit;
+                    }
+                }
+            }
+        }
+        EventSummary::Synchronization(..) => return true,
+        _ => {}
+    }
+    false
+}
+
+#[cfg(test)]
+pub(super) fn pair_state() -> PadState {
+    let mut state = PadState::default();
+    let mut hat = (0, 0);
+    let ranges = [0, 1, 2, 5, 16]
+        .into_iter()
+        .map(|axis| (axis, Range { min: 0, max: 4 }))
+        .collect();
+    for (kind, code, value) in [
+        (1, 0x130, 1),
+        (3, 0, 0),
+        (3, 1, 0),
+        (3, 2, 1),
+        (3, 5, 3),
+        (3, 16, -1),
+    ] {
+        apply_event(
+            &mut state,
+            &mut hat,
+            &ranges,
+            evdev::InputEvent::new(kind, code, value).destructure(),
+        );
+    }
+    state
 }

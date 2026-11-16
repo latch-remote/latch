@@ -136,6 +136,8 @@ pub struct Sync {
     /// Repainted when a paste's text has arrived.
     ctx: egui::Context,
     pastes: AtomicU64,
+    #[cfg(test)]
+    pub(crate) pair_sender: Option<std::sync::mpsc::Sender<Clipboard>>,
 }
 
 impl Sync {
@@ -143,6 +145,11 @@ impl Sync {
     pub fn spawn(ip: Ipv4Addr, ctx: egui::Context) -> Self {
         let shared: Arc<Mutex<Shared>> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        if std::env::var_os("LATCH_PAIR_RECORD").is_some() {
+            // Pair fixtures use an in-memory peer and never poll their dummy IP.
+            stop.store(true, Ordering::Relaxed);
+        }
         {
             let shared = shared.clone();
             let stop = stop.clone();
@@ -158,6 +165,8 @@ impl Sync {
             stop,
             ctx,
             pastes: AtomicU64::new(0),
+            #[cfg(test)]
+            pair_sender: None,
         }
     }
 
@@ -227,6 +236,8 @@ impl Sync {
             self.ctx.clone(),
             self.ip,
         );
+        #[cfg(test)]
+        let pair_sender = self.pair_sender.clone();
         std::thread::spawn(move || {
             if let Some((pokes, seq)) = poke {
                 let until = Instant::now() + POKE_WAIT;
@@ -244,6 +255,16 @@ impl Sync {
                 }
             }
             let before = shared.lock().sending(&fitted);
+            #[cfg(test)]
+            let result = if let Some(sender) = pair_sender {
+                // In-memory HTTP peer for the real paste path, including its JSON encoding.
+                let body = serde_json::to_string(&fitted).unwrap();
+                sender.send(serde_json::from_str(&body).unwrap()).unwrap();
+                Ok(())
+            } else {
+                send(ip, &fitted)
+            };
+            #[cfg(not(test))]
             let result = send(ip, &fitted);
             let mut sh = shared.lock();
             match result {
@@ -542,6 +563,8 @@ mod tests {
             stop: Arc::new(AtomicBool::new(true)),
             ctx: egui::Context::default(),
             pastes: AtomicU64::new(0),
+            #[cfg(test)]
+            pair_sender: None,
         }
     }
 

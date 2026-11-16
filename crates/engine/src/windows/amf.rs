@@ -4,7 +4,7 @@
 use super::capture::Gpu;
 use crate::{
     bitstream::{Format, Sequence},
-    video::VideoConfig,
+    video::{Codec, VideoConfig},
 };
 use anyhow::{ensure, Context, Result};
 use std::{
@@ -561,10 +561,11 @@ impl Encoder {
                     ensure!(length <= 64 * 1024 * 1024, "AMF output exceeds 64 MiB");
                     let bytes = (table.native)(output.ptr());
                     ensure!(!bytes.is_null(), "AMF output buffer is null");
-                    return self
+                    let (mut bytes, keyframe) = self
                         .seq
-                        .assemble(std::slice::from_raw_parts(bytes.cast(), length), || None)
-                        .map(Some);
+                        .assemble(std::slice::from_raw_parts(bytes.cast(), length), || None)?;
+                    crate::bitstream::low_delay(Codec::Hevc, &mut bytes)?;
+                    return Ok(Some((bytes, keyframe)));
                 }
                 if code != 0 && code != AMF_REPEAT {
                     check(code, "query output")?;

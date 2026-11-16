@@ -64,6 +64,10 @@ pub fn write(text: &str) -> Result<()> {
 
     let mut wide: Vec<u16> = to_windows(text).encode_utf16().collect();
     wide.push(0);
+    #[cfg(test)]
+    if pair_interop::capture(&String::from_utf16(&wide[..wide.len() - 1])?) {
+        return Ok(());
+    }
     unsafe {
         let mem = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2)?;
         let p = GlobalLock(mem) as *mut u16;
@@ -196,6 +200,10 @@ pub fn read() -> Result<Clipboard> {
 /// than the clipboard in xterm and the VTE terminals (GNOME's, XFCE's).
 #[cfg(not(windows))]
 pub fn write(text: &str) -> Result<()> {
+    #[cfg(test)]
+    if pair_interop::capture(text) {
+        return Ok(());
+    }
     with_clipboard(|c| {
         c.set_text(text.to_string())?;
         #[cfg(target_os = "linux")]
@@ -208,6 +216,10 @@ pub fn write(text: &str) -> Result<()> {
         Ok(())
     })
 }
+
+#[cfg(test)]
+#[path = "../../../tests/pairs/clipboard.rs"]
+mod pair_interop;
 
 /// macOS and X11 have no sequence number a program can read, so the text
 /// stands in for one: it changes whenever different text is copied, which

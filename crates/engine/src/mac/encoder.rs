@@ -52,6 +52,8 @@ struct Output {
     /// boundary: (index, bytes, IDR), once a simulator asks for them.
     #[cfg(test)]
     tap: Option<Vec<(i64, Vec<u8>, bool)>>,
+    #[cfg(test)]
+    raw_sps: Option<Vec<Vec<u8>>>,
 }
 /// How the low-latency mode keeps up, over the current window.
 struct Pace {
@@ -164,6 +166,8 @@ impl Encoder {
                 latest_idr: 0,
                 #[cfg(test)]
                 tap: None,
+                #[cfg(test)]
+                raw_sps: None,
             }),
             ready: Condvar::new(),
             wake: Mutex::new(None),
@@ -886,6 +890,25 @@ unsafe extern "C" fn encoded(
                         }
                     }
                 }
+                #[cfg(test)]
+                if let Some(tap) = out.raw_sps.as_mut().filter(|_| !hevc) {
+                    let format = CMSampleBufferGetFormatDescription(sample);
+                    let mut bytes = ptr::null();
+                    let mut size = 0;
+                    check(
+                        CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                            format,
+                            0,
+                            &mut bytes,
+                            &mut size,
+                            ptr::null_mut(),
+                            ptr::null_mut(),
+                        ),
+                        "read original test SPS",
+                    )?;
+                    ensure!(!bytes.is_null() && size > 0, "empty original test SPS");
+                    tap.push(std::slice::from_raw_parts(bytes, size).to_vec());
+                }
                 let mut frame = annex_b(sample, hevc, captured)?;
                 frame.picture = index as u64 + 1;
                 Ok(frame)
@@ -999,6 +1022,7 @@ unsafe fn annex_b(sample: Ref, hevc: bool, captured: Instant) -> Result<EncodedV
             )?;
             append_nals(&bytes, header as usize, &mut data)?;
         }
+        crate::bitstream::low_delay(if hevc { Codec::Hevc } else { Codec::H264High }, &mut data)?;
         Ok(EncodedVideo {
             generation: 0,
             data,

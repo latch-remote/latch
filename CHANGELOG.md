@@ -169,6 +169,35 @@ GitHub release notes, so each version gets a heading of the form
 
 ### Streaming
 
+- Fix stale or missing host pictures and decoder buffering on Windows. Declare
+  zero H.264/HEVC reordering on hosts, normalize legacy hosts' parameter
+  sets in the Windows viewer, preserve decoder output identities, and
+  expose held-picture counters in stream statistics. Returning every ready
+  output fixes intermittent picture loss with Linux-encoded streams. Windows
+  CI also exposed intermittent first-picture withholding. For explicit
+  zero-reorder sequences, allow cold-start and reconfigured first pictures
+  the existing one-second decode deadline with a 20 ms reply margin. Use a
+  50 ms steady-state wait, preserving polling after a single slow picture.
+  After a missed picture, probe without further waits. Two consecutive
+  inputs returning only the previous picture confirm retained delay and
+  disable polling with one warning per decoder instance. Keep each original
+  sample identity and the decoder's pipeline latency, with no decode error
+  from this fallback. A decoder that retains one picture can cost about one
+  second without a picture and one keyframe request when a stream starts
+  and after each reconfiguration.
+  Polling stress tests used the software decoder. A short hardware H.264
+  replay returned every picture immediately, so hardware polling and
+  switch-off remain unverified. The same fallback applies to hardware decoders.
+  CI retains its strict picture-on-every-call assertions. Bound drain passes
+  by time and call count, and report timeout phases, elapsed times and recent
+  output status. Parameter sets rejected
+  by the optimizer, including streams declaring nonzero reordering, pass
+  through unchanged with rate-limited warnings. Verification covers Mac
+  VideoToolbox H.264 and HEVC through Media Foundation's software decoder
+  and one AMD GPU, with NVENC, VA-API and AMF normalisation on hardware,
+  Intel and NVIDIA DXVA, and physical presentation unverified, and streams
+  whose encoder declares frame reordering keep their decoder delay.
+
 - Repair late desktop audio packets while their samples are still queued
   for playback, recovering more audio in deterministic burst-capture loss
   tests with the existing playback latency and queue controller. Real-network
@@ -216,6 +245,9 @@ GitHub release notes, so each version gets a heading of the form
   real headless streams through blocked, lossy, proxy, TLS-inspecting,
   captive-portal and MTU-limited networks. Record decoded video, sound,
   input and path recovery in CI, with strict expected-failure tracking.
+- Add artifact-exchanged host/viewer interoperability CI across Windows,
+  macOS and Linux x64/arm64, with decoded media, native input construction,
+  clipboard contracts and explicit known-gap assertions.
 - Schedule the relay throughput fixture with socket readiness and bounded
   per-direction delay queues. Wake the sender for received frames or its next
   send deadline, and report offered, accepted, refused and delivered frames

@@ -7,5 +7,6 @@ authors.workspace = true
 description = "Latch's codecs in Rust: H.264 Constrained Baseline encoder and decoder, colour conversion, lossless audio"
 
 [dependencies]
+tracing.workspace = true
 
 [dev-dependencies]

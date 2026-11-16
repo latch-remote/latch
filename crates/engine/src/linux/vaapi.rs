@@ -1277,6 +1277,7 @@ impl PictureEncoder for Vaapi {
         self.render(idr)?;
         self.rate_changed = false;
         self.take_output(out)?;
+        crate::bitstream::low_delay(self.codec, out)?;
         if idr {
             self.idr_id = self.idr_id.wrapping_add(1);
         }

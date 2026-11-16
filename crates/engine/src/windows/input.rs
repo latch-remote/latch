@@ -614,3 +614,84 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod pair_interop {
+    use super::*;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/pairs/native_input.rs"
+    ));
+    fn native(events: &[Event]) -> Vec<Value> {
+        let mut out = Vec::new();
+        let display = DisplayRect {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 360,
+        };
+        for event in events {
+            for input in construct(event, display).unwrap() {
+                // SAFETY: construct initializes the union matching its discriminator.
+                unsafe {
+                    if input.r#type == INPUT_KEYBOARD {
+                        let key = input.Anonymous.ki;
+                        if key.dwFlags.contains(KEYEVENTF_UNICODE) {
+                            if !key.dwFlags.contains(KEYEVENTF_KEYUP) {
+                                out.push(json!(["text", key.wScan]));
+                            }
+                        } else {
+                            assert!(key.dwFlags.contains(KEYEVENTF_SCANCODE));
+                            out.push(json!([
+                                "key",
+                                key.wScan,
+                                !key.dwFlags.contains(KEYEVENTF_KEYUP),
+                                0
+                            ]));
+                            assert_eq!(
+                                key.dwFlags.contains(KEYEVENTF_EXTENDEDKEY),
+                                matches!(event, Event::Key { vk: 0x5b, .. })
+                            );
+                        }
+                    } else {
+                        let mouse = input.Anonymous.mi;
+                        if mouse.dwFlags.contains(MOUSEEVENTF_ABSOLUTE) {
+                            assert!(mouse.dwFlags.contains(MOUSEEVENTF_VIRTUALDESK));
+                            let x = i64::from(mouse.dx)
+                                * i64::from(GetSystemMetrics(SM_CXVIRTUALSCREEN))
+                                / 65536
+                                + i64::from(GetSystemMetrics(SM_XVIRTUALSCREEN));
+                            let y = i64::from(mouse.dy)
+                                * i64::from(GetSystemMetrics(SM_CYVIRTUALSCREEN))
+                                / 65536
+                                + i64::from(GetSystemMetrics(SM_YVIRTUALSCREEN));
+                            out.push(json!(["absolute", x, y]));
+                        } else if mouse.dwFlags == MOUSEEVENTF_MOVE {
+                            out.push(json!(["relative", mouse.dx, mouse.dy]));
+                        } else if mouse.dwFlags == MOUSEEVENTF_WHEEL {
+                            out.push(json!(["wheel-v", mouse.mouseData as i32]));
+                        } else if mouse.dwFlags == MOUSEEVENTF_HWHEEL {
+                            out.push(json!(["wheel-h", mouse.mouseData as i32]));
+                        } else {
+                            let (button, down) = match mouse.dwFlags {
+                                MOUSEEVENTF_LEFTDOWN => (1, true),
+                                MOUSEEVENTF_LEFTUP => (1, false),
+                                MOUSEEVENTF_RIGHTDOWN => (3, true),
+                                MOUSEEVENTF_RIGHTUP => (3, false),
+                                MOUSEEVENTF_MIDDLEDOWN => (2, true),
+                                MOUSEEVENTF_MIDDLEUP => (2, false),
+                                MOUSEEVENTF_XDOWN | MOUSEEVENTF_XUP => {
+                                    assert!(matches!(mouse.mouseData, 1 | 2));
+                                    (mouse.mouseData + 3, mouse.dwFlags == MOUSEEVENTF_XDOWN)
+                                }
+                                flags => panic!("unexpected mouse flags {flags:?}"),
+                            };
+                            out.push(json!(["button", button, down]));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+}

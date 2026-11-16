@@ -1033,6 +1033,7 @@ impl PictureEncoder for Nvenc {
                 lock.bitstream_size_in_bytes as usize,
             ));
             call!(api, unlock_bitstream(self.encoder, self.output));
+            crate::bitstream::low_delay(self.codec, out)?;
             Ok(matches!(lock.picture_type, PIC_TYPE_IDR | PIC_TYPE_I))
         }
     }

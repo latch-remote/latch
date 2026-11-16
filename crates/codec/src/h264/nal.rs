@@ -17,7 +17,7 @@ fn start_code(stream: &[u8], from: usize) -> Option<(usize, usize)> {
 
 /// Streams byte ranges so a hostile access unit cannot allocate a second
 /// start-code table before the decoder applies its NAL-count bound.
-fn spans(stream: &[u8]) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+pub(crate) fn spans(stream: &[u8]) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
     let mut next = start_code(stream, 0);
     std::iter::from_fn(move || {
         let (start, begin) = next?;
@@ -30,7 +30,8 @@ fn spans(stream: &[u8]) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
     })
 }
 
-pub(crate) fn iter_nal_units(stream: &[u8]) -> impl Iterator<Item = &[u8]> {
+/// Iterate non-empty Annex B NAL units without allocating a start-code table.
+pub fn iter_nal_units(stream: &[u8]) -> impl Iterator<Item = &[u8]> {
     spans(stream)
         .filter(|(_, begin, end)| begin < end)
         .map(|(_, begin, end)| &stream[begin..end])
