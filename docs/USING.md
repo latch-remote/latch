@@ -316,7 +316,8 @@ limits set by the operator. Quota exhaustion or admission rejection prevents
 a new relay route. The monthly ledger survives daemon restarts.
 
 The toolbar names the current media transport. “Tailscale UDP” uses Tailscale's
-reported path, shown as Direct, Via your relay, or Relayed via a DERP city.
+reported path, shown as Direct, Via your relay, Your relay dropped (Tailscale left your
+relay after packet loss and uses DERP until it finds it again), or Relayed via a DERP city.
 “Latch relay” uses the public relay for video, sound and input. Open
 Stream performance for its Tailscale route or relay carrier, the reason, and how long that media path has been in
 use. A brief notice appears when the path changes, for example “UDP is losing
