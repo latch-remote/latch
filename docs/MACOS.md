@@ -163,7 +163,7 @@ the Mac cursor's position is sent 1:1 instead and nothing is captured.
 | Toolbar item | What it does |
 |--------------|--------------|
 | **● Machine name · 1920×1080 · 60 fps · HEVC** | The stream as negotiated (the numbers show on wide windows); the dot turns amber while the connection is poor |
-| **Direct · 38 ms / Relayed via Tokyo · 210 ms / Via your relay · 60 ms** | The path Tailscale found and its round trip. Amber means every packet goes through one of Tailscale's shared relays, which adds delay; **Connection details** under the machine list say why and what would give a direct path. What Latch asks for is the same on every path |
+| **Direct · 38 ms / Relayed via Tokyo · 210 ms / Via your relay · 60 ms / Your relay dropped · 160 ms** | The path Tailscale found and its round trip. Amber means every packet goes through one of Tailscale's shared relays, which adds delay; **Connection details** under the machine list say why and what would give a direct path. **Your relay dropped** means your peer relay carried the stream moments ago and Tailscale left it after packets went missing: it uses its own relay until it finds yours again, usually within half a minute, and the fix is a steadier network, not the router. What Latch asks for is the same on every path |
 | **Mouse** | **Captured, for games** (the default): a click on the picture hides the cursor and sends raw movement, which games read; the host key frees it. **Free, for desktops**: the Mac cursor's position is sent 1:1 and nothing is captured. The choice is remembered, and is also in Settings |
 | **Keys** | Ctrl+Alt+Delete, Windows key, Alt+Tab, Escape, Print Screen; and **Command acts as Ctrl** |
 | **Stats** | The stats overlay (above). **More → Stream performance** opens the full panel: frame rate and bitrate against what was asked for, round trip, packet loss, encode, assembly, queue and decode times, and the decoder. **Copy diagnostics** puts it all on the clipboard |
@@ -447,7 +447,11 @@ Latch shows which case you are in next to each PC (**Relayed via Tokyo ·
 210 ms**, **Via your relay · 60 ms**) and, when relayed, **Connection
 details** under the list says which router is in the way and what would
 fix it: UPnP or NAT-PMP turned on in the PC's router, a UDP port forwarded
-to the PC, or IPv6 on both networks. Both machines report their own side
+to the PC, or IPv6 on both networks. **Your relay dropped** is different:
+your relay works, but packets went missing (lossy Wi-Fi, usually), so
+Tailscale stopped trusting it and sends through its own relay until it
+finds yours again. Tailscale chooses a path on each machine separately, so
+the PC can still be using your relay at the same time. Both machines report their own side
 (`tailscale netcheck`); the PC's report needs Latch Host 3.1.
 
 ## A machine's menu

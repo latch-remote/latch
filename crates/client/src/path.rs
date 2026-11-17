@@ -25,6 +25,13 @@ pub struct Path {
     pub peer_relay: String,
     /// One round trip to the PC, from a TCP connect.
     pub rtt_ms: Option<u32>,
+    /// Reported through DERP now, but carried by a peer relay moments ago.
+    /// Tailscale leaves a peer relay that misses a heartbeat on a lossy
+    /// network: for a few seconds it sends through both it and DERP, and
+    /// after a ping times out through DERP alone, until it finds the relay
+    /// again (it looks at most every 30 s). The cause is then packet loss,
+    /// not a router, and the relay is set up correctly.
+    pub relay_dropped: bool,
 }
 
 /// Which of Tailscale's three paths carries the stream, in its own order of
@@ -100,6 +107,7 @@ impl Path {
         match path_kind(self) {
             Some(PathKind::Direct) => format!("Direct{rtt}"),
             Some(PathKind::PeerRelay) => format!("Via your relay{rtt}"),
+            Some(PathKind::Derp) if self.relay_dropped => format!("Your relay dropped{rtt}"),
             Some(PathKind::Derp) if self.relay.is_empty() => format!("Relayed{rtt}"),
             Some(PathKind::Derp) => format!("Relayed via {}{rtt}", derp_city(&self.relay)),
             None => format!("Path unknown{rtt}"),
@@ -152,6 +160,16 @@ pub fn explain(
     pc_nat: Option<&NatReport>,
     mac_nat: Option<&NatReport>,
 ) -> Option<String> {
+    if path_kind(path) == Some(PathKind::Derp) && path.relay_dropped {
+        let derp = if path.relay.is_empty() {
+            "a Tailscale relay".to_string()
+        } else {
+            format!("Tailscale's {} relay", derp_city(&path.relay))
+        };
+        return Some(format!(
+            "{pc} was reached through your relay until packets went missing. Tailscale then sends through {derp} until it finds your relay again, usually within half a minute. Your relay is set up correctly; the loss is in the network on one side, often Wi-Fi. A steadier connection keeps your relay in use."
+        ));
+    }
     let mut out = match path_kind(path) {
         Some(PathKind::PeerRelay) => format!(
             "{pc} is reached through your relay, not directly. Every packet takes that detour, which adds delay but caps neither the bitrate nor the frame rate. "
@@ -287,6 +305,7 @@ mod tests {
             relay: "tok".into(),
             peer_relay: "100.64.0.40:40000:vni:17".into(),
             rtt_ms: Some(60),
+            relay_dropped: false,
         };
         assert_eq!(p.label(), "Via your relay · 60 ms");
         assert_eq!(p.tone(), Tone::Neutral, "a detour chosen on purpose");
@@ -328,6 +347,40 @@ mod tests {
             t.starts_with("Gaming-PC is reached through your relay"),
             "{t}"
         );
+    }
+
+    #[test]
+    fn a_dropped_peer_relay_is_blamed_on_loss_not_the_router() {
+        // Given: Tailscale reports DERP, but a peer relay carried the PC
+        // moments ago.
+        let p = Path {
+            direct: Some(false),
+            relay: "tok".into(),
+            rtt_ms: Some(162),
+            relay_dropped: true,
+            ..Default::default()
+        };
+        assert_eq!(p.label(), "Your relay dropped · 162 ms");
+        assert_eq!(p.tone(), Tone::Warning, "DERP still carries packets");
+        assert!(p.relayed());
+        let pc_easy = nat(true, Some(false), false, false);
+        let t = explain("windows", &p, Some(&pc_easy), Some(&pc_easy)).unwrap();
+        assert!(t.contains("packets went missing"), "{t}");
+        assert!(t.contains("Tailscale's Tokyo relay"), "{t}");
+        assert!(!t.contains("UPnP"), "the router is not the cause: {t}");
+
+        // A peer relay back in use is just the relay.
+        let back = Path {
+            peer_relay: "54.116.93.176:443:vni:908".into(),
+            ..p.clone()
+        };
+        assert_eq!(back.label(), "Via your relay · 162 ms");
+        // And a direct path is direct.
+        let direct = Path {
+            direct: Some(true),
+            ..p
+        };
+        assert_eq!(direct.label(), "Direct · 162 ms");
     }
 
     /// The path is not an input at all: latency and relays never lower
@@ -423,6 +476,7 @@ mod tests {
             relay: "tok".into(),
             peer_relay: "100.64.0.40:40000:vni:17".into(),
             rtt_ms: Some(60),
+            relay_dropped: false,
         };
         assert_eq!(path_kind(&peer_relayed), Some(PathKind::PeerRelay));
         assert!(peer_relayed.relayed());

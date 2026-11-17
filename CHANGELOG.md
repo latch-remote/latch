@@ -9,6 +9,12 @@ GitHub release notes, so each version gets a heading of the form
 - Keep Windows mouse and keyboard input responsive when a foreground game
   denies cursor confinement, including through the elevated input helper.
 - Fix stretched letter spacing in wrapped menu help text.
+- Say **Your relay dropped** instead of **Relayed via Tokyo** when
+  Tailscale leaves a working peer relay for its DERP relay after packets go
+  missing, and blame the packet loss instead of the router in Connection
+  details. Tailscale's status cannot tell a briefly untrusted peer relay
+  from DERP alone, so a PC seen on a peer relay in the last 90 seconds
+  counts as one that dropped.
 
 ## 6.1.1 (2026-11-16)
 

@@ -6148,6 +6148,7 @@ pub(crate) mod tests {
             relay: String::new(),
             peer_relay: String::new(),
             rtt_ms: Some(25),
+            relay_dropped: false,
         };
         h.run_steps(1);
         assert!(
@@ -6177,6 +6178,7 @@ pub(crate) mod tests {
             relay: "tok".into(),
             peer_relay: String::new(),
             rtt_ms: Some(150),
+            relay_dropped: false,
         };
         h_relayed.run_steps(1);
         assert!(

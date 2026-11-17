@@ -145,6 +145,8 @@ pub fn spawn_discovery_worker(
         // the path's real round trip (a first connect also pays for the
         // WireGuard handshake).
         let mut rtts: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        // When each PC was last seen on a peer relay.
+        let mut on_relay: BTreeMap<String, Instant> = BTreeMap::new();
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -163,6 +165,7 @@ pub fn spawn_discovery_worker(
                     }
                     pc.path.rtt_ms = h.iter().copied().min();
                 }
+                note_relay_dropped(&mut on_relay, &mut pc.path, &pc.node_id, Instant::now());
             }
             scan.self_nat = nat.lock().clone();
             scan.peer_relay_servers = servers.lock().clone();
@@ -181,6 +184,37 @@ pub fn spawn_discovery_worker(
             }
         }
     })
+}
+
+/// How long after a peer relay was last seen a DERP reading still counts as
+/// that relay having dropped. Tailscale looks for the relay again at most
+/// every 30 s, and the other side offers it about once a minute.
+const RELAY_DROP_MEMORY: Duration = Duration::from_secs(90);
+
+/// Marks `path` as a dropped peer relay when Tailscale reports DERP for a
+/// PC it carried through a peer relay within [`RELAY_DROP_MEMORY`], and
+/// remembers when each PC was last on one.
+fn note_relay_dropped(
+    on_relay: &mut BTreeMap<String, Instant>,
+    path: &mut Path,
+    node_id: &str,
+    now: Instant,
+) {
+    match crate::path::path_kind(path) {
+        Some(crate::path::PathKind::PeerRelay) => {
+            on_relay.insert(node_id.to_string(), now);
+        }
+        Some(crate::path::PathKind::Derp) => {
+            path.relay_dropped = on_relay
+                .get(node_id)
+                .is_some_and(|seen| now.saturating_duration_since(*seen) < RELAY_DROP_MEMORY);
+        }
+        // A direct path replaces the relay; forget it.
+        Some(crate::path::PathKind::Direct) => {
+            on_relay.remove(node_id);
+        }
+        None => {}
+    }
 }
 
 fn normalize_for_comparison(d: &Discovery) -> Discovery {
@@ -490,6 +524,7 @@ fn probe_peer(cfg: &ClientConfig, n: &tailscale::Node) -> Pc {
             relay: n.relay.clone(),
             peer_relay: n.peer_relay.clone(),
             rtt_ms,
+            relay_dropped: false,
         },
     }
 }
@@ -1647,6 +1682,55 @@ mod tests {
             },
         );
         assert_eq!(checks, 2);
+    }
+
+    #[test]
+    fn derp_soon_after_a_peer_relay_is_a_dropped_relay() {
+        let mut seen = BTreeMap::new();
+        let t0 = Instant::now();
+        let relay = Path {
+            direct: Some(false),
+            relay: "tok".into(),
+            peer_relay: "54.116.93.176:443:vni:908".into(),
+            ..Default::default()
+        };
+        let derp = Path {
+            peer_relay: String::new(),
+            ..relay.clone()
+        };
+        // Given: DERP with no relay ever seen.
+        let mut p = derp.clone();
+        note_relay_dropped(&mut seen, &mut p, "pc", t0);
+        assert!(!p.relay_dropped, "a plain DERP path");
+
+        // Given: a peer relay, then DERP a few seconds later.
+        let mut p = relay.clone();
+        note_relay_dropped(&mut seen, &mut p, "pc", t0);
+        let mut p = derp.clone();
+        note_relay_dropped(&mut seen, &mut p, "pc", t0 + Duration::from_secs(6));
+        assert!(p.relay_dropped);
+
+        // Another PC's relay says nothing about this one.
+        let mut other = derp.clone();
+        note_relay_dropped(&mut seen, &mut other, "other", t0 + Duration::from_secs(6));
+        assert!(!other.relay_dropped);
+
+        // Long after, DERP is just DERP again.
+        let mut p = derp.clone();
+        note_relay_dropped(&mut seen, &mut p, "pc", t0 + RELAY_DROP_MEMORY);
+        assert!(!p.relay_dropped);
+
+        // A direct path forgets the relay.
+        let mut p = relay.clone();
+        note_relay_dropped(&mut seen, &mut p, "pc", t0);
+        let mut p = Path {
+            direct: Some(true),
+            ..derp.clone()
+        };
+        note_relay_dropped(&mut seen, &mut p, "pc", t0 + Duration::from_secs(1));
+        let mut p = derp;
+        note_relay_dropped(&mut seen, &mut p, "pc", t0 + Duration::from_secs(2));
+        assert!(!p.relay_dropped);
     }
 
     #[test]
