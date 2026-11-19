@@ -136,12 +136,32 @@ pub fn run_helper() -> bool {
     }
     // A helper writes no log: the user's data folder is one they could
     // point elsewhere. A failure just leaves the host on its own.
-    let _ = (|| match role(&own_token(TOKEN_QUERY)?)? {
-        Role::Broker => broker(),
-        Role::Agent => serve(true),
-        Role::User => serve(false),
+    let result = (|| {
+        let role = role(&own_token(TOKEN_QUERY)?)?;
+        trace(|| format!("role {role:?}"));
+        match role {
+            Role::Broker => broker(),
+            Role::Agent => serve(true),
+            Role::User => serve(false),
+        }
     })();
+    trace(|| format!("exit: {result:?}"));
     true
+}
+
+/// Test builds only (see [`TEST_DIR`]): a line in the helper's log there.
+/// Release builds write nothing, as the helper never logs.
+fn trace(message: impl FnOnce() -> String) {
+    if let Some(dir) = TEST_DIR {
+        use std::io::Write as _;
+        if let Ok(mut log) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(Path::new(dir).join(format!("helper-{}.log", std::process::id())))
+        {
+            let _ = writeln!(log, "{:?} {}", std::time::SystemTime::now(), message());
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -429,9 +449,15 @@ fn broker() -> Result<()> {
     let expected = recorded_host()?;
     let exe = std::env::current_exe()?;
     let mut agents = Vec::new();
-    for session in agent_sessions(&hosts(&expected)) {
-        if let Ok(agent) = start_agent(&exe, session) {
-            agents.push(agent);
+    let found = hosts(&expected);
+    trace(|| format!("hosts of {}: {found:?}", expected.display()));
+    for session in agent_sessions(&found) {
+        let Some(user) = session_user(&found, session) else {
+            continue;
+        };
+        match start_agent(&exe, session, &user) {
+            Ok(agent) => agents.push(agent),
+            Err(e) => trace(|| format!("agent for session {session}: {e:#}")),
         }
     }
     for agent in agents {
@@ -441,10 +467,47 @@ fn broker() -> Result<()> {
     Ok(())
 }
 
+/// The agent process's security. A SYSTEM token's default would let no
+/// one else open it, and the host must read its image path to trust the
+/// pipe: so SYSTEM fully, the user only that and waiting on it.
+fn agent_process_sddl(user_sid: &str) -> String {
+    format!("D:P(A;;GA;;;SY)(A;;0x00101000;;;{user_sid})")
+}
+
 /// Starts `exe` (this very executable) as SYSTEM in `session`, on the
 /// interactive window station's default desktop.
-fn start_agent(exe: &Path, session: u32) -> Result<Handle> {
+fn start_agent(exe: &Path, session: u32, user_sid: &str) -> Result<Handle> {
     let own = own_token(TOKEN_DUPLICATE | TOKEN_QUERY)?;
+    let sddl = HSTRING::from(agent_process_sddl(user_sid));
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: Allocated by the call, freed below after process creation.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )?;
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: false.into(),
+    };
+    let started = start_agent_as(&own, exe, session, &attributes);
+    // SAFETY: Allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
+    unsafe {
+        LocalFree(HLOCAL(descriptor.0));
+    }
+    started
+}
+
+fn start_agent_as(
+    own: &Handle,
+    exe: &Path,
+    session: u32,
+    process_security: &SECURITY_ATTRIBUTES,
+) -> Result<Handle> {
     let mut token = HANDLE::default();
     // SAFETY: Each handle is owned; the session id is a local u32; the
     // strings outlive the call; the thread handle is closed at once.
@@ -481,7 +544,7 @@ fn start_agent(exe: &Path, session: u32) -> Result<Handle> {
             token.0,
             &HSTRING::from(exe.as_os_str()),
             PWSTR(line.as_mut_ptr()),
-            None,
+            Some(process_security),
             None,
             false,
             CREATE_NO_WINDOW,
@@ -507,8 +570,10 @@ fn serve(system: bool) -> Result<()> {
         super::desktop::enable_following();
         session_user(&hosts(&expected), session).context("no host runs in this session")?
     } else {
+        // (An elevated helper's user is its own.)
         user_sid(&token)?
     };
+    trace(|| format!("serving {} for {user}", pipe_name(session)));
     let name = HSTRING::from(pipe_name(session));
     let sddl = HSTRING::from(pipe_sddl(&user, system));
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
@@ -561,6 +626,7 @@ fn serve(system: bool) -> Result<()> {
             )
         };
         if pipe.is_invalid() {
+            trace(|| format!("create pipe: {}", windows::core::Error::from_win32()));
             if first {
                 bail!(
                     "create the input pipe: {}",
@@ -584,11 +650,13 @@ fn serve(system: bool) -> Result<()> {
         if unsafe { GetNamedPipeClientSessionId(pipe, &mut client_session) }.is_err()
             || client_session != session
         {
+            trace(|| format!("refused a client in session {client_session}"));
             continue;
         }
         let mut pid = 0;
         // SAFETY: The pipe is connected and the output points to a local.
         if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) }.is_err() {
+            trace(|| "client process id unreadable".into());
             continue;
         }
         // The client's identity is read through the very handle the frames
@@ -598,16 +666,26 @@ fn serve(system: bool) -> Result<()> {
         } else {
             PROCESS_QUERY_LIMITED_INFORMATION
         };
-        let Ok(client) = open_process(pid, access) else {
-            continue;
+        let client = match open_process(pid, access) {
+            Ok(client) => client,
+            Err(e) => {
+                trace(|| format!("open client {pid}: {e:#}"));
+                continue;
+            }
         };
-        if !image(&client).is_ok_and(|image| same_file_name(&image, &expected)) {
+        let client_image = image(&client);
+        if !client_image
+            .as_ref()
+            .is_ok_and(|image| same_file_name(image, &expected))
+        {
+            trace(|| format!("refused client {pid}: {client_image:?}"));
             continue;
         }
         active.fetch_add(1, Ordering::AcqRel);
         let (active, last, user) = (active.clone(), last.clone(), user.clone());
         thread::spawn(move || {
-            let _ = serve_connection(file, &client, &user, system);
+            let result = serve_connection(file, &client, &user, system);
+            trace(|| format!("client {pid} done: {result:?}"));
             *last.lock() = Instant::now();
             active.fetch_sub(1, Ordering::AcqRel);
         });
@@ -1246,6 +1324,28 @@ mod tests {
     }
 
     #[test]
+    fn only_the_user_may_look_the_agent_process_up() {
+        let sddl = agent_process_sddl("S-1-5-21-1-2-3-1001");
+        assert!(sddl.starts_with("D:P(A;;GA;;;SY)"));
+        // PROCESS_QUERY_LIMITED_INFORMATION and SYNCHRONIZE, nothing that
+        // could read its memory, inject into it or end it.
+        assert!(sddl.ends_with("(A;;0x00101000;;;S-1-5-21-1-2-3-1001)"));
+        assert_eq!(sddl.matches("(A;").count(), 2);
+        for denied in [
+            0x0001,
+            0x0002,
+            0x0008,
+            0x0010,
+            0x0020,
+            0x0040,
+            0x0400,
+            0x0004_0000,
+        ] {
+            assert_eq!(0x0010_1000 & denied, 0, "{denied:#x}");
+        }
+    }
+
+    #[test]
     fn the_token_decides_the_role() {
         assert_eq!(role_of("S-1-5-18", 0), Role::Broker);
         assert_eq!(role_of("S-1-5-18", 1), Role::Agent);
@@ -1377,7 +1477,9 @@ mod tests {
     #[ignore]
     fn live_system_agent_serves_this_session() -> Result<()> {
         let started = Instant::now();
-        let mut client = connect_now().context("the helper did not answer")?;
+        let own = session(&own_token(TOKEN_QUERY)?)?;
+        let expected = helper_exe().context("no helper path")?;
+        let mut client = with_helper(|| Client::connect(own, &expected), |_| true)?;
         eprintln!("input helper answered after {:?}", started.elapsed());
         client
             .apply(&Event::ReleaseAll, DisplayRect::default())
@@ -1389,7 +1491,6 @@ mod tests {
         let mut server_session = 0;
         // SAFETY: Writes the session id into a local.
         unsafe { ProcessIdToSessionId(pid, &mut server_session)? };
-        let own = session(&own_token(TOKEN_QUERY)?)?;
         eprintln!(
             "pipe server: pid {pid}, {}, session {server_session} (this test: session {own})",
             image(&process)?.display()
