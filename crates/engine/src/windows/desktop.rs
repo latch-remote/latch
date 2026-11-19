@@ -109,10 +109,12 @@ pub(super) fn follow() -> Result<bool> {
         )
     }
     .context("open the input desktop")?;
-    let desktop = Desktop {
+    // Owned before the name is read, so a failed read still closes it.
+    let mut desktop = Desktop {
         handle,
-        name: name(handle)?,
+        name: String::new(),
     };
+    desktop.name = name(desktop.handle)?;
     CURRENT.with(|followed| {
         let mut slot = followed.borrow_mut();
         if slot.is_none() {
