@@ -203,8 +203,11 @@ fn main() -> Result<()> {
 
 fn run_setup() -> Result<()> {
     let exe = std::env::current_exe()?;
+    // Read only: an administrator may run --setup, and the elevated
+    // process must neither write to the user's folder nor start PowerShell
+    // to migrate it.
     latch_host::setup::run(&latch_host::setup::Plan {
-        elevated_input: latch_host::config::HostConfig::load().elevated_input,
+        elevated_input: latch_host::config::HostConfig::load_read_only().elevated_input,
         exe: &exe,
         adapter: "",
         adapter_description: "",

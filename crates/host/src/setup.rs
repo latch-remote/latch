@@ -28,11 +28,10 @@ pub fn log_path() -> Option<PathBuf> {
 /// Under `%ProgramFiles%`, which only administrators can change.
 const SETUP_DIR: &str = r"Latch\Setup";
 
-/// Windows' own PowerShell, by full path. A bare `powershell` is looked
-/// for in the running executable's folder first, which for Latch is one
-/// the user can write to.
+/// Windows' system folder (`System32`), from Windows itself rather than
+/// an environment variable the caller chose.
 #[cfg(any(windows, test))]
-fn powershell_exe() -> PathBuf {
+fn system_dir() -> PathBuf {
     #[cfg(windows)]
     {
         #[link(name = "kernel32")]
@@ -47,10 +46,70 @@ fn powershell_exe() -> PathBuf {
             "Windows system directory unavailable"
         );
         PathBuf::from(String::from_utf16_lossy(&buffer[..n]))
-            .join(r"WindowsPowerShell\v1.0\powershell.exe")
     }
     #[cfg(not(windows))]
-    PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+    PathBuf::from(r"C:\Windows\System32")
+}
+
+/// Windows' own PowerShell, by full path. A bare `powershell` is looked
+/// for in the running executable's folder first, which for Latch is one
+/// the user can write to.
+#[cfg(any(windows, test))]
+fn powershell_exe() -> PathBuf {
+    system_dir().join(r"WindowsPowerShell\v1.0\powershell.exe")
+}
+
+/// `program` (a file in [`system_dir`]) in an environment the caller
+/// cannot steer, as setup needs it whenever it may run elevated: `PATH` is
+/// only the system folder, PowerShell loads modules only from Windows' own
+/// folder (Windows PowerShell 5.1 otherwise looks in the user's Documents
+/// first, which their unelevated processes can write to), and the working
+/// directory is the system folder. No window.
+#[cfg(any(windows, test))]
+fn trusted_command(program: &Path) -> std::process::Command {
+    let system = system_dir();
+    let mut command = std::process::Command::new(program);
+    command
+        .env("PATH", &system)
+        .env(
+            "PSModulePath",
+            system.join(r"WindowsPowerShell\v1.0\Modules"),
+        )
+        .current_dir(&system);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command
+}
+
+/// Windows' PowerShell as [`trusted_command`] starts it, without the
+/// user's profile scripts and without prompts.
+#[cfg(any(windows, test))]
+fn powershell_command() -> std::process::Command {
+    let mut command = trusted_command(&powershell_exe());
+    command.args(["-NoProfile", "-NonInteractive"]);
+    command
+}
+
+/// Windows' `schtasks.exe`, as [`trusted_command`] starts it.
+#[cfg(any(windows, test))]
+fn schtasks_command() -> std::process::Command {
+    trusted_command(&system_dir().join("schtasks.exe"))
+}
+
+/// Whether the task `name` is registered and this user may see it, as
+/// `schtasks.exe` says (no PowerShell module is loaded to ask).
+#[cfg(windows)]
+pub(crate) fn task_registered(name: &str) -> bool {
+    schtasks_command()
+        .args(["/Query", "/TN", name])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// What the administrator step exits with when it never ran setup.
@@ -529,7 +588,6 @@ pub fn run(p: &Plan<'_>) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         static WARNED: parking_lot::Mutex<Option<std::time::Instant>> =
             parking_lot::Mutex::new(None);
         let viewer = latch_core::http::get_json::<latch_core::api::Status>(
@@ -561,9 +619,8 @@ pub fn run(p: &Plan<'_>) -> Result<()> {
             &user_sid,
             p.elevated_input,
         ));
-        let status = std::process::Command::new(powershell_exe())
-            .args(["-NoProfile", "-NonInteractive", "-Command", &launch])
-            .creation_flags(0x0800_0000)
+        let status = powershell_command()
+            .args(["-Command", &launch])
             .status()
             .context("launch elevated Latch Host")?;
         anyhow::ensure!(status.success(), elevation_error(status.code()));
@@ -590,10 +647,9 @@ fn refuse_during_stream(
 /// Run a read-only PowerShell probe and return what it printed.
 #[cfg(windows)]
 pub(crate) fn powershell(script: &str) -> Result<String> {
-    use std::os::windows::process::CommandExt;
-    let out = std::process::Command::new(powershell_exe())
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .creation_flags(0x0800_0000)
+    let out = powershell_command()
+        .args(["-Command", script])
+        .stdin(std::process::Stdio::null())
         .output()
         .context("run powershell")?;
     anyhow::ensure!(
@@ -661,7 +717,6 @@ pub fn run_as_admin(
 ) -> Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         let exe = std::env::current_exe().context("own path")?;
         let Some(program) = program else {
             let sha256 = latch_core::update::sha256_hex(&std::fs::read(&exe)?);
@@ -670,12 +725,11 @@ pub fn run_as_admin(
                 &exe.display().to_string(),
                 &sha256,
                 &user_sid,
-                crate::config::HostConfig::load().elevated_input,
+                crate::config::HostConfig::load_read_only().elevated_input,
             );
-            let status = std::process::Command::new(powershell_exe())
-                .args(["-NoProfile", "-NonInteractive", "-EncodedCommand"])
+            let status = powershell_command()
+                .arg("-EncodedCommand")
                 .arg(encoded_command(&stage))
-                .creation_flags(0x0800_0000)
                 .status()
                 .context("run the setup copy")?;
             anyhow::ensure!(status.success(), elevation_error(status.code()));
@@ -710,7 +764,7 @@ pub fn run_as_admin(
         let wake = crate::wake::probe();
         let plan = Plan {
             elevated_input: elevated_input
-                .unwrap_or_else(|| crate::config::HostConfig::load().elevated_input),
+                .unwrap_or_else(|| crate::config::HostConfig::load_read_only().elevated_input),
             exe: program,
             adapter: &wake.adapter,
             adapter_description: &wake.description,
@@ -750,10 +804,8 @@ pub fn run_as_admin(
         let log = dir.join("setup.log");
         let out = std::fs::File::create(&log)?;
         let err = out.try_clone()?;
-        let status = std::process::Command::new(powershell_exe())
+        let status = powershell_command()
             .args([
-                "-NoProfile",
-                "-NonInteractive",
                 "-ExecutionPolicy",
                 "Bypass",
                 "-File",
@@ -761,7 +813,6 @@ pub fn run_as_admin(
             ])
             .stdout(out)
             .stderr(err)
-            .creation_flags(0x0800_0000)
             .status();
         let _ = std::fs::remove_file(&tmp);
         let status = status.context("run setup script")?;
@@ -824,11 +875,9 @@ fn plausible_program(path: &str) -> bool {
 pub fn uninstall() -> Result<Vec<String>> {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        let user = std::process::Command::new(powershell_exe())
-            .args(["-NoProfile", "-NonInteractive", "-EncodedCommand"])
+        let user = powershell_command()
+            .arg("-EncodedCommand")
             .arg(encoded_command(&uninstall_user_ps(std::process::id())))
-            .creation_flags(0x0800_0000)
             .output()
             .context("run the uninstall script")?;
         let mut done: Vec<String> = String::from_utf8_lossy(&user.stdout)
@@ -837,14 +886,8 @@ pub fn uninstall() -> Result<Vec<String>> {
             .filter(|l| !l.is_empty())
             .map(String::from)
             .collect();
-        let status = std::process::Command::new(powershell_exe())
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &launch_script(&uninstall_machine_ps()),
-            ])
-            .creation_flags(0x0800_0000)
+        let status = powershell_command()
+            .args(["-Command", &launch_script(&uninstall_machine_ps())])
             .status()
             .context("launch the administrator step")?;
         match status.code() {
@@ -1494,6 +1537,80 @@ mod tests {
         assert_eq!(INPUT_TASK, latch_engine::windows::INPUT_TASK);
         let exe = latch_engine::windows::input_helper_exe().unwrap();
         assert!(exe.ends_with(r"Latch\Input\latch-host.exe"));
+    }
+
+    /// Every PowerShell and schtasks setup starts is Windows' own, by full
+    /// path, without profiles, finding modules and programs only in the
+    /// system folder and starting there: nothing the user can write is
+    /// loaded into a process that may be elevated.
+    #[test]
+    fn setup_starts_windows_tools_in_a_trusted_environment() {
+        let system = system_dir();
+        for (command, program) in [
+            (powershell_command(), powershell_exe()),
+            (schtasks_command(), system.join("schtasks.exe")),
+        ] {
+            assert_eq!(Path::new(command.get_program()), program);
+            assert!(program.starts_with(&system));
+            assert_eq!(command.get_current_dir(), Some(system.as_path()));
+            let envs: std::collections::HashMap<_, _> = command
+                .get_envs()
+                .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(PathBuf::from)))
+                .collect();
+            assert_eq!(envs.get("PATH"), Some(&Some(system.clone())));
+            assert_eq!(
+                envs.get("PSModulePath"),
+                Some(&Some(system.join(r"WindowsPowerShell\v1.0\Modules")))
+            );
+        }
+        let args: Vec<_> = powershell_command()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["-NoProfile", "-NonInteractive"]);
+        // No other way to start them is left in setup.
+        let source = include_str!("setup.rs");
+        let spawn = ["std::process::Command::new(", "powershell_exe())"].concat();
+        assert!(!source.contains(&spawn));
+        assert_eq!(
+            source
+                .matches(&["Command::new(", "program)"].concat())
+                .count(),
+            1
+        );
+    }
+
+    /// What PowerShell itself reports in that environment: no user module
+    /// folder, and the system folder as its location.
+    #[cfg(windows)]
+    #[test]
+    fn trusted_powershell_sees_only_system_modules() {
+        let out = powershell(
+            "Write-Output $env:PSModulePath; Write-Output $env:PATH; Write-Output (Get-Location).Path",
+        )
+        .unwrap();
+        let lines: Vec<_> = out.lines().map(str::trim).collect();
+        let system = system_dir().display().to_string();
+        let modules = system_dir()
+            .join(r"WindowsPowerShell\v1.0\Modules")
+            .display()
+            .to_string();
+        let documents = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users".into());
+        assert!(
+            lines[0].split(';').all(|dir| !dir
+                .to_ascii_lowercase()
+                .starts_with(&documents.to_ascii_lowercase())),
+            "{out}"
+        );
+        assert!(
+            lines[0]
+                .split(';')
+                .any(|dir| dir.eq_ignore_ascii_case(&modules)),
+            "{out}"
+        );
+        assert!(lines[1].eq_ignore_ascii_case(&system), "{out}");
+        assert!(lines[2].eq_ignore_ascii_case(&system), "{out}");
+        assert!(!task_registered("LatchNoSuchTask-7f3a"));
     }
 
     #[test]
