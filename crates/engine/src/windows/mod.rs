@@ -373,21 +373,23 @@ impl MfPipeline {
             {
                 let device = self.capture.gpu.device.as_raw();
                 let size = (self.capture.display.width, self.capture.display.height);
-                // Only a new picture goes ahead; repeats wait their turn.
-                if self.capture.grab(Duration::ZERO)? {
-                    if device != self.capture.gpu.device.as_raw()
-                        || size != (self.capture.display.width, self.capture.display.height)
-                    {
-                        self.moved = true;
-                    } else {
-                        self.pacer.taken(Instant::now());
-                        self.last_capture = self.capture.captured;
-                        let picture = self.converter.convert(&self.capture.frame)?;
-                        let (number, recovery) = encoder.submit(&picture.texture, false)?;
-                        self.last_picture = self.last_picture.max(self.picture_base + number);
-                        self.ahead
-                            .push_back((self.last_capture, false, number, recovery));
-                    }
+                let grabbed = self.capture.grab(Duration::ZERO)?;
+                // A reopen (after unlock, or a deferred resize) can change the
+                // size or device without delivering a picture yet: notice it
+                // either way, or the stream keeps the old size.
+                if device != self.capture.gpu.device.as_raw()
+                    || size != (self.capture.display.width, self.capture.display.height)
+                {
+                    self.moved = true;
+                } else if grabbed {
+                    // Only a new picture goes ahead; repeats wait their turn.
+                    self.pacer.taken(Instant::now());
+                    self.last_capture = self.capture.captured;
+                    let picture = self.converter.convert(&self.capture.frame)?;
+                    let (number, recovery) = encoder.submit(&picture.texture, false)?;
+                    self.last_picture = self.last_picture.max(self.picture_base + number);
+                    self.ahead
+                        .push_back((self.last_capture, false, number, recovery));
                 }
             }
             if Instant::now() >= deadline {
