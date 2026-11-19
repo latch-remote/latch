@@ -14,7 +14,9 @@ use windows::{
     core::PCWSTR,
     Win32::{
         Devices::Display::*,
-        Foundation::{ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, E_ACCESSDENIED, HWND},
+        Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, E_ACCESSDENIED, HWND, WIN32_ERROR,
+        },
         Graphics::{Dxgi::*, Gdi::*},
         System::StationsAndDesktops::{
             CloseDesktop, OpenInputDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS,
@@ -228,7 +230,10 @@ fn topology() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_IN
         let (mut np, mut nm) = (0, 0);
         // SAFETY: Sized output arrays remain live through the query.
         unsafe {
-            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).ok()?;
+            query_result(
+                "GetDisplayConfigBufferSizes",
+                GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm),
+            )?;
             let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
             let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
             let rc = QueryDisplayConfig(
@@ -242,13 +247,22 @@ fn topology() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_IN
             if rc == ERROR_INSUFFICIENT_BUFFER {
                 continue;
             }
-            rc.ok()?;
+            query_result("QueryDisplayConfig", rc)?;
             paths.truncate(np as usize);
             modes.truncate(nm as usize);
             return Ok((paths, modes));
         }
     }
     bail!("display topology kept changing")
+}
+/// Windows refuses to read the topology to a process without access to the
+/// input desktop (a lock, an administrator prompt): the same as a denied
+/// change, which defers.
+fn query_result(call: &'static str, rc: WIN32_ERROR) -> Result<()> {
+    if rc == ERROR_ACCESS_DENIED {
+        return Err(anyhow::anyhow!("{call} returned {}", rc.0).context(DesktopUnavailable));
+    }
+    rc.ok().context(call)
 }
 fn apply_topology(
     paths: &[DISPLAYCONFIG_PATH_INFO],
@@ -820,7 +834,7 @@ fn prepare_mode(
         );
     }
     mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
-    let (paths, modes) = topology()?;
+    let active = topology();
     let mut previous = state.saved.as_ref().map_or(
         Previous {
             width: original.dmPelsWidth,
@@ -831,6 +845,13 @@ fn prepare_mode(
         |saved| saved.previous.clone(),
     );
     previous.generation = state.generation;
+    // Denied (a lock, an administrator prompt): this generation defers
+    // before it changed or saved anything, and its retry reads and saves
+    // the topology once the desktop is back.
+    let (paths, modes) = match active {
+        Ok(topology) => topology,
+        Err(error) => return Preparation::from_change(previous, Err(error)).map(Some),
+    };
     let adapters = if state.saved.is_none() {
         // Record adapter identity before only_virtual detaches physical outputs.
         let attached = outputs()?;
@@ -1107,6 +1128,90 @@ mod tests {
             assert_eq!(writes.get(), if sizes[0] == requested { 1 } else { 2 });
             assert_eq!(reads.get(), writes.get());
         }
+    }
+
+    #[test]
+    fn a_denied_topology_read_defers_like_a_denied_change() {
+        use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_SUCCESS};
+
+        assert!(query_result("QueryDisplayConfig", ERROR_SUCCESS).is_ok());
+        let denied = query_result("QueryDisplayConfig", ERROR_ACCESS_DENIED).unwrap_err();
+        assert!(DesktopUnavailable::is(&denied));
+        let other = query_result("GetDisplayConfigBufferSizes", ERROR_INVALID_PARAMETER);
+        assert!(!DesktopUnavailable::is(&other.unwrap_err()));
+        // As prepare_mode passes it on: a deferral of this generation, not
+        // an error that refuses the stream.
+        let mut state = saved_display();
+        state.saved = None;
+        let generation = state.begin_prepare();
+        let previous = Previous {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+            generation,
+        };
+        let prepared = state
+            .prepare_session(
+                |_| panic!("nothing to recover"),
+                |_| Preparation::from_change(previous.clone(), Err(denied)).map(Some),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(prepared.deferred);
+        assert_eq!(prepared.previous.generation, generation);
+        assert!(state.saved.is_none(), "nothing saved while denied");
+    }
+
+    #[test]
+    fn a_deferral_without_a_saved_topology_saves_it_when_applied() {
+        let mut state = saved_display();
+        let mut original = state.saved.take().unwrap();
+        let stale = state.begin_prepare();
+        state.deferred_prepare = Some(ModeRequest {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            display: None,
+        });
+        // A newer session drops the stale deferral: it never applies there.
+        let generation = state.begin_prepare();
+        let stopping = AtomicBool::new(false);
+        assert!(state
+            .retry_prepare(stale, &stopping, |_, _| panic!("stale deferral"))
+            .is_none());
+        assert!(state
+            .retry_prepare(generation, &stopping, |_, _| panic!("dropped"))
+            .is_none());
+        state.deferred_prepare = Some(ModeRequest {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            display: None,
+        });
+        // The current one applies once the desktop is back, saving the
+        // topology then, and its undo restores that.
+        assert!(state
+            .retry_prepare(generation, &stopping, |state, _| {
+                assert!(state.saved.is_none());
+                original.previous.generation = generation;
+                state.saved = Some(original);
+                Ok(true)
+            })
+            .unwrap()
+            .unwrap());
+        let restored = Cell::new(false);
+        assert!(state
+            .attempt(stale, |_| panic!("a stale undo restored"))
+            .is_none());
+        state
+            .attempt(generation, |saved| {
+                assert_eq!(saved.previous.generation, generation);
+                restored.set(true);
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        assert!(restored.get() && state.saved.is_none());
     }
 
     #[test]
