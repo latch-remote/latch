@@ -1,13 +1,14 @@
 //! The cursor uses a pixel shader compiled by the system d3dcompiler_47.dll.
 //! This preserves XOR cursors without reading the desktop back to the CPU.
 use super::display;
+use super::{elevated, frames::Frames};
 use crate::windows_cursor::{CaptureState, Control, Owner, Plane, PointerSample, ShapeInfo};
 use crate::{
     input::DisplayRect,
     software::{Bgra, CpuCapture},
 };
 use anyhow::{Context, Result};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::{
     mem::ManuallyDrop,
     thread,
@@ -458,6 +459,147 @@ fn shape_info(info: &DXGI_OUTDUPL_POINTER_SHAPE_INFO) -> ShapeInfo {
     }
 }
 
+/// Which output a capture duplicates.
+#[derive(Clone)]
+pub(super) enum Target {
+    /// The one the viewer chose (its monitor device path), else the default.
+    Named(Option<String>),
+    /// Exactly this one: the SYSTEM helper captures what the host names.
+    Exact { luid: (i32, u32), name: [u16; 32] },
+}
+impl Target {
+    fn select(&self) -> Result<display::Output> {
+        match self {
+            Self::Named(wanted) => display::select_named(wanted.as_deref()),
+            Self::Exact { luid, name } => {
+                // SAFETY: The factory and enumerated interfaces are owned COM references.
+                unsafe {
+                    let factory: IDXGIFactory4 = CreateDXGIFactory1()?;
+                    let adapter: IDXGIAdapter1 = factory
+                        .EnumAdapterByLuid(LUID {
+                            HighPart: luid.0,
+                            LowPart: luid.1,
+                        })
+                        .context("find the stream's adapter")?;
+                    for i in 0.. {
+                        let output = match adapter.EnumOutputs(i) {
+                            Ok(o) => o,
+                            Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+                            Err(e) => return Err(e).context("enumerate outputs"),
+                        };
+                        let desc = output.GetDesc()?;
+                        if desc.DeviceName == *name && desc.AttachedToDesktop.as_bool() {
+                            return Ok(display::Output {
+                                adapter,
+                                output,
+                                desc,
+                                virtual_display: false,
+                                id: String::new(),
+                            });
+                        }
+                    }
+                    anyhow::bail!("the stream's output is not attached to the desktop")
+                }
+            }
+        }
+    }
+}
+
+/// How long a stream waits for its own desktop to come back after Windows
+/// took it, with no helper to show the secure desktop meanwhile.
+const OWN_LIMIT: Duration = Duration::from_secs(5);
+/// The same while the SYSTEM helper starts: the task, its agent in this
+/// session and its first frame.
+const HELPER_LIMIT: Duration = Duration::from_secs(15);
+/// A loss that is not an access denial (a mode change, a driver reset)
+/// usually ends by itself; the helper is asked only once it lasts this long.
+const HELPER_AFTER: Duration = Duration::from_secs(1);
+
+/// Where frames come from while the host cannot duplicate its own desktop.
+/// Kept apart from the GPU work so the switching can be tested.
+#[derive(Debug, Default)]
+struct Fallback {
+    /// When the host's own duplication went away; `None` while it works.
+    lost: Option<Instant>,
+    /// Setup installed the helper.
+    installed: bool,
+    /// The helper could not serve this loss: an older one, or it failed.
+    /// The next loss asks again.
+    failed: bool,
+    connecting: bool,
+    serving: bool,
+}
+impl Fallback {
+    fn new(helper_installed: bool) -> Self {
+        Self {
+            installed: helper_installed,
+            ..Default::default()
+        }
+    }
+    /// No helper serves this loss, so the stream ends after [`OWN_LIMIT`]
+    /// as it did before there was one.
+    fn unavailable(&self) -> bool {
+        !self.installed || self.failed
+    }
+    fn lose(&mut self, now: Instant) {
+        self.lost.get_or_insert(now);
+    }
+    /// The host duplicates its own desktop again; any helper is let go.
+    fn regain(&mut self) {
+        self.lost = None;
+        self.failed = false;
+        self.connecting = false;
+        self.serving = false;
+    }
+    /// Whether to ask the helper now. `denied`: the last attempt to
+    /// duplicate was refused, as on the secure desktop.
+    fn wants_helper(&self, now: Instant, denied: bool) -> bool {
+        !self.unavailable()
+            && !self.connecting
+            && !self.serving
+            && self
+                .lost
+                .is_some_and(|t| denied || now.saturating_duration_since(t) >= HELPER_AFTER)
+    }
+    fn connecting(&mut self) {
+        self.connecting = true;
+    }
+    fn connected(&mut self) {
+        self.connecting = false;
+        self.serving = true;
+    }
+    fn failed(&mut self) {
+        self.failed = true;
+        self.connecting = false;
+        self.serving = false;
+    }
+    /// The stream should end: neither its own desktop nor the helper's
+    /// frames came back in time.
+    fn expired(&self, now: Instant) -> bool {
+        let limit = if self.unavailable() {
+            OWN_LIMIT
+        } else {
+            HELPER_LIMIT
+        };
+        !self.serving
+            && self
+                .lost
+                .is_some_and(|t| now.saturating_duration_since(t) >= limit)
+    }
+    /// Whether the last picture may be repeated meanwhile: only while the
+    /// helper can still take over, so a stream without one never shows a
+    /// stale desktop.
+    fn keeps_picture(&self) -> bool {
+        !self.unavailable()
+    }
+}
+
+enum Helper {
+    Off,
+    Connecting(mpsc::Receiver<Result<Frames>>),
+    Serving(Frames),
+}
+
 pub(super) struct Capture {
     plane: Plane,
     stream_size: (u32, u32),
@@ -484,24 +626,21 @@ pub(super) struct Capture {
     white: f32,
     retry: ReopenBackoff,
     staging: Option<ID3D11Texture2D>,
-    /// The output the viewer chose (its monitor device path), kept across reopens.
-    wanted: Option<String>,
+    /// The output to capture, kept across reopens.
+    target: Target,
+    fallback: Fallback,
+    helper: Helper,
 }
 struct ReopenBackoff {
-    started: Instant,
     at: Instant,
     delay: Duration,
 }
 impl ReopenBackoff {
     fn new() -> Self {
         Self {
-            started: Instant::now(),
             at: Instant::now(),
             delay: Duration::from_millis(50),
         }
-    }
-    fn expired(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.started) >= Duration::from_secs(5)
     }
     fn defer(&mut self, now: Instant) {
         self.at = now + self.delay;
@@ -574,8 +713,28 @@ impl Capture {
         color: latch_proto::color::ColorDescription,
         wanted: Option<&str>,
     ) -> Result<Self> {
+        let mut capture = Self::open_with(color, Target::Named(wanted.map(str::to_owned)), true)?;
+        if capture.duplication.is_none() {
+            // The secure desktop is up as the stream starts: it opens on the
+            // helper's frames, or not at all.
+            capture.first_helper_frame()?;
+        }
+        Ok(capture)
+    }
+    /// Duplicates `target`, as the SYSTEM helper does for a host.
+    pub fn open(color: latch_proto::color::ColorDescription, target: Target) -> Result<Self> {
+        Self::open_with(color, target, false)
+    }
+    /// `secure`: when Windows denies the duplication (the secure desktop),
+    /// open without one and connect the helper, if it is set up.
+    fn open_with(
+        color: latch_proto::color::ColorDescription,
+        target: Target,
+        secure: bool,
+    ) -> Result<Self> {
         let _dpi = display::DpiAwareness::physical();
-        let output = display::select_named(wanted)?;
+        let _ = super::desktop::follow();
+        let output = target.select()?;
         let ten_bit = color.bit_depth == 10;
         let hdr_output = color.is_hdr()
             && unsafe {
@@ -586,14 +745,45 @@ impl Capture {
                     .is_ok_and(|d| d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
             };
         let gpu = Gpu::new(&output.adapter)?;
-        let duplication = duplicate(&output, &gpu)?;
-        // SAFETY: The duplication owns its descriptor.
-        let desc = unsafe { duplication.GetDesc() };
-        let display = desktop_rect(&desc, output.desc.DesktopCoordinates);
+        let installed = !super::desktop::following() && elevated::frames_installed();
+        let (duplication, display, source_size, rotation) = match duplicate(&output, &gpu) {
+            Ok(duplication) => {
+                // SAFETY: The duplication owns its descriptor.
+                let desc = unsafe { duplication.GetDesc() };
+                (
+                    Some(duplication),
+                    desktop_rect(&desc, output.desc.DesktopCoordinates),
+                    (
+                        desc.ModeDesc.Width,
+                        desc.ModeDesc.Height,
+                        desc.ModeDesc.Format,
+                    ),
+                    desc.Rotation,
+                )
+            }
+            Err(e) if secure && installed && crate::video::DesktopUnavailable::is(&e) => {
+                // The helper's frames are upright BGRA of the desktop's size.
+                let r = output.desc.DesktopCoordinates;
+                let display = DisplayRect {
+                    x: r.left,
+                    y: r.top,
+                    width: (r.right - r.left).max(0) as u32,
+                    height: (r.bottom - r.top).max(0) as u32,
+                };
+                anyhow::ensure!(display.width > 0 && display.height > 0, e);
+                (
+                    None,
+                    display,
+                    (display.width, display.height, DXGI_FORMAT_B8G8R8A8_UNORM),
+                    output.desc.Rotation,
+                )
+            }
+            Err(e) => return Err(e),
+        };
         let source = gpu.texture(
-            desc.ModeDesc.Width,
-            desc.ModeDesc.Height,
-            desc.ModeDesc.Format,
+            source_size.0,
+            source_size.1,
+            source_size.2,
             D3D11_BIND_SHADER_RESOURCE.0 as u32,
             false,
         )?;
@@ -609,6 +799,10 @@ impl Capture {
             false,
         )?;
         let renderer = CursorRenderer::new(&gpu)?;
+        let mut fallback = Fallback::new(installed);
+        if duplication.is_none() {
+            fallback.lose(Instant::now());
+        }
         Ok(Self {
             plane: Plane::new(Control::composited()),
             stream_size: (display.width, display.height),
@@ -618,7 +812,7 @@ impl Capture {
             hdr_output,
             ten_bit,
             gpu,
-            duplication: Some(duplication),
+            duplication,
             source,
             frame,
             renderer,
@@ -627,7 +821,7 @@ impl Capture {
             bitmap: Vec::new(),
             output_id: output.id.clone(),
             output_name: output.desc.DeviceName,
-            rotation: desc.Rotation,
+            rotation,
             display,
             has_frame: false,
             captured: Instant::now(),
@@ -635,8 +829,52 @@ impl Capture {
             white: display::sdr_white_level(&output.desc.DeviceName),
             retry: ReopenBackoff::new(),
             staging: None,
-            wanted: wanted.map(str::to_owned),
+            target,
+            fallback,
+            helper: Helper::Off,
         })
+    }
+    /// Opening on the secure desktop: waits for the helper's first frame,
+    /// or fails as a denied duplication does without a helper.
+    fn first_helper_frame(&mut self) -> Result<()> {
+        let unavailable = || {
+            anyhow::Error::msg("duplicate desktop output: the secure desktop is up")
+                .context(crate::video::DesktopUnavailable)
+        };
+        let frames = match elevated::connect_frames(self.want()) {
+            Ok(frames) => frames,
+            Err(e) => {
+                tracing::warn!(
+                    "the secure desktop is up and the screen helper did not answer: {e:#}"
+                );
+                return Err(unavailable());
+            }
+        };
+        self.helper = Helper::Serving(frames);
+        self.fallback.connected();
+        let deadline = Instant::now() + OWN_LIMIT;
+        while Instant::now() < deadline {
+            match self.helper_frame(Duration::from_millis(100)) {
+                Ok(true) => {
+                    tracing::info!(
+                        "the secure desktop is up: showing it through the SYSTEM helper"
+                    );
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!("the screen helper stopped: {e:#}");
+                    break;
+                }
+            }
+        }
+        Err(unavailable())
+    }
+    fn want(&self) -> super::frames::Want {
+        super::frames::Want {
+            luid: self.gpu.adapter,
+            name: self.output_name,
+        }
     }
     pub fn cursor_control(&mut self, control: Arc<Control>, size: (u32, u32)) {
         self.plane = Plane::new(control);
@@ -808,7 +1046,9 @@ impl Capture {
     }
     fn reopen(&mut self) -> Result<()> {
         let _dpi = display::DpiAwareness::physical();
-        let output = display::select_named(self.wanted.as_deref())?;
+        // The helper first moves to whichever desktop now has input.
+        super::desktop::follow()?;
+        let output = self.target.select()?;
         // Reuse the device and cursor shaders while the adapter is unchanged.
         // SAFETY: both descriptors are copied from live DXGI interfaces.
         let (old, new) = unsafe {
@@ -831,7 +1071,7 @@ impl Capture {
                 color.transfer = 16;
             }
             let hdr_output = self.hdr_output;
-            let mut replacement = Self::new_color(color, self.wanted.as_deref())?;
+            let mut replacement = Self::open(color, self.target.clone())?;
             std::mem::swap(&mut replacement.plane, &mut self.plane);
             replacement.stream_size = self.stream_size;
             let same_output = self.same_output(&replacement.output_id, replacement.output_name);
@@ -895,6 +1135,154 @@ impl Capture {
         self.retry = ReopenBackoff::new();
         Ok(())
     }
+    /// While the host cannot duplicate its own desktop: retries it on the
+    /// backoff, shows the helper's frames meanwhile, and fails once neither
+    /// came back in time. `None`: the own desktop is back; acquire from it.
+    fn without_own_desktop(&mut self, timeout: Duration) -> Result<Option<bool>> {
+        self.poll_helper();
+        let now = Instant::now();
+        if now >= self.retry.at {
+            match self.reopen() {
+                Ok(()) => {
+                    if self.fallback.serving {
+                        tracing::info!("the desktop is back: capturing it directly again");
+                    }
+                    self.helper = Helper::Off;
+                    self.fallback.regain();
+                    return Ok(None);
+                }
+                Err(e) => {
+                    tracing::debug!("desktop duplication still unavailable: {e:#}");
+                    self.retry.defer(Instant::now());
+                    if self
+                        .fallback
+                        .wants_helper(now, crate::video::DesktopUnavailable::is(&e))
+                    {
+                        tracing::info!("asking the SYSTEM helper for the secure desktop");
+                        self.helper = Helper::Connecting(elevated::request_frames(self.want()));
+                        self.fallback.connecting();
+                    }
+                }
+            }
+        }
+        if matches!(self.helper, Helper::Serving(_)) {
+            // Wake for the next own retry even when the helper sends nothing.
+            let wait = timeout.min(self.retry.at.saturating_duration_since(Instant::now()));
+            match self.helper_frame(wait) {
+                Ok(changed) => return Ok(Some(changed)),
+                Err(e) => {
+                    tracing::warn!("the screen helper stopped: {e:#}");
+                    self.helper = Helper::Off;
+                    self.fallback.failed();
+                    self.has_frame = false;
+                }
+            }
+        }
+        anyhow::ensure!(
+            !self.fallback.expired(Instant::now()),
+            "desktop duplication unavailable after access loss"
+        );
+        let now = Instant::now();
+        // Nothing to wait on: sleep out the caller's wait (or the backoff)
+        // instead of having it poll in a loop.
+        thread::sleep(timeout.min(self.retry.at.saturating_duration_since(now)));
+        Ok(Some(false))
+    }
+    fn poll_helper(&mut self) {
+        let Helper::Connecting(started) = &self.helper else {
+            return;
+        };
+        match started.try_recv() {
+            Ok(Ok(frames)) => {
+                tracing::info!("the secure desktop is up: showing it through the SYSTEM helper");
+                self.helper = Helper::Serving(frames);
+                self.fallback.connected();
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("the screen helper is unavailable, so the lock screen and administrator prompts cannot be shown: {e:#}");
+                self.helper = Helper::Off;
+                self.fallback.failed();
+                if self.duplication.is_none() {
+                    self.has_frame = false;
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.helper = Helper::Off;
+                self.fallback.failed();
+                if self.duplication.is_none() {
+                    self.has_frame = false;
+                }
+            }
+        }
+    }
+    /// Waits up to `wait` for a frame from the helper and renders it.
+    fn helper_frame(&mut self, wait: Duration) -> Result<bool> {
+        let Helper::Serving(frames) = &mut self.helper else {
+            return Ok(false);
+        };
+        let (width, height) = frames.size();
+        let mut have = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: The source owns its descriptor.
+        unsafe { self.source.GetDesc(&mut have) };
+        if (have.Width, have.Height, have.Format) != (width, height, DXGI_FORMAT_B8G8R8A8_UNORM) {
+            self.source = self.gpu.texture(
+                width,
+                height,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                false,
+            )?;
+        }
+        if (self.display.width, self.display.height) != (width, height) {
+            self.frame = self.gpu.texture(
+                width,
+                height,
+                if self.ten_bit {
+                    DXGI_FORMAT_R10G10B10A2_UNORM
+                } else {
+                    DXGI_FORMAT_B8G8R8A8_UNORM
+                },
+                D3D11_BIND_RENDER_TARGET.0 as u32,
+                false,
+            )?;
+            self.display.width = width;
+            self.display.height = height;
+            let fit = self.display.fitted(self.stream_size.0, self.stream_size.1);
+            self.plane.resize((width, height), (fit.width, fit.height));
+            self.has_frame = false;
+        }
+        let (context, source) = (&self.gpu.context, &self.source);
+        let uploaded = frames.next(wait, |pixels, stride| {
+            // SAFETY: The reader hands `height` rows of `stride` bytes; the
+            // runtime copies them during the call.
+            unsafe {
+                context.UpdateSubresource(source, 0, None, pixels.cast(), stride as u32, 0);
+            }
+        })?;
+        if uploaded.is_none() {
+            return Ok(false);
+        }
+        self.captured = Instant::now();
+        // The helper composited the cursor into an upright SDR picture.
+        if !self.ten_bit && !self.hdr_output {
+            // SAFETY: Both are BGRA textures of the same size.
+            unsafe { self.gpu.context.CopyResource(&self.frame, &self.source) };
+        } else {
+            let hidden = DXGI_OUTDUPL_POINTER_POSITION::default();
+            self.renderer.draw(
+                &self.gpu,
+                &self.source,
+                &self.frame,
+                &hidden,
+                &self.shape,
+                (DXGI_MODE_ROTATION_IDENTITY, self.white, self.hdr_output),
+            )?;
+        }
+        self.has_frame = true;
+        self.cpu_seeded = false;
+        Ok(true)
+    }
     /// Windows took the desktop away (access loss) and it has not been
     /// duplicated again since: a lock screen, an administrator prompt, or
     /// a mode change. Whatever fails meanwhile is not the encoder's fault.
@@ -907,7 +1295,7 @@ impl Capture {
             .control
             .drawn
             .load(std::sync::atomic::Ordering::Relaxed);
-        if self.has_frame && drawn != self.last_drawn {
+        if self.has_frame && drawn != self.last_drawn && self.duplication.is_some() {
             self.last_drawn = drawn;
             let Some(separate) = self.cursor_status() else {
                 return Ok(false);
@@ -917,21 +1305,8 @@ impl Capture {
         }
         self.last_drawn = drawn;
         if self.duplication.is_none() {
-            anyhow::ensure!(
-                !self.retry.expired(Instant::now()),
-                "desktop duplication unavailable for five seconds after access loss"
-            );
-            let now = Instant::now();
-            if now < self.retry.at {
-                // Nothing to wait on: sleep out the caller's wait (or the
-                // backoff) instead of having it poll in a loop.
-                thread::sleep(timeout.min(self.retry.at - now));
-                return Ok(false);
-            }
-            if let Err(e) = self.reopen() {
-                tracing::debug!("desktop duplication still unavailable: {e:#}");
-                self.retry.defer(Instant::now());
-                return Ok(false);
+            if let Some(changed) = self.without_own_desktop(timeout)? {
+                return Ok(changed);
             }
         }
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -961,12 +1336,17 @@ impl Capture {
             }
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
                 // Release the old interface before DuplicateOutput: a process can
-                // own only one duplication per output. Mark the copy unavailable
-                // so repeated reopen failures cannot stream a stale desktop forever.
+                // own only one duplication per output. Without a helper to take
+                // over, mark the copy unavailable so repeated reopen failures
+                // cannot stream a stale desktop forever; with one, the last
+                // picture stands in until the helper's first frame or the limit.
                 self.plane.suspend();
                 self.cursor_state.reopen();
                 self.duplication = None;
-                self.has_frame = false;
+                self.fallback.lose(Instant::now());
+                if !self.fallback.keeps_picture() {
+                    self.has_frame = false;
+                }
                 self.cpu_seeded = false;
                 self.retry = ReopenBackoff::new();
                 self.retry.defer(Instant::now());
@@ -1438,12 +1818,129 @@ mod tests {
         );
         let mut retry = ReopenBackoff::new();
         let now = Instant::now();
-        assert!(!retry.expired(retry.started + Duration::from_secs(4)));
-        assert!(retry.expired(retry.started + Duration::from_secs(5)));
         for millis in [50, 100, 200, 400, 800, 1000, 1000] {
             retry.defer(now);
             assert_eq!(retry.at.duration_since(now), Duration::from_millis(millis));
         }
+    }
+    #[test]
+    fn without_a_helper_a_lost_desktop_ends_the_stream_after_five_seconds() {
+        use super::*;
+        let t = Instant::now();
+        let mut f = Fallback::new(false);
+        assert!(!f.expired(t + Duration::from_secs(60)), "nothing lost yet");
+        f.lose(t);
+        f.lose(t + Duration::from_secs(3)); // a second loss keeps the first time
+        assert!(!f.keeps_picture(), "no stale desktop without a helper");
+        assert!(!f.wants_helper(t + Duration::from_secs(4), true));
+        assert!(!f.expired(t + Duration::from_millis(4999)));
+        assert!(f.expired(t + OWN_LIMIT));
+        f.regain();
+        assert!(!f.expired(t + Duration::from_secs(60)));
+    }
+    #[test]
+    fn the_helper_takes_over_a_denied_desktop_until_the_own_one_returns() {
+        use super::*;
+        let t = Instant::now();
+        let mut f = Fallback::new(true);
+        f.lose(t);
+        assert!(f.keeps_picture());
+        // A denial (the secure desktop) asks at once; another loss waits.
+        assert!(f.wants_helper(t, true));
+        assert!(!f.wants_helper(t + Duration::from_millis(500), false));
+        assert!(f.wants_helper(t + HELPER_AFTER, false));
+        f.connecting();
+        assert!(
+            !f.wants_helper(t + Duration::from_secs(2), true),
+            "asked once"
+        );
+        // Starting the helper gets longer than a plain loss, not forever.
+        assert!(!f.expired(t + OWN_LIMIT));
+        assert!(f.expired(t + HELPER_LIMIT));
+        f.connected();
+        // Serving frames, the stream lasts as long as the secure desktop.
+        assert!(!f.expired(t + Duration::from_secs(3600)));
+        f.regain();
+        assert!(!f.serving && f.lost.is_none());
+        // The next prompt asks again.
+        f.lose(t + Duration::from_secs(10));
+        assert!(f.wants_helper(t + Duration::from_secs(10), true));
+    }
+    #[test]
+    fn a_helper_that_fails_falls_back_to_the_old_limit_for_that_loss() {
+        use super::*;
+        let t = Instant::now();
+        let mut f = Fallback::new(true);
+        f.lose(t);
+        f.connecting();
+        f.failed();
+        assert!(!f.keeps_picture());
+        assert!(
+            f.expired(t + OWN_LIMIT),
+            "an older helper ends it as before"
+        );
+        assert!(
+            !f.wants_helper(t + Duration::from_secs(6), true),
+            "once per loss"
+        );
+        // The next prompt asks again: a helper that died may be back.
+        f.regain();
+        f.lose(t + Duration::from_secs(20));
+        assert!(f.keeps_picture());
+        assert!(f.wants_helper(t + Duration::from_secs(20), true));
+        // Serving, then failing mid-way, also ends it once the limit passed.
+        let mut f = Fallback::new(true);
+        f.lose(t);
+        f.connecting();
+        f.connected();
+        assert!(!f.expired(t + Duration::from_secs(30)));
+        f.failed();
+        assert!(f.expired(t + Duration::from_secs(30)));
+    }
+    /// Needs the helper set up (a build with LATCH_HELPER_TEST_DIR, its
+    /// folder and task): pretends Windows took the desktop, takes the
+    /// helper's frames into the stream's texture, then switches back.
+    #[test]
+    #[ignore]
+    fn live_switches_to_the_helpers_frames_and_back() -> anyhow::Result<()> {
+        use super::*;
+        let mut capture = Capture::new()?;
+        let (width, height) = (capture.display.width, capture.display.height);
+        capture.duplication = None;
+        capture.plane.suspend();
+        capture.fallback.lose(Instant::now());
+        capture.retry.at = Instant::now() + Duration::from_secs(60);
+        capture.helper = Helper::Connecting(elevated::request_frames(capture.want()));
+        capture.fallback.connecting();
+        let started = Instant::now();
+        let mut frames = 0;
+        let mut first = None;
+        while started.elapsed() < Duration::from_secs(20) && frames < 3 {
+            if capture.grab(Duration::from_millis(100))? {
+                frames += 1;
+                first.get_or_insert(started.elapsed());
+                anyhow::ensure!(matches!(capture.helper, Helper::Serving(_)));
+            }
+            if first.is_some_and(|t| started.elapsed() > t + Duration::from_secs(3)) {
+                break;
+            }
+        }
+        anyhow::ensure!(frames > 0, "no frame from the helper");
+        anyhow::ensure!((capture.display.width, capture.display.height) == (width, height));
+        let frame = capture.frame.clone();
+        let lit = capture.read(&frame, height as usize, |rows, _| {
+            rows.iter().filter(|&&b| b != 0).count()
+        })?;
+        eprintln!(
+            "helper: first frame after {:?}, {frames} frames, {lit} non-zero bytes",
+            first.unwrap()
+        );
+        anyhow::ensure!(lit > 0, "the helper's frame is black");
+        capture.retry.at = Instant::now();
+        capture.grab(Duration::from_millis(100))?;
+        anyhow::ensure!(capture.duplication.is_some(), "own desktop not reopened");
+        anyhow::ensure!(matches!(capture.helper, Helper::Off) && capture.fallback.lost.is_none());
+        Ok(())
     }
     #[test]
     fn cursor_shaders_compile_without_a_gpu() -> anyhow::Result<()> {

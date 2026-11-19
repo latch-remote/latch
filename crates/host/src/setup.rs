@@ -325,15 +325,36 @@ try {{
     )
 }
 
-/// The task that runs the input helper, elevated, for windows that run as
-/// administrator (see `latch_engine::windows`'s `elevated` module).
+/// The task that runs the input helper as SYSTEM, for windows that run as
+/// administrator and the secure desktop (see `latch_engine::windows`'s
+/// `elevated` module).
 const INPUT_TASK: &str = "LatchInput";
+/// Windows' policy that lets services send Ctrl+Alt+Delete (SendSAS).
+const SAS_POLICY_KEY: &str = r"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
+/// Setup turned that policy on (it was unset), so it turns it off again.
+const SAS_MARK_KEY: &str = r"HKLM:\SOFTWARE\Latch\Input";
+
+/// Takes back the SendSAS policy when setup set it, and only then.
+fn sas_policy_removal_ps() -> String {
+    format!(
+        r#"if ((Get-ItemProperty -LiteralPath '{mark}' -Name SasPolicyAdded -ErrorAction SilentlyContinue).SasPolicyAdded -eq '1') {{
+    Remove-ItemProperty -LiteralPath '{policy}' -Name SoftwareSASGeneration -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath '{mark}' -Recurse -Force -ErrorAction SilentlyContinue
+}}"#,
+        mark = SAS_MARK_KEY,
+        policy = SAS_POLICY_KEY,
+    )
+}
 
 /// Setup's step for the input helper. Windows ignores input an unelevated
-/// Latch sends while an elevated window is in front, so a stream starts
-/// this task, which runs a copy of this checked file elevated as the user
-/// who ran setup. The copy sits in `%ProgramFiles%\Latch\Input`, which
-/// only administrators can change, and is replaced on every setup.
+/// Latch sends while an elevated window is in front, and only SYSTEM can
+/// show or control the lock screen, the sign-in screen and administrator
+/// prompts. So a stream starts this task, which runs a copy of this checked
+/// file as LocalSystem; that copy starts its agent in the session of the
+/// host recorded in `host-path.txt` and serves only that host. The copy
+/// sits in `%ProgramFiles%\Latch\Input`, which only administrators can
+/// change, and is replaced on every setup. The task's security lets the
+/// user who ran setup start it, and only administrators change it.
 fn input_helper_ps(enabled: bool, installed: &Path) -> String {
     if !enabled {
         return format!(
@@ -341,11 +362,13 @@ fn input_helper_ps(enabled: bool, installed: &Path) -> String {
 Stop-ScheduledTask -TaskName '{INPUT_TASK}' -ErrorAction SilentlyContinue
 if (Get-ScheduledTask -TaskName '{INPUT_TASK}' -ErrorAction SilentlyContinue) {{
     Unregister-ScheduledTask -TaskName '{INPUT_TASK}' -Confirm:$false -ErrorAction Stop
-}}"#
+}}
+{sas}"#,
+            sas = sas_policy_removal_ps(),
         );
     }
     format!(
-        r#"Step "Letting a viewer control windows that run as administrator"
+        r#"Step "Letting a viewer control windows that run as administrator, the lock screen and administrator prompts"
 try {{
     $inputSource = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Latch\Setup\latch-host.exe'
     Assert-ProtectedTree $inputSource
@@ -363,13 +386,32 @@ try {{
     if (Test-Path -LiteralPath $hostRecord) {{ Assert-Protected $hostRecord }}
     Set-Content -LiteralPath $hostRecord -Value '{installed}' -Encoding UTF8 -ErrorAction Stop
     $action = New-ScheduledTaskAction -Execute $inputExe -Argument '{arg}' -WorkingDirectory $inputDir
-    $principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Highest
+    # LocalSystem, the only account that can reach the secure desktop.
+    $principal = New-ScheduledTaskPrincipal -UserId '{system}' -LogonType ServiceAccount -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -Priority 4
     Register-ScheduledTask -TaskName '{task}' -Action $action -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+    # SYSTEM and administrators may change the task; the user who ran setup
+    # may only read and start it. Nobody else may even start it.
+    $scheduler = New-Object -ComObject Schedule.Service
+    $scheduler.Connect()
+    $scheduler.GetFolder('\').GetTask('{task}').SetSecurityDescriptor("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;$($identity.User.Value))", 0)
+    # Ctrl+Alt+Delete from a viewer: Windows lets a service (the helper runs
+    # as SYSTEM) send it only under this policy. Setup sets it when unset,
+    # and marks that it did, so turning this off or uninstalling takes it back.
+    if ($null -eq (Get-ItemProperty -LiteralPath '{policy}' -Name SoftwareSASGeneration -ErrorAction SilentlyContinue)) {{
+        New-ItemProperty -LiteralPath '{policy}' -Name SoftwareSASGeneration -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+        if (-not (Test-Path -LiteralPath '{mark}')) {{ New-Item -Path '{mark}' -Force -ErrorAction Stop | Out-Null }}
+        New-ItemProperty -LiteralPath '{mark}' -Name SasPolicyAdded -Value '1' -PropertyType String -Force -ErrorAction Stop | Out-Null
+    }} elseif ((Get-ItemProperty -LiteralPath '{policy}').SoftwareSASGeneration -notin 1, 3) {{
+        Write-Output "  Ctrl+Alt+Delete from a viewer stays off: the SoftwareSASGeneration policy is set to something else"
+    }}
 }} catch {{ Write-Output "  input helper: $_"; $setupFailed = $true }}"#,
         installed = installed.display().to_string().replace('\'', "''"),
         task = INPUT_TASK,
         arg = "--input-helper",
+        system = "S-1-5-18",
+        policy = SAS_POLICY_KEY,
+        mark = SAS_MARK_KEY,
     )
 }
 
@@ -787,6 +829,7 @@ Stop-ScheduledTask -TaskName '{input_task}' -ErrorAction SilentlyContinue
 if (Get-ScheduledTask -TaskName '{input_task}' -ErrorAction SilentlyContinue) {{
     Unregister-ScheduledTask -TaskName '{input_task}' -Confirm:$false -ErrorAction SilentlyContinue
 }}
+{sas}
 $latchSaved = '{key}'
 Step "Removing the ViGEmBus gamepad driver if Latch's setup installed it"
 if ((Get-ItemProperty -LiteralPath $latchSaved -Name '{mark}' -ErrorAction SilentlyContinue).'{mark}' -eq '1') {{
@@ -848,6 +891,7 @@ exit 0
         vdd = crate::virtual_display::uninstall_ps(),
         task = START_TASK,
         input_task = INPUT_TASK,
+        sas = sas_policy_removal_ps(),
         key = SAVED_KEY,
         mark = VIGEM_MARK,
         entry = VIGEM_ENTRY,
@@ -1130,22 +1174,52 @@ mod tests {
             assert!(step.find(check).unwrap() < copy, "{check} before the copy");
         }
         assert!(step.contains("-Argument '--input-helper'"));
-        assert!(step.contains("-RunLevel Highest"));
-        assert!(step.contains("-LogonType Interactive"));
+        // LocalSystem, by SID so no translated account name can miss.
+        assert!(step.contains(
+            "New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest"
+        ));
+        assert!(!step.contains("-LogonType Interactive"));
         assert!(step.contains("-MultipleInstances IgnoreNew"));
         assert!(step.contains("Register-ScheduledTask -TaskName 'LatchInput'"));
+        // Only the user who ran setup may start the SYSTEM task, besides
+        // SYSTEM and administrators; nobody else may change it.
+        let register = step.find("Register-ScheduledTask").unwrap();
+        let secure = step
+            .find(".GetTask('LatchInput').SetSecurityDescriptor(\"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;$($identity.User.Value))\", 0)")
+            .expect("task security");
+        assert!(register < secure);
+        for broad in [";AU)", ";WD)", ";IU)", ";BU)"] {
+            assert!(!step.contains(broad), "{broad}");
+        }
         assert!(step.contains("$setupFailed = $true"));
         assert!(
             !step.contains("LOCALAPPDATA"),
             "nothing elevated from the user's folder"
         );
+        // Ctrl+Alt+Delete: the policy is set only when unset, and marked.
+        let unset = step
+            .find("if ($null -eq (Get-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System' -Name SoftwareSASGeneration")
+            .expect("checks the policy first");
+        assert!(
+            unset
+                < step
+                    .find("-Name SoftwareSASGeneration -Value 1 -PropertyType DWord")
+                    .unwrap()
+        );
+        assert!(step.contains(
+            r"New-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Latch\Input' -Name SasPolicyAdded"
+        ));
 
         let disabled = input_helper_ps(false, Path::new(r"C:\Latch\latch-host.exe"));
         assert!(disabled.contains("Stop-ScheduledTask"));
         assert!(disabled.contains("Unregister-ScheduledTask"));
         assert!(!disabled.contains("-RunLevel Highest"));
+        // Takes the policy back only when setup set it.
+        let mark = disabled.find("SasPolicyAdded -eq '1'").unwrap();
+        assert!(mark < disabled.find("Remove-ItemProperty").unwrap());
         assert!(step.contains("host-path.txt"));
         let m = uninstall_machine_ps();
+        assert!(m.contains(&sas_policy_removal_ps()));
         assert!(m.contains("Unregister-ScheduledTask -TaskName 'LatchInput'"));
         assert!(m.contains("$inputDir = Join-Path $latchDir 'Input'"));
         assert!(

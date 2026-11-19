@@ -837,7 +837,7 @@ impl HostApp {
                 ui::row_separator(ui);
                 if ui::toggle_row(ui, &mut self.cfg.elevated_input,
                     "Control windows that run as administrator",
-                    Some("While on, any program running as you on this PC can do the same. Apply changes with Set up as administrator.")) {
+                    Some("Also lets a viewer see and answer the lock screen and administrator prompts. While on, any program running as you on this PC can do the same. Apply changes with Set up as administrator.")) {
                     self.dirty = true;
                 }
             }
