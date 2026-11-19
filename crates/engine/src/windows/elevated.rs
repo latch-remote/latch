@@ -138,6 +138,8 @@ const MAX_REQUEST: usize = 16 + 2 + latch_proto::input::MAX_TEXT;
 const IDLE: Duration = Duration::from_secs(5);
 /// How long a stream waits for the helper it started.
 const START_WAIT: Duration = Duration::from_secs(10);
+/// How often a start is asked for again while the helper does not answer.
+const START_AGAIN: Duration = Duration::from_secs(2);
 /// How long either end waits for the other's greeting (and, for frames,
 /// the request and its answer) before it hangs up.
 const HANDSHAKE: Duration = Duration::from_secs(3);
@@ -1348,8 +1350,14 @@ impl Me {
 /// Opens the session's pipe and checks who serves it (see
 /// [`judge_server`]): the protected helper copy, running as SYSTEM in this
 /// session or as this user elevated, and already running when the pipe
-/// was opened. Then greets it with `version`, which it must echo in time.
-fn open_pipe(me: &Me, expected: &Path, version: &[u8; 8]) -> Result<(Pipe, Server)> {
+/// was opened. Then greets it with `version`, which it must echo within
+/// [`HANDSHAKE`] and by `until`.
+fn open_pipe(
+    me: &Me,
+    expected: &Path,
+    version: &[u8; 8],
+    until: Instant,
+) -> Result<(Pipe, Server)> {
     let opened_at = now();
     let mut pipe = Pipe::open(&pipe_name(me.session))?;
     let mut server_session = u32::MAX;
@@ -1383,7 +1391,7 @@ fn open_pipe(me: &Me, expected: &Path, version: &[u8; 8]) -> Result<(Pipe, Serve
         version != HELLO_FRAMES || server == Server::System,
         "only the SYSTEM helper may share the screen"
     );
-    pipe.set_deadline(Some(Instant::now() + HANDSHAKE));
+    pipe.set_deadline(Some(by(until, HANDSHAKE)));
     pipe.write_all(version)?;
     let mut hello = [0; HELLO.len()];
     pipe.read_exact(&mut hello).context(Refused)?;
@@ -1403,20 +1411,25 @@ pub(super) struct Client {
 }
 
 impl Client {
-    fn connect(me: &Me, expected: &Path) -> Result<Self> {
+    fn connect(me: &Me, expected: &Path, until: Instant) -> Result<Self> {
         // An old helper closes an unrecognised handshake. Reopen its pipe
         // using v1, validating server identity on both connections. Any
         // other failure (a server that is not the helper) stands as it is.
-        match Self::connect_version(me, expected, HELLO2) {
+        match Self::connect_version(me, expected, HELLO2, until) {
             Err(e) if e.downcast_ref::<Refused>().is_some() => {
-                Self::connect_version(me, expected, HELLO)
+                Self::connect_version(me, expected, HELLO, until)
             }
             result => result,
         }
     }
 
-    fn connect_version(me: &Me, expected: &Path, version: &[u8; 8]) -> Result<Self> {
-        let (pipe, server) = open_pipe(me, expected, version)?;
+    fn connect_version(
+        me: &Me,
+        expected: &Path,
+        version: &[u8; 8],
+        until: Instant,
+    ) -> Result<Self> {
+        let (pipe, server) = open_pipe(me, expected, version, until)?;
         if server == Server::ElevatedUser {
             tracing::info!("an older setup's input helper serves this stream; the lock screen and administrator prompts need Set up as administrator again");
         }
@@ -1486,7 +1499,12 @@ fn connect_now() -> Option<Client> {
         }
         return None;
     }
-    match with_helper(|| Client::connect(&me, &expected), |_| true) {
+    let until = Instant::now() + START_WAIT + HANDSHAKE;
+    match with_helper(
+        until,
+        |until| Client::connect(&me, &expected, until),
+        |_| true,
+    ) {
         Ok(client) => Some(client),
         Err(e) => {
             if !NOT_SET_UP.swap(true, Ordering::Relaxed) {
@@ -1500,36 +1518,57 @@ fn connect_now() -> Option<Client> {
 }
 
 /// Runs `attempt` against the helper, starting its task when it is not
-/// running, for up to [`START_WAIT`] (plus one attempt, whose own waits
-/// are bounded by [`HANDSHAKE`]). `retry` says whether an attempt's error
-/// may mean it is still starting.
+/// running, until `until`: one deadline for all of it, the Task Scheduler
+/// call and each attempt's own waits (`attempt` is given it) included, so
+/// nothing that waits for the helper (a stream being admitted) waits past
+/// it. `retry` says whether an attempt's error may mean it is still
+/// starting.
 fn with_helper<T>(
-    attempt: impl Fn() -> Result<T>,
+    until: Instant,
+    attempt: impl Fn(Instant) -> Result<T>,
+    retry: impl Fn(&anyhow::Error) -> bool,
+) -> Result<T> {
+    with_helper_using(until, start_task, attempt, retry)
+}
+
+/// [`with_helper`], starting the helper with `start`.
+fn with_helper_using<T>(
+    until: Instant,
+    start: impl Fn(Instant) -> Result<()>,
+    attempt: impl Fn(Instant) -> Result<T>,
     retry: impl Fn(&anyhow::Error) -> bool,
 ) -> Result<T> {
     // A helper an earlier stream started may still be running.
-    let mut last = match attempt() {
+    let mut last = match attempt(until) {
         Ok(v) => return Ok(v),
         Err(e) if !retry(&e) => return Err(e),
         Err(e) => e,
     };
-    let deadline = Instant::now() + START_WAIT;
     let mut started = None::<Instant>;
-    while Instant::now() < deadline {
+    while Instant::now() < until {
         // The task ignores a start while an instance runs; one that is just
         // exiting would leave nothing, so ask again now and then.
-        if started.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
-            start_task().context("start the helper's task; run setup again")?;
+        if started.is_none_or(|t| t.elapsed() >= START_AGAIN) {
+            start(until).context("start the helper's task; run setup again")?;
             started = Some(Instant::now());
         }
-        thread::sleep(Duration::from_millis(100));
-        match attempt() {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        thread::sleep(left.min(Duration::from_millis(100)));
+        match attempt(until) {
             Ok(v) => return Ok(v),
             Err(e) if !retry(&e) => return Err(e),
             Err(e) => last = e,
         }
     }
-    Err(last.context("the helper did not answer"))
+    Err(last.context("the helper did not answer in time"))
+}
+
+/// `wait` from now, but no later than `until`.
+fn by(until: Instant, wait: Duration) -> Instant {
+    until.min(Instant::now() + wait)
 }
 
 /// Whether connecting failed because no helper serves the pipe (yet),
@@ -1542,16 +1581,17 @@ fn absent(error: &anyhow::Error) -> bool {
 }
 
 /// Frames of the output `want` from the helper, starting it if needed,
-/// and when the helper granted them. Blocks for up to [`START_WAIT`], a
-/// handshake and [`GRANT_WAIT`].
-pub(super) fn connect_frames(want: Want) -> Result<(Frames, Instant)> {
+/// and when the helper granted them. Gives up at `until`, the Task
+/// Scheduler call included.
+pub(super) fn connect_frames(want: Want, until: Instant) -> Result<(Frames, Instant)> {
     let me = Me::current()?;
     let expected = helper_exe().context("no Program Files folder")?;
     ensure!(expected.is_file(), "the helper is not set up");
     with_helper(
-        || {
-            let (mut pipe, _) = open_pipe(&me, &expected, HELLO_FRAMES)?;
-            pipe.set_deadline(Some(Instant::now() + GRANT_WAIT));
+        until,
+        |until| {
+            let (mut pipe, _) = open_pipe(&me, &expected, HELLO_FRAMES, until)?;
+            pipe.set_deadline(Some(by(until, GRANT_WAIT)));
             pipe.write_all(&frames::encode_want(&want))?;
             let granted = frames::read_granted(&mut pipe)?;
             let at = Instant::now();
@@ -1564,13 +1604,14 @@ pub(super) fn connect_frames(want: Want) -> Result<(Frames, Instant)> {
 
 /// [`connect_frames`] on a thread of its own, so capture never waits.
 pub(super) fn request_frames(want: Want) -> mpsc::Receiver<Result<(Frames, Instant)>> {
+    let until = Instant::now() + START_WAIT + HANDSHAKE + GRANT_WAIT;
     let (tx, rx) = mpsc::channel();
     let spawned = thread::Builder::new()
         .name("latch-screen-helper".into())
         .spawn({
             let tx = tx.clone();
             move || {
-                let _ = tx.send(connect_frames(want));
+                let _ = tx.send(connect_frames(want, until));
             }
         });
     if let Err(e) = spawned {
@@ -1580,8 +1621,10 @@ pub(super) fn request_frames(want: Want) -> mpsc::Receiver<Result<(Frames, Insta
 }
 
 /// Asks for the helper: rings a running broker's wake event, and starts
-/// the task, which Windows ignores while the broker runs.
-fn start_task() -> Result<()> {
+/// the task, which Windows ignores while the broker runs. A Task Scheduler
+/// that has not answered by `until` is given up on: `schtasks.exe` is
+/// stopped and this fails.
+fn start_task(until: Instant) -> Result<()> {
     let name = HSTRING::from(wake_name());
     // SAFETY: The handle is owned and closed by Handle.
     if let Ok(wake) = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, &name) } {
@@ -1593,18 +1636,42 @@ fn start_task() -> Result<()> {
     // SAFETY: The buffer's length is passed with it.
     let len = unsafe { GetSystemDirectoryW(Some(&mut dir)) } as usize;
     ensure!(len > 0 && len < dir.len(), "system folder");
-    let schtasks = PathBuf::from(String::from_utf16_lossy(&dir[..len])).join("schtasks.exe");
-    let out = std::process::Command::new(schtasks)
+    let system = PathBuf::from(String::from_utf16_lossy(&dir[..len]));
+    let mut child = std::process::Command::new(system.join("schtasks.exe"))
         .args(["/Run", "/TN", task_name()])
+        .current_dir(&system)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW.0)
-        .output()
+        .spawn()
         .context("run schtasks")?;
-    ensure!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
+    let status = wait_until(&mut child, until).context("Task Scheduler did not answer")?;
+    if !status.success() {
+        let mut error = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut error);
+        }
+        bail!("{}", error.trim());
+    }
     Ok(())
+}
+
+/// Waits for `child` to exit, but only until `until`: then it is killed
+/// (and reaped) and this fails.
+fn wait_until(child: &mut std::process::Child, until: Instant) -> Result<std::process::ExitStatus> {
+    use std::os::windows::io::AsRawHandle;
+    let left = until.saturating_duration_since(Instant::now());
+    let millis = u32::try_from(left.as_millis()).unwrap_or(u32::MAX - 1);
+    // SAFETY: The handle is the child's process handle, open while `child`
+    // is borrowed.
+    let waited = unsafe { WaitForSingleObject(HANDLE(child.as_raw_handle()), millis) };
+    if waited == WAIT_TIMEOUT {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("still running after {left:?}, stopped");
+    }
+    Ok(child.wait()?)
 }
 
 #[cfg(test)]
@@ -2334,6 +2401,122 @@ mod tests {
         assert!(same_file_name(&actual, &std::env::current_exe().unwrap()));
     }
 
+    /// A Task Scheduler call that hangs is stopped at the deadline.
+    #[test]
+    fn a_stalled_child_is_stopped_at_the_deadline() {
+        let system = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap();
+        let mut child = std::process::Command::new(system.join(r"System32\PING.EXE"))
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let error = wait_until(&mut child, started + Duration::from_millis(300)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2), "{error:#}");
+        assert!(child.try_wait().unwrap().is_some(), "killed and reaped");
+        // One that finishes in time is waited for.
+        let mut quick = std::process::Command::new(system.join(r"System32\PING.EXE"))
+            .args(["-n", "1", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .spawn()
+            .unwrap();
+        assert!(
+            wait_until(&mut quick, Instant::now() + Duration::from_secs(20))
+                .unwrap()
+                .success()
+        );
+    }
+
+    /// One deadline bounds the whole start: a scheduler call that uses it
+    /// up ends the wait, attempts get the deadline to bound their own
+    /// waits, and nothing runs past it.
+    #[test]
+    fn helper_startup_ends_at_one_deadline() {
+        let absent =
+            || -> Result<()> { Err(std::io::Error::from(std::io::ErrorKind::NotFound).into()) };
+        // The scheduler hangs until the deadline and is then stopped.
+        let until = Instant::now() + Duration::from_millis(400);
+        let attempts = std::cell::Cell::new(0);
+        let error = with_helper_using(
+            until,
+            |by| {
+                assert_eq!(by, until);
+                thread::sleep(by.saturating_duration_since(Instant::now()));
+                bail!("stopped at the deadline")
+            },
+            |by| {
+                assert_eq!(by, until);
+                attempts.set(attempts.get() + 1);
+                absent()
+            },
+            absent_error,
+        )
+        .unwrap_err();
+        let late = Instant::now().saturating_duration_since(until);
+        assert!(late < Duration::from_millis(200), "{late:?}: {error:#}");
+        assert_eq!(attempts.get(), 1, "only the attempt before the start");
+        assert!(format!("{error:#}").contains("start the helper's task"));
+
+        // A helper that never answers: asked again now and then, given up
+        // on at the deadline.
+        let until = Instant::now() + Duration::from_millis(2500);
+        let starts = std::cell::Cell::new(0);
+        let error = with_helper_using(
+            until,
+            |_| {
+                starts.set(starts.get() + 1);
+                Ok(())
+            },
+            |_| absent(),
+            absent_error,
+        )
+        .unwrap_err();
+        let late = Instant::now().saturating_duration_since(until);
+        assert!(late < Duration::from_millis(200), "{late:?}");
+        assert_eq!(
+            starts.get(),
+            2,
+            "started, then asked again after {START_AGAIN:?}"
+        );
+        assert!(format!("{error:#}").contains("did not answer in time"));
+
+        // A deadline already past: one attempt, no start.
+        let error = with_helper_using(
+            Instant::now(),
+            |_| panic!("no start after the deadline"),
+            |_| absent(),
+            absent_error,
+        );
+        assert!(error.is_err());
+        // An answer ends it at once.
+        let until = Instant::now() + Duration::from_secs(5);
+        let calls = std::cell::Cell::new(0);
+        let answer = with_helper_using(
+            until,
+            |_| Ok(()),
+            |_| {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    absent().map(|_| 0)
+                } else {
+                    Ok(7)
+                }
+            },
+            absent_error,
+        );
+        assert_eq!(answer.unwrap(), 7);
+        assert!(Instant::now() < until);
+        // `by` never passes the deadline.
+        let soon = Instant::now() + Duration::from_millis(5);
+        assert_eq!(by(soon, Duration::from_secs(3)), soon);
+    }
+
+    fn absent_error(error: &anyhow::Error) -> bool {
+        absent(error)
+    }
+
     /// Needs the helper set up (a build with LATCH_HELPER_TEST_DIR, its
     /// folder and SYSTEM task, `host-path.txt` naming this test binary).
     #[test]
@@ -2343,7 +2526,11 @@ mod tests {
         let me = Me::current()?;
         let own = me.session;
         let expected = helper_exe().context("no helper path")?;
-        let mut client = with_helper(|| Client::connect(&me, &expected), |_| true)?;
+        let mut client = with_helper(
+            started + START_WAIT + HANDSHAKE,
+            |until| Client::connect(&me, &expected, until),
+            |_| true,
+        )?;
         eprintln!("input helper answered after {:?}", started.elapsed());
         client
             .apply(&Event::ReleaseAll, DisplayRect::default())

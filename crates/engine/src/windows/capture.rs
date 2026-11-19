@@ -892,8 +892,11 @@ impl Capture {
                 .context(crate::video::DesktopUnavailable)
         };
         let asked = Instant::now();
+        // One deadline for starting the helper, however often a resize asks
+        // again: the stream's admission waits for this.
+        let until = asked + HELPER_LIMIT;
         loop {
-            let (frames, granted) = match elevated::connect_frames(self.want()) {
+            let (frames, granted) = match elevated::connect_frames(self.want(), until) {
                 Ok(answer) => answer,
                 Err(e) => {
                     tracing::warn!(
