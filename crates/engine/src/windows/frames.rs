@@ -16,12 +16,11 @@
 //! sets the event. Each slot carries a sequence (odd while it is written),
 //! so a reader that was overtaken sees it and drops that copy.
 use super::capture::{Capture, Target};
+use super::pipe::Pipe;
 use crate::software::{Bgra, CpuCapture};
 use anyhow::{bail, ensure, Context, Result};
 use std::{
-    fs::File,
     io::{Read, Write},
-    os::windows::io::AsRawHandle,
     sync::atomic::{fence, AtomicU32, AtomicU64, Ordering},
     thread,
     time::{Duration, Instant},
@@ -30,8 +29,8 @@ use windows::{
     core::{HSTRING, PCWSTR},
     Win32::{
         Foundation::{
-            CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_HANDLE_OPTIONS, HANDLE, HLOCAL,
-            INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+            CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_CLOSE_SOURCE,
+            DUPLICATE_HANDLE_OPTIONS, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
         },
         Security::{
             Authorization::{
@@ -68,6 +67,17 @@ pub(super) mod state {
     pub const RESIZED: u32 = 2;
     pub const FAILED: u32 = 3;
 }
+
+/// The helper's output changed size and ended this mapping: ask again for
+/// one of the new size, rather than giving up on the helper.
+#[derive(Debug)]
+pub(super) struct Resized;
+impl std::fmt::Display for Resized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the output changed size")
+    }
+}
+impl std::error::Error for Resized {}
 
 #[repr(C)]
 struct Header {
@@ -425,26 +435,52 @@ fn free(descriptor: PSECURITY_DESCRIPTOR) {
 }
 
 /// Whether the other end of `pipe` is still there.
-fn connected(pipe: &File) -> bool {
+fn connected(pipe: &Pipe) -> bool {
     let mut available = 0;
     // SAFETY: Reads nothing; only asks how many bytes wait.
-    unsafe {
-        PeekNamedPipe(
-            HANDLE(pipe.as_raw_handle()),
-            None,
-            0,
-            None,
-            Some(&mut available),
-            None,
-        )
+    unsafe { PeekNamedPipe(pipe.raw(), None, 0, None, Some(&mut available), None) }.is_ok()
+}
+
+/// A handle duplicated into the host's process. Until the host has been
+/// told about it, it is closed there again (DUPLICATE_CLOSE_SOURCE from
+/// that process) when the grant fails, so a failed grant leaks nothing.
+struct Given {
+    process: HANDLE,
+    handle: HANDLE,
+}
+impl Given {
+    fn value(&self) -> u64 {
+        self.handle.0 as u64
     }
-    .is_ok()
+    /// The host has it now: it is the host's to close.
+    fn handed_over(self) {
+        std::mem::forget(self);
+    }
+}
+impl Drop for Given {
+    fn drop(&mut self) {
+        // SAFETY: Closes the handle this helper put into the host's process,
+        // which the host never learnt of; nothing is duplicated here.
+        unsafe {
+            let _ = DuplicateHandle(
+                self.process,
+                self.handle,
+                HANDLE::default(),
+                std::ptr::null_mut(),
+                0,
+                false,
+                DUPLICATE_CLOSE_SOURCE,
+            );
+        }
+    }
 }
 
 /// The helper's side of one frame connection: the host's process handle
 /// (opened when the pipe was accepted, with PROCESS_DUP_HANDLE) receives
-/// the objects. Ends when the host closes the pipe.
-pub(super) fn serve(mut pipe: File, client: HANDLE, user_sid: &str) -> Result<()> {
+/// the objects. Reading the request, and writing the answer, each end
+/// within `wait`; the connection then ends when the host closes the pipe.
+pub(super) fn serve(mut pipe: Pipe, client: HANDLE, user_sid: &str, wait: Duration) -> Result<()> {
+    pipe.set_deadline(Some(Instant::now() + wait));
     let want = read_want(&mut pipe)?;
     let opened = (|| {
         super::desktop::follow()?;
@@ -481,7 +517,7 @@ pub(super) fn serve(mut pipe: File, client: HANDLE, user_sid: &str) -> Result<()
         ensure!(!view.0.Value.is_null(), "map the frame mapping");
         // SAFETY: The view is `size` bytes, page aligned, and outlives the writer.
         let writer = unsafe { Writer::init(view.0.Value.cast(), size, width, height)? };
-        let give = |handle: HANDLE, access: u32| -> Result<u64> {
+        let give = |handle: HANDLE, access: u32| -> Result<Given> {
             let mut theirs = HANDLE::default();
             // SAFETY: Duplicates into the verified host process, with no more
             // access than it needs and nothing inheritable.
@@ -496,23 +532,40 @@ pub(super) fn serve(mut pipe: File, client: HANDLE, user_sid: &str) -> Result<()
                     DUPLICATE_HANDLE_OPTIONS(0),
                 )
             }?;
-            Ok(theirs.0 as u64)
+            Ok(Given {
+                process: client,
+                handle: theirs,
+            })
         };
-        let granted = Granted {
-            mapping: give(mapping.0, FILE_MAP_READ.0)?,
-            event: give(event.0, SYNCHRONIZE)?,
-            size: size as u64,
-        };
-        Ok::<_, anyhow::Error>((capture, mapping, event, view, writer, granted))
+        // If the event cannot be given, dropping the mapping's closes it
+        // in the host again.
+        let given = (
+            give(mapping.0, FILE_MAP_READ.0)?,
+            give(event.0, SYNCHRONIZE)?,
+        );
+        Ok::<_, anyhow::Error>((capture, mapping, event, view, writer, given, size))
     })();
-    let (mut capture, _mapping, event, _view, mut writer, granted) = match opened {
-        Ok(v) => v,
-        Err(e) => {
-            pipe.write_all(&encode_refusal(&format!("{e:#}")))?;
-            return Err(e);
-        }
+    let (mut capture, _mapping, event, _view, mut writer, (mapping_given, event_given), size) =
+        match opened {
+            Ok(v) => v,
+            Err(e) => {
+                pipe.set_deadline(Some(Instant::now() + wait));
+                pipe.write_all(&encode_refusal(&format!("{e:#}")))?;
+                return Err(e);
+            }
+        };
+    let granted = Granted {
+        mapping: mapping_given.value(),
+        event: event_given.value(),
+        size: size as u64,
     };
+    // If the answer does not reach the host, the handles drop here, which
+    // closes them in the host again.
+    pipe.set_deadline(Some(Instant::now() + wait));
     pipe.write_all(&encode_granted(&granted))?;
+    mapping_given.handed_over();
+    event_given.handed_over();
+    pipe.set_deadline(None);
     let interval = Duration::from_secs(1) / MAX_FPS;
     let mut frame = Bgra::default();
     let mut last = Instant::now() - interval;
@@ -550,9 +603,18 @@ pub(super) fn serve(mut pipe: File, client: HANDLE, user_sid: &str) -> Result<()
     result
 }
 
+/// Whether the header's state lets the host keep reading this mapping.
+fn running(state: u32) -> Result<()> {
+    match state {
+        state::RUNNING => Ok(()),
+        state::RESIZED => Err(Resized.into()),
+        _ => bail!("the screen helper stopped capturing"),
+    }
+}
+
 /// The host's end: frames of one output from the helper.
 pub(super) struct Frames {
-    pipe: File,
+    pipe: Pipe,
     _mapping: Owned,
     event: Owned,
     reader: Reader,
@@ -562,7 +624,7 @@ pub(super) struct Frames {
 impl Frames {
     /// Takes over the handles the helper sent over `pipe`, already
     /// duplicated into this process.
-    pub(super) fn open(pipe: File, granted: Granted) -> Result<Self> {
+    pub(super) fn open(pipe: Pipe, granted: Granted) -> Result<Self> {
         let mapping = Owned(HANDLE(granted.mapping as usize as *mut _));
         let event = Owned(HANDLE(granted.event as usize as *mut _));
         let size = usize::try_from(granted.size)?;
@@ -585,18 +647,15 @@ impl Frames {
         (self.reader.width, self.reader.height)
     }
     /// Waits up to `timeout` for a new frame and hands it to `upload`.
-    /// `Ok(None)`: none came (or it was overtaken while read). An error
-    /// means the helper stopped; ask again for a new connection.
+    /// `Ok(None)`: none came (or it was overtaken while read). A [`Resized`]
+    /// error: ask again for a mapping of the new size. Any other error
+    /// means the helper stopped.
     pub(super) fn next<R>(
         &mut self,
         timeout: Duration,
         upload: impl FnOnce(*const u8, usize) -> R,
     ) -> Result<Option<R>> {
-        match self.reader.state() {
-            state::RUNNING => {}
-            state::RESIZED => bail!("the output changed size"),
-            _ => bail!("the screen helper stopped capturing"),
-        }
+        running(self.reader.state())?;
         // SAFETY: The event handle is owned.
         let signalled = unsafe {
             WaitForSingleObject(
@@ -742,6 +801,59 @@ mod tests {
             format!("D:P(A;;GA;;;SY)(A;;0x00100000;;;{sid})"),
             "the user may only wait on the event"
         );
+    }
+
+    #[test]
+    fn a_resize_asks_for_a_new_mapping_and_a_failure_stops() {
+        assert!(running(state::RUNNING).is_ok());
+        assert!(running(state::RESIZED).unwrap_err().is::<Resized>());
+        let failed = running(state::FAILED).unwrap_err();
+        assert!(!failed.is::<Resized>());
+        assert!(!running(0).unwrap_err().is::<Resized>());
+    }
+
+    #[test]
+    fn handles_given_to_a_host_that_never_heard_of_them_are_closed_there() {
+        use windows::Win32::Foundation::GetHandleInformation;
+        // This process stands in for the host.
+        // SAFETY: An unnamed event, owned and closed below.
+        let event = Owned(unsafe { CreateEventW(None, false, false, PCWSTR::null()) }.unwrap());
+        let give = || {
+            let mut theirs = HANDLE::default();
+            // SAFETY: Duplicates within this process.
+            unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    event.0,
+                    GetCurrentProcess(),
+                    &mut theirs,
+                    SYNCHRONIZE,
+                    false,
+                    DUPLICATE_HANDLE_OPTIONS(0),
+                )
+            }
+            .unwrap();
+            Given {
+                // SAFETY: The pseudo-handle stands for this process.
+                process: unsafe { GetCurrentProcess() },
+                handle: theirs,
+            }
+        };
+        let open = |h: HANDLE| {
+            let mut flags = 0;
+            // SAFETY: Only reads the handle's flags.
+            unsafe { GetHandleInformation(h, &mut flags) }.is_ok()
+        };
+        let dropped = give();
+        let handle = dropped.handle;
+        assert!(open(handle));
+        drop(dropped);
+        assert!(!open(handle), "a grant that failed leaves nothing behind");
+        let kept = give();
+        let handle = kept.handle;
+        kept.handed_over();
+        assert!(open(handle), "a grant the host received is the host's");
+        drop(Owned(handle));
     }
 
     #[test]

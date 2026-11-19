@@ -8,43 +8,49 @@
 //! input to it or duplicate it, so a stream used to end at every
 //! administrator prompt and every lock.
 //!
-//! Setup copies latch-host.exe into `%ProgramFiles%\Latch\Input`, a folder
-//! only administrators can change, records the signed-in user's host path
-//! beside it (`host-path.txt`), and registers the [`TASK`] task that runs
-//! that copy with [`HELPER_ARG`] as LocalSystem. The task's own security
-//! lets that user start it, nothing more. The copy then plays one of three
-//! roles, by its token:
+//! Turning this on gives one Windows user's Latch the power to answer
+//! administrator prompts: whatever runs as that user and can start or
+//! replace their Latch can do the same. Setup copies latch-host.exe into
+//! `%ProgramFiles%\Latch\Input`, a folder only administrators can change,
+//! and records beside it the user who asked for setup (`user-sid.txt`,
+//! the unelevated user, not the administrator who approved the prompt)
+//! and that user's host path (`host-path.txt`). It registers the [`TASK`]
+//! task that runs that copy with [`HELPER_ARG`] as LocalSystem; the task's
+//! own security lets that user start it, nothing more. The copy then plays
+//! one of three roles, by its token:
 //!
 //! - The **broker**: SYSTEM in session 0, where the task starts it. The task
 //!   takes no arguments, so the broker finds the sessions to serve itself:
-//!   those running the recorded host executable. Into each it starts the
-//!   agent, its own executable and nothing else, with a copy of its SYSTEM
-//!   token moved to that session, on `winsta0\default`; it waits for them
-//!   and exits.
+//!   those where the recorded user runs the recorded host executable. Into
+//!   each it starts the agent, its own executable and nothing else, with a
+//!   copy of its SYSTEM token moved to that session, on `winsta0\default`.
+//!   It looks again every few seconds, and when a host rings its wake
+//!   event, while any agent runs; then it exits.
 //! - The **agent**: SYSTEM in the user's session. It serves the named pipe
-//!   `LatchInput-{session}`, whose security admits only SYSTEM and the user
-//!   whose recorded host runs in this session, and accepts a connection
-//!   only from that host executable in this session. Each of its threads
-//!   follows the desktop that has input (see `desktop`). It injects input
-//!   there, calls SendSAS for Ctrl+Alt+Delete, and on a second kind of
-//!   connection duplicates an output for the host (see `frames`).
+//!   `LatchInput-{session}`, whose security admits only SYSTEM and the
+//!   recorded user, and accepts a connection only from that user's host
+//!   executable in this session. Each of its threads follows the desktop
+//!   that has input (see `desktop`). It injects input there, calls SendSAS
+//!   for Ctrl+Alt+Delete, and on a second kind of connection duplicates an
+//!   output for the host (see `frames`).
 //! - **Elevated as the user**: what an older setup's task ran. It serves
 //!   input as before; it cannot reach the secure desktop and refuses frames.
 //!
-//! The host checks that the pipe's server is that protected copy before it
-//! sends anything. The helper keeps what it pressed and lets go of it when
-//! the stream's end closes the pipe.
+//! Before it sends anything, the host checks who serves the pipe: the
+//! protected copy, running as SYSTEM in this session (or, for input only,
+//! as this very user elevated). The helper keeps what it pressed and lets
+//! go of it when the stream's end closes the pipe.
 use super::frames::{self, Frames, Want};
 use super::input::Local;
+use super::pipe::Pipe;
 use crate::input::{DisplayRect, Event};
 use anyhow::{bail, ensure, Context, Result};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
-    fs::File,
     io::{Read, Write},
     os::windows::{
-        fs::OpenOptionsExt,
-        io::{AsRawHandle, FromRawHandle},
+        io::{FromRawHandle, OwnedHandle},
         process::CommandExt,
     },
     path::{Path, PathBuf},
@@ -58,21 +64,24 @@ use std::{
 use windows::{
     core::{s, HSTRING, PCWSTR, PWSTR},
     Win32::{
-        Foundation::{CloseHandle, LocalFree, BOOL, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, HWND},
+        Foundation::{
+            CloseHandle, LocalFree, BOOL, FILETIME, HANDLE, HLOCAL, HWND, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
+        },
         Security::{
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
                 SDDL_REVISION_1,
             },
             DuplicateTokenEx, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
-            SecurityImpersonation, SetTokenInformation, TokenIntegrityLevel, TokenPrimary,
-            TokenSessionId, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+            SecurityImpersonation, SetKernelObjectSecurity, SetTokenInformation,
+            TokenIntegrityLevel, TokenPrimary, TokenSessionId, TokenUser,
+            DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
             TOKEN_ACCESS_MASK, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL,
             TOKEN_QUERY, TOKEN_USER,
         },
         Storage::FileSystem::{
-            FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION,
-            SECURITY_SQOS_PRESENT,
+            FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
         },
         System::{
             Diagnostics::ToolHelp::{
@@ -81,17 +90,18 @@ use windows::{
             },
             LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32},
             Pipes::{
-                ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
-                GetNamedPipeClientSessionId, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
+                CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeClientSessionId,
+                GetNamedPipeServerProcessId, GetNamedPipeServerSessionId, PIPE_READMODE_BYTE,
                 PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
             },
             Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD},
             RemoteDesktop::ProcessIdToSessionId,
-            SystemInformation::GetSystemDirectoryW,
+            SystemInformation::{GetSystemDirectoryW, GetSystemTimePreciseAsFileTime},
             Threading::{
-                CreateProcessAsUserW, GetCurrentProcess, OpenProcess, OpenProcessToken,
-                QueryFullProcessImageNameW, WaitForSingleObject, CREATE_NO_WINDOW, INFINITE,
-                PROCESS_ACCESS_RIGHTS, PROCESS_DUP_HANDLE, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
+                CreateEventW, CreateProcessAsUserW, GetCurrentProcess, GetProcessTimes, OpenEventW,
+                OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, SetEvent,
+                WaitForSingleObject, CREATE_NO_WINDOW, EVENT_MODIFY_STATE, PROCESS_ACCESS_RIGHTS,
+                PROCESS_DUP_HANDLE, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
                 PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
             },
         },
@@ -105,6 +115,9 @@ pub const TASK: &str = "LatchInput";
 pub const HELPER_ARG: &str = "--input-helper";
 /// Where setup puts the helper, under `%ProgramFiles%`.
 pub const DIR: &str = r"Latch\Input";
+/// Beside the helper: the user setup approved, and that user's host.
+pub const USER_RECORD: &str = "user-sid.txt";
+pub const HOST_RECORD: &str = "host-path.txt";
 /// A build compiled with `LATCH_HELPER_TEST_DIR` set uses its own task,
 /// pipe and folder, so it can be tried beside an installed Latch. Release
 /// builds never set it.
@@ -121,10 +134,24 @@ const MAX_REQUEST: usize = 16 + 2 + latch_proto::input::MAX_TEXT;
 const IDLE: Duration = Duration::from_secs(5);
 /// How long a stream waits for the helper it started.
 const START_WAIT: Duration = Duration::from_secs(10);
+/// How long either end waits for the other's greeting (and, for frames,
+/// the request and its answer) before it hangs up.
+const HANDSHAKE: Duration = Duration::from_secs(3);
+/// How long the host waits for the helper's frames once it asked: the
+/// helper opens a capture of the output first.
+const GRANT_WAIT: Duration = Duration::from_secs(8);
+/// How long the host waits for the helper to answer one input event. The
+/// longest is Ctrl+Alt+Delete, which waits up to [`SAS_CHECK`].
+const REPLY_WAIT: Duration = Duration::from_secs(3);
+/// How long the agent waits for the secure desktop after SendSAS.
+const SAS_CHECK: Duration = Duration::from_secs(1);
+/// How often the broker looks for sessions that need an agent.
+const RECONCILE: Duration = Duration::from_secs(3);
 /// How often an injecting thread checks that it is on the input desktop
 /// (it also checks whenever Windows refuses an event).
 const DESKTOP_CHECK: Duration = Duration::from_millis(250);
 const MEDIUM: u32 = 0x2000;
+const HIGH: u32 = 0x3000;
 const SYSTEM_SID: &str = "S-1-5-18";
 const VK_DELETE: u16 = 0x2e;
 
@@ -210,6 +237,35 @@ fn pipe_name(session: u32) -> String {
         "LatchInput"
     };
     format!(r"\\.\pipe\{base}-{session}")
+}
+
+/// The broker's wake event, in the global namespace, which only services
+/// and administrators may create names in.
+fn wake_name() -> String {
+    let base = if TEST_DIR.is_some() {
+        TEST_NAME
+    } else {
+        "LatchInput"
+    };
+    format!(r"Global\{base}Wake")
+}
+
+/// Whether `sid` names a person's account: a local or domain account
+/// (`S-1-5-21-…`) or a Microsoft Entra one (`S-1-12-1-…`). Never SYSTEM,
+/// a service or a group.
+pub fn is_user_sid(sid: &str) -> bool {
+    let Some(rest) = sid
+        .strip_prefix("S-1-5-21-")
+        .or_else(|| sid.strip_prefix("S-1-12-1-"))
+    else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('-').collect();
+    parts.len() == 4
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 10 && p.bytes().all(|b| b.is_ascii_digit()))
+        && parts.iter().all(|p| p.parse::<u32>().is_ok())
 }
 
 /// The pipe's security. The user (not as an administrator) may read and
@@ -302,6 +358,12 @@ fn user_sid(token: &Handle) -> Result<String> {
     }
 }
 
+/// The user this process runs as: what the unelevated panel passes to the
+/// elevated setup as the user to approve.
+pub fn current_user_sid() -> Result<String> {
+    user_sid(&own_token(TOKEN_QUERY)?)
+}
+
 fn image(process: &Handle) -> Result<PathBuf> {
     let mut buf = vec![0u16; 1024];
     let mut len = buf.len() as u32;
@@ -319,14 +381,103 @@ fn image(process: &Handle) -> Result<PathBuf> {
     )))
 }
 
-fn process_image(pid: u32) -> Result<PathBuf> {
-    image(&open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?)
-}
-
 fn same_file_name(a: &Path, b: &Path) -> bool {
     a.as_os_str()
         .to_string_lossy()
         .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+}
+
+fn filetime(t: FILETIME) -> u64 {
+    u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime)
+}
+
+/// Now, as process creation times are kept. Precise, so it is never
+/// behind a creation time Windows took from its coarser clock in the same
+/// tick.
+fn now() -> u64 {
+    // SAFETY: Only returns the time.
+    filetime(unsafe { GetSystemTimePreciseAsFileTime() })
+}
+
+/// When the process behind `process` started.
+fn created(process: &Handle) -> Result<u64> {
+    let [mut created, mut exited, mut kernel, mut user] = [FILETIME::default(); 4];
+    // SAFETY: Writes four locals; the handle is open.
+    unsafe { GetProcessTimes(process.0, &mut created, &mut exited, &mut kernel, &mut user)? };
+    Ok(filetime(created))
+}
+
+/// A process id names whichever process has it now. The process a pipe
+/// names must already have run when the pipe was opened: one started
+/// since then got a reused id, and is not the pipe's other end.
+fn existed_by(created: u64, at: u64) -> bool {
+    created <= at
+}
+
+/// Who a process runs as, from its token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Identity {
+    sid: String,
+    session: u32,
+    integrity: u32,
+}
+fn identity(process: &Handle) -> Result<Identity> {
+    let token = process_token(process)?;
+    Ok(Identity {
+        sid: user_sid(&token)?,
+        session: session(&token)?,
+        integrity: integrity(&token)?,
+    })
+}
+
+/// Who serves the input pipe, as far as the host trusts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Server {
+    /// The SYSTEM agent: input, Ctrl+Alt+Delete and frames.
+    System,
+    /// An older setup's helper, elevated as this very user: input only.
+    ElevatedUser,
+}
+
+/// Whether the host may talk to a pipe server running as `server`: SYSTEM
+/// in the host's own session, or this same user elevated. Anything else (a
+/// copy of the helper that a user started, another user's process, a
+/// process in another session) is refused before it receives anything.
+fn judge_server(server: &Identity, own_sid: &str, own_session: u32) -> Result<Server> {
+    ensure!(
+        server.session == own_session,
+        "the input pipe's server runs in session {}, not this one ({own_session})",
+        server.session
+    );
+    if server.sid == SYSTEM_SID {
+        return Ok(Server::System);
+    }
+    ensure!(
+        server.sid == own_sid,
+        "the input pipe's server runs as {}, neither SYSTEM nor this user",
+        server.sid
+    );
+    ensure!(
+        server.integrity >= HIGH,
+        "the input pipe's server runs as this user but not elevated"
+    );
+    Ok(Server::ElevatedUser)
+}
+
+/// Whether the helper serves a client running as `client`: the approved
+/// user in the helper's own session.
+fn judge_client(client: &Identity, approved: &str, session: u32) -> Result<()> {
+    ensure!(
+        client.session == session,
+        "client in session {}",
+        client.session
+    );
+    ensure!(
+        client.sid == approved,
+        "client runs as {}, not the approved user",
+        client.sid
+    );
+    Ok(())
 }
 
 /// The program that owns `window` and its integrity level, when this
@@ -354,14 +505,26 @@ pub(super) fn own_integrity() -> u32 {
         .unwrap_or(MEDIUM)
 }
 
-/// The host executable setup recorded, from beside this executable in the
+/// A record setup wrote beside this executable, in the
 /// administrators-only folder.
+fn record(name: &str) -> Result<String> {
+    let path = std::env::current_exe()?.with_file_name(name);
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {name}"))?;
+    Ok(text.trim().trim_start_matches('\u{feff}').trim().to_owned())
+}
+
+/// The host executable setup recorded.
 fn recorded_host() -> Result<PathBuf> {
-    let record = std::env::current_exe()?.with_file_name("host-path.txt");
-    let text = std::fs::read_to_string(record).context("read host-path.txt")?;
-    let path = PathBuf::from(text.trim().trim_start_matches('\u{feff}'));
-    ensure!(path.is_absolute(), "host-path.txt names no full path");
+    let path = PathBuf::from(record(HOST_RECORD)?);
+    ensure!(path.is_absolute(), "{HOST_RECORD} names no full path");
     Ok(path)
+}
+
+/// The one user setup approved: whoever asked for it, unelevated.
+fn recorded_user() -> Result<String> {
+    let sid = record(USER_RECORD)?;
+    ensure!(is_user_sid(&sid), "{USER_RECORD} names no user");
+    Ok(sid)
 }
 
 /// A running copy of the recorded host: its session and user.
@@ -420,67 +583,75 @@ fn hosts(expected: &Path) -> Vec<Host> {
     found
 }
 
-/// The sessions the broker starts an agent in: those running the host.
-fn agent_sessions(hosts: &[Host]) -> Vec<u32> {
+/// The users running `exe` (elevated setup: whether the user it was asked
+/// to approve really runs the Latch that asked).
+pub fn users_running(exe: &Path) -> Vec<String> {
+    let mut users: Vec<String> = hosts(exe).into_iter().map(|h| h.sid).collect();
+    users.sort();
+    users.dedup();
+    users
+}
+
+/// The sessions the broker starts an agent in: those where the approved
+/// user runs the host. Another account's copy of the same path (a shared
+/// PC, a folder every user can write to) never gets one.
+fn approved_sessions(hosts: &[Host], approved: &str) -> Vec<u32> {
     let mut sessions: Vec<u32> = hosts
         .iter()
+        .filter(|h| h.sid == approved && h.session != 0)
         .map(|h| h.session)
-        .filter(|&s| s != 0)
         .collect();
     sessions.sort_unstable();
     sessions.dedup();
     sessions
 }
 
-/// The one user whose host runs in `session`; none when there is no host
-/// or several users' (which a per-user install cannot produce).
-fn session_user(hosts: &[Host], session: u32) -> Option<String> {
-    let mut users = hosts
-        .iter()
-        .filter(|h| h.session == session)
-        .map(|h| &h.sid);
-    let first = users.next()?;
-    users.all(|sid| sid == first).then(|| first.clone())
+/// What the broker knows about its agents, apart from their handles.
+#[derive(Debug, Default)]
+struct Roster {
+    /// Sessions with a running agent.
+    running: BTreeSet<u32>,
+    /// Sessions whose agent ended (idle, or it could not start): left alone
+    /// until a host rings the wake event, so an agent that went idle is
+    /// not started again and again while another session streams.
+    quiet: BTreeSet<u32>,
 }
-
-/// The task's process: starts an agent in each session running the
-/// recorded host, and lives as long as they do.
-fn broker() -> Result<()> {
-    let expected = recorded_host()?;
-    let exe = std::env::current_exe()?;
-    let mut agents = Vec::new();
-    let found = hosts(&expected);
-    trace(|| format!("hosts of {}: {found:?}", expected.display()));
-    for session in agent_sessions(&found) {
-        let Some(user) = session_user(&found, session) else {
-            continue;
-        };
-        match start_agent(&exe, session, &user) {
-            Ok(agent) => agents.push(agent),
-            Err(e) => trace(|| format!("agent for session {session}: {e:#}")),
-        }
+impl Roster {
+    /// The approved sessions to start an agent in now: each at most once.
+    fn to_start(&self, approved: &[u32]) -> Vec<u32> {
+        approved
+            .iter()
+            .copied()
+            .filter(|s| !self.running.contains(s) && !self.quiet.contains(s))
+            .collect()
     }
-    for agent in agents {
-        // SAFETY: The process handle is owned.
-        unsafe { WaitForSingleObject(agent.0, INFINITE) };
+    fn started(&mut self, session: u32) {
+        self.running.insert(session);
     }
-    Ok(())
+    fn ended(&mut self, session: u32) {
+        self.running.remove(&session);
+        self.quiet.insert(session);
+    }
+    /// A host asked for its agent.
+    fn woken(&mut self) {
+        self.quiet.clear();
+    }
+    /// The broker's work is done once no agent runs.
+    fn done(&self) -> bool {
+        self.running.is_empty()
+    }
 }
 
-/// The agent process's security. A SYSTEM token's default would let no
-/// one else open it, and the host must read its image path to trust the
-/// pipe: so SYSTEM fully, the user only that and waiting on it.
-fn agent_process_sddl(user_sid: &str) -> String {
-    format!("D:P(A;;GA;;;SY)(A;;0x00101000;;;{user_sid})")
+/// The wake event's security: SYSTEM fully, the approved user may only
+/// set it.
+fn wake_sddl(user_sid: &str) -> String {
+    format!("D:P(A;;GA;;;SY)(A;;0x00100002;;;{user_sid})")
 }
 
-/// Starts `exe` (this very executable) as SYSTEM in `session`, on the
-/// interactive window station's default desktop.
-fn start_agent(exe: &Path, session: u32, user_sid: &str) -> Result<Handle> {
-    let own = own_token(TOKEN_DUPLICATE | TOKEN_QUERY)?;
-    let sddl = HSTRING::from(agent_process_sddl(user_sid));
+fn security(sddl: &str) -> Result<(SECURITY_ATTRIBUTES, Descriptor)> {
+    let sddl = HSTRING::from(sddl);
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: Allocated by the call, freed below after process creation.
+    // SAFETY: Allocated by the call; freed by Descriptor.
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             PCWSTR(sddl.as_ptr()),
@@ -489,17 +660,108 @@ fn start_agent(exe: &Path, session: u32, user_sid: &str) -> Result<Handle> {
             None,
         )?;
     }
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor.0,
-        bInheritHandle: false.into(),
-    };
-    let started = start_agent_as(&own, exe, session, &attributes);
-    // SAFETY: Allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
-    unsafe {
-        LocalFree(HLOCAL(descriptor.0));
+    Ok((
+        SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: false.into(),
+        },
+        Descriptor(descriptor),
+    ))
+}
+
+/// A security descriptor ConvertStringSecurityDescriptorToSecurityDescriptorW
+/// allocated.
+struct Descriptor(PSECURITY_DESCRIPTOR);
+impl Drop for Descriptor {
+    fn drop(&mut self) {
+        // SAFETY: Allocated with LocalAlloc by the conversion; freed once.
+        unsafe {
+            LocalFree(HLOCAL(self.0 .0));
+        }
     }
-    started
+}
+
+/// The task's process: starts an agent in each session where the approved
+/// user runs the recorded host, and keeps doing so while any agent runs.
+/// The task ignores a start while the broker runs, so a host whose agent
+/// went idle rings the wake event instead.
+fn broker() -> Result<()> {
+    let expected = recorded_host()?;
+    let approved = recorded_user()?;
+    let exe = std::env::current_exe()?;
+    let (attributes, _descriptor) = security(&wake_sddl(&approved))?;
+    let name = HSTRING::from(wake_name());
+    // SAFETY: The attributes outlive the call; the event is owned.
+    let wake = Handle(unsafe { CreateEventW(Some(&attributes), false, false, &name)? });
+    let mut agents: BTreeMap<u32, Handle> = BTreeMap::new();
+    let mut roster = Roster::default();
+    loop {
+        agents.retain(|&session, agent| {
+            // SAFETY: The process handle is owned.
+            let alive = unsafe { WaitForSingleObject(agent.0, 0) } == WAIT_TIMEOUT;
+            if !alive {
+                roster.ended(session);
+            }
+            alive
+        });
+        let found = hosts(&expected);
+        for session in roster.to_start(&approved_sessions(&found, &approved)) {
+            match start_agent(&exe, session, &approved) {
+                Ok(agent) => {
+                    agents.insert(session, agent);
+                    roster.started(session);
+                }
+                Err(e) => {
+                    trace(|| format!("agent for session {session}: {e:#}"));
+                    roster.ended(session);
+                }
+            }
+        }
+        if roster.done() {
+            return Ok(());
+        }
+        // SAFETY: The event is owned.
+        if unsafe { WaitForSingleObject(wake.0, RECONCILE.as_millis() as u32) } == WAIT_OBJECT_0 {
+            trace(|| "woken by a host".into());
+            roster.woken();
+        }
+    }
+}
+
+/// The agent process's security. A SYSTEM token's default would let no
+/// one else open it, and the host must read its image path to trust the
+/// pipe: so SYSTEM fully, the user only that and waiting on it.
+/// Administrators may also find and end it (setup stops it to replace the
+/// file it runs from).
+fn agent_process_sddl(user_sid: &str) -> String {
+    format!("D:P(A;;GA;;;SY)(A;;0x00101001;;;BA)(A;;0x00101000;;;{user_sid})")
+}
+
+/// The agent's token's security: the user's host may read who the agent
+/// runs as (TOKEN_QUERY), which is how it tells this agent from a copy of
+/// the helper anyone else started. Nothing that could use the token.
+fn agent_token_sddl(user_sid: &str) -> String {
+    format!("D:P(A;;GA;;;SY)(A;;0x00020008;;;BA)(A;;0x00000008;;;{user_sid})")
+}
+
+/// Lets `user_sid` read this process's token (see [`agent_token_sddl`]).
+fn share_identity(user_sid: &str) -> Result<()> {
+    // WRITE_DAC on the token.
+    let token = own_token(TOKEN_ACCESS_MASK(0x0004_0000))?;
+    let (_, descriptor) = security(&agent_token_sddl(user_sid))?;
+    // SAFETY: The token and the descriptor are open for the call.
+    unsafe { SetKernelObjectSecurity(token.0, DACL_SECURITY_INFORMATION, descriptor.0) }
+        .context("let the host read the agent's token")?;
+    Ok(())
+}
+
+/// Starts `exe` (this very executable) as SYSTEM in `session`, on the
+/// interactive window station's default desktop.
+fn start_agent(exe: &Path, session: u32, user_sid: &str) -> Result<Handle> {
+    let own = own_token(TOKEN_DUPLICATE | TOKEN_QUERY)?;
+    let (attributes, _descriptor) = security(&agent_process_sddl(user_sid))?;
+    start_agent_as(&own, exe, session, &attributes)
 }
 
 fn start_agent_as(
@@ -564,34 +826,31 @@ fn start_agent_as(
 fn serve(system: bool) -> Result<()> {
     let token = own_token(TOKEN_QUERY)?;
     let session = session(&token)?;
-    // Only setup writes this record in the administrators-only helper folder.
+    // Only setup writes these records in the administrators-only folder.
     let expected = recorded_host()?;
+    let approved = recorded_user();
     let user = if system {
+        let user = approved?;
+        ensure!(
+            approved_sessions(&hosts(&expected), &user).contains(&session),
+            "the approved user's host does not run in this session"
+        );
+        share_identity(&user)?;
         super::desktop::enable_following();
-        session_user(&hosts(&expected), session).context("no host runs in this session")?
+        user
     } else {
-        // (An elevated helper's user is its own.)
-        user_sid(&token)?
+        // An elevated helper's user is its own, and must be the approved
+        // one when setup recorded one.
+        let own = user_sid(&token)?;
+        if let Ok(approved) = approved {
+            ensure!(own == approved, "this helper runs as another user");
+        }
+        own
     };
     trace(|| format!("serving {} for {user}", pipe_name(session)));
     let name = HSTRING::from(pipe_name(session));
-    let sddl = HSTRING::from(pipe_sddl(&user, system));
-    let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: The descriptor is allocated by the call and kept for the
-    // process's life, since every pipe instance is created with it.
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(sddl.as_ptr()),
-            SDDL_REVISION_1,
-            &mut descriptor,
-            None,
-        )?;
-    }
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor.0,
-        bInheritHandle: false.into(),
-    };
+    // Kept for the process's life: every pipe instance is created with it.
+    let (attributes, _descriptor) = security(&pipe_sddl(&user, system))?;
     let active = Arc::new(AtomicUsize::new(0));
     let last = Arc::new(parking_lot::Mutex::new(Instant::now()));
     {
@@ -608,10 +867,11 @@ fn serve(system: bool) -> Result<()> {
     loop {
         // SAFETY: The name and attributes outlive the call. The first
         // instance fails if another process already owns this name.
-        let pipe = unsafe {
+        let handle = unsafe {
             CreateNamedPipeW(
                 PCWSTR(name.as_ptr()),
                 PIPE_ACCESS_DUPLEX
+                    | FILE_FLAG_OVERLAPPED
                     | if first {
                         FILE_FLAG_FIRST_PIPE_INSTANCE
                     } else {
@@ -625,7 +885,7 @@ fn serve(system: bool) -> Result<()> {
                 Some(&attributes),
             )
         };
-        if pipe.is_invalid() {
+        if handle.is_invalid() {
             trace(|| format!("create pipe: {}", windows::core::Error::from_win32()));
             if first {
                 bail!(
@@ -637,59 +897,75 @@ fn serve(system: bool) -> Result<()> {
             continue;
         }
         first = false;
-        // SAFETY: The pipe handle is owned by the File from here on.
-        let file = unsafe { File::from_raw_handle(pipe.0) };
-        // SAFETY: Blocks until a client opens this instance.
-        match unsafe { ConnectNamedPipe(pipe, None) } {
-            Ok(()) => {}
-            Err(e) if e.code() == ERROR_PIPE_CONNECTED.to_hresult() => {}
+        // SAFETY: The pipe handle is owned by the Pipe from here on.
+        let mut pipe = match Pipe::from_handle(unsafe { OwnedHandle::from_raw_handle(handle.0) }) {
+            Ok(pipe) => pipe,
             Err(_) => continue,
-        }
-        let mut client_session = u32::MAX;
-        // SAFETY: Reads the connected client's session into a local.
-        if unsafe { GetNamedPipeClientSessionId(pipe, &mut client_session) }.is_err()
-            || client_session != session
-        {
-            trace(|| format!("refused a client in session {client_session}"));
-            continue;
-        }
-        let mut pid = 0;
-        // SAFETY: The pipe is connected and the output points to a local.
-        if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) }.is_err() {
-            trace(|| "client process id unreadable".into());
-            continue;
-        }
-        // The client's identity is read through the very handle the frames
-        // are later duplicated into, so a reused process id cannot slip in.
-        let access = if system {
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_DUP_HANDLE
-        } else {
-            PROCESS_QUERY_LIMITED_INFORMATION
         };
-        let client = match open_process(pid, access) {
+        if pipe.accept().is_err() {
+            continue;
+        }
+        let connected_at = now();
+        let client = match accept_client(&pipe, session, &expected, &user, system, connected_at) {
             Ok(client) => client,
             Err(e) => {
-                trace(|| format!("open client {pid}: {e:#}"));
+                trace(|| format!("refused a client: {e:#}"));
                 continue;
             }
         };
-        let client_image = image(&client);
-        if !client_image
-            .as_ref()
-            .is_ok_and(|image| same_file_name(image, &expected))
-        {
-            trace(|| format!("refused client {pid}: {client_image:?}"));
-            continue;
-        }
         active.fetch_add(1, Ordering::AcqRel);
         let (active, last, user) = (active.clone(), last.clone(), user.clone());
         thread::spawn(move || {
-            let result = serve_connection(file, &client, &user, system);
-            trace(|| format!("client {pid} done: {result:?}"));
+            let result = serve_connection(pipe, &client, &user, system);
+            trace(|| format!("client done: {result:?}"));
             *last.lock() = Instant::now();
             active.fetch_sub(1, Ordering::AcqRel);
         });
     }
+}
+
+/// Checks the client that just connected (at `connected_at`): the
+/// approved user's recorded host, in this session. Returns its process,
+/// opened for the frames to be duplicated into.
+fn accept_client(
+    pipe: &Pipe,
+    session: u32,
+    expected: &Path,
+    user: &str,
+    system: bool,
+    connected_at: u64,
+) -> Result<Handle> {
+    let mut client_session = u32::MAX;
+    // SAFETY: Reads the connected client's session into a local.
+    unsafe { GetNamedPipeClientSessionId(pipe.raw(), &mut client_session) }?;
+    ensure!(
+        client_session == session,
+        "client in session {client_session}"
+    );
+    let mut pid = 0;
+    // SAFETY: The pipe is connected and the output points to a local.
+    unsafe { GetNamedPipeClientProcessId(pipe.raw(), &mut pid) }?;
+    // The client's identity is read through the very handle the frames
+    // are later duplicated into.
+    let access = if system {
+        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_DUP_HANDLE
+    } else {
+        PROCESS_QUERY_LIMITED_INFORMATION
+    };
+    let client = open_process(pid, access).with_context(|| format!("open client {pid}"))?;
+    // A process that started after it connected only reused its id.
+    ensure!(
+        existed_by(created(&client)?, connected_at),
+        "client {pid} started after it connected"
+    );
+    let client_image = image(&client)?;
+    ensure!(
+        same_file_name(&client_image, expected),
+        "client {pid} runs {}",
+        client_image.display()
+    );
+    judge_client(&identity(&client)?, user, session)?;
+    Ok(client)
 }
 
 enum Hello {
@@ -713,10 +989,16 @@ fn handshake(pipe: &mut (impl Read + Write), frames: bool) -> Result<Hello> {
     Ok(kind)
 }
 
-fn serve_connection(mut pipe: File, client: &Handle, user: &str, system: bool) -> Result<()> {
+fn serve_connection(mut pipe: Pipe, client: &Handle, user: &str, system: bool) -> Result<()> {
+    // A client that connects and says nothing is not a stream, and must
+    // not keep the helper from going idle.
+    pipe.set_deadline(Some(Instant::now() + HANDSHAKE));
     match handshake(&mut pipe, system)? {
-        Hello::Input => serve_input(pipe, system),
-        Hello::Frames => frames::serve(pipe, client.0, user),
+        Hello::Input => {
+            pipe.set_deadline(None);
+            serve_input(pipe, system)
+        }
+        Hello::Frames => frames::serve(pipe, client.0, user, HANDSHAKE),
     }
 }
 
@@ -790,11 +1072,25 @@ fn software_sas_allowed() -> bool {
     status.is_ok() && matches!(value, 1 | 3)
 }
 
+fn is_secure_desktop(name: &str) -> bool {
+    name.eq_ignore_ascii_case("Winlogon")
+}
+
+/// Asks Windows for the secure attention sequence, as Ctrl+Alt+Delete.
+///
+/// SendSAS is documented for services and for `uiAccess` applications
+/// that are signed and installed in a secure folder. The agent is
+/// neither: it runs as LocalSystem from a scheduled task, which Windows
+/// accepts as a service under SoftwareSASGeneration 1 today. SendSAS
+/// returns nothing, so if a Windows version stops accepting that, the call
+/// silently does nothing; the agent checks that the secure desktop came up
+/// and otherwise reports the failure to the host, which logs it.
 fn send_sas() -> Result<()> {
     ensure!(
         software_sas_allowed(),
         "Ctrl+Alt+Delete from a viewer needs Windows' SoftwareSASGeneration policy; run Set up as administrator again"
     );
+    let before = super::desktop::input_name().ok();
     // SAFETY: sas.dll is loaded from System32 only and stays loaded; the
     // export has the documented `VOID SendSAS(BOOL AsUser)` signature.
     unsafe {
@@ -808,7 +1104,18 @@ fn send_sas() -> Result<()> {
         let send: unsafe extern "system" fn(BOOL) = std::mem::transmute(send);
         send(false.into());
     }
-    Ok(())
+    // Already on the secure desktop (the lock screen): nothing to see.
+    if before.as_deref().is_none_or(is_secure_desktop) {
+        return Ok(());
+    }
+    let deadline = Instant::now() + SAS_CHECK;
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+        if super::desktop::input_name().is_ok_and(|n| is_secure_desktop(&n)) {
+            return Ok(());
+        }
+    }
+    bail!("Windows ignored Ctrl+Alt+Delete from the helper: SendSAS did not bring up the secure desktop")
 }
 
 /// One stream's input until it closes the pipe. Dropping `local` lets go
@@ -934,52 +1241,106 @@ fn decode(bytes: &[u8]) -> Result<(Event, DisplayRect)> {
     Ok((event, display))
 }
 
-/// Opens the session's pipe and checks that its server is the protected
-/// helper copy, then greets it with `version`, which it must echo.
-fn open_pipe(session: u32, expected: &Path, version: &[u8; 8]) -> Result<File> {
-    let mut pipe = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .security_qos_flags(SECURITY_SQOS_PRESENT.0 | SECURITY_IDENTIFICATION.0)
-        .open(pipe_name(session))?;
-    let mut pid = 0;
+/// A verified helper closed the pipe instead of answering the greeting:
+/// it does not speak this version (or this kind of connection).
+#[derive(Debug)]
+struct Refused;
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the helper refused; it may be from an older setup")
+    }
+}
+
+/// This process: the session whose pipe it opens, and the user it is.
+struct Me {
+    session: u32,
+    sid: String,
+}
+impl Me {
+    fn current() -> Result<Self> {
+        let token = own_token(TOKEN_QUERY)?;
+        Ok(Self {
+            session: session(&token)?,
+            sid: user_sid(&token)?,
+        })
+    }
+}
+
+/// Opens the session's pipe and checks who serves it (see
+/// [`judge_server`]): the protected helper copy, running as SYSTEM in this
+/// session or as this user elevated, and already running when the pipe
+/// was opened. Then greets it with `version`, which it must echo in time.
+fn open_pipe(me: &Me, expected: &Path, version: &[u8; 8]) -> Result<(Pipe, Server)> {
+    let opened_at = now();
+    let mut pipe = Pipe::open(&pipe_name(me.session))?;
+    let mut server_session = u32::MAX;
     // SAFETY: The handle is the open pipe's; the id is written to a local.
-    unsafe { GetNamedPipeServerProcessId(HANDLE(pipe.as_raw_handle()), &mut pid)? };
-    let image = process_image(pid)?;
+    unsafe { GetNamedPipeServerSessionId(pipe.raw(), &mut server_session)? };
+    ensure!(
+        server_session == me.session,
+        "the input pipe's server runs in session {server_session}"
+    );
+    let mut pid = 0;
+    // SAFETY: As above.
+    unsafe { GetNamedPipeServerProcessId(pipe.raw(), &mut pid)? };
+    let process = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)
+        .context("open the input pipe's server")?;
+    ensure!(
+        existed_by(created(&process)?, opened_at),
+        "the input pipe's server process started after the pipe was opened"
+    );
+    let image = image(&process)?;
     ensure!(
         same_file_name(&image, expected),
         "the input pipe belongs to {}, not {}",
         image.display(),
         expected.display()
     );
+    let server = identity(&process).context("read who the input pipe's server runs as")?;
+    let server = judge_server(&server, &me.sid, me.session)?;
+    // Frame handles come only from the SYSTEM agent: an older helper,
+    // elevated as this user, is not even asked.
+    ensure!(
+        version != HELLO_FRAMES || server == Server::System,
+        "only the SYSTEM helper may share the screen"
+    );
+    pipe.set_deadline(Some(Instant::now() + HANDSHAKE));
     pipe.write_all(version)?;
     let mut hello = [0; HELLO.len()];
-    pipe.read_exact(&mut hello)
-        .context("the helper refused; it may be from an older setup")?;
+    pipe.read_exact(&mut hello).context(Refused)?;
     ensure!(
         &hello == version,
         "the input helper is a different Latch build"
     );
-    Ok(pipe)
+    pipe.set_deadline(None);
+    Ok((pipe, server))
 }
 
 /// The host's end of the pipe.
 pub(super) struct Client {
-    pipe: File,
+    pipe: Pipe,
     key_positions: bool,
     legacy_held: std::collections::BTreeSet<u16>,
 }
 
 impl Client {
-    fn connect(session: u32, expected: &Path) -> Result<Self> {
+    fn connect(me: &Me, expected: &Path) -> Result<Self> {
         // An old helper closes an unrecognised handshake. Reopen its pipe
-        // using v1, validating server identity on both connections.
-        Self::connect_version(session, expected, HELLO2)
-            .or_else(|_| Self::connect_version(session, expected, HELLO))
+        // using v1, validating server identity on both connections. Any
+        // other failure (a server that is not the helper) stands as it is.
+        match Self::connect_version(me, expected, HELLO2) {
+            Err(e) if e.downcast_ref::<Refused>().is_some() => {
+                Self::connect_version(me, expected, HELLO)
+            }
+            result => result,
+        }
     }
 
-    fn connect_version(session: u32, expected: &Path, version: &[u8; 8]) -> Result<Self> {
-        let pipe = open_pipe(session, expected, version)?;
+    fn connect_version(me: &Me, expected: &Path, version: &[u8; 8]) -> Result<Self> {
+        let (pipe, server) = open_pipe(me, expected, version)?;
+        if server == Server::ElevatedUser {
+            tracing::info!("an older setup's input helper serves this stream; the lock screen and administrator prompts need Set up as administrator again");
+        }
         Ok(Self {
             pipe,
             key_positions: version == HELLO2,
@@ -987,8 +1348,8 @@ impl Client {
         })
     }
 
-    /// The outer error is the pipe's (the helper is gone); the inner one
-    /// is the helper's (it could not inject).
+    /// The outer error is the pipe's (the helper is gone, or did not
+    /// answer in time); the inner one is the helper's (it could not inject).
     pub(super) fn apply(
         &mut self,
         event: &Event,
@@ -997,6 +1358,7 @@ impl Client {
         let Some(event) = helper_event(event, self.key_positions, &mut self.legacy_held) else {
             return Ok(Ok(()));
         };
+        self.pipe.set_deadline(Some(Instant::now() + REPLY_WAIT));
         self.pipe.write_all(&encode(&event, display))?;
         let mut status = [0];
         self.pipe.read_exact(&mut status)?;
@@ -1037,7 +1399,7 @@ pub(super) fn connect() -> mpsc::Receiver<Client> {
 }
 
 fn connect_now() -> Option<Client> {
-    let session = own_token(TOKEN_QUERY).and_then(|t| session(&t)).ok()?;
+    let me = Me::current().ok()?;
     let expected = helper_exe()?;
     if !expected.is_file() {
         if !NOT_SET_UP.swap(true, Ordering::Relaxed) {
@@ -1045,7 +1407,7 @@ fn connect_now() -> Option<Client> {
         }
         return None;
     }
-    match with_helper(|| Client::connect(session, &expected), |_| true) {
+    match with_helper(|| Client::connect(&me, &expected), |_| true) {
         Ok(client) => Some(client),
         Err(e) => {
             if !NOT_SET_UP.swap(true, Ordering::Relaxed) {
@@ -1059,8 +1421,9 @@ fn connect_now() -> Option<Client> {
 }
 
 /// Runs `attempt` against the helper, starting its task when it is not
-/// running, for up to [`START_WAIT`]. `retry` says whether an attempt's
-/// error may mean it is still starting.
+/// running, for up to [`START_WAIT`] (plus one attempt, whose own waits
+/// are bounded by [`HANDSHAKE`]). `retry` says whether an attempt's error
+/// may mean it is still starting.
 fn with_helper<T>(
     attempt: impl Fn() -> Result<T>,
     retry: impl Fn(&anyhow::Error) -> bool,
@@ -1100,16 +1463,18 @@ fn absent(error: &anyhow::Error) -> bool {
 }
 
 /// Frames of the output `want` from the helper, starting it if needed.
-/// Blocks for up to [`START_WAIT`].
+/// Blocks for up to [`START_WAIT`], a handshake and [`GRANT_WAIT`].
 pub(super) fn connect_frames(want: Want) -> Result<Frames> {
-    let session = own_token(TOKEN_QUERY).and_then(|t| session(&t))?;
+    let me = Me::current()?;
     let expected = helper_exe().context("no Program Files folder")?;
     ensure!(expected.is_file(), "the helper is not set up");
     with_helper(
         || {
-            let mut pipe = open_pipe(session, &expected, HELLO_FRAMES)?;
+            let (mut pipe, _) = open_pipe(&me, &expected, HELLO_FRAMES)?;
+            pipe.set_deadline(Some(Instant::now() + GRANT_WAIT));
             pipe.write_all(&frames::encode_want(&want))?;
             let granted = frames::read_granted(&mut pipe)?;
+            pipe.set_deadline(None);
             Frames::open(pipe, granted)
         },
         absent,
@@ -1133,7 +1498,16 @@ pub(super) fn request_frames(want: Want) -> mpsc::Receiver<Result<Frames>> {
     rx
 }
 
+/// Asks for the helper: rings a running broker's wake event, and starts
+/// the task, which Windows ignores while the broker runs.
 fn start_task() -> Result<()> {
+    let name = HSTRING::from(wake_name());
+    // SAFETY: The handle is owned and closed by Handle.
+    if let Ok(wake) = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, &name) } {
+        let wake = Handle(wake);
+        // SAFETY: The event is open for EVENT_MODIFY_STATE.
+        let _ = unsafe { SetEvent(wake.0) };
+    }
     let mut dir = vec![0u16; 260];
     // SAFETY: The buffer's length is passed with it.
     let len = unsafe { GetSystemDirectoryW(Some(&mut dir)) } as usize;
@@ -1330,7 +1704,9 @@ mod tests {
         // PROCESS_QUERY_LIMITED_INFORMATION and SYNCHRONIZE, nothing that
         // could read its memory, inject into it or end it.
         assert!(sddl.ends_with("(A;;0x00101000;;;S-1-5-21-1-2-3-1001)"));
-        assert_eq!(sddl.matches("(A;").count(), 2);
+        // Administrators may also end it, as setup does to replace its file.
+        assert!(sddl.contains("(A;;0x00101001;;;BA)"));
+        assert_eq!(sddl.matches("(A;").count(), 3);
         for denied in [
             0x0001,
             0x0002,
@@ -1342,6 +1718,27 @@ mod tests {
             0x0004_0000,
         ] {
             assert_eq!(0x0010_1000 & denied, 0, "{denied:#x}");
+        }
+        for denied in [0x0002, 0x0008, 0x0010, 0x0020, 0x0040, 0x0400, 0x0004_0000] {
+            assert_eq!(0x0010_1001 & denied, 0, "{denied:#x}");
+        }
+    }
+
+    #[test]
+    fn the_user_may_only_read_who_the_agent_runs_as() {
+        let sddl = agent_token_sddl("S-1-5-21-1-2-3-1001");
+        assert!(sddl.starts_with("D:P(A;;GA;;;SY)"));
+        // TOKEN_QUERY alone: not duplicate, impersonate, assign or adjust.
+        assert!(sddl.ends_with("(A;;0x00000008;;;S-1-5-21-1-2-3-1001)"));
+        assert!(sddl.contains("(A;;0x00020008;;;BA)"));
+        assert_eq!(sddl.matches("(A;").count(), 3);
+        // The wake event: the user may set it and nothing else.
+        assert_eq!(
+            wake_sddl("S-1-5-21-1-2-3-1001"),
+            "D:P(A;;GA;;;SY)(A;;0x00100002;;;S-1-5-21-1-2-3-1001)"
+        );
+        if TEST_DIR.is_none() {
+            assert_eq!(wake_name(), r"Global\LatchInputWake");
         }
     }
 
@@ -1358,21 +1755,148 @@ mod tests {
     }
 
     #[test]
-    fn agents_go_to_the_sessions_running_the_host_and_serve_its_user() {
+    fn agents_go_only_to_the_approved_users_sessions() {
         let host = |session, sid: &str| Host {
             session,
             sid: sid.into(),
         };
         let a = "S-1-5-21-1-2-3-1001";
         let b = "S-1-5-21-1-2-3-1002";
-        let hosts = [host(2, a), host(1, a), host(2, a), host(0, a)];
-        // Never session 0, each session once.
-        assert_eq!(agent_sessions(&hosts), vec![1, 2]);
-        assert_eq!(agent_sessions(&[]), Vec::<u32>::new());
-        assert_eq!(session_user(&hosts, 1).as_deref(), Some(a));
-        assert_eq!(session_user(&hosts, 3), None, "no host, no agent");
-        // Two users' hosts in one session: whose would the pipe admit? Neither.
-        assert_eq!(session_user(&[host(1, a), host(1, b)], 1), None);
+        let hosts = [host(2, a), host(1, a), host(2, a), host(0, a), host(3, b)];
+        // Never session 0, each session once, never another account's.
+        assert_eq!(approved_sessions(&hosts, a), vec![1, 2]);
+        assert_eq!(approved_sessions(&hosts, b), vec![3]);
+        assert_eq!(approved_sessions(&[], a), Vec::<u32>::new());
+        // Another user's copy of the same path in a session of their own,
+        // or beside the approved user's: only the approved user's counts.
+        assert_eq!(approved_sessions(&[host(1, b)], a), Vec::<u32>::new());
+        assert_eq!(approved_sessions(&[host(1, a), host(1, b)], a), vec![1]);
+    }
+
+    #[test]
+    fn the_broker_starts_each_session_once_and_again_only_when_woken() {
+        let mut roster = Roster::default();
+        assert_eq!(roster.to_start(&[1, 2]), vec![1, 2]);
+        roster.started(1);
+        roster.started(2);
+        // Already running: no duplicate.
+        assert_eq!(roster.to_start(&[1, 2]), Vec::<u32>::new());
+        // A session that appears later gets one on the next pass.
+        assert_eq!(roster.to_start(&[1, 2, 5]), vec![5]);
+        roster.started(5);
+        // An agent that went idle is not restarted by itself while the
+        // others still run...
+        roster.ended(2);
+        assert!(!roster.done());
+        assert_eq!(roster.to_start(&[1, 2, 5]), Vec::<u32>::new());
+        // ...but when its host rings the wake event.
+        roster.woken();
+        assert_eq!(roster.to_start(&[1, 2, 5]), vec![2]);
+        roster.ended(1);
+        roster.ended(5);
+        assert!(roster.done(), "no agent left: the broker exits");
+    }
+
+    #[test]
+    fn the_host_talks_only_to_system_in_its_session_or_itself_elevated() {
+        let me = "S-1-5-21-1-2-3-1001";
+        let id = |sid: &str, session, integrity| Identity {
+            sid: sid.into(),
+            session,
+            integrity,
+        };
+        assert_eq!(
+            judge_server(&id(SYSTEM_SID, 1, 0x4000), me, 1).unwrap(),
+            Server::System
+        );
+        // The legacy helper: this very user, elevated, input only.
+        assert_eq!(
+            judge_server(&id(me, 1, HIGH), me, 1).unwrap(),
+            Server::ElevatedUser
+        );
+        // A copy of the helper the user started without elevation.
+        assert!(judge_server(&id(me, 1, MEDIUM), me, 1).is_err());
+        // Another user, elevated or not.
+        assert!(judge_server(&id("S-1-5-21-1-2-3-1002", 1, HIGH), me, 1).is_err());
+        // Administrators or a service account are not SYSTEM.
+        assert!(judge_server(&id("S-1-5-32-544", 1, 0x4000), me, 1).is_err());
+        assert!(judge_server(&id("S-1-5-19", 1, 0x4000), me, 1).is_err());
+        // SYSTEM, but serving from another session.
+        assert!(judge_server(&id(SYSTEM_SID, 0, 0x4000), me, 1).is_err());
+        assert!(judge_server(&id(SYSTEM_SID, 2, 0x4000), me, 1).is_err());
+    }
+
+    #[test]
+    fn the_helper_serves_only_the_approved_user_in_its_session() {
+        let approved = "S-1-5-21-1-2-3-1001";
+        let id = |sid: &str, session| Identity {
+            sid: sid.into(),
+            session,
+            integrity: MEDIUM,
+        };
+        assert!(judge_client(&id(approved, 1), approved, 1).is_ok());
+        assert!(judge_client(&id("S-1-5-21-1-2-3-1002", 1), approved, 1).is_err());
+        assert!(judge_client(&id(approved, 2), approved, 1).is_err());
+        assert!(judge_client(&id(SYSTEM_SID, 1), approved, 1).is_err());
+    }
+
+    #[test]
+    fn only_a_refused_greeting_falls_back_to_the_old_handshake() {
+        let refused: Result<()> =
+            Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)).context(Refused);
+        assert!(refused.unwrap_err().downcast_ref::<Refused>().is_some());
+        // A server that failed the identity check is not retried as an
+        // older helper, so its reason is what the host reports.
+        let impostor = judge_server(
+            &Identity {
+                sid: "S-1-5-21-1-2-3-1001".into(),
+                session: 1,
+                integrity: MEDIUM,
+            },
+            "S-1-5-21-1-2-3-1001",
+            1,
+        )
+        .unwrap_err();
+        assert!(impostor.downcast_ref::<Refused>().is_none());
+    }
+
+    #[test]
+    fn a_process_that_started_later_only_reused_the_id() {
+        assert!(existed_by(10, 10));
+        assert!(existed_by(9, 10));
+        assert!(!existed_by(11, 10));
+        let me = open_process(std::process::id(), PROCESS_QUERY_LIMITED_INFORMATION).unwrap();
+        let started = created(&me).unwrap();
+        assert!(started > 0 && existed_by(started, now()));
+        let id = identity(&me).unwrap();
+        let token = own_token(TOKEN_QUERY).unwrap();
+        assert_eq!(id.sid, user_sid(&token).unwrap());
+        assert_eq!(id.session, session(&token).unwrap());
+    }
+
+    #[test]
+    fn only_person_accounts_can_be_approved() {
+        assert!(is_user_sid("S-1-5-21-3623811015-3361044348-30300820-1013"));
+        assert!(is_user_sid(
+            "S-1-12-1-1234567890-1234567890-1234567890-123456789"
+        ));
+        for sid in [
+            "S-1-5-18",
+            "S-1-5-19",
+            "S-1-5-32-544",
+            "S-1-1-0",
+            "S-1-5-21-1-2-3",
+            "S-1-5-21-1-2-3-4-5",
+            "S-1-5-21-1-2-3-x",
+            "S-1-5-21-1-2-3-99999999999",
+            "S-1-5-21-1-2-3-1001)(A;;GA;;;WD",
+            "S-1-5-21-1-2-3-1001 ",
+            "",
+        ] {
+            assert!(!is_user_sid(sid), "{sid}");
+        }
+        let me = current_user_sid().unwrap();
+        assert!(is_user_sid(&me) || me == SYSTEM_SID, "{me}");
     }
 
     #[test]
@@ -1467,7 +1991,9 @@ mod tests {
             installed,
             Path::new(r"C:\Users\User\AppData\Local\Latch\other.exe")
         ));
-        let actual = process_image(std::process::id()).unwrap();
+        let actual =
+            image(&open_process(std::process::id(), PROCESS_QUERY_LIMITED_INFORMATION).unwrap())
+                .unwrap();
         assert!(same_file_name(&actual, &std::env::current_exe().unwrap()));
     }
 
@@ -1477,16 +2003,17 @@ mod tests {
     #[ignore]
     fn live_system_agent_serves_this_session() -> Result<()> {
         let started = Instant::now();
-        let own = session(&own_token(TOKEN_QUERY)?)?;
+        let me = Me::current()?;
+        let own = me.session;
         let expected = helper_exe().context("no helper path")?;
-        let mut client = with_helper(|| Client::connect(own, &expected), |_| true)?;
+        let mut client = with_helper(|| Client::connect(&me, &expected), |_| true)?;
         eprintln!("input helper answered after {:?}", started.elapsed());
         client
             .apply(&Event::ReleaseAll, DisplayRect::default())
             .context("pipe")??;
         let mut pid = 0;
         // SAFETY: The handle is the open pipe's; the id is written to a local.
-        unsafe { GetNamedPipeServerProcessId(HANDLE(client.pipe.as_raw_handle()), &mut pid)? };
+        unsafe { GetNamedPipeServerProcessId(client.pipe.raw(), &mut pid)? };
         let process = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
         let mut server_session = 0;
         // SAFETY: Writes the session id into a local.

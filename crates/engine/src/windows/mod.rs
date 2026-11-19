@@ -12,6 +12,7 @@ mod frames;
 mod input;
 mod mf;
 mod mf_ltr;
+mod pipe;
 mod runtime;
 mod vigem;
 
@@ -768,7 +769,8 @@ pub fn open_pads(feedback: crate::gamepad::FeedbackFn) -> Result<crate::gamepad:
     Ok(crate::gamepad::Pads::opened(vigem::open()?, feedback))
 }
 pub use elevated::{
-    helper_exe as input_helper_exe, run_helper as run_input_helper, TASK as INPUT_TASK,
+    current_user_sid, helper_exe as input_helper_exe, is_user_sid, run_helper as run_input_helper,
+    users_running, TASK as INPUT_TASK,
 };
 pub fn encodable(display: Option<&str>) -> Vec<Codec> {
     let display = display.map(str::to_owned);

@@ -13,7 +13,8 @@ use windows::Win32::{
     System::{
         StationsAndDesktops::{
             CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop,
-            SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, HDESK, UOI_NAME,
+            SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS,
+            HDESK, UOI_NAME,
         },
         Threading::GetCurrentThreadId,
     },
@@ -139,6 +140,20 @@ pub(super) fn follow() -> Result<bool> {
         followed.current = Some(desktop);
         Ok(true)
     })
+}
+
+/// The name of the desktop that has input: `Winlogon` for the secure
+/// desktop, `Default` for the user's.
+pub(super) fn input_name() -> Result<String> {
+    // SAFETY: The handle is owned by Desktop, which closes it; this thread
+    // never moves to it.
+    let handle = unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) }
+        .context("open the input desktop")?;
+    let desktop = Desktop {
+        handle,
+        name: String::new(),
+    };
+    name(desktop.handle)
 }
 
 #[cfg(test)]
