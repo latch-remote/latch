@@ -1862,8 +1862,24 @@ mod tests {
     fn the_installer_stops_only_its_own_host() {
         let installer = include_str!("../../../scripts/install-host.ps1");
         assert!(!installer.contains("Get-Process latch-host"));
-        assert!(installer.contains("$candidate.ExecutablePath -ine $DestExe"));
-        assert!(installer.contains("$owner.Sid -ne $Me"));
+        assert!(!installer.contains("Stop-Process -InputObject"));
+        // Checked and ended through one handle, from either PowerShell.
+        let stop = installer.split("public static bool Stop(").nth(1).unwrap();
+        let at = |needle: &str| stop.find(needle).unwrap_or_else(|| panic!("no {needle}"));
+        let open = at("OpenProcess(Terminate | QueryLimited | Synchronize, false, pid)");
+        for check in [
+            "QueryFullProcessImageNameW(process,",
+            "GetProcessTimes(process,",
+            "Owner(process) != sid",
+        ] {
+            assert!(
+                open < at(check) && at(check) < at("TerminateProcess(process, 1)"),
+                "{check}"
+            );
+        }
+        assert!(installer.contains(
+            "[LatchInstallStop]::Stop([uint32]$candidate.ProcessId, $DestExe, $Me, $candidate.CreationDate.ToFileTimeUtc())"
+        ));
     }
 
     #[test]

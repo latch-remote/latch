@@ -52,16 +52,87 @@ try {
 } catch {}
 # Only this user's host at the path being replaced: the secure-desktop
 # helper also runs as latch-host.exe, as SYSTEM from Program Files, and
-# stopping it unelevated fails with access denied.
+# stopping it unelevated fails with access denied. Each candidate is opened
+# once, and its path, user and start time are checked through that very
+# handle before it is ended through it: a process id reused since the list
+# was taken is never stopped, and the path is read the same way from 32-bit
+# PowerShell as from 64-bit (where Get-Process gives none for a 64-bit
+# process).
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.Text;
+public static class LatchInstallStop {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool QueryFullProcessImageNameW(IntPtr process, uint flags, StringBuilder name, ref uint size);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool GetTokenInformation(IntPtr token, int infoClass, IntPtr info, int length, out int needed);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetProcessTimes(IntPtr process, out long created, out long exited, out long kernel, out long user);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool TerminateProcess(IntPtr process, uint code);
+    [DllImport("kernel32.dll")]
+    static extern uint WaitForSingleObject(IntPtr handle, uint millis);
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr handle);
+    const uint Terminate = 0x0001, QueryLimited = 0x1000, Synchronize = 0x00100000, TokenQuery = 0x0008;
+
+    // Ends process `pid` if it is `path`, run by `sid`, created at `created`
+    // (a FILETIME, within a millisecond). False when it is not, or cannot be
+    // opened (another user's, such as the SYSTEM helper).
+    public static bool Stop(uint pid, string path, string sid, long created) {
+        IntPtr process = OpenProcess(Terminate | QueryLimited | Synchronize, false, pid);
+        if (process == IntPtr.Zero) { return false; }
+        try {
+            var name = new StringBuilder(32768);
+            uint size = (uint)name.Capacity;
+            if (!QueryFullProcessImageNameW(process, 0, name, ref size)) { return false; }
+            if (!string.Equals(name.ToString(), path, StringComparison.OrdinalIgnoreCase)) { return false; }
+            long start, exited, kernel, user;
+            if (!GetProcessTimes(process, out start, out exited, out kernel, out user)) { return false; }
+            if (Math.Abs(start - created) > 10000) { return false; }
+            if (Owner(process) != sid) { return false; }
+            if (!TerminateProcess(process, 1) && WaitForSingleObject(process, 0) != 0) {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "could not stop " + path + " (process " + pid + ")");
+            }
+            WaitForSingleObject(process, 5000);
+            return true;
+        } finally {
+            CloseHandle(process);
+        }
+    }
+
+    static string Owner(IntPtr process) {
+        IntPtr token;
+        if (!OpenProcessToken(process, TokenQuery, out token)) { return null; }
+        try {
+            int needed;
+            GetTokenInformation(token, 1, IntPtr.Zero, 0, out needed);
+            if (needed <= 0) { return null; }
+            IntPtr info = Marshal.AllocHGlobal(needed);
+            try {
+                if (!GetTokenInformation(token, 1, info, needed, out needed)) { return null; }
+                // TOKEN_USER starts with a SID_AND_ATTRIBUTES whose first field is the SID.
+                return new SecurityIdentifier(Marshal.ReadIntPtr(info)).Value;
+            } finally {
+                Marshal.FreeHGlobal(info);
+            }
+        } finally {
+            CloseHandle(token);
+        }
+    }
+}
+'@
 $Me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 foreach ($candidate in Get-CimInstance Win32_Process -Filter "Name = 'latch-host.exe'") {
-    if ($candidate.ExecutablePath -ine $DestExe) { continue }
-    $owner = Invoke-CimMethod -InputObject $candidate -MethodName GetOwnerSid -ErrorAction SilentlyContinue
-    if (!$owner -or $owner.ReturnValue -ne 0 -or $owner.Sid -ne $Me) { continue }
-    # Skip a PID reused since the snapshot.
-    $process = Get-Process -Id $candidate.ProcessId -ErrorAction SilentlyContinue
-    if (!$process -or $process.Path -ine $DestExe) { continue }
-    try { Stop-Process -InputObject $process -Force } catch { if (!$process.HasExited) { throw } }
+    if (!$candidate.CreationDate) { continue }
+    [void][LatchInstallStop]::Stop([uint32]$candidate.ProcessId, $DestExe, $Me, $candidate.CreationDate.ToFileTimeUtc())
 }
 Get-Process brolink-host -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 300
