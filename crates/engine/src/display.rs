@@ -11,6 +11,8 @@ pub struct Previous {
     pub width: u32,
     pub height: u32,
     pub refresh_hz: u32,
+    #[cfg(windows)]
+    pub(crate) generation: u64,
 }
 
 /// The displays this host can share, each with the id a stream request
@@ -40,10 +42,7 @@ pub fn prepare(
     #[cfg(target_os = "linux")]
     return crate::linux::prepare_display(width, height, fps, display);
     #[cfg(windows)]
-    {
-        finish_pending_restore()?;
-        crate::windows::prepare_display(width, height, fps, display)
-    }
+    return crate::windows::prepare_display(width, height, fps, display);
     #[cfg(target_os = "macos")]
     {
         let _ = (width, height, fps, display);
@@ -51,12 +50,13 @@ pub fn prepare(
     }
 }
 
-/// Restore the previous mode. Windows defers the restore if the secure desktop is active.
+/// Restore the previous mode. Windows defers the restore if the secure desktop
+/// is active and ignores it after another preparation starts.
 pub fn restore(previous: &Previous) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     return crate::linux::restore_display(previous);
     #[cfg(windows)]
-    return deferred::restore(previous);
+    return crate::windows::restore_display(previous);
     #[cfg(target_os = "macos")]
     {
         let _ = previous;
@@ -64,109 +64,10 @@ pub fn restore(previous: &Previous) -> anyhow::Result<()> {
     }
 }
 
-/// Finish an older Windows restore before running a custom desktop prep command.
+/// Supersede any Windows restore before running a custom desktop prep command.
 #[cfg(windows)]
-pub fn finish_pending_restore() -> anyhow::Result<()> {
-    deferred::finish()
-}
-
-#[cfg(windows)]
-mod deferred {
-    use super::Previous;
-    use crate::{video::DesktopUnavailable, windows::restore_display};
-    use anyhow::{Context, Result};
-    use parking_lot::Mutex;
-    use std::{sync::Arc, thread, time::Duration};
-
-    static PENDING: Mutex<Option<Arc<Previous>>> = Mutex::new(None);
-    const INTERVAL: Duration = Duration::from_secs(5);
-    const ATTEMPTS: usize = 60;
-
-    pub(super) fn restore(previous: &Previous) -> Result<()> {
-        let mut pending = PENDING.lock();
-        if pending.is_some() {
-            return Ok(());
-        }
-        match restore_display(previous) {
-            Err(e) if DesktopUnavailable::is(&e) => {
-                tracing::warn!("desktop is inaccessible; deferring display restore: {e:#}");
-                let restore = Arc::new(previous.clone());
-                *pending = Some(restore.clone());
-                thread::Builder::new()
-                    .name("display-restore".into())
-                    .spawn(move || retry(restore))
-                    .context("start desktop restore worker")?;
-                Ok(())
-            }
-            result => result,
-        }
-    }
-
-    pub(super) fn finish() -> Result<()> {
-        attempt(&mut PENDING.lock(), restore_display)
-            .context("restore the previous session's desktop before starting a new session")
-    }
-
-    fn attempt(
-        pending: &mut Option<Arc<Previous>>,
-        restore_display: impl FnOnce(&Previous) -> Result<()>,
-    ) -> Result<()> {
-        let Some(previous) = pending else {
-            return Ok(());
-        };
-        let result = restore_display(previous);
-        if !result.as_ref().is_err_and(DesktopUnavailable::is) {
-            *pending = None;
-        }
-        result
-    }
-
-    fn retry(restore: Arc<Previous>) {
-        for _ in 0..ATTEMPTS {
-            thread::sleep(INTERVAL);
-            let mut pending = PENDING.lock();
-            // A new stream may have already finished this restore and installed another.
-            if !pending.as_ref().is_some_and(|p| Arc::ptr_eq(p, &restore)) {
-                return;
-            }
-            match attempt(&mut pending, restore_display) {
-                Ok(()) => {
-                    tracing::info!("restored the desktop after it became accessible");
-                    return;
-                }
-                Err(e) if DesktopUnavailable::is(&e) => {}
-                Err(e) => {
-                    tracing::warn!("could not restore the desktop: {e:#}");
-                    return;
-                }
-            }
-        }
-        tracing::debug!("desktop restore retry window ended; the next stream will try again");
-    }
-
-    #[cfg(test)]
-    #[test]
-    fn a_pending_restore_keeps_the_original_mode_until_access_returns() {
-        let original = Arc::new(Previous {
-            width: 1920,
-            height: 1080,
-            refresh_hz: 60,
-        });
-        let mut pending = Some(original.clone());
-        assert!(attempt(&mut pending, |_| Err(DesktopUnavailable.into())).is_err());
-        assert!(Arc::ptr_eq(pending.as_ref().unwrap(), &original));
-        attempt(&mut pending, |previous| {
-            assert_eq!(previous, original.as_ref());
-            Ok(())
-        })
-        .unwrap();
-        assert!(pending.is_none());
-        attempt(&mut pending, |_| panic!("the restore already finished")).unwrap();
-
-        pending = Some(original);
-        assert!(attempt(&mut pending, |_| anyhow::bail!("display was removed")).is_err());
-        assert!(pending.is_none());
-    }
+pub fn begin_custom_prepare() {
+    Previous::begin_custom_prepare();
 }
 
 #[cfg(test)]

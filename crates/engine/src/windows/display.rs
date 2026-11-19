@@ -1,6 +1,7 @@
-use crate::display::Previous;
+use crate::{display::Previous, video::DesktopUnavailable};
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
+use parking_lot::Mutex;
+use std::{collections::BTreeMap, thread, time::Duration};
 use windows::{
     core::PCWSTR,
     Win32::{
@@ -35,16 +36,106 @@ impl Drop for DpiAwareness {
     }
 }
 
-// Previous's shared contract contains dimensions only. Keep the full topology
-// here so disconnect restores paths by adapter/target identity, not DISPLAYn.
+// Keep paths by adapter/target identity, since Windows can renumber DISPLAYn.
 struct Saved {
     previous: Previous,
+    output_id: String,
     paths: Vec<DISPLAYCONFIG_PATH_INFO>,
     modes: Vec<DISPLAYCONFIG_MODE_INFO>,
     adapters: BTreeMap<String, (i32, u32)>,
     default_adapter: (i32, u32),
 }
-static SAVED: parking_lot::Mutex<Option<Saved>> = parking_lot::Mutex::new(None);
+
+struct DisplayState {
+    generation: u64,
+    saved: Option<Saved>,
+    pending: bool,
+}
+
+// The same lock orders generation changes and all Windows display writes.
+static STATE: Mutex<DisplayState> = Mutex::new(DisplayState {
+    generation: 0,
+    saved: None,
+    pending: false,
+});
+
+impl DisplayState {
+    fn begin_prepare(&mut self, recover: impl FnOnce(&Saved) -> Result<()>) -> u64 {
+        self.generation += 1;
+        // Give the new preparation a chance to recover the idle topology,
+        // including any detached physical displays, before selecting its output.
+        // If access is still denied, carry the original snapshot into its undo.
+        if std::mem::take(&mut self.pending) {
+            if let Some(Err(error)) = self.attempt(self.generation, recover) {
+                tracing::warn!(%error, "could not recover the idle display topology before preparing");
+            }
+        }
+        self.generation
+    }
+
+    fn attempt(
+        &mut self,
+        generation: u64,
+        restore: impl FnOnce(&Saved) -> Result<()>,
+    ) -> Option<Result<()>> {
+        if generation != self.generation {
+            return None;
+        }
+        let result = restore(self.saved.as_ref()?);
+        if !result.as_ref().is_err_and(DesktopUnavailable::is) {
+            self.saved = None;
+            self.pending = false;
+        }
+        Some(result)
+    }
+
+    fn restore(&mut self, generation: u64) -> Result<()> {
+        if self.pending {
+            return Ok(());
+        }
+        match self.attempt(generation, Saved::restore) {
+            Some(Err(error)) if DesktopUnavailable::is(&error) => {
+                tracing::warn!("desktop is inaccessible; deferring display restore: {error:#}");
+                self.pending = true;
+                thread::Builder::new()
+                    .name("display-restore".into())
+                    .spawn(move || retry_restore(generation))
+                    .context("start desktop restore worker")?;
+                Ok(())
+            }
+            result => result.unwrap_or(Ok(())),
+        }
+    }
+}
+
+fn retry_restore(generation: u64) {
+    for _ in 0..60 {
+        thread::sleep(Duration::from_secs(5));
+        match STATE.lock().attempt(generation, Saved::restore) {
+            None => return,
+            Some(Ok(())) => {
+                tracing::info!("restored the desktop after it became accessible");
+                return;
+            }
+            Some(Err(error)) if DesktopUnavailable::is(&error) => {}
+            Some(Err(error)) => {
+                tracing::warn!("could not restore the desktop: {error:#}");
+                return;
+            }
+        }
+    }
+    tracing::debug!("desktop restore retry window ended");
+}
+
+impl Previous {
+    pub(crate) fn begin_custom_prepare() {
+        let mut state = STATE.lock();
+        state.begin_prepare(Saved::restore);
+        // The custom command and its own undo now own the display.
+        state.saved = None;
+    }
+}
+
 fn topology() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>)> {
     for _ in 0..4 {
         let (mut np, mut nm) = (0, 0);
@@ -91,8 +182,7 @@ fn topology_result(rc: i32) -> Result<()> {
     match rc {
         0 => Ok(()),
         rc if rc == ERROR_ACCESS_DENIED.0 as i32 => {
-            Err(anyhow::anyhow!("SetDisplayConfig returned {rc}")
-                .context(crate::video::DesktopUnavailable))
+            Err(anyhow::anyhow!("SetDisplayConfig returned {rc}").context(DesktopUnavailable))
         }
         _ => bail!("SetDisplayConfig returned {rc}"),
     }
@@ -128,6 +218,10 @@ fn only_virtual(
                 mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
                 "invalid display source mode"
             );
+            let position = mode.Anonymous.sourceMode.position;
+            if paths.len() == 1 && position.x == 0 && position.y == 0 {
+                return Ok(());
+            }
             mode.Anonymous.sourceMode.position = Default::default();
             return apply_topology(&[*path], &modes);
         }
@@ -275,6 +369,7 @@ fn keys(outputs: &[Output]) -> Vec<(String, bool, bool)> {
         .map(|o| (o.id.clone(), o.virtual_display, primary(o)))
         .collect()
 }
+#[cfg(test)]
 pub(super) fn select() -> Result<Output> {
     select_named(None)
 }
@@ -291,8 +386,9 @@ pub(super) fn select_named(wanted: Option<&str>) -> Result<Output> {
 /// Probe the adapter a display will use after the active session restores its
 /// topology. Physical outputs disabled for virtual capture remain selectable.
 pub(super) fn encoding_adapter(wanted: Option<&str>) -> Result<IDXGIAdapter1> {
-    let saved_adapter = SAVED
+    let saved_adapter = STATE
         .lock()
+        .saved
         .as_ref()
         .map(|saved| adapter_choice(&saved.adapters, saved.default_adapter, wanted));
     let Some((high, low)) = saved_adapter else {
@@ -445,6 +541,29 @@ fn change(name: &[u16], mode: &DEVMODEW) -> Result<()> {
     }
     Ok(())
 }
+
+fn set_stream_mode(
+    display_name: &[u16; 32],
+    (width, height): (u32, u32),
+    change: impl Fn() -> Result<()>,
+    read_size: impl Fn() -> Result<(u32, u32)>,
+) -> Result<()> {
+    change()?;
+    if read_size().is_ok_and(|size| size == (width, height)) {
+        return Ok(());
+    }
+    let retry = change();
+    let (actual_width, actual_height) = read_size().context("verify the virtual display size")?;
+    if (actual_width, actual_height) != (width, height) {
+        tracing::warn!(
+            display = %text(display_name),
+            retry_error = ?retry.err(),
+            "requested virtual display size {width}x{height}, got {actual_width}x{actual_height}; scaling capture"
+        );
+    }
+    Ok(())
+}
+
 // Prefer the lowest sufficient refresh, otherwise the highest available.
 fn refresh_rank(hz: u32, requested: u32) -> (bool, u32) {
     (
@@ -458,15 +577,39 @@ pub(super) fn prepare(
     fps: u32,
     display: Option<&str>,
 ) -> Result<Option<Previous>> {
-    let mut saved = SAVED.lock();
-    anyhow::ensure!(saved.is_none(), "display topology already prepared");
+    let mut state = STATE.lock();
+    let generation = state.begin_prepare(Saved::restore);
+    match prepare_mode(&mut state, width, height, fps, display) {
+        Ok(None) => {
+            state.saved = None;
+            Ok(None)
+        }
+        Err(error) => {
+            if let Err(restore) = state.restore(generation) {
+                tracing::warn!(
+                    "could not restore the desktop after preparation failed: {restore:#}"
+                );
+            }
+            Err(error)
+        }
+        result => result,
+    }
+}
+
+fn prepare_mode(
+    state: &mut DisplayState,
+    width: u32,
+    height: u32,
+    fps: u32,
+    display: Option<&str>,
+) -> Result<Option<Previous>> {
     // A viewer that chose a real monitor shares it as it is: the virtual
     // display keeps its size and every monitor stays on.
     let output = select_named(display)?;
     if !output.virtual_display {
         return Ok(None);
     }
-    let current = current(&output)?;
+    let original = current(&output)?;
     let mut best: Option<DEVMODEW> = None;
     for i in 0.. {
         let mut mode = DEVMODEW {
@@ -494,15 +637,7 @@ pub(super) fn prepare(
             best = Some(mode);
         }
     }
-    let mut mode = best.unwrap_or_else(|| {
-        tracing::warn!(
-            width,
-            height,
-            fps,
-            "virtual display has no requested size; keeping current mode and scaling capture"
-        );
-        current
-    });
+    let mut mode = best.unwrap_or(original);
     if mode.dmDisplayFrequency < fps {
         tracing::info!(
             requested_fps = fps,
@@ -511,84 +646,202 @@ pub(super) fn prepare(
         );
     }
     mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
-    let previous = Previous {
-        width: current.dmPelsWidth,
-        height: current.dmPelsHeight,
-        refresh_hz: current.dmDisplayFrequency,
-    };
     let (paths, modes) = topology()?;
-    // Record adapter identity before only_virtual detaches physical outputs.
-    let attached = outputs()?;
-    let default = pick(&keys(&attached), None).context("no default display")?;
-    let adapter_id = |output: &Output| -> Result<(i32, u32)> {
-        // SAFETY: Output owns this adapter interface.
-        let luid = unsafe { output.adapter.GetDesc1()? }.AdapterLuid;
-        Ok((luid.HighPart, luid.LowPart))
+    let adapters = if state.saved.is_none() {
+        // Record adapter identity before only_virtual detaches physical outputs.
+        let attached = outputs()?;
+        let default = pick(&keys(&attached), None).context("no default display")?;
+        let adapter_id = |output: &Output| -> Result<(i32, u32)> {
+            // SAFETY: Output owns this adapter interface.
+            let luid = unsafe { output.adapter.GetDesc1()? }.AdapterLuid;
+            Ok((luid.HighPart, luid.LowPart))
+        };
+        let default_adapter = adapter_id(&attached[default])?;
+        let adapters = attached
+            .iter()
+            .map(|output| Ok((output.id.clone(), adapter_id(output)?)))
+            .collect::<Result<_>>()?;
+        Some((adapters, default_adapter))
+    } else {
+        None
     };
-    let default_adapter = adapter_id(&attached[default])?;
-    let adapters = attached
-        .iter()
-        .map(|output| Ok((output.id.clone(), adapter_id(output)?)))
-        .collect::<Result<_>>()?;
     only_virtual(&output.desc.DeviceName, &paths, &modes)?;
-    *saved = Some(Saved {
-        previous: previous.clone(),
-        paths,
-        modes,
-        adapters,
-        default_adapter,
-    });
-    if let Err(e) = change(&output.desc.DeviceName, &mode) {
-        drop(saved);
-        crate::display::restore(&previous).context("restore topology after mode failure")?;
-        return Err(e);
+    if let Some((adapters, default_adapter)) = adapters {
+        state.saved = Some(Saved {
+            previous: Previous {
+                width: original.dmPelsWidth,
+                height: original.dmPelsHeight,
+                refresh_hz: original.dmDisplayFrequency,
+                generation: state.generation,
+            },
+            output_id: output.id.clone(),
+            paths,
+            modes,
+            adapters,
+            default_adapter,
+        });
     }
-    Ok(Some(previous))
+    let name = &output.desc.DeviceName;
+    set_stream_mode(
+        name,
+        (width, height),
+        || change(name, &mode),
+        || {
+            let mode = current(&output)?;
+            Ok((mode.dmPelsWidth, mode.dmPelsHeight))
+        },
+    )?;
+    let saved = state
+        .saved
+        .as_mut()
+        .expect("virtual display has a snapshot");
+    saved.previous.generation = state.generation;
+    Ok(Some(saved.previous.clone()))
 }
+
 pub(super) fn restore(previous: &Previous) -> Result<()> {
-    let mut saved = SAVED.lock();
-    if let Some(state) = saved.as_ref().filter(|state| &state.previous == previous) {
-        // Keep adapter/target identities while Windows denies access. Once it
-        // accepts the topology or rejects it for another reason (e.g. an
-        // adapter went away), the snapshot has served its purpose.
-        let result = apply_topology(&state.paths, &state.modes);
-        if result
-            .as_ref()
-            .is_err_and(crate::video::DesktopUnavailable::is)
-        {
-            return result;
-        }
-        *saved = None;
-        match result {
+    STATE.lock().restore(previous.generation)
+}
+
+impl Saved {
+    fn restore(&self) -> Result<()> {
+        let error = match apply_topology(&self.paths, &self.modes) {
             Ok(()) => return Ok(()),
-            Err(e) => tracing::warn!(
-                "restore the saved display topology: {e:#}; setting the size back instead"
-            ),
+            Err(error) if DesktopUnavailable::is(&error) => return Err(error),
+            Err(error) => error,
+        };
+        let output = select_named(Some(&self.output_id))?;
+        if self.output_id.is_empty() || output.id != self.output_id || !output.virtual_display {
+            return Err(error);
         }
+        tracing::warn!(
+            "restore the saved display topology: {error:#}; setting the size back instead"
+        );
+        let mode = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            dmFields: DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY,
+            dmPelsWidth: self.previous.width,
+            dmPelsHeight: self.previous.height,
+            dmDisplayFrequency: self.previous.refresh_hz,
+            ..Default::default()
+        };
+        change(&output.desc.DeviceName, &mode)
     }
-    let output = select()?;
-    if !output.virtual_display {
-        return Ok(());
-    }
-    let name = output.desc.DeviceName;
-    let mode = DEVMODEW {
-        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
-        dmFields: DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY,
-        dmPelsWidth: previous.width,
-        dmPelsHeight: previous.height,
-        dmDisplayFrequency: previous.refresh_hz,
-        ..Default::default()
-    };
-    change(&name, &mode)?;
-    Ok(())
 }
 #[cfg(test)]
 mod tests {
-    use super::selection_rank;
+    use super::*;
+    use std::cell::Cell;
+
+    fn saved_display() -> DisplayState {
+        DisplayState {
+            generation: 1,
+            saved: Some(Saved {
+                previous: Previous {
+                    width: 1920,
+                    height: 1080,
+                    refresh_hz: 60,
+                    generation: 1,
+                },
+                output_id: "virtual".into(),
+                paths: Vec::new(),
+                modes: Vec::new(),
+                adapters: BTreeMap::new(),
+                default_adapter: (0, 0),
+            }),
+            pending: false,
+        }
+    }
+
+    #[test]
+    fn a_late_undo_cannot_restore_another_preparations_display() {
+        let mut state = saved_display();
+        let old = state.generation;
+        let new = state.begin_prepare(|_| panic!("no restore was pending"));
+        assert!(state
+            .attempt(old, |_| panic!("stale undo changed the display"))
+            .is_none());
+        assert!(state.saved.is_some());
+        state.attempt(new, |_| Ok(())).unwrap().unwrap();
+        assert!(state
+            .attempt(new, |_| panic!("undo already completed"))
+            .is_none());
+    }
+
+    #[test]
+    fn a_new_prepare_can_inherit_the_original_topology_after_access_denied() {
+        let mut state = saved_display();
+        let old = state.generation;
+        assert!(state
+            .attempt(old, |_| Err(DesktopUnavailable.into()))
+            .unwrap()
+            .is_err());
+        state.pending = true;
+
+        // Access is still denied during the new preparation's recovery attempt.
+        let new = state.begin_prepare(|_| Err(DesktopUnavailable.into()));
+        assert!(!state.pending);
+        assert!(state
+            .attempt(old, |_| panic!("an old retry changed the display"))
+            .is_none());
+        state
+            .attempt(new, |saved| {
+                assert_eq!(saved.previous.width, 1920);
+                assert_eq!(saved.previous.height, 1080);
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        assert!(state.saved.is_none());
+    }
+
+    #[test]
+    fn only_access_denied_keeps_a_snapshot_for_retry() {
+        let mut state = saved_display();
+        let generation = state.generation;
+        assert!(state
+            .attempt(generation, |_| Err(DesktopUnavailable.into()))
+            .unwrap()
+            .is_err());
+        assert!(state.saved.is_some());
+        assert!(state
+            .attempt(generation, |_| bail!("display was removed"))
+            .unwrap()
+            .is_err());
+        assert!(state.saved.is_none());
+    }
+
+    #[test]
+    fn the_requested_size_is_read_back_and_a_mismatch_is_retried_once() {
+        let requested = (3024, 1964);
+        for sizes in [
+            [requested, requested],
+            [(800, 600), requested],
+            [(800, 600); 2],
+        ] {
+            let writes = Cell::new(0);
+            let reads = Cell::new(0);
+            set_stream_mode(
+                &[0; 32],
+                requested,
+                || {
+                    writes.set(writes.get() + 1);
+                    Ok(())
+                },
+                || {
+                    let size = sizes[reads.get()];
+                    reads.set(reads.get() + 1);
+                    Ok(size)
+                },
+            )
+            .unwrap();
+            assert_eq!(writes.get(), if sizes[0] == requested { 1 } else { 2 });
+            assert_eq!(reads.get(), writes.get());
+        }
+    }
 
     #[test]
     fn access_denied_defers_topology_restore() {
-        use super::*;
         use windows::Win32::Foundation::ERROR_INVALID_PARAMETER;
 
         assert!(topology_result(0).is_ok());

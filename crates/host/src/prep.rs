@@ -31,7 +31,7 @@ fn prepare_desktop(cfg: &HostConfig, req: &StreamRequest) -> Result<Undo> {
     ];
     if !cfg.prep_do.trim().is_empty() {
         #[cfg(windows)]
-        latch_engine::display::finish_pending_restore()?;
+        latch_engine::display::begin_custom_prepare();
         let undo = cfg.prep_undo.clone();
         if let Err(e) = run(&cfg.prep_do, size, Duration::from_secs(15)) {
             if !undo.trim().is_empty() {
