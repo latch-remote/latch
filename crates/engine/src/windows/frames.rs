@@ -119,7 +119,7 @@ impl Region {
     /// bytes, 8-byte aligned, for as long as the region is used.
     unsafe fn new(ptr: *mut u8, len: usize) -> Result<Self> {
         ensure!(!ptr.is_null() && len >= HEADER, "frame mapping too small");
-        ensure!(ptr as usize % 8 == 0, "frame mapping misaligned");
+        ensure!((ptr as usize).is_multiple_of(8), "frame mapping misaligned");
         Ok(Self { ptr, len })
     }
     fn header(&self) -> &Header {

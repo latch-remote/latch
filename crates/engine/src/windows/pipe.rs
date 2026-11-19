@@ -49,7 +49,7 @@ pub(super) struct Pipe {
 
 fn io_error(e: windows::core::Error) -> io::Error {
     // Win32 errors arrive as HRESULTs of FACILITY_WIN32: the low word.
-    io::Error::from_raw_os_error((e.code().0 & 0xffff) as i32)
+    io::Error::from_raw_os_error(e.code().0 & 0xffff)
 }
 
 fn is(e: &windows::core::Error, code: windows::Win32::Foundation::WIN32_ERROR) -> bool {
