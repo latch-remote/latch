@@ -2,7 +2,7 @@
 # log symlinks before any elevated file write. No real install is touched.
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\setup-protection.ps1"
-$root = Join-Path $env:RUNNER_TEMP ([guid]::NewGuid().ToString('N'))
+$root = Join-Path ([IO.Path]::GetPathRoot($env:RUNNER_TEMP)) ('LatchProtectionTest-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
 try {
     $acl = New-Object Security.AccessControl.DirectorySecurity
@@ -21,6 +21,28 @@ try {
         if (-not $rejected) { throw "Accepted unsafe path: $path" }
     }
     Must-Reject $unsafe
+    # The base can be protected while its writable parent can redirect it.
+    $badBase = Join-Path $unsafe 'Program Files'
+    $protected = New-Object Security.AccessControl.DirectorySecurity
+    $protected.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)')
+    [IO.Directory]::CreateDirectory($badBase, $protected) | Out-Null
+    Assert-Protected $badBase
+    $refused = $false
+    try { Use-ProtectedFolder (Join-Path $badBase 'Latch\Setup') $badBase } catch { $refused = $true }
+    if (!$refused -or (Test-Path -LiteralPath (Join-Path $badBase 'Latch'))) { throw 'Accepted a protected base below a writable ancestor' }
+    # The handles survive the helper and prevent renaming a checked parent.
+    $pins = @{}
+    $pinned = Join-Path $root 'pinned'
+    $renamed = Join-Path $root 'renamed'
+    try {
+        Use-ProtectedFolder (Join-Path $pinned 'Setup') $root $pins
+        $refused = $false
+        try { [IO.Directory]::Move($pinned, $renamed) } catch { $refused = $true }
+        if (!$refused) { throw 'Renamed a pinned directory' }
+    } finally {
+        foreach ($handle in $pins.Values) { $handle.Dispose() }
+    }
+    [IO.Directory]::Move($pinned, $renamed)
     $victim = Join-Path $root 'victim.txt'
     Set-Content -LiteralPath $victim -Value 'unchanged'
     $link = Join-Path $root 'setup.log'

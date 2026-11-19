@@ -103,16 +103,18 @@ $sha256 = {sha256}
 $userSid = {user_sid}
 $elevatedInput = {elevated_input}
 {protection}
+$pins = @{{}}
 try {{
+  try {{
     # Everything the elevated copy may load sits in this folder. One that
     # anyone else could change is made again, empty and protected.
     $dir = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) '{dir}'
-    Reset-ProtectedFolder $dir
+    Reset-ProtectedFolder $dir ([Environment]::GetFolderPath('ProgramFiles')) $pins
     $copy = Join-Path $dir 'latch-host.exe'
     if (Test-Path -LiteralPath $copy) {{ Remove-Item -LiteralPath $copy -Force }}
     [IO.File]::Copy($program, $copy)
     if (Test-Protected $copy) {{ Repair-Protected $copy }}
-}} catch {{ exit {copy_failed} }}
+  }} catch {{ exit {copy_failed} }}
 if ((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne $sha256) {{
     Remove-Item -LiteralPath $copy -Force -ErrorAction SilentlyContinue
     exit {changed}
@@ -127,6 +129,9 @@ $p = [System.Diagnostics.Process]::Start($start)
 $p.WaitForExit()
 Remove-Item -LiteralPath $copy -Force -ErrorAction SilentlyContinue
 exit $p.ExitCode
+}} finally {{
+    foreach ($handle in $pins.Values) {{ $handle.Dispose() }}
+}}
 "#,
         program = ps_data(program),
         protection = protection_ps(),
@@ -167,17 +172,13 @@ fn protection_checks_ps() -> String {
 /// fixes when it is approved, rather than in a file the user could edit.
 #[cfg(any(windows, test))]
 fn launch_script(stage: &str) -> String {
-    // Elevated scripts must not resolve tools from a caller's PATH or cwd.
-    let stage = format!(
-        "$env:PATH = [Environment]::SystemDirectory; Set-Location -LiteralPath ([Environment]::SystemDirectory);\n{stage}"
-    );
     // Already elevated (an administrator's SSH session, a window started as
     // administrator): no prompt to show, and none could be shown in
     // session 0.
     format!(
         "$encoded = '{encoded}'; $ps = {ps}; if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{ & $ps -NoProfile -NonInteractive -EncodedCommand $encoded; exit $LASTEXITCODE }}; try {{ $p = Start-Process -FilePath $ps -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList ('-NoProfile -NonInteractive -EncodedCommand ' + $encoded) -ErrorAction Stop }} catch {{ exit {declined} }}; if ($null -eq $p) {{ exit {declined} }}; exit $p.ExitCode",
         ps = ps_data(&powershell_exe().display().to_string()),
-        encoded = encoded_command(&stage),
+        encoded = encoded_command(stage),
         declined = exit::DECLINED,
     )
 }
@@ -612,6 +613,41 @@ fn ps_data(s: &str) -> String {
     )
 }
 
+/// Hold each directory from the local volume root before opening its
+/// children. The caller also checks the owners and ACLs before writing.
+#[cfg(windows)]
+fn pin_setup_path(path: &Path) -> Result<Vec<std::fs::File>> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::{Component, Prefix};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    anyhow::ensure!(
+        matches!(path.components().next(), Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))),
+        "setup requires a local path"
+    );
+    let mut pins = Vec::new();
+    let ancestors = path.ancestors().collect::<Vec<_>>();
+    for dir in ancestors.into_iter().rev() {
+        let pin = std::fs::OpenOptions::new()
+            .access_mode((FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES).0)
+            .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(dir)
+            .with_context(|| format!("pin setup directory {}", dir.display()))?;
+        let info = pin.metadata()?;
+        anyhow::ensure!(
+            info.is_dir() && info.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0,
+            "unsafe setup directory {}",
+            dir.display()
+        );
+        pins.push(pin);
+    }
+    Ok(pins)
+}
+
 /// Generate and run the setup script. Called from `--setup-elevated`,
 /// already elevated: with `program`, by the copy [`stage_script`] made in
 /// `%ProgramFiles%\Latch\Setup`, which also passes the user who asked
@@ -648,6 +684,7 @@ pub fn run_as_admin(
         // Everything below is written beside this copy, so it has to be
         // the one in Program Files and not a file a user put anywhere.
         let dir = exe.parent().context("own folder")?.to_path_buf();
+        let _pins = pin_setup_path(&dir)?;
         let checked = powershell(&format!(
             "{}\n$dir = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Latch\\Setup'; Assert-ProtectedTree $dir; $log = Join-Path $dir 'setup.log'; if ((Test-Path -LiteralPath $log) -and (Test-Protected $log)) {{ Remove-Item -LiteralPath $log -Force }}; Write-Output $dir",
             protection_ps()
@@ -1553,25 +1590,24 @@ mod tests {
             2,
             "elevated or prompted, the same script"
         );
-        let secured = format!("$env:PATH = [Environment]::SystemDirectory; Set-Location -LiteralPath ([Environment]::SystemDirectory);\n{stage}");
-        let utf16 = secured
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>();
-        assert_eq!(encoded, base64(&utf16));
-        assert_eq!(encoded, encoded_command(&secured));
+        assert_eq!(encoded, encoded_command(&stage));
+        assert!(stage.contains("$env:PATH = [Environment]::SystemDirectory"));
+        assert!(stage.contains("Set-Location -LiteralPath ([Environment]::SystemDirectory)"));
         assert!(launch.contains("catch { exit 1223 }"));
     }
 
     #[test]
     fn setup_checks_permissions_and_links_before_writing() {
         let s = stage_script(r"C:\Latch\latch-host.exe", &"ab".repeat(32), TEST_SID, true);
-        assert!(s.contains("Reset-ProtectedFolder $dir"));
+        assert!(s.contains(
+            "Reset-ProtectedFolder $dir ([Environment]::GetFolderPath('ProgramFiles')) $pins"
+        ));
         assert!(s.contains("if (Test-Protected $copy) { Repair-Protected $copy }"));
         assert!(s.contains("ReparsePoint"));
         assert!(s.contains("GetOwner([Security.Principal.SecurityIdentifier])"));
         assert!(s.find("Reset-ProtectedFolder $dir").unwrap() < s.find("[IO.File]::Copy").unwrap());
         assert!(s.contains("$start.WorkingDirectory = $dir"));
+        assert!(s.find("$p.WaitForExit()").unwrap() < s.rfind("$handle.Dispose()").unwrap());
         // The asking user and their setting go to the elevated step.
         assert!(s.contains(&format!("$userSid = {}", ps_data(TEST_SID))));
         assert!(s.contains(&format!("$elevatedInput = {}", ps_data("true"))));
