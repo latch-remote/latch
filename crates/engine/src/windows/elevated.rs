@@ -1501,9 +1501,10 @@ fn absent(error: &anyhow::Error) -> bool {
     })
 }
 
-/// Frames of the output `want` from the helper, starting it if needed.
-/// Blocks for up to [`START_WAIT`], a handshake and [`GRANT_WAIT`].
-pub(super) fn connect_frames(want: Want) -> Result<Frames> {
+/// Frames of the output `want` from the helper, starting it if needed,
+/// and when the helper granted them. Blocks for up to [`START_WAIT`], a
+/// handshake and [`GRANT_WAIT`].
+pub(super) fn connect_frames(want: Want) -> Result<(Frames, Instant)> {
     let me = Me::current()?;
     let expected = helper_exe().context("no Program Files folder")?;
     ensure!(expected.is_file(), "the helper is not set up");
@@ -1513,15 +1514,16 @@ pub(super) fn connect_frames(want: Want) -> Result<Frames> {
             pipe.set_deadline(Some(Instant::now() + GRANT_WAIT));
             pipe.write_all(&frames::encode_want(&want))?;
             let granted = frames::read_granted(&mut pipe)?;
+            let at = Instant::now();
             pipe.set_deadline(None);
-            Frames::open(pipe, granted)
+            Ok((Frames::open(pipe, granted)?, at))
         },
         absent,
     )
 }
 
 /// [`connect_frames`] on a thread of its own, so capture never waits.
-pub(super) fn request_frames(want: Want) -> mpsc::Receiver<Result<Frames>> {
+pub(super) fn request_frames(want: Want) -> mpsc::Receiver<Result<(Frames, Instant)>> {
     let (tx, rx) = mpsc::channel();
     let spawned = thread::Builder::new()
         .name("latch-screen-helper".into())
