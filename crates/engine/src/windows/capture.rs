@@ -1,7 +1,10 @@
 //! The cursor uses a pixel shader compiled by the system d3dcompiler_47.dll.
 //! This preserves XOR cursors without reading the desktop back to the CPU.
 use super::display;
-use super::{elevated, frames::Frames};
+use super::{
+    elevated,
+    frames::{Frames, Resized},
+};
 use crate::windows_cursor::{CaptureState, Control, Owner, Plane, PointerSample, ShapeInfo};
 use crate::{
     input::DisplayRect,
@@ -519,15 +522,30 @@ const HELPER_AFTER: Duration = Duration::from_secs(1);
 /// Kept apart from the GPU work so the switching can be tested.
 #[derive(Debug, Default)]
 struct Fallback {
-    /// When the host's own duplication went away; `None` while it works.
+    /// When the host's own duplication went away (or, after a resize, when
+    /// the helper was asked again); `None` while it works.
     lost: Option<Instant>,
     /// Setup installed the helper.
     installed: bool,
     /// The helper could not serve this loss: an older one, or it failed.
     /// The next loss asks again.
     failed: bool,
-    connecting: bool,
-    serving: bool,
+    phase: Phase,
+}
+/// How far the helper got with this loss.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    #[default]
+    Idle,
+    /// Asked; no mapping yet.
+    Connecting,
+    /// A mapping, but no frame in it yet. Until one comes, the loss still
+    /// ends the stream at the limit: a helper that connects and then sends
+    /// nothing must not freeze the last picture forever.
+    Awaiting,
+    /// Frames came: the stream lasts as long as the secure desktop does,
+    /// even while it is still and nothing new arrives.
+    Serving,
 }
 impl Fallback {
     fn new(helper_installed: bool) -> Self {
@@ -548,30 +566,40 @@ impl Fallback {
     fn regain(&mut self) {
         self.lost = None;
         self.failed = false;
-        self.connecting = false;
-        self.serving = false;
+        self.phase = Phase::Idle;
     }
     /// Whether to ask the helper now. `denied`: the last attempt to
     /// duplicate was refused, as on the secure desktop.
     fn wants_helper(&self, now: Instant, denied: bool) -> bool {
         !self.unavailable()
-            && !self.connecting
-            && !self.serving
+            && self.phase == Phase::Idle
             && self
                 .lost
                 .is_some_and(|t| denied || now.saturating_duration_since(t) >= HELPER_AFTER)
     }
     fn connecting(&mut self) {
-        self.connecting = true;
+        self.phase = Phase::Connecting;
     }
+    /// The helper sent a mapping; its first frame is still to come.
     fn connected(&mut self) {
-        self.connecting = false;
-        self.serving = true;
+        self.phase = Phase::Awaiting;
+    }
+    /// A frame from the helper arrived.
+    fn served(&mut self) {
+        self.phase = Phase::Serving;
+    }
+    fn serving(&self) -> bool {
+        self.phase == Phase::Serving
+    }
+    /// The output changed size, which ends the helper's mapping: it is
+    /// asked again, with a fresh [`HELPER_LIMIT`] for the new one.
+    fn renegotiate(&mut self, now: Instant) {
+        self.phase = Phase::Connecting;
+        self.lost = Some(now);
     }
     fn failed(&mut self) {
         self.failed = true;
-        self.connecting = false;
-        self.serving = false;
+        self.phase = Phase::Idle;
     }
     /// The stream should end: neither its own desktop nor the helper's
     /// frames came back in time.
@@ -581,7 +609,7 @@ impl Fallback {
         } else {
             HELPER_LIMIT
         };
-        !self.serving
+        !self.serving()
             && self
                 .lost
                 .is_some_and(|t| now.saturating_duration_since(t) >= limit)
@@ -835,40 +863,47 @@ impl Capture {
         })
     }
     /// Opening on the secure desktop: waits for the helper's first frame,
-    /// or fails as a denied duplication does without a helper.
+    /// or fails as a denied duplication does without a helper. A resize
+    /// meanwhile asks the helper again for a mapping of the new size.
     fn first_helper_frame(&mut self) -> Result<()> {
         let unavailable = || {
             anyhow::Error::msg("duplicate desktop output: the secure desktop is up")
                 .context(crate::video::DesktopUnavailable)
         };
-        let frames = match elevated::connect_frames(self.want()) {
-            Ok(frames) => frames,
-            Err(e) => {
-                tracing::warn!(
-                    "the secure desktop is up and the screen helper did not answer: {e:#}"
-                );
+        let deadline = Instant::now() + OWN_LIMIT;
+        loop {
+            let frames = match elevated::connect_frames(self.want()) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    tracing::warn!(
+                        "the secure desktop is up and the screen helper did not answer: {e:#}"
+                    );
+                    return Err(unavailable());
+                }
+            };
+            self.helper = Helper::Serving(frames);
+            self.fallback.connected();
+            let mut resized = false;
+            while Instant::now() < deadline {
+                match self.helper_frame(Duration::from_millis(100)) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(e) if e.is::<Resized>() => {
+                        resized = true;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("the screen helper stopped: {e:#}");
+                        break;
+                    }
+                }
+            }
+            self.helper = Helper::Off;
+            if !resized || Instant::now() >= deadline {
                 return Err(unavailable());
             }
-        };
-        self.helper = Helper::Serving(frames);
-        self.fallback.connected();
-        let deadline = Instant::now() + OWN_LIMIT;
-        while Instant::now() < deadline {
-            match self.helper_frame(Duration::from_millis(100)) {
-                Ok(true) => {
-                    tracing::info!(
-                        "the secure desktop is up: showing it through the SYSTEM helper"
-                    );
-                    return Ok(());
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!("the screen helper stopped: {e:#}");
-                    break;
-                }
-            }
+            self.fallback.connecting();
         }
-        Err(unavailable())
     }
     fn want(&self) -> super::frames::Want {
         super::frames::Want {
@@ -1144,7 +1179,7 @@ impl Capture {
         if now >= self.retry.at {
             match self.reopen() {
                 Ok(()) => {
-                    if self.fallback.serving {
+                    if self.fallback.serving() {
                         tracing::info!("the desktop is back: capturing it directly again");
                     }
                     self.helper = Helper::Off;
@@ -1170,6 +1205,14 @@ impl Capture {
             let wait = timeout.min(self.retry.at.saturating_duration_since(Instant::now()));
             match self.helper_frame(wait) {
                 Ok(changed) => return Ok(Some(changed)),
+                Err(e) if e.is::<Resized>() => {
+                    // Keep the last picture while the helper maps the new size.
+                    tracing::info!(
+                        "the secure desktop changed size: asking the SYSTEM helper again"
+                    );
+                    self.helper = Helper::Connecting(elevated::request_frames(self.want()));
+                    self.fallback.renegotiate(Instant::now());
+                }
                 Err(e) => {
                     tracing::warn!("the screen helper stopped: {e:#}");
                     self.helper = Helper::Off;
@@ -1194,7 +1237,7 @@ impl Capture {
         };
         match started.try_recv() {
             Ok(Ok(frames)) => {
-                tracing::info!("the secure desktop is up: showing it through the SYSTEM helper");
+                tracing::info!("the screen helper answered: waiting for its first frame");
                 self.helper = Helper::Serving(frames);
                 self.fallback.connected();
             }
@@ -1262,6 +1305,10 @@ impl Capture {
         })?;
         if uploaded.is_none() {
             return Ok(false);
+        }
+        if !self.fallback.serving() {
+            tracing::info!("the secure desktop is up: showing it through the SYSTEM helper");
+            self.fallback.served();
         }
         self.captured = Instant::now();
         // The helper composited the cursor into an upright SDR picture.
@@ -1858,10 +1905,16 @@ mod tests {
         assert!(!f.expired(t + OWN_LIMIT));
         assert!(f.expired(t + HELPER_LIMIT));
         f.connected();
+        assert!(!f.wants_helper(t + Duration::from_secs(2), true));
+        // Connected but no frame yet: still the helper's limit, so a helper
+        // that never sends one cannot freeze the old picture.
+        assert!(!f.expired(t + OWN_LIMIT));
+        assert!(f.expired(t + HELPER_LIMIT));
+        f.served();
         // Serving frames, the stream lasts as long as the secure desktop.
         assert!(!f.expired(t + Duration::from_secs(3600)));
         f.regain();
-        assert!(!f.serving && f.lost.is_none());
+        assert!(!f.serving() && f.lost.is_none() && f.phase == Phase::Idle);
         // The next prompt asks again.
         f.lose(t + Duration::from_secs(10));
         assert!(f.wants_helper(t + Duration::from_secs(10), true));
@@ -1893,9 +1946,34 @@ mod tests {
         f.lose(t);
         f.connecting();
         f.connected();
+        f.served();
         assert!(!f.expired(t + Duration::from_secs(30)));
         f.failed();
         assert!(f.expired(t + Duration::from_secs(30)));
+    }
+    #[test]
+    fn a_resize_asks_the_helper_again_with_a_fresh_limit() {
+        use super::*;
+        let t = Instant::now();
+        let mut f = Fallback::new(true);
+        f.lose(t);
+        f.connecting();
+        f.connected();
+        f.served();
+        // Long into the secure desktop, its size changes: the helper ends
+        // that mapping, and is asked for one of the new size.
+        let resized = t + Duration::from_secs(600);
+        f.renegotiate(resized);
+        assert!(!f.unavailable() && f.keeps_picture(), "not a failure");
+        assert!(!f.wants_helper(resized, true), "already asked again");
+        assert!(!f.expired(resized + OWN_LIMIT));
+        // The new mapping gets the same time to show its first frame...
+        f.connected();
+        assert!(!f.expired(resized + HELPER_LIMIT - Duration::from_millis(1)));
+        assert!(f.expired(resized + HELPER_LIMIT));
+        // ...and once it does, serves on.
+        f.served();
+        assert!(!f.expired(resized + Duration::from_secs(3600)));
     }
     /// Needs the helper set up (a build with LATCH_HELPER_TEST_DIR, its
     /// folder and task): pretends Windows took the desktop, takes the
