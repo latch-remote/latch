@@ -24,9 +24,12 @@
 //!   those where the recorded user runs the recorded host executable. Into
 //!   each it starts the agent, its own executable and nothing else, with a
 //!   copy of its SYSTEM token moved to that session, on `winsta0\default`.
-//!   It looks again every few seconds, and when a host rings its wake
-//!   event, while any agent runs; then it exits. The wake only hurries it:
-//!   when the event's name is taken, it runs without one.
+//!   While an agent it started runs, it looks again every few seconds for
+//!   new sessions and waits on its wake event. An agent that went idle is
+//!   started again only when its host asks: by ringing the event, or, once
+//!   the broker exited with its last agent, by starting the task again.
+//!   When the event's name is taken, no host could ring it, so the broker
+//!   starts what is needed and exits at once, leaving the task free.
 //! - The **agent**: SYSTEM in the user's session. It serves the named pipe
 //!   `LatchInput-{session}`, whose security admits only SYSTEM and the
 //!   recorded user, and accepts a connection only from that user's host
@@ -611,44 +614,92 @@ fn approved_sessions(hosts: &[Host], approved: &str) -> Vec<u32> {
     sessions
 }
 
-/// What the broker knows about its agents, apart from their handles.
-#[derive(Debug, Default)]
-struct Roster {
-    /// Sessions with a running agent.
-    running: BTreeSet<u32>,
-    /// Sessions whose agent ended (idle, or it could not start): left alone
-    /// until a host rings the wake event, so an agent that went idle is
-    /// not started again and again while another session streams.
+/// The sessions where an agent already runs: SYSTEM, outside session 0,
+/// in `processes` (those running the helper's own executable).
+fn agent_sessions(processes: &[Host]) -> Vec<u32> {
+    processes
+        .iter()
+        .filter(|p| p.sid == SYSTEM_SID && p.session != 0)
+        .map(|p| p.session)
+        .collect()
+}
+
+/// The broker's agents, by session (`A`: a process handle; anything in
+/// tests).
+#[derive(Debug)]
+struct Roster<A> {
+    /// The agents this broker started that still run.
+    running: BTreeMap<u32, A>,
+    /// Sessions left alone until a host rings the wake event: their agent
+    /// ended (idle, or it could not start), or one this broker did not
+    /// start serves them. So an agent that went idle is not started again
+    /// and again while another session streams.
     quiet: BTreeSet<u32>,
-    /// No wake event: a host could not ask again, so an ended agent is
-    /// started again on the next pass instead of being left quiet.
+    /// No wake event: no host could reach this broker while it runs, so it
+    /// starts what is needed and exits, and the next host that wants an
+    /// agent starts the task again.
     unwakeable: bool,
 }
-impl Roster {
-    /// The approved sessions to start an agent in now: each at most once.
-    fn to_start(&self, approved: &[u32]) -> Vec<u32> {
-        approved
+impl<A> Roster<A> {
+    fn new(unwakeable: bool) -> Self {
+        Self {
+            running: BTreeMap::new(),
+            quiet: BTreeSet::new(),
+            unwakeable,
+        }
+    }
+    /// One pass: lets go of the agents that ended, starts one in each
+    /// `approved` session that has none and is not quiet, and says whether
+    /// the broker keeps running. `serving` lists the sessions where an
+    /// agent runs already, asked only when one would be started. Ended
+    /// agents are let go before anything starts, so the pass that sees the
+    /// last one end exits instead of starting it again.
+    fn pass(
+        &mut self,
+        alive: impl Fn(&A) -> bool,
+        approved: &[u32],
+        serving: impl FnOnce() -> Vec<u32>,
+        mut start: impl FnMut(u32) -> Result<A>,
+    ) -> bool {
+        let quiet = &mut self.quiet;
+        self.running.retain(|&session, agent| {
+            let alive = alive(agent);
+            if !alive {
+                quiet.insert(session);
+            }
+            alive
+        });
+        let mut wanted: Vec<u32> = approved
             .iter()
             .copied()
-            .filter(|s| !self.running.contains(s) && !self.quiet.contains(s))
-            .collect()
-    }
-    fn started(&mut self, session: u32) {
-        self.running.insert(session);
-    }
-    fn ended(&mut self, session: u32) {
-        self.running.remove(&session);
-        if !self.unwakeable {
-            self.quiet.insert(session);
+            .filter(|s| !self.running.contains_key(s) && !self.quiet.contains(s))
+            .collect();
+        if !wanted.is_empty() {
+            let serving = serving();
+            wanted.retain(|s| {
+                let free = !serving.contains(s);
+                if !free {
+                    self.quiet.insert(*s);
+                }
+                free
+            });
         }
+        for session in wanted {
+            match start(session) {
+                Ok(agent) => {
+                    self.running.insert(session, agent);
+                }
+                Err(e) => {
+                    trace(|| format!("agent for session {session}: {e:#}"));
+                    self.quiet.insert(session);
+                }
+            }
+        }
+        !self.unwakeable && !self.running.is_empty()
     }
     /// A host asked for its agent.
     fn woken(&mut self) {
         self.quiet.clear();
-    }
-    /// The broker's work is done once no agent runs.
-    fn done(&self) -> bool {
-        self.running.is_empty()
     }
 }
 
@@ -707,57 +758,46 @@ fn wake_event(approved: &str) -> Option<Handle> {
         anyhow::Ok(event)
     })();
     created
-        .map_err(|e| trace(|| format!("no wake event, looking every few seconds: {e:#}")))
+        .map_err(|e| trace(|| format!("no wake event, so one pass and exit: {e:#}")))
         .ok()
 }
 
 /// The task's process: starts an agent in each session where the approved
-/// user runs the recorded host, and keeps doing so while any agent runs.
-/// The task ignores a start while the broker runs, so a host whose agent
-/// went idle rings the wake event instead.
+/// user runs the recorded host, and keeps doing so while an agent it
+/// started runs (see [`Roster`]). The task ignores a start while the broker
+/// runs, so a host whose agent went idle rings the wake event instead; one
+/// that finds the broker gone starts the task.
 fn broker() -> Result<()> {
     let expected = recorded_host()?;
     let approved = recorded_user()?;
     let exe = std::env::current_exe()?;
     let wake = wake_event(&approved);
-    let mut agents: BTreeMap<u32, Handle> = BTreeMap::new();
-    let mut roster = Roster {
-        unwakeable: wake.is_none(),
-        ..Default::default()
-    };
+    let mut roster = Roster::new(wake.is_none());
     loop {
-        agents.retain(|&session, agent| {
+        let sessions = approved_sessions(&hosts(&expected), &approved);
+        let running = roster.pass(
             // SAFETY: The process handle is owned.
-            let alive = unsafe { WaitForSingleObject(agent.0, 0) } == WAIT_TIMEOUT;
-            if !alive {
-                roster.ended(session);
-            }
-            alive
-        });
-        let found = hosts(&expected);
-        for session in roster.to_start(&approved_sessions(&found, &approved)) {
-            match start_agent(&exe, session, &approved) {
-                Ok(agent) => {
-                    agents.insert(session, agent);
-                    roster.started(session);
-                }
-                Err(e) => {
-                    trace(|| format!("agent for session {session}: {e:#}"));
-                    roster.ended(session);
-                }
-            }
-        }
-        if roster.done() {
-            return Ok(());
-        }
+            |agent: &Handle| unsafe { WaitForSingleObject(agent.0, 0) } == WAIT_TIMEOUT,
+            &sessions,
+            || agent_sessions(&hosts(&exe)),
+            |session| start_agent(&exe, session, &approved),
+        );
         let Some(wake) = &wake else {
-            thread::sleep(RECONCILE);
-            continue;
+            return Ok(());
+        };
+        // With no agent left, a host that rang since the last look still
+        // gets one: the event stays set until waited on.
+        let wait = if running {
+            RECONCILE.as_millis() as u32
+        } else {
+            0
         };
         // SAFETY: The event is owned.
-        if unsafe { WaitForSingleObject(wake.0, RECONCILE.as_millis() as u32) } == WAIT_OBJECT_0 {
+        if unsafe { WaitForSingleObject(wake.0, wait) } == WAIT_OBJECT_0 {
             trace(|| "woken by a host".into());
             roster.woken();
+        } else if !running {
+            return Ok(());
         }
     }
 }
@@ -1896,46 +1936,202 @@ mod tests {
         assert_eq!(approved_sessions(&[host(1, a), host(1, b)], a), vec![1]);
     }
 
-    #[test]
-    fn the_broker_starts_each_session_once_and_again_only_when_woken() {
-        let mut roster = Roster::default();
-        assert_eq!(roster.to_start(&[1, 2]), vec![1, 2]);
-        roster.started(1);
-        roster.started(2);
-        // Already running: no duplicate.
-        assert_eq!(roster.to_start(&[1, 2]), Vec::<u32>::new());
-        // A session that appears later gets one on the next pass.
-        assert_eq!(roster.to_start(&[1, 2, 5]), vec![5]);
-        roster.started(5);
-        // An agent that went idle is not restarted by itself while the
-        // others still run...
-        roster.ended(2);
-        assert!(!roster.done());
-        assert_eq!(roster.to_start(&[1, 2, 5]), Vec::<u32>::new());
-        // ...but when its host rings the wake event.
-        roster.woken();
-        assert_eq!(roster.to_start(&[1, 2, 5]), vec![2]);
-        roster.ended(1);
-        roster.ended(5);
-        assert!(roster.done(), "no agent left: the broker exits");
+    /// Agents in tests: a number each, alive while in the shared set.
+    #[derive(Default)]
+    struct Agents {
+        alive: std::cell::RefCell<BTreeSet<u32>>,
+        /// Every start, by session.
+        started: std::cell::RefCell<Vec<u32>>,
+        next: std::cell::Cell<u32>,
+    }
+    impl Agents {
+        fn start(&self, session: u32) -> Result<u32> {
+            let id = self.next.get();
+            self.next.set(id + 1);
+            self.alive.borrow_mut().insert(id);
+            self.started.borrow_mut().push(session);
+            Ok(id)
+        }
+        fn pass(&self, roster: &mut Roster<u32>, approved: &[u32], serving: &[u32]) -> bool {
+            roster.pass(
+                |id| self.alive.borrow().contains(id),
+                approved,
+                || serving.to_vec(),
+                |s| self.start(s),
+            )
+        }
+        /// The agents in `session` go idle and exit (ids index `started`).
+        fn end(&self, session: u32) {
+            let started = self.started.borrow();
+            self.alive
+                .borrow_mut()
+                .retain(|&id| started[id as usize] != session);
+        }
+        /// Every agent goes idle and exits, as with no viewer.
+        fn idle(&self) {
+            self.alive.borrow_mut().clear();
+        }
+        /// Runs a broker to its end, every agent going idle between
+        /// passes; panics when it never ends.
+        fn run(&self, roster: &mut Roster<u32>, approved: &[u32]) -> usize {
+            for passes in 1..=100 {
+                if !self.pass(roster, approved, &[]) {
+                    return passes;
+                }
+                self.idle();
+            }
+            panic!(
+                "the broker never exits: started {:?}",
+                self.started.borrow()
+            );
+        }
     }
 
     #[test]
-    fn without_a_wake_event_an_ended_agent_starts_again_on_the_next_pass() {
-        // Another process holds the wake event's name: no host can ring it,
-        // so the broker keeps every approved session served by itself.
-        let mut roster = Roster {
-            unwakeable: true,
-            ..Default::default()
+    fn an_idle_agent_is_never_restarted_unasked_in_any_wake_state() {
+        // Created, or taken or missing (no event): one approved host, no
+        // viewer. Each agent goes idle after it starts.
+        for unwakeable in [false, true] {
+            let agents = Agents::default();
+            let mut roster = Roster::new(unwakeable);
+            let passes = agents.run(&mut roster, &[1]);
+            assert_eq!(*agents.started.borrow(), vec![1], "once ({unwakeable})");
+            // With an event the broker sees the agent end, then exits;
+            // without one it exits as soon as the agent starts.
+            assert_eq!(passes, if unwakeable { 1 } else { 2 });
+        }
+    }
+
+    #[test]
+    fn the_broker_starts_each_session_once_and_again_only_when_woken() {
+        let agents = Agents::default();
+        let mut roster = Roster::new(false);
+        assert!(agents.pass(&mut roster, &[1, 2], &[]));
+        // Already running: no duplicate.
+        assert!(agents.pass(&mut roster, &[1, 2], &[1, 2]));
+        // A session that appears later gets one on the next pass.
+        assert!(agents.pass(&mut roster, &[1, 2, 5], &[1, 2]));
+        assert_eq!(*agents.started.borrow(), vec![1, 2, 5]);
+        // An agent that went idle is not restarted by itself while the
+        // others still run, however many passes go by...
+        agents.end(1);
+        for _ in 0..10 {
+            assert!(agents.pass(&mut roster, &[1, 2, 5], &[2, 5]));
+        }
+        assert_eq!(*agents.started.borrow(), vec![1, 2, 5]);
+        // ...but when its host rings the wake event.
+        roster.woken();
+        assert!(agents.pass(&mut roster, &[1, 2, 5], &[2, 5]));
+        assert_eq!(*agents.started.borrow(), vec![1, 2, 5, 1]);
+        // The pass that sees the last agent end exits; it starts nothing.
+        agents.idle();
+        assert!(!agents.pass(&mut roster, &[1, 2, 5], &[]));
+        assert_eq!(agents.started.borrow().len(), 4);
+        // The host's next request starts the task, a new broker, again.
+        let mut roster = Roster::new(false);
+        assert!(agents.pass(&mut roster, &[1], &[]));
+        assert_eq!(agents.started.borrow().len(), 5);
+    }
+
+    #[test]
+    fn without_a_wake_event_the_broker_starts_what_is_needed_and_exits() {
+        // Another process holds the wake event's name, or it could not be
+        // made: no host can ring it, so each start of the task is one pass.
+        let agents = Agents::default();
+        let mut roster = Roster::new(true);
+        assert!(!agents.pass(&mut roster, &[1, 2], &[]));
+        assert_eq!(*agents.started.borrow(), vec![1, 2]);
+        // The host in session 2 asks again while session 1 streams: its
+        // agent went idle, and only it is started.
+        agents.end(2);
+        let mut roster = Roster::new(true);
+        assert!(!agents.pass(&mut roster, &[1, 2], &[1]));
+        assert_eq!(*agents.started.borrow(), vec![1, 2, 2]);
+        // Every agent still runs: nothing to start.
+        let mut roster = Roster::new(true);
+        assert!(!agents.pass(&mut roster, &[1, 2], &[1, 2]));
+        assert_eq!(agents.started.borrow().len(), 3);
+    }
+
+    #[test]
+    fn an_agent_the_broker_did_not_start_is_left_until_its_host_asks() {
+        // One an earlier broker started still serves session 1.
+        let agents = Agents::default();
+        let mut roster = Roster::new(false);
+        assert!(!agents.pass(&mut roster, &[1], &[1]), "nothing of its own");
+        let mut roster = Roster::new(false);
+        assert!(agents.pass(&mut roster, &[1, 2], &[1]));
+        assert_eq!(*agents.started.borrow(), vec![2]);
+        // That agent ends: not restarted until its host rings.
+        for _ in 0..5 {
+            assert!(agents.pass(&mut roster, &[1, 2], &[2]));
+        }
+        assert_eq!(*agents.started.borrow(), vec![2]);
+        roster.woken();
+        assert!(agents.pass(&mut roster, &[1, 2], &[2]));
+        assert_eq!(*agents.started.borrow(), vec![2, 1]);
+    }
+
+    #[test]
+    fn an_agent_that_cannot_start_is_not_retried_unasked() {
+        // Alone, it ends the broker; each later start of the task (a host
+        // asking) tries once more.
+        let mut tries = 0;
+        for _ in 0..5 {
+            let mut roster = Roster::<u32>::new(false);
+            let running = roster.pass(
+                |_| true,
+                &[1],
+                Vec::new,
+                |_| {
+                    tries += 1;
+                    bail!("no")
+                },
+            );
+            assert!(!running);
+        }
+        assert_eq!(tries, 5, "each broker tries once");
+        let mut roster = Roster::<u32>::new(false);
+        let mut tries = 0;
+        assert!(roster.pass(
+            |_| true,
+            &[1, 2],
+            Vec::new,
+            |s| {
+                tries += 1;
+                if s == 1 {
+                    bail!("no")
+                }
+                Ok(s)
+            }
+        ));
+        for _ in 0..5 {
+            assert!(roster.pass(
+                |_| true,
+                &[1, 2],
+                Vec::new,
+                |_| {
+                    tries += 1;
+                    Ok(0)
+                }
+            ));
+        }
+        assert_eq!(tries, 2, "not again while session 2 runs");
+    }
+
+    #[test]
+    fn only_system_agents_outside_session_0_count_as_running() {
+        let p = |session, sid: &str| Host {
+            session,
+            sid: sid.into(),
         };
-        assert_eq!(roster.to_start(&[1, 2]), vec![1, 2]);
-        roster.started(1);
-        roster.started(2);
-        roster.ended(2);
-        assert!(!roster.done());
-        assert_eq!(roster.to_start(&[1, 2]), vec![2]);
-        roster.ended(1);
-        assert!(roster.done(), "it still exits once no agent runs");
+        let user = "S-1-5-21-1-2-3-1001";
+        // The broker itself (session 0) and the user's own elevated copy
+        // are not agents.
+        assert_eq!(
+            agent_sessions(&[p(0, SYSTEM_SID), p(1, user), p(2, SYSTEM_SID)]),
+            vec![2]
+        );
     }
 
     #[test]
