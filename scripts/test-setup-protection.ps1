@@ -57,16 +57,20 @@ try {
     Set-Acl -LiteralPath $generic -AclObject $acl
     Must-Reject $generic
 
-    # Repair: a folder setup owns, found owned by the user and writable by
-    # Users, goes back to administrators and what its parent passes on.
+    # A writable ancestor is moved as a unit, and the new tree cannot
+    # inherit any files or permissions from it.
     $repaired = Join-Path $root 'Latch'
     New-Item -ItemType Directory -Path $repaired | Out-Null
     $acl = Get-Acl -LiteralPath $repaired
     $acl.SetOwner($me)
     $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($users, 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
     Set-Acl -LiteralPath $repaired -AclObject $acl
+    Set-Content -LiteralPath (Join-Path $repaired 'keep-old.txt') -Value 'old tree'
     Must-Reject $repaired
     Use-ProtectedFolder (Join-Path $repaired 'Input') $root
+    $quarantine = @(Get-ChildItem -LiteralPath $root -Filter 'Latch.untrusted-*')
+    if ($quarantine.Count -ne 1 -or !(Test-Path -LiteralPath (Join-Path $quarantine[0].FullName 'keep-old.txt'))) { throw 'Did not quarantine the ancestor as a unit' }
+    if (Test-Path -LiteralPath (Join-Path $repaired 'keep-old.txt')) { throw 'Reused the old ancestor' }
     Assert-Protected $repaired
     Assert-Protected (Join-Path $repaired 'Input')
     # A folder setup fills is made again when anything in it is not
@@ -78,7 +82,7 @@ try {
     $acl.SetOwner($me)
     Set-Acl -LiteralPath $planted -AclObject $acl
     if (Test-ProtectedContents $inputDir) { throw 'Accepted a planted file' }
-    # A junction inside it is removed, never followed.
+    # A junction inside the old tree is quarantined without following it.
     New-Item -ItemType Junction -Path (Join-Path $inputDir 'out') -Target $unsafe | Out-Null
     Set-Content -LiteralPath (Join-Path $unsafe 'keep.txt') -Value 'kept'
     Reset-ProtectedFolder $inputDir $root
@@ -86,6 +90,23 @@ try {
     if (Get-ChildItem -LiteralPath $inputDir -Force) { throw 'The folder was not made again' }
     if ((Get-Content -LiteralPath (Join-Path $unsafe 'keep.txt')) -ne 'kept') { throw 'Followed a junction' }
     if (-not (Test-ProtectedContents $inputDir)) { throw 'The new folder is not protected' }
+    $quarantine = @(Get-ChildItem -LiteralPath $repaired -Filter 'Input.untrusted-*')
+    if ($quarantine.Count -ne 1) { throw 'Did not quarantine the unsafe contents' }
+    [IO.Directory]::Delete((Join-Path $quarantine[0].FullName 'out'))
+    # A junction at the original root can be removed without recursion.
+    New-Item -ItemType Junction -Path $junction -Target $unsafe | Out-Null
+    Use-ProtectedFolder $junction $root
+    Assert-Protected $junction
+    if (Get-ChildItem -LiteralPath $root -Filter 'junction.untrusted-*') { throw 'Did not remove the quarantined junction entry' }
+    if ((Get-Content -LiteralPath (Join-Path $unsafe 'keep.txt')) -ne 'kept') { throw 'Removed the junction target' }
+    # If Windows refuses the rename, leave the old entry and fail closed.
+    $blocked = Join-Path $root 'blocked'
+    $held = [IO.File]::Open($blocked, 'CreateNew', 'ReadWrite', 'Read')
+    try {
+        $refused = $false
+        try { Use-ProtectedFolder (Join-Path $blocked 'Child') $root } catch { $refused = $true }
+        if (!$refused -or !(Test-Path -LiteralPath $blocked -PathType Leaf)) { throw 'Continued after a blocked rename' }
+    } finally { $held.Dispose() }
     # A protected folder is left as it is.
     Set-Content -LiteralPath (Join-Path $inputDir 'host-path.txt') -Value 'x'
     Reset-ProtectedFolder $inputDir $root

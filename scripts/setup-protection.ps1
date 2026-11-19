@@ -24,7 +24,10 @@ function Test-Protected($path) {
     $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
     if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $trusted) { return "Untrusted owner: $path" }
     foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
-        if ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        # CREATOR OWNER is replaced by the owner of the child. A fixed
+        # untrusted SID can still make a new child writable via inheritance.
+        if ($rule.IdentityReference.Value -eq 'S-1-3-0' -and
+            ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) { continue }
         if ($rule.AccessControlType -eq 'Allow' -and (([int64]$rule.FileSystemRights -band 0xFFFFFFFFL) -band $writeRights) -and $rule.IdentityReference.Value -notin $trusted) {
             return "Untrusted write access: $path"
         }
@@ -45,7 +48,7 @@ function Assert-ProtectedTree($path) {
         Assert-Protected $walk
     }
 }
-# Gives a folder or file setup made back to administrators, in place:
+# Gives a folder or file setup just created back to administrators:
 # Administrators own it, and it has only what it inherits from its parent,
 # which the caller checked first. Never a reparse point. Then checks again.
 function Repair-Protected($path) {
@@ -58,47 +61,64 @@ function Repair-Protected($path) {
     if ($LASTEXITCODE -ne 0) { throw "Could not reset the permissions of $path" }
     Assert-Protected $path
 }
-# Makes sure every folder below $base (which must already be protected,
-# and is never repaired) down to $path exists and is protected, creating or
-# repairing each in turn. $base is %ProgramFiles% unless a test names
-# another.
+# The parent is protected. Move this entry as a unit without opening any
+# descendants, and fail if Windows cannot rename it (for example, an open
+# handle denies delete sharing).
+function Move-UntrustedTree($item) {
+    $path = $item.FullName
+    $quarantine = $path + '.untrusted-' + [guid]::NewGuid().ToString('N')
+    if ($item.PSIsContainer) {
+        [IO.Directory]::Move($path, $quarantine)
+    } else {
+        [IO.File]::Move($path, $quarantine)
+    }
+    # A nonrecursive delete removes a junction or symlink itself. Leave
+    # nonempty directories quarantined: old handles may still modify
+    # their contents, including changing a directory into a junction.
+    try {
+        if ($item.PSIsContainer) { [IO.Directory]::Delete($quarantine) }
+        else { [IO.File]::Delete($quarantine) }
+    } catch {}
+}
+# Makes each folder below the protected base available. An unsafe entry
+# is replaced, since an ACL change cannot revoke access from open handles.
 function Use-ProtectedFolder($path, $base = [Environment]::GetFolderPath('ProgramFiles')) {
     $base = [IO.Path]::GetFullPath($base).TrimEnd('\')
     $path = [IO.Path]::GetFullPath($path).TrimEnd('\')
     if ($base.StartsWith('\\')) { throw 'Setup requires a local path' }
-    if (-not $path.StartsWith($base + '\', [StringComparison]::OrdinalIgnoreCase)) { throw "Not under ${base}: $path" }
+    if ($path -ine $base -and -not $path.StartsWith($base + '\', [StringComparison]::OrdinalIgnoreCase)) { throw "Not under ${base}: $path" }
     Assert-Protected $base
     $walk = $base
     foreach ($part in $path.Substring($base.Length).Split('\')) {
         if (-not $part) { continue }
         $walk = Join-Path $walk $part
-        if (-not (Test-Path -LiteralPath $walk)) { New-Item -ItemType Directory -Path $walk -ErrorAction Stop | Out-Null }
-        if (Test-Protected $walk) { Repair-Protected $walk }
+        $item = try { Get-Item -LiteralPath $walk -Force -ErrorAction Stop } catch [System.Management.Automation.ItemNotFoundException] {}
+        if ($item -and $item.PSIsContainer -and -not (Test-Protected $walk)) { continue }
+        if ($item) { Move-UntrustedTree $item }
+        $acl = New-Object Security.AccessControl.DirectorySecurity
+        $acl.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)')
+        [IO.Directory]::CreateDirectory($walk, $acl) | Out-Null
+        Assert-Protected $walk
     }
 }
 # Whether $path and everything in it is protected.
 function Test-ProtectedContents($path) {
     if (Test-Protected $path) { return $false }
-    foreach ($child in Get-ChildItem -LiteralPath $path -Recurse -Force -ErrorAction Stop) {
-        if (Test-Protected $child.FullName) { return $false }
+    foreach ($child in Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop) {
+        if ($child.PSIsContainer) {
+            if (-not (Test-ProtectedContents $child.FullName)) { return $false }
+        } elseif (Test-Protected $child.FullName) { return $false }
     }
     return $true
 }
-# Deletes $path and what it holds. A reparse point (a junction, a link) is
-# removed itself, never followed.
+# Called under a protected parent. Recurse only through a protected tree.
 function Remove-Tree($path) {
     $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
-    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-        if ($item.PSIsContainer) { [IO.Directory]::Delete($path) } else { [IO.File]::Delete($path) }
+    if (!$item.PSIsContainer -or !(Test-ProtectedContents $path)) {
+        Move-UntrustedTree $item
         return
     }
-    if ($item.PSIsContainer) {
-        foreach ($child in Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop) { Remove-Tree $child.FullName }
-        [IO.Directory]::Delete($path)
-    } else {
-        $item.Attributes = 'Normal'
-        [IO.File]::Delete($path)
-    }
+    Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
 }
 # A folder setup fills completely, such as the SYSTEM helper's: anything in
 # it that is not protected may have been planted, and a folder that was not
@@ -106,6 +126,7 @@ function Remove-Tree($path) {
 # made again, empty and protected.
 function Reset-ProtectedFolder($path, $base = [Environment]::GetFolderPath('ProgramFiles')) {
     Use-ProtectedFolder (Split-Path -Parent $path) $base
-    if ((Test-Path -LiteralPath $path) -and -not (Test-ProtectedContents $path)) { Remove-Tree $path }
+    $item = try { Get-Item -LiteralPath $path -Force -ErrorAction Stop } catch [System.Management.Automation.ItemNotFoundException] {}
+    if ($item -and (!$item.PSIsContainer -or !(Test-ProtectedContents $path))) { Move-UntrustedTree $item }
     Use-ProtectedFolder $path $base
 }

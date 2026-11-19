@@ -98,7 +98,10 @@ fn elevation_error(code: Option<i32>) -> String {
 fn stage_script(program: &str, sha256: &str, user_sid: &str, elevated_input: bool) -> String {
     format!(
         r#"$ErrorActionPreference = 'Stop'
-$program = '{program}'
+$program = {program}
+$sha256 = {sha256}
+$userSid = {user_sid}
+$elevatedInput = {elevated_input}
 {protection}
 try {{
     # Everything the elevated copy may load sits in this folder. One that
@@ -106,17 +109,18 @@ try {{
     $dir = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) '{dir}'
     Reset-ProtectedFolder $dir
     $copy = Join-Path $dir 'latch-host.exe'
-    Copy-Item -LiteralPath $program -Destination $copy -Force
+    if (Test-Path -LiteralPath $copy) {{ Remove-Item -LiteralPath $copy -Force }}
+    [IO.File]::Copy($program, $copy)
     if (Test-Protected $copy) {{ Repair-Protected $copy }}
 }} catch {{ exit {copy_failed} }}
-if ((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne '{sha256}') {{
+if ((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne $sha256) {{
     Remove-Item -LiteralPath $copy -Force -ErrorAction SilentlyContinue
     exit {changed}
 }}
 # Started directly rather than through the shell, which would ask again
 # about a downloaded file this window already runs.
 $start = New-Object System.Diagnostics.ProcessStartInfo $copy
-$start.Arguments = '--setup-elevated --program "' + $program + '" --for-user {user_sid} --elevated-input {elevated_input}'
+$start.Arguments = '--setup-elevated --program "' + $program + '" --for-user ' + $userSid + ' --elevated-input ' + $elevatedInput
 $start.UseShellExecute = $false
 $start.WorkingDirectory = $dir
 $p = [System.Diagnostics.Process]::Start($start)
@@ -124,12 +128,12 @@ $p.WaitForExit()
 Remove-Item -LiteralPath $copy -Force -ErrorAction SilentlyContinue
 exit $p.ExitCode
 "#,
-        program = q(program),
+        program = ps_data(program),
         protection = protection_ps(),
         dir = SETUP_DIR,
-        sha256 = sha256,
-        user_sid = q(user_sid),
-        elevated_input = elevated_input,
+        sha256 = ps_data(sha256),
+        user_sid = ps_data(user_sid),
+        elevated_input = ps_data(&elevated_input.to_string()),
         copy_failed = exit::COPY_FAILED,
         changed = exit::CHANGED,
     )
@@ -171,8 +175,8 @@ fn launch_script(stage: &str) -> String {
     // administrator): no prompt to show, and none could be shown in
     // session 0.
     format!(
-        "$encoded = '{encoded}'; if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{ & '{ps}' -NoProfile -NonInteractive -EncodedCommand $encoded; exit $LASTEXITCODE }}; try {{ $p = Start-Process -FilePath '{ps}' -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList ('-NoProfile -NonInteractive -EncodedCommand ' + $encoded) -ErrorAction Stop }} catch {{ exit {declined} }}; if ($null -eq $p) {{ exit {declined} }}; exit $p.ExitCode",
-        ps = q(&powershell_exe().display().to_string()),
+        "$encoded = '{encoded}'; $ps = {ps}; if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{ & $ps -NoProfile -NonInteractive -EncodedCommand $encoded; exit $LASTEXITCODE }}; try {{ $p = Start-Process -FilePath $ps -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList ('-NoProfile -NonInteractive -EncodedCommand ' + $encoded) -ErrorAction Stop }} catch {{ exit {declined} }}; if ($null -eq $p) {{ exit {declined} }}; exit $p.ExitCode",
+        ps = ps_data(&powershell_exe().display().to_string()),
         encoded = encoded_command(&stage),
         declined = exit::DECLINED,
     )
@@ -187,7 +191,6 @@ fn encoded_command(script: &str) -> String {
 }
 
 /// Standard base64 with padding, for `-EncodedCommand`.
-#[cfg(any(windows, test))]
 fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -210,15 +213,12 @@ fn base64(bytes: &[u8]) -> String {
 /// The setup script. `user_sid`: the user setup is for (see
 /// [`stage_script`]), already checked.
 pub fn script(p: &Plan<'_>, user_sid: &str) -> String {
-    let q = |s: &str| s.replace('\'', "''");
     let adapter = if p.adapter.is_empty() {
         "Step \"Wake-on-LAN: adapter unknown, skipped\"\n".to_string()
     } else {
         format!(
-            r#"# The names are single-quoted literals held in variables. Spliced into
-# a double-quoted string, a '$' in a name would expand and a '"' end it.
-$wakeAdapter = '{adapter}'
-$wakeDevice = '{desc}'
+            r#"$wakeAdapter = {adapter}
+$wakeDevice = {desc}
 Step "Enabling Wake-on-LAN on '$wakeAdapter'"
 try {{
     Set-NetAdapterPowerManagement -Name $wakeAdapter -WakeOnMagicPacket Enabled -ErrorAction Stop
@@ -241,8 +241,8 @@ if ($k) {{
 }} else {{ Write-Output "  no class key for the adapter; keywords unchanged" }}
 try {{ powercfg /deviceenablewake $wakeDevice | Out-Null }} catch {{ Write-Output "  powercfg: $_" }}
 "#,
-            adapter = q(p.adapter),
-            desc = q(p.adapter_description)
+            adapter = ps_data(p.adapter),
+            desc = ps_data(p.adapter_description)
         )
     };
     format!(
@@ -258,17 +258,17 @@ Step "Opening TCP and UDP {port} to the tailnet for Latch"
 # it; unanswered (nobody at the PC, an install over SSH) that becomes a pair
 # of inbound Block rules for the program, and a Block rule wins over every
 # Allow below. Only rules for this very executable are removed.
-$latchExe = '{exe}'
+$latchExe = {exe}
 Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue | Where-Object {{ $_.Program -ieq $latchExe }} | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {{ $_.Action -eq 'Block' -and $_.Direction -eq 'Inbound' }} | Remove-NetFirewallRule -ErrorAction SilentlyContinue
 foreach ($rule in 'Latch Host', 'Latch Media') {{ netsh advfirewall firewall delete rule name="$rule" | Out-Null }}
 # Tailscale's addresses only: its IPv4 range and its IPv6 one.
-netsh advfirewall firewall add rule name="Latch Host" dir=in action=allow protocol=TCP localport={port} remoteip={tailnet} program='{exe}' | Out-Null
+netsh advfirewall firewall add rule name="Latch Host" dir=in action=allow protocol=TCP localport={port} remoteip={tailnet} "program=$latchExe" | Out-Null
 if ($LASTEXITCODE -ne 0) {{ $setupFailed = $true }}
-netsh advfirewall firewall add rule name="Latch Media" dir=in action=allow protocol=UDP localport={port} remoteip={tailnet} program='{exe}' | Out-Null
+netsh advfirewall firewall add rule name="Latch Media" dir=in action=allow protocol=UDP localport={port} remoteip={tailnet} "program=$latchExe" | Out-Null
 if ($LASTEXITCODE -ne 0) {{ $setupFailed = $true }}
 Step "Opening UDP 9 to check the wake path while this PC is awake"
 netsh advfirewall firewall delete rule name="Latch wake" | Out-Null
-netsh advfirewall firewall add rule name="Latch wake" dir=in action=allow protocol=UDP localport=9 program='{exe}' | Out-Null
+netsh advfirewall firewall add rule name="Latch wake" dir=in action=allow protocol=UDP localport=9 "program=$latchExe" | Out-Null
 if ($LASTEXITCODE -ne 0) {{ $setupFailed = $true }}
 {input_helper}
 {virtual_display}
@@ -292,9 +292,9 @@ exit 0
         retire = crate::legacy::retire_windows_ps(),
         port = CONTROL_PORT,
         tailnet = "100.64.0.0/10,fd7a:115c:a1e0::/48",
-        exe = q(&p.exe.display().to_string()),
+        exe = ps_data(&p.exe.display().to_string()),
         virtual_display = crate::virtual_display::setup_ps(),
-        input_helper = input_helper_ps(p.elevated_input, p.exe, user_sid),
+        input_helper = input_helper_ps(p.elevated_input, user_sid),
         record = record_power_ps(),
         gamepad_driver = gamepad_driver_ps(),
     )
@@ -396,7 +396,7 @@ fn sas_policy_removal_ps() -> String {
 /// administrators can change and which is made again when anything in it
 /// is not theirs, and is replaced on every setup. The task's security lets
 /// the approved user start it, and only administrators change it.
-fn input_helper_ps(enabled: bool, installed: &Path, user_sid: &str) -> String {
+fn input_helper_ps(enabled: bool, user_sid: &str) -> String {
     if !enabled {
         return format!(
             r#"Step "Removing administrator input helper"
@@ -425,7 +425,7 @@ try {{
 try {{
     # The user who asked for setup; whoever approved the prompt may be
     # another administrator. Only this user's Latch may use the helper.
-    $approvedSid = '{user_sid}'
+    $approvedSid = {user_sid}
     $approvedName = ([Security.Principal.SecurityIdentifier]$approvedSid).Translate([Security.Principal.NTAccount]).Value
     Write-Output "  for $approvedName, whose Latch can then answer administrator prompts"
     $inputSource = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Latch\Setup\latch-host.exe'
@@ -436,13 +436,12 @@ try {{
     Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue
     Get-Process -Name 'latch-host' -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -ieq $inputExe }} | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 500
-    # SYSTEM runs what is in this folder: anything in it not owned and
-    # only writable by SYSTEM, Administrators or TrustedInstaller, the
-    # folder is made again; its parents are repaired in place.
+    # SYSTEM runs what is in this folder. A tree with unsafe contents
+    # is moved aside and replaced with a protected one.
     Reset-ProtectedFolder $inputDir
     Copy-Item -LiteralPath $inputSource -Destination $inputExe -Force -ErrorAction Stop
     $hostRecord = Join-Path $inputDir 'host-path.txt'
-    Set-Content -LiteralPath $hostRecord -Value '{installed}' -Encoding UTF8 -ErrorAction Stop
+    Set-Content -LiteralPath $hostRecord -Value $latchExe -Encoding UTF8 -ErrorAction Stop
     $userRecord = Join-Path $inputDir 'user-sid.txt'
     Set-Content -LiteralPath $userRecord -Value $approvedSid -Encoding ASCII -ErrorAction Stop
     foreach ($written in $inputExe, $hostRecord, $userRecord) {{ if (Test-Protected $written) {{ Repair-Protected $written }} }}
@@ -475,8 +474,7 @@ try {{
         Write-Output "  Ctrl+Alt+Delete from a viewer stays off: the SoftwareSASGeneration policy is set to something else"
     }}
 }} catch {{ Write-Output "  input helper: $_"; $setupFailed = $true }}"#,
-        installed = installed.display().to_string().replace('\'', "''"),
-        user_sid = q(user_sid),
+        user_sid = ps_data(user_sid),
         task = INPUT_TASK,
         arg = "--input-helper",
         system = "S-1-5-18",
@@ -606,12 +604,12 @@ pub(crate) fn powershell(script: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-// Only the Windows setup path is compiled in a release build; tests use it everywhere.
-#[cfg_attr(not(windows), allow(dead_code))]
-/// A PowerShell single-quoted literal: only `'` needs escaping, nothing is
-/// expanded.
-fn q(s: &str) -> String {
-    s.replace('\'', "''")
+/// A PowerShell expression that decodes data without parsing it as source.
+fn ps_data(s: &str) -> String {
+    format!(
+        "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}'))",
+        base64(s.as_bytes())
+    )
 }
 
 /// Generate and run the setup script. Called from `--setup-elevated`,
@@ -1101,6 +1099,9 @@ pub fn run_value(exe: &Path) -> String {
 }
 
 #[cfg(test)]
+const SPECIAL_PATH: &str = r"C:\Users\’ ‘ ‚ ‛ ' $ ` lab\Latch\latch-host.exe";
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1125,7 +1126,7 @@ mod tests {
         assert!(
             s.contains("protocol=UDP localport=47850 remoteip=100.64.0.0/10,fd7a:115c:a1e0::/48")
         );
-        assert!(s.contains("O''Brien"));
+        assert!(s.contains(&ps_data(r"C:\Users\O'Brien\Latch\latch-host.exe")));
         assert!(s.contains("HiberbootEnabled"));
         assert!(s.contains("*WakeOnMagicPacket"));
         assert!(s.contains("vdd_settings.xml"));
@@ -1296,7 +1297,7 @@ mod tests {
             },
             TEST_SID,
         );
-        let step = input_helper_ps(true, Path::new(r"C:\Latch\latch-host.exe"), TEST_SID);
+        let step = input_helper_ps(true, TEST_SID);
         assert!(setup.contains(&step));
         assert!(step.contains(r"'Latch\Setup\latch-host.exe'"));
         assert!(step.contains(r"'Latch\Input'"));
@@ -1330,7 +1331,7 @@ mod tests {
         assert!(step.contains("Register-ScheduledTask -TaskName 'LatchInput'"));
         // The approved user is the one who asked for setup, recorded beside
         // the helper, and checked to be a real account before anything.
-        assert!(step.contains(&format!("$approvedSid = '{TEST_SID}'")));
+        assert!(step.contains(&format!("$approvedSid = {}", ps_data(TEST_SID))));
         let translate = step
             .find("([Security.Principal.SecurityIdentifier]$approvedSid).Translate([Security.Principal.NTAccount])")
             .expect("the SID names an account");
@@ -1374,7 +1375,7 @@ mod tests {
             .expect("rolls the mark back");
         assert!(write < rollback);
 
-        let disabled = input_helper_ps(false, Path::new(r"C:\Latch\latch-host.exe"), TEST_SID);
+        let disabled = input_helper_ps(false, TEST_SID);
         assert!(disabled.contains("Stop-ScheduledTask"));
         assert!(disabled.contains("Unregister-ScheduledTask"));
         assert!(!disabled.contains("-RunLevel Highest"));
@@ -1512,16 +1513,12 @@ mod tests {
     /// the caller names is written to (IN-01, IN-02).
     #[test]
     fn the_elevated_step_runs_a_checked_copy_from_program_files() {
-        let program = r"C:\Users\O'Brien $x\AppData\Local\Latch\latch-host.exe";
+        let program = SPECIAL_PATH;
         let stage = stage_script(program, &"ab".repeat(32), TEST_SID, true);
-        assert!(
-            stage.contains(r"$program = 'C:\Users\O''Brien $x\AppData\Local\Latch\latch-host.exe'"),
-            "{stage}"
-        );
+        assert!(stage.contains(&format!("$program = {}", ps_data(program))));
+        assert!(!stage.contains(program));
         assert!(stage.contains(r"[Environment]::GetFolderPath('ProgramFiles')) 'Latch\Setup'"));
-        let copy = stage
-            .find("Copy-Item -LiteralPath $program -Destination $copy")
-            .unwrap();
+        let copy = stage.find("[IO.File]::Copy($program, $copy)").unwrap();
         let check = stage
             .find("Get-FileHash -LiteralPath $copy -Algorithm SHA256")
             .unwrap();
@@ -1530,18 +1527,18 @@ mod tests {
             copy < check && check < run,
             "copy, then check, then run the copy"
         );
-        assert!(stage.contains(&format!("-ne '{}'", "ab".repeat(32))));
+        assert!(stage.contains(&format!("$sha256 = {}", ps_data(&"ab".repeat(32)))));
+        assert!(stage.contains(".Hash -ne $sha256"));
         assert!(stage.contains("'--setup-elevated --program \"' + $program + '\" --for-user "));
         assert!(!stage.contains("--local-app-data"));
         assert!(!stage.contains("ProcessStartInfo $program"));
 
         let launch = launch_script(&stage);
-        assert!(
-            launch.contains(
-                r"-FilePath 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -Verb RunAs"
-            ) || std::env::var_os("SystemRoot").is_some(),
-            "{launch}"
-        );
+        assert!(launch.contains(&format!(
+            "$ps = {}",
+            ps_data(&powershell_exe().display().to_string())
+        )));
+        assert!(launch.contains("-FilePath $ps -Verb RunAs"));
         assert!(
             !launch.contains("latch-host.exe"),
             "the user's file is never elevated: {launch}"
@@ -1573,10 +1570,12 @@ mod tests {
         assert!(s.contains("if (Test-Protected $copy) { Repair-Protected $copy }"));
         assert!(s.contains("ReparsePoint"));
         assert!(s.contains("GetOwner([Security.Principal.SecurityIdentifier])"));
-        assert!(s.find("Reset-ProtectedFolder $dir").unwrap() < s.find("Copy-Item").unwrap());
+        assert!(s.find("Reset-ProtectedFolder $dir").unwrap() < s.find("[IO.File]::Copy").unwrap());
         assert!(s.contains("$start.WorkingDirectory = $dir"));
         // The asking user and their setting go to the elevated step.
-        assert!(s.contains(&format!("'\" --for-user {TEST_SID} --elevated-input true'")));
+        assert!(s.contains(&format!("$userSid = {}", ps_data(TEST_SID))));
+        assert!(s.contains(&format!("$elevatedInput = {}", ps_data("true"))));
+        assert!(s.contains(" + $userSid + ' --elevated-input ' + $elevatedInput"));
     }
 
     #[test]
@@ -1587,6 +1586,7 @@ mod tests {
             "function Assert-Protected",
             "function Assert-ProtectedTree",
             "function Repair-Protected",
+            "function Move-UntrustedTree",
             "function Use-ProtectedFolder",
             "function Test-ProtectedContents",
             "function Remove-Tree",
@@ -1701,16 +1701,18 @@ mod tests {
         let s = script(
             &Plan {
                 elevated_input: true,
-                exe: Path::new("C:\\Users\\O'Brien\\latch-host.exe"),
-                adapter: "",
-                adapter_description: "",
+                exe: Path::new(SPECIAL_PATH),
+                adapter: SPECIAL_PATH,
+                adapter_description: SPECIAL_PATH,
             },
             TEST_SID,
         );
-        assert!(
-            s.contains("$latchExe = 'C:\\Users\\O''Brien\\latch-host.exe'"),
-            "{s}"
-        );
+        for variable in ["$latchExe", "$wakeAdapter", "$wakeDevice"] {
+            assert!(s.contains(&format!("{variable} = {}", ps_data(SPECIAL_PATH))));
+        }
+        assert!(!s.contains(SPECIAL_PATH));
+        assert!(s.contains(r#""program=$latchExe""#));
+        assert!(s.contains("-LiteralPath $hostRecord -Value $latchExe"));
         assert!(s.contains("$_.Program -ieq $latchExe"));
         assert!(s.contains("$_.Action -eq 'Block' -and $_.Direction -eq 'Inbound'"));
         let lift = s.find("Remove-NetFirewallRule").unwrap();
