@@ -3,27 +3,48 @@ use crate::config::HostConfig;
 #[cfg(target_os = "linux")]
 use crate::config::FILE;
 use anyhow::{Context, Result};
+use latch_engine::server::DesktopPreparation;
 use latch_proto::control::StreamRequest;
 use std::process::{Command, Stdio};
+use std::sync::{atomic::AtomicBool, Arc};
 use std::time::{Duration, Instant};
 
-type Undo = Option<Box<dyn FnOnce() + Send>>;
-
-pub fn prepare(cfg: &HostConfig, req: &StreamRequest) -> Result<Undo> {
-    let held = crate::streamer::hold_displays();
-    let undo = prepare_desktop(cfg, req)?;
-    if held.is_none() && undo.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(Box::new(move || {
-        if let Some(undo) = undo {
-            undo();
-        }
-        drop(held);
-    })))
+struct HeldPreparation {
+    held: crate::streamer::HeldDisplays,
+    desktop: Option<Box<dyn DesktopPreparation>>,
 }
 
-fn prepare_desktop(cfg: &HostConfig, req: &StreamRequest) -> Result<Undo> {
+impl DesktopPreparation for HeldPreparation {
+    fn start(&mut self, stopping: Arc<AtomicBool>) {
+        if let Some(desktop) = self.desktop.as_mut() {
+            desktop.start(stopping);
+        }
+    }
+
+    fn undo(self: Box<Self>) {
+        if let Some(desktop) = self.desktop {
+            desktop.undo();
+        }
+        drop(self.held);
+    }
+}
+
+pub fn prepare(
+    cfg: &HostConfig,
+    req: &StreamRequest,
+) -> Result<Option<Box<dyn DesktopPreparation>>> {
+    let held = crate::streamer::hold_displays();
+    let desktop = prepare_desktop(cfg, req)?;
+    if let Some(held) = held {
+        return Ok(Some(Box::new(HeldPreparation { held, desktop })));
+    }
+    Ok(desktop)
+}
+
+fn prepare_desktop(
+    cfg: &HostConfig,
+    req: &StreamRequest,
+) -> Result<Option<Box<dyn DesktopPreparation>>> {
     let size = [
         req.width.clamp(64, latch_proto::control::MAX_SIDE) & !1,
         req.height.clamp(64, latch_proto::control::MAX_SIDE) & !1,
@@ -44,7 +65,7 @@ fn prepare_desktop(cfg: &HostConfig, req: &StreamRequest) -> Result<Undo> {
                 if let Err(e) = run(&undo, size, Duration::from_secs(15)) {
                     tracing::warn!("could not restore the desktop: {e:#}");
                 }
-            }) as Box<dyn FnOnce() + Send>
+            }) as Box<dyn DesktopPreparation>
         }));
     }
     if !cfg!(windows) && !crate::streamer::display_follows_viewer() {
@@ -52,13 +73,7 @@ fn prepare_desktop(cfg: &HostConfig, req: &StreamRequest) -> Result<Undo> {
     }
     let previous =
         latch_engine::display::prepare(size[0], size[1], size[2], req.display.as_deref())?;
-    Ok(previous.map(|previous| {
-        Box::new(move || {
-            if let Err(e) = latch_engine::display::restore(&previous) {
-                tracing::warn!("could not restore the desktop: {e:#}");
-            }
-        }) as Box<dyn FnOnce() + Send>
-    }))
+    Ok(previous.map(|previous| Box::new(previous) as Box<dyn DesktopPreparation>))
 }
 
 fn run(script: &str, size: [u32; 3], limit: Duration) -> Result<()> {

@@ -1,13 +1,24 @@
 use crate::{display::Previous, video::DesktopUnavailable};
 use anyhow::{bail, Context, Result};
 use parking_lot::Mutex;
-use std::{collections::BTreeMap, thread, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
 use windows::{
     core::PCWSTR,
     Win32::{
         Devices::Display::*,
-        Foundation::{ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, HWND},
+        Foundation::{ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, E_ACCESSDENIED, HWND},
         Graphics::{Dxgi::*, Gdi::*},
+        System::StationsAndDesktops::{
+            CloseDesktop, OpenInputDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS,
+        },
     },
 };
 
@@ -49,28 +60,83 @@ struct Saved {
 struct DisplayState {
     generation: u64,
     saved: Option<Saved>,
-    pending: bool,
+    pending_restore: Option<u64>,
+    deferred_prepare: Option<ModeRequest>,
+}
+
+struct ModeRequest {
+    width: u32,
+    height: u32,
+    fps: u32,
+    display: Option<String>,
 }
 
 // The same lock orders generation changes and all Windows display writes.
 static STATE: Mutex<DisplayState> = Mutex::new(DisplayState {
     generation: 0,
     saved: None,
-    pending: false,
+    pending_restore: None,
+    deferred_prepare: None,
 });
 
 impl DisplayState {
-    fn begin_prepare(&mut self, recover: impl FnOnce(&Saved) -> Result<()>) -> u64 {
+    fn begin_prepare(&mut self) -> u64 {
         self.generation += 1;
+        self.deferred_prepare = None;
+        self.generation
+    }
+
+    fn recover_idle(&mut self, restore: impl FnOnce(&Saved) -> Result<()>) -> Option<Previous> {
         // Give the new preparation a chance to recover the idle topology,
         // including any detached physical displays, before selecting its output.
-        // If access is still denied, carry the original snapshot into its undo.
-        if std::mem::take(&mut self.pending) {
-            if let Some(Err(error)) = self.attempt(self.generation, recover) {
-                tracing::warn!(%error, "could not recover the idle display topology before preparing");
+        self.pending_restore?;
+        match self.attempt(self.generation, restore) {
+            Some(Err(error)) if DesktopUnavailable::is(&error) => {
+                let mut previous = self.saved.as_ref()?.previous.clone();
+                previous.generation = self.generation;
+                Some(previous)
             }
+            Some(Err(error)) => {
+                tracing::warn!(%error, "could not recover the idle display topology before preparing");
+                None
+            }
+            _ => None,
         }
-        self.generation
+    }
+
+    fn prepare_session(
+        &mut self,
+        restore: impl FnOnce(&Saved) -> Result<()>,
+        prepare: impl FnOnce(&mut Self) -> Result<Option<Preparation>>,
+    ) -> Result<Option<Preparation>> {
+        if let Some(previous) = self.recover_idle(restore) {
+            return Ok(Some(Preparation {
+                previous,
+                deferred: true,
+            }));
+        }
+        let prepared = prepare(self)?;
+        if prepared.is_none() {
+            self.saved = None;
+        }
+        Ok(prepared)
+    }
+
+    fn retry_prepare(
+        &mut self,
+        generation: u64,
+        stopping: &AtomicBool,
+        apply: impl FnOnce(&mut Self, &ModeRequest) -> Result<bool>,
+    ) -> Option<Result<bool>> {
+        if generation != self.generation || stopping.load(Ordering::Acquire) {
+            return None;
+        }
+        let request = self.deferred_prepare.take()?;
+        let applied = apply(self, &request);
+        if matches!(applied, Ok(false)) {
+            self.deferred_prepare = Some(request);
+        }
+        Some(applied)
     }
 
     fn attempt(
@@ -84,19 +150,23 @@ impl DisplayState {
         let result = restore(self.saved.as_ref()?);
         if !result.as_ref().is_err_and(DesktopUnavailable::is) {
             self.saved = None;
-            self.pending = false;
+            self.pending_restore = None;
         }
         Some(result)
     }
 
     fn restore(&mut self, generation: u64) -> Result<()> {
-        if self.pending {
+        if generation != self.generation {
+            return Ok(());
+        }
+        self.deferred_prepare = None;
+        if self.pending_restore == Some(generation) {
             return Ok(());
         }
         match self.attempt(generation, Saved::restore) {
             Some(Err(error)) if DesktopUnavailable::is(&error) => {
                 tracing::warn!("desktop is inaccessible; deferring display restore: {error:#}");
-                self.pending = true;
+                self.pending_restore = Some(generation);
                 thread::Builder::new()
                     .name("display-restore".into())
                     .spawn(move || retry_restore(generation))
@@ -128,11 +198,28 @@ fn retry_restore(generation: u64) {
 }
 
 impl Previous {
+    pub(crate) fn start_deferred(&self, stopping: Arc<AtomicBool>) {
+        let generation = self.generation;
+        let state = STATE.lock();
+        if state.generation != generation || state.deferred_prepare.is_none() {
+            return;
+        }
+        drop(state);
+        if let Err(error) = thread::Builder::new()
+            .name("display-prepare".into())
+            .spawn(move || retry_prepare(generation, &stopping))
+        {
+            tracing::warn!(%error, "could not start the deferred display preparation worker");
+        }
+    }
+
     pub(crate) fn begin_custom_prepare() {
         let mut state = STATE.lock();
-        state.begin_prepare(Saved::restore);
+        state.begin_prepare();
+        state.recover_idle(Saved::restore);
         // The custom command and its own undo now own the display.
         state.saved = None;
+        state.pending_restore = None;
     }
 }
 
@@ -525,6 +612,19 @@ fn current(output: &Output) -> Result<DEVMODEW> {
     }
     Ok(mode)
 }
+fn input_desktop_denied() -> bool {
+    // SAFETY: This only checks access. The thread stays on its own desktop.
+    unsafe {
+        match OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) {
+            Ok(desktop) => {
+                let _ = CloseDesktop(desktop);
+                false
+            }
+            Err(error) => error.code() == E_ACCESSDENIED,
+        }
+    }
+}
+
 fn change(name: &[u16], mode: &DEVMODEW) -> Result<()> {
     // SAFETY: The device name and DEVMODE remain valid for the call. No registry changes.
     let status = unsafe {
@@ -536,10 +636,18 @@ fn change(name: &[u16], mode: &DEVMODEW) -> Result<()> {
             None,
         )
     };
-    if status != DISP_CHANGE_SUCCESSFUL {
-        bail!("ChangeDisplaySettingsExW returned {}", status.0);
+    mode_result(status, input_desktop_denied)
+}
+
+fn mode_result(status: DISP_CHANGE, input_denied: impl FnOnce() -> bool) -> Result<()> {
+    if status == DISP_CHANGE_SUCCESSFUL {
+        return Ok(());
     }
-    Ok(())
+    let error = anyhow::anyhow!("ChangeDisplaySettingsExW returned {}", status.0);
+    if status == DISP_CHANGE_FAILED && input_denied() {
+        return Err(error.context(DesktopUnavailable));
+    }
+    Err(error)
 }
 
 fn set_stream_mode(
@@ -553,6 +661,9 @@ fn set_stream_mode(
         return Ok(());
     }
     let retry = change();
+    if retry.as_ref().is_err_and(DesktopUnavailable::is) {
+        return retry;
+    }
     let (actual_width, actual_height) = read_size().context("verify the virtual display size")?;
     if (actual_width, actual_height) != (width, height) {
         tracing::warn!(
@@ -571,6 +682,22 @@ fn refresh_rank(hz: u32, requested: u32) -> (bool, u32) {
         if hz >= requested { hz } else { u32::MAX - hz },
     )
 }
+
+struct Preparation {
+    previous: Previous,
+    deferred: bool,
+}
+
+impl Preparation {
+    fn from_change(previous: Previous, result: Result<()>) -> Result<Self> {
+        let deferred = result.as_ref().is_err_and(DesktopUnavailable::is);
+        if !deferred {
+            result?;
+        }
+        Ok(Self { previous, deferred })
+    }
+}
+
 pub(super) fn prepare(
     width: u32,
     height: u32,
@@ -578,12 +705,25 @@ pub(super) fn prepare(
     display: Option<&str>,
 ) -> Result<Option<Previous>> {
     let mut state = STATE.lock();
-    let generation = state.begin_prepare(Saved::restore);
-    match prepare_mode(&mut state, width, height, fps, display) {
-        Ok(None) => {
-            state.saved = None;
-            Ok(None)
-        }
+    let generation = state.begin_prepare();
+    match state.prepare_session(Saved::restore, |state| {
+        prepare_mode(state, width, height, fps, display)
+    }) {
+        Ok(prepared) => Ok(prepared.map(|prepared| {
+            if prepared.deferred {
+                tracing::info!(
+                    generation,
+                    "desktop is inaccessible; deferring display preparation"
+                );
+                state.deferred_prepare = Some(ModeRequest {
+                    width,
+                    height,
+                    fps,
+                    display: display.map(str::to_owned),
+                });
+            }
+            prepared.previous
+        })),
         Err(error) => {
             if let Err(restore) = state.restore(generation) {
                 tracing::warn!(
@@ -592,7 +732,41 @@ pub(super) fn prepare(
             }
             Err(error)
         }
-        result => result,
+    }
+}
+
+fn retry_prepare(generation: u64, stopping: &AtomicBool) {
+    loop {
+        thread::sleep(Duration::from_secs(1));
+        let applied = STATE
+            .lock()
+            .retry_prepare(generation, stopping, |state, request| {
+                if input_desktop_denied() {
+                    return Ok(false);
+                }
+                let prepared = state.prepare_session(Saved::restore, |state| {
+                    prepare_mode(
+                        state,
+                        request.width,
+                        request.height,
+                        request.fps,
+                        request.display.as_deref(),
+                    )
+                })?;
+                Ok(!prepared.is_some_and(|p| p.deferred))
+            });
+        match applied {
+            None => return,
+            Some(Ok(false)) => {}
+            Some(Ok(true)) => {
+                tracing::info!(generation, "applied deferred display preparation");
+                return;
+            }
+            Some(Err(error)) => {
+                tracing::warn!("could not apply deferred display preparation: {error:#}");
+                return;
+            }
+        }
     }
 }
 
@@ -602,7 +776,7 @@ fn prepare_mode(
     height: u32,
     fps: u32,
     display: Option<&str>,
-) -> Result<Option<Previous>> {
+) -> Result<Option<Preparation>> {
     // A viewer that chose a real monitor shares it as it is: the virtual
     // display keeps its size and every monitor stays on.
     let output = select_named(display)?;
@@ -647,6 +821,16 @@ fn prepare_mode(
     }
     mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
     let (paths, modes) = topology()?;
+    let mut previous = state.saved.as_ref().map_or(
+        Previous {
+            width: original.dmPelsWidth,
+            height: original.dmPelsHeight,
+            refresh_hz: original.dmDisplayFrequency,
+            generation: state.generation,
+        },
+        |saved| saved.previous.clone(),
+    );
+    previous.generation = state.generation;
     let adapters = if state.saved.is_none() {
         // Record adapter identity before only_virtual detaches physical outputs.
         let attached = outputs()?;
@@ -665,38 +849,30 @@ fn prepare_mode(
     } else {
         None
     };
-    only_virtual(&output.desc.DeviceName, &paths, &modes)?;
-    if let Some((adapters, default_adapter)) = adapters {
-        state.saved = Some(Saved {
-            previous: Previous {
-                width: original.dmPelsWidth,
-                height: original.dmPelsHeight,
-                refresh_hz: original.dmDisplayFrequency,
-                generation: state.generation,
+    let result = (|| {
+        only_virtual(&output.desc.DeviceName, &paths, &modes)?;
+        if let Some((adapters, default_adapter)) = adapters {
+            state.saved = Some(Saved {
+                previous: previous.clone(),
+                output_id: output.id.clone(),
+                paths,
+                modes,
+                adapters,
+                default_adapter,
+            });
+        }
+        let name = &output.desc.DeviceName;
+        set_stream_mode(
+            name,
+            (width, height),
+            || change(name, &mode),
+            || {
+                let mode = current(&output)?;
+                Ok((mode.dmPelsWidth, mode.dmPelsHeight))
             },
-            output_id: output.id.clone(),
-            paths,
-            modes,
-            adapters,
-            default_adapter,
-        });
-    }
-    let name = &output.desc.DeviceName;
-    set_stream_mode(
-        name,
-        (width, height),
-        || change(name, &mode),
-        || {
-            let mode = current(&output)?;
-            Ok((mode.dmPelsWidth, mode.dmPelsHeight))
-        },
-    )?;
-    let saved = state
-        .saved
-        .as_mut()
-        .expect("virtual display has a snapshot");
-    saved.previous.generation = state.generation;
-    Ok(Some(saved.previous.clone()))
+        )
+    })();
+    Preparation::from_change(previous, result).map(Some)
 }
 
 pub(super) fn restore(previous: &Previous) -> Result<()> {
@@ -749,7 +925,8 @@ mod tests {
                 adapters: BTreeMap::new(),
                 default_adapter: (0, 0),
             }),
-            pending: false,
+            pending_restore: None,
+            deferred_prepare: None,
         }
     }
 
@@ -757,7 +934,7 @@ mod tests {
     fn a_late_undo_cannot_restore_another_preparations_display() {
         let mut state = saved_display();
         let old = state.generation;
-        let new = state.begin_prepare(|_| panic!("no restore was pending"));
+        let new = state.begin_prepare();
         assert!(state
             .attempt(old, |_| panic!("stale undo changed the display"))
             .is_none());
@@ -776,23 +953,115 @@ mod tests {
             .attempt(old, |_| Err(DesktopUnavailable.into()))
             .unwrap()
             .is_err());
-        state.pending = true;
+        state.pending_restore = Some(old);
 
         // Access is still denied during the new preparation's recovery attempt.
-        let new = state.begin_prepare(|_| Err(DesktopUnavailable.into()));
-        assert!(!state.pending);
+        let new = state.begin_prepare();
+        let preparation = state
+            .prepare_session(
+                |_| Err(DesktopUnavailable.into()),
+                |_| panic!("preparation changed the active topology"),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(preparation.deferred);
+        assert_eq!(preparation.previous.generation, new);
+        assert_eq!(state.pending_restore, Some(old));
         assert!(state
             .attempt(old, |_| panic!("an old retry changed the display"))
             .is_none());
         state
-            .attempt(new, |saved| {
-                assert_eq!(saved.previous.width, 1920);
-                assert_eq!(saved.previous.height, 1080);
-                Ok(())
-            })
-            .unwrap()
+            .prepare_session(
+                |saved| {
+                    assert_eq!(saved.previous.width, 1920);
+                    assert_eq!(saved.previous.height, 1080);
+                    Ok(())
+                },
+                |state| {
+                    assert!(
+                        state.saved.is_none(),
+                        "recover before selecting the display"
+                    );
+                    Ok(None)
+                },
+            )
             .unwrap();
         assert!(state.saved.is_none());
+    }
+
+    #[test]
+    fn only_access_denied_defers_a_new_display_change() {
+        let previous = saved_display().saved.unwrap().previous;
+        assert!(
+            !Preparation::from_change(previous.clone(), Ok(()))
+                .unwrap()
+                .deferred
+        );
+        assert!(
+            Preparation::from_change(previous.clone(), Err(DesktopUnavailable.into()))
+                .unwrap()
+                .deferred
+        );
+        let err = Preparation::from_change(previous, Err(anyhow::anyhow!("invalid mode")))
+            .err()
+            .unwrap();
+        assert_eq!(err.to_string(), "invalid mode");
+    }
+
+    #[test]
+    fn deferred_preparation_retries_only_for_the_running_generation() {
+        let mut state = saved_display();
+        state.saved = None;
+        let old = state.generation;
+        let generation = state.begin_prepare();
+        state.deferred_prepare = Some(ModeRequest {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            display: Some("virtual".into()),
+        });
+        let stopping = AtomicBool::new(false);
+        assert!(state
+            .retry_prepare(old, &stopping, |_, _| panic!("old retry"))
+            .is_none());
+        state.restore(old).unwrap();
+        assert!(!state
+            .retry_prepare(generation, &stopping, |_, _| Ok(false))
+            .unwrap()
+            .unwrap());
+        stopping.store(true, Ordering::Release);
+        assert!(state
+            .retry_prepare(generation, &stopping, |_, _| panic!("stopping"))
+            .is_none());
+        stopping.store(false, Ordering::Release);
+        assert!(state
+            .retry_prepare(generation, &stopping, |_, mode| {
+                assert_eq!((mode.width, mode.height, mode.fps), (1280, 720, 60));
+                assert_eq!(mode.display.as_deref(), Some("virtual"));
+                Ok(true)
+            })
+            .unwrap()
+            .unwrap());
+        assert!(state
+            .retry_prepare(generation, &stopping, |_, _| panic!("already applied"))
+            .is_none());
+    }
+
+    #[test]
+    fn undo_cancels_deferred_preparation_even_without_a_saved_topology() {
+        let mut state = saved_display();
+        state.saved = None;
+        let generation = state.generation;
+        state.deferred_prepare = Some(ModeRequest {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            display: None,
+        });
+        state.restore(generation).unwrap();
+        assert!(state
+            .retry_prepare(generation, &AtomicBool::new(false), |_, _| panic!("undone"))
+            .is_none());
     }
 
     #[test]
@@ -850,6 +1119,20 @@ mod tests {
         ));
         assert!(!crate::video::DesktopUnavailable::is(
             &topology_result(ERROR_INVALID_PARAMETER.0 as i32).unwrap_err()
+        ));
+    }
+
+    #[test]
+    fn a_generic_mode_change_failure_requires_input_desktop_access_denial() {
+        assert!(mode_result(DISP_CHANGE_SUCCESSFUL, || panic!("no check needed")).is_ok());
+        assert!(DesktopUnavailable::is(
+            &mode_result(DISP_CHANGE_FAILED, || true).unwrap_err()
+        ));
+        assert!(!DesktopUnavailable::is(
+            &mode_result(DISP_CHANGE_FAILED, || false).unwrap_err()
+        ));
+        assert!(!DesktopUnavailable::is(
+            &mode_result(DISP_CHANGE_BADMODE, || panic!("no check needed")).unwrap_err()
         ));
     }
     #[test]

@@ -1555,6 +1555,24 @@ fn idle_probes_share_sender_accounting_and_stop_under_pressure() {
 }
 
 #[test]
+fn preparation_refusal_preserves_the_retryable_desktop_message() {
+    let error = anyhow::anyhow!("a display write was denied").context(video::DesktopUnavailable);
+    let refusal = Refusal::preparation(error.context("preparing the display"));
+    assert_eq!(refusal.status, 503);
+    assert_eq!(refusal.message, end::DESKTOP_UNAVAILABLE);
+    let ended = refusal.into_end();
+    assert_eq!(ended.code, end::TRANSPORT_FAILED);
+    assert_eq!(ended.message, end::DESKTOP_UNAVAILABLE);
+
+    let refusal = Refusal::preparation(anyhow::anyhow!("invalid mode"));
+    assert_eq!(refusal.status, 500);
+    assert_eq!(
+        refusal.message,
+        "could not prepare the desktop: invalid mode"
+    );
+}
+
+#[test]
 fn fallback_refits_geometry_and_prepares_the_final_mode() {
     let prepared_sizes = Arc::new(Mutex::new(Vec::new()));
     let seen = prepared_sizes.clone();
@@ -1997,7 +2015,7 @@ fn dropping_an_unused_preparation_keeps_its_reservation_through_undo() {
     let opening = Arc::new(Opening::default());
     let guard = opening.lock(Duration::ZERO).unwrap();
     let prepared = Prepared {
-        undo: Some(Box::new({
+        desktop: Some(Box::new({
             let opening = opening.clone();
             move || assert!(opening.lock(Duration::ZERO).is_none())
         })),
