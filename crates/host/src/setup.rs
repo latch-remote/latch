@@ -1686,6 +1686,16 @@ mod tests {
         assert!(installer.contains("Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false"));
     }
 
+    /// The SYSTEM helper's broker and agents are also latch-host.exe; the
+    /// unelevated installer stops only this user's copy at its own path.
+    #[test]
+    fn the_installer_stops_only_its_own_host() {
+        let installer = include_str!("../../../scripts/install-host.ps1");
+        assert!(!installer.contains("Get-Process latch-host"));
+        assert!(installer.contains("$candidate.ExecutablePath -ine $DestExe"));
+        assert!(installer.contains("$owner.Sid -ne $Me"));
+    }
+
     #[test]
     fn base64_matches_the_rfc_vectors() {
         for (plain, coded) in [

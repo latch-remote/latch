@@ -50,7 +50,20 @@ try {
     Invoke-RestMethod -Headers $ControlHeaders -Method Post -Uri "http://127.0.0.1:47850/v1/quit" -ContentType 'application/json' -Body '{}' -TimeoutSec 2 | Out-Null
     Start-Sleep -Milliseconds 800
 } catch {}
-Get-Process latch-host, brolink-host -ErrorAction SilentlyContinue | Stop-Process -Force
+# Only this user's host at the path being replaced: the secure-desktop
+# helper also runs as latch-host.exe, as SYSTEM from Program Files, and
+# stopping it unelevated fails with access denied.
+$Me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+foreach ($candidate in Get-CimInstance Win32_Process -Filter "Name = 'latch-host.exe'") {
+    if ($candidate.ExecutablePath -ine $DestExe) { continue }
+    $owner = Invoke-CimMethod -InputObject $candidate -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+    if (!$owner -or $owner.ReturnValue -ne 0 -or $owner.Sid -ne $Me) { continue }
+    # Skip a PID reused since the snapshot.
+    $process = Get-Process -Id $candidate.ProcessId -ErrorAction SilentlyContinue
+    if (!$process -or $process.Path -ine $DestExe) { continue }
+    try { Stop-Process -InputObject $process -Force } catch { if (!$process.HasExited) { throw } }
+}
+Get-Process brolink-host -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 300
 if ((Test-Path $OldDir) -and -not (Test-Path (Join-Path $DestDir "host.toml"))) {
     New-Item -ItemType Directory -Force -Path $DestDir | Out-Null
