@@ -482,6 +482,9 @@ try {{
     }
     format!(
         r#"Step "Letting a viewer control windows that run as administrator, the lock screen and administrator prompts"
+$inputOldEnabled = $false
+$inputReplaced = $false
+$inputReady = $false
 try {{
     # The user who asked for setup; whoever approved the prompt may be
     # another administrator. Only this user's Latch may use the helper.
@@ -492,12 +495,24 @@ try {{
     Assert-ProtectedTree $inputSource
     $inputDir = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Latch\Input'
     $inputExe = Join-Path $inputDir 'latch-host.exe'
-    # A running helper holds the file it runs from.
-    Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue
-    Get-Process -Name 'latch-host' -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -ieq $inputExe }} | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Milliseconds 500
+    # A running helper holds the file it runs from, and a stream would
+    # start an enabled task again: disable it first, then stop it and
+    # wait until no helper runs.
+    $inputOld = Get-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue
+    if ($inputOld) {{
+        $inputOldEnabled = $inputOld.State -ne 'Disabled'
+        Disable-ScheduledTask -TaskName '{task}' -ErrorAction Stop | Out-Null
+        Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue
+    }}
+    $inputStopBy = (Get-Date).AddSeconds(10)
+    while ($running = @(Get-Process -Name 'latch-host' -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -ieq $inputExe }})) {{
+        if ((Get-Date) -gt $inputStopBy) {{ throw "the running input helper did not stop" }}
+        $running | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 200
+    }}
     # SYSTEM runs what is in this folder. A tree with unsafe contents
     # is moved aside and replaced with a protected one.
+    $inputReplaced = $true
     Reset-ProtectedFolder $inputDir
     Copy-Item -LiteralPath $inputSource -Destination $inputExe -Force -ErrorAction Stop
     $hostRecord = Join-Path $inputDir 'host-path.txt'
@@ -509,13 +524,16 @@ try {{
     $action = New-ScheduledTaskAction -Execute $inputExe -Argument '{arg}' -WorkingDirectory $inputDir
     # LocalSystem, the only account that can reach the secure desktop.
     $principal = New-ScheduledTaskPrincipal -UserId '{system}' -LogonType ServiceAccount -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -Priority 4
+    # Registered disabled, and enabled once only the approved user may start it.
+    $settings = New-ScheduledTaskSettingsSet -Disable -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -Priority 4
     Register-ScheduledTask -TaskName '{task}' -Action $action -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
     # SYSTEM and administrators may change the task; the approved user may
     # only read and start it. Nobody else may even start it.
     $scheduler = New-Object -ComObject Schedule.Service
     $scheduler.Connect()
     $scheduler.GetFolder('\').GetTask('{task}').SetSecurityDescriptor("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;$approvedSid)", 0)
+    Enable-ScheduledTask -TaskName '{task}' -ErrorAction Stop | Out-Null
+    $inputReady = $true
     # Ctrl+Alt+Delete from a viewer: Windows lets a service (the helper runs
     # as SYSTEM) send it only under this policy. Setup sets it when unset.
     # It marks that first, so a setup that stops part way still takes it
@@ -533,7 +551,16 @@ try {{
     }} elseif ((Get-ItemProperty -LiteralPath '{policy}').SoftwareSASGeneration -notin 1, 3) {{
         Write-Output "  Ctrl+Alt+Delete from a viewer stays off: the SoftwareSASGeneration policy is set to something else"
     }}
-}} catch {{ Write-Output "  input helper: $_"; $setupFailed = $true }}"#,
+}} catch {{
+    Write-Output "  input helper: $_"
+    $setupFailed = $true
+    if (-not $inputReplaced) {{
+        # Its files are untouched: the helper this PC had keeps working.
+        if ($inputOldEnabled) {{ Enable-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue | Out-Null }}
+    }} elseif (-not $inputReady) {{
+        Write-Output "  the input helper stays off until setup runs again"
+    }}
+}}"#,
         user_sid = ps_data(user_sid),
         task = INPUT_TASK,
         arg = "--input-helper",
@@ -1382,15 +1409,41 @@ mod tests {
         assert!(step.contains(r"'Latch\Setup\latch-host.exe'"));
         assert!(step.contains(r"'Latch\Input'"));
         let copy = step.find("Copy-Item -LiteralPath $inputSource").unwrap();
-        for check in [
+        let at = |needle: &str| step.find(needle).unwrap_or_else(|| panic!("no {needle}"));
+        // The old task is disabled before it is stopped, so a reconnect
+        // cannot start the old helper again while its file is replaced, and
+        // the files are replaced only once no helper runs (bounded).
+        let in_order = [
             "Assert-ProtectedTree $inputSource",
+            "Disable-ScheduledTask -TaskName 'LatchInput' -ErrorAction Stop",
             "Stop-ScheduledTask -TaskName 'LatchInput'",
-            "Stop-Process -Force",
+            "$inputStopBy = (Get-Date).AddSeconds(10)",
+            "throw \"the running input helper did not stop\"",
+            "$running | Stop-Process -Force",
+            "$inputReplaced = $true",
             // Made again when anything in it is not administrators'.
             "Reset-ProtectedFolder $inputDir",
-        ] {
-            assert!(step.find(check).unwrap() < copy, "{check} before the copy");
+            "Copy-Item -LiteralPath $inputSource",
+        ];
+        for pair in in_order.windows(2) {
+            assert!(at(pair[0]) < at(pair[1]), "{} before {}", pair[0], pair[1]);
         }
+        assert!(!step.contains("Start-Sleep -Milliseconds 500"));
+        // The new task is registered disabled and enabled only once its
+        // file, records and permissions are in place.
+        assert!(step.contains("New-ScheduledTaskSettingsSet -Disable "));
+        let enable = at("Enable-ScheduledTask -TaskName 'LatchInput' -ErrorAction Stop");
+        assert!(at(".SetSecurityDescriptor(") < enable);
+        assert!(enable < at("$inputReady = $true"));
+        // A failure before the files were touched re-enables the old task
+        // if it was enabled; after, the helper stays off and says so.
+        let failed = step.split("} catch {").last().unwrap();
+        let restore = failed
+            .find("if ($inputOldEnabled) { Enable-ScheduledTask -TaskName 'LatchInput'")
+            .expect("re-enables the untouched old task");
+        assert!(failed.find("if (-not $inputReplaced)").unwrap() < restore);
+        assert!(failed.contains("elseif (-not $inputReady)"));
+        assert!(failed.contains("stays off until setup runs again"));
         // What setup wrote is checked, repaired if the owner is not trusted,
         // and the whole folder checked again before the task is registered.
         let register = step.find("Register-ScheduledTask").unwrap();
