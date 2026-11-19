@@ -10,9 +10,12 @@ use std::{
 };
 use windows::Win32::{
     Foundation::{GENERIC_ALL, HANDLE},
-    System::StationsAndDesktops::{
-        CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
-        DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, HDESK, UOI_NAME,
+    System::{
+        StationsAndDesktops::{
+            CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop,
+            SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, HDESK, UOI_NAME,
+        },
+        Threading::GetCurrentThreadId,
     },
 };
 
@@ -27,22 +30,48 @@ pub(super) fn following() -> bool {
     FOLLOW.load(Ordering::Relaxed)
 }
 
+/// A desktop handle this thread opened. Dropped only when the thread is
+/// not on it: Windows refuses to close a thread's current desktop, and the
+/// handle would stay open for the life of the process.
 struct Desktop {
     handle: HDESK,
     name: String,
 }
 impl Drop for Desktop {
     fn drop(&mut self) {
-        // SAFETY: The handle is owned. Closing the thread's current desktop
-        // fails harmlessly; it is replaced before it is dropped.
+        // SAFETY: The handle is owned, and no thread is on it (see above).
         unsafe {
             let _ = CloseDesktop(self.handle);
         }
     }
 }
 
+/// The desktop this thread moved to, and the one it started on.
+struct Followed {
+    /// From GetThreadDesktop: not to be closed.
+    original: HDESK,
+    current: Option<Desktop>,
+}
+impl Drop for Followed {
+    /// As the thread exits: back to the desktop it started on, and only
+    /// then close the one it moved to. If it cannot move back, the handle
+    /// stays open rather than being closed under the thread.
+    fn drop(&mut self) {
+        let Some(current) = self.current.take() else {
+            return;
+        };
+        // SAFETY: `original` is the desktop this thread started on, which
+        // stays open as long as the process's window station does.
+        if unsafe { SetThreadDesktop(self.original) }.is_ok() {
+            drop(current);
+        } else {
+            std::mem::forget(current);
+        }
+    }
+}
+
 thread_local! {
-    static CURRENT: RefCell<Option<Desktop>> = const { RefCell::new(None) };
+    static CURRENT: RefCell<Option<Followed>> = const { RefCell::new(None) };
 }
 
 fn name(desktop: HDESK) -> Result<String> {
@@ -83,16 +112,31 @@ pub(super) fn follow() -> Result<bool> {
         handle,
         name: name(handle)?,
     };
-    CURRENT.with(|current| {
-        let mut current = current.borrow_mut();
-        if current.as_ref().is_some_and(|c| c.name == desktop.name) {
+    CURRENT.with(|followed| {
+        let mut slot = followed.borrow_mut();
+        if slot.is_none() {
+            // SAFETY: Reads this thread's desktop; the handle is not owned.
+            let original = unsafe { GetThreadDesktop(GetCurrentThreadId()) }
+                .context("read this thread's desktop")?;
+            *slot = Some(Followed {
+                original,
+                current: None,
+            });
+        }
+        let followed = slot.as_mut().expect("set above");
+        if followed
+            .current
+            .as_ref()
+            .is_some_and(|c| c.name == desktop.name)
+        {
+            // `desktop`, a second handle to the one the thread is on, closes.
             return Ok(false);
         }
-        // SAFETY: The desktop handle is open; the previous one is closed
-        // only after the thread has left it.
+        // SAFETY: The desktop handle is open.
         unsafe { SetThreadDesktop(desktop.handle) }
             .with_context(|| format!("switch to the {} desktop", desktop.name))?;
-        *current = Some(desktop);
+        // The previous desktop closes here, now that the thread left it.
+        followed.current = Some(desktop);
         Ok(true)
     })
 }
