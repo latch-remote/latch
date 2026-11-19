@@ -169,6 +169,21 @@ impl Pipe {
     }
 }
 
+/// Something whose reads and writes can be made to end by a deadline.
+pub(super) trait Deadline {
+    fn set_deadline(&mut self, deadline: Option<Instant>);
+}
+impl Deadline for Pipe {
+    fn set_deadline(&mut self, deadline: Option<Instant>) {
+        Pipe::set_deadline(self, deadline);
+    }
+}
+impl<T: Deadline> Deadline for &mut T {
+    fn set_deadline(&mut self, deadline: Option<Instant>) {
+        (**self).set_deadline(deadline);
+    }
+}
+
 impl Read for Pipe {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {

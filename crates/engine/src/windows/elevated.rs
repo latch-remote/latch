@@ -43,7 +43,7 @@
 //! go of it when the stream's end closes the pipe.
 use super::frames::{self, Frames, Want};
 use super::input::Local;
-use super::pipe::Pipe;
+use super::pipe::{Deadline, Pipe};
 use crate::input::{DisplayRect, Event};
 use anyhow::{bail, ensure, Context, Result};
 use std::{
@@ -144,6 +144,10 @@ const GRANT_WAIT: Duration = Duration::from_secs(8);
 /// How long the host waits for the helper to answer one input event. The
 /// longest is Ctrl+Alt+Delete, which waits up to [`SAS_CHECK`].
 const REPLY_WAIT: Duration = Duration::from_secs(3);
+/// How long the helper waits for the rest of an input request once its
+/// first byte came, and for the host to take the reply. Between requests it
+/// waits as long as the stream lasts.
+const REQUEST_WAIT: Duration = Duration::from_secs(3);
 /// How long the agent waits for the secure desktop after SendSAS.
 const SAS_CHECK: Duration = Duration::from_secs(1);
 /// How often the broker looks for sessions that need an agent.
@@ -1023,17 +1027,14 @@ fn serve_connection(mut pipe: Pipe, client: &Handle, user: &str, system: bool) -
     // not keep the helper from going idle.
     pipe.set_deadline(Some(Instant::now() + HANDSHAKE));
     match handshake(&mut pipe, system)? {
-        Hello::Input => {
-            pipe.set_deadline(None);
-            serve_input(pipe, system)
-        }
+        Hello::Input => serve_input(pipe, system),
         Hello::Frames => frames::serve(pipe, client.0, user, HANDSHAKE),
     }
 }
 
 /// One stream's input until it closes the pipe (tests: with its greeting).
 #[cfg(test)]
-fn serve_client(mut pipe: impl Read + Write) -> Result<()> {
+fn serve_client(mut pipe: impl Read + Write + Deadline) -> Result<()> {
     handshake(&mut pipe, false)?;
     serve_input(pipe, false)
 }
@@ -1150,16 +1151,24 @@ fn send_sas() -> Result<()> {
 /// One stream's input until it closes the pipe. Dropping `local` lets go
 /// of whatever this stream still holds. The agent (`system`) injects on
 /// whichever desktop has input.
-fn serve_input(mut pipe: impl Read + Write, system: bool) -> Result<()> {
+///
+/// A stream may sit idle between requests for as long as it lasts, but a
+/// request, once begun, and its reply each end within [`REQUEST_WAIT`]: a
+/// client that stalls mid-message must not hold a pipe instance (shared
+/// with the screen's connections) forever.
+fn serve_input(mut pipe: impl Read + Write + Deadline, system: bool) -> Result<()> {
     let mut local = Local::default();
     let mut sas = Sas::default();
     let mut checked = Instant::now() - DESKTOP_CHECK;
     let mut buf = [0u8; MAX_REQUEST];
     loop {
         let mut len = [0; 2];
-        if pipe.read_exact(&mut len).is_err() {
+        pipe.set_deadline(None);
+        if pipe.read_exact(&mut len[..1]).is_err() {
             return Ok(());
         }
+        pipe.set_deadline(Some(Instant::now() + REQUEST_WAIT));
+        pipe.read_exact(&mut len[1..])?;
         let len = usize::from(u16::from_le_bytes(len));
         ensure!(len <= MAX_REQUEST, "input request too long");
         pipe.read_exact(&mut buf[..len])?;
@@ -1199,6 +1208,7 @@ fn serve_input(mut pipe: impl Read + Write, system: bool) -> Result<()> {
                 reply
             }
         };
+        pipe.set_deadline(Some(Instant::now() + REQUEST_WAIT));
         pipe.write_all(&reply)?;
     }
 }
@@ -1649,6 +1659,9 @@ mod tests {
                 Ok(())
             }
         }
+        impl Deadline for Pipe {
+            fn set_deadline(&mut self, _: Option<Instant>) {}
+        }
         for hello in [HELLO, HELLO2] {
             let mut bytes = hello.to_vec();
             bytes.extend(17u16.to_le_bytes());
@@ -1664,6 +1677,85 @@ mod tests {
             assert_eq!(pipe.output[8], 1);
             let error_len = u16::from_le_bytes([pipe.output[9], pipe.output[10]]) as usize;
             assert_eq!(pipe.output[11 + error_len], 0);
+        }
+    }
+
+    #[test]
+    fn a_request_once_begun_and_its_reply_end_in_time() {
+        /// A client that sends what it has and then stalls: a read with a
+        /// deadline times out, one without waits (here: the end).
+        struct Stalling {
+            input: std::io::Cursor<Vec<u8>>,
+            output: Vec<u8>,
+            deadline: Option<Instant>,
+            log: Vec<(&'static str, usize, bool)>,
+        }
+        impl Read for Stalling {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.log.push(("read", buf.len(), self.deadline.is_some()));
+                if self.input.position() as usize == self.input.get_ref().len()
+                    && self.deadline.is_some()
+                {
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+                self.input.read(buf)
+            }
+        }
+        impl Write for Stalling {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.log.push(("write", buf.len(), self.deadline.is_some()));
+                self.output.extend(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Deadline for Stalling {
+            fn set_deadline(&mut self, deadline: Option<Instant>) {
+                self.deadline = deadline;
+            }
+        }
+        let request = encode(&Event::ReleaseAll, DisplayRect::default());
+        let body = request.len() - 2;
+        let stalled = |tail: &[u8]| {
+            let mut bytes = HELLO2.to_vec();
+            bytes.extend(&request);
+            bytes.extend(tail);
+            let mut pipe = Stalling {
+                input: std::io::Cursor::new(bytes),
+                output: Vec::new(),
+                deadline: None,
+                log: Vec::new(),
+            };
+            let result = serve_client(&mut pipe);
+            (result, pipe)
+        };
+        // Idle after a whole request: the stream simply waits (and ends).
+        let (result, pipe) = stalled(&[]);
+        result.unwrap();
+        assert_eq!(&pipe.output[8..], &[0]);
+        assert_eq!(
+            pipe.log[1..],
+            [
+                ("write", 8, false),
+                ("read", 1, false),
+                ("read", 1, true),
+                ("read", body, true),
+                ("write", 1, true),
+                ("read", 1, false),
+            ]
+        );
+        // Stalled after a length's first byte, or partway through the body:
+        // the request times out instead of holding the instance.
+        for tail in [&request[..1], &request[..5]] {
+            let (result, _) = stalled(tail);
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::TimedOut,
+                "{error:#}"
+            );
         }
     }
 
