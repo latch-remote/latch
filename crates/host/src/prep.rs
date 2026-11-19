@@ -30,6 +30,8 @@ fn prepare_desktop(cfg: &HostConfig, req: &StreamRequest) -> Result<Undo> {
         req.fps.clamp(1, latch_proto::control::MAX_FPS),
     ];
     if !cfg.prep_do.trim().is_empty() {
+        #[cfg(windows)]
+        latch_engine::display::finish_pending_restore()?;
         let undo = cfg.prep_undo.clone();
         if let Err(e) = run(&cfg.prep_do, size, Duration::from_secs(15)) {
             if !undo.trim().is_empty() {

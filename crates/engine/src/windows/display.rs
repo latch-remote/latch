@@ -5,7 +5,7 @@ use windows::{
     core::PCWSTR,
     Win32::{
         Devices::Display::*,
-        Foundation::{ERROR_INSUFFICIENT_BUFFER, HWND},
+        Foundation::{ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, HWND},
         Graphics::{Dxgi::*, Gdi::*},
     },
 };
@@ -84,10 +84,18 @@ fn apply_topology(
             SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
         )
     };
-    if rc != 0 {
-        bail!("SetDisplayConfig returned {rc}");
+    topology_result(rc)
+}
+
+fn topology_result(rc: i32) -> Result<()> {
+    match rc {
+        0 => Ok(()),
+        rc if rc == ERROR_ACCESS_DENIED.0 as i32 => {
+            Err(anyhow::anyhow!("SetDisplayConfig returned {rc}")
+                .context(crate::video::DesktopUnavailable))
+        }
+        _ => bail!("SetDisplayConfig returned {rc}"),
     }
-    Ok(())
 }
 fn only_virtual(
     name: &[u16; 32],
@@ -450,6 +458,8 @@ pub(super) fn prepare(
     fps: u32,
     display: Option<&str>,
 ) -> Result<Option<Previous>> {
+    let mut saved = SAVED.lock();
+    anyhow::ensure!(saved.is_none(), "display topology already prepared");
     // A viewer that chose a real monitor shares it as it is: the virtual
     // display keeps its size and every monitor stays on.
     let output = select_named(display)?;
@@ -506,8 +516,6 @@ pub(super) fn prepare(
         height: current.dmPelsHeight,
         refresh_hz: current.dmDisplayFrequency,
     };
-    let mut saved = SAVED.lock();
-    anyhow::ensure!(saved.is_none(), "display topology already prepared");
     let (paths, modes) = topology()?;
     // Record adapter identity before only_virtual detaches physical outputs.
     let attached = outputs()?;
@@ -523,10 +531,6 @@ pub(super) fn prepare(
         .map(|output| Ok((output.id.clone(), adapter_id(output)?)))
         .collect::<Result<_>>()?;
     only_virtual(&output.desc.DeviceName, &paths, &modes)?;
-    if let Err(e) = change(&output.desc.DeviceName, &mode) {
-        apply_topology(&paths, &modes).context("restore topology after mode failure")?;
-        return Err(e);
-    }
     *saved = Some(Saved {
         previous: previous.clone(),
         paths,
@@ -534,17 +538,28 @@ pub(super) fn prepare(
         adapters,
         default_adapter,
     });
+    if let Err(e) = change(&output.desc.DeviceName, &mode) {
+        drop(saved);
+        crate::display::restore(&previous).context("restore topology after mode failure")?;
+        return Err(e);
+    }
     Ok(Some(previous))
 }
 pub(super) fn restore(previous: &Previous) -> Result<()> {
     let mut saved = SAVED.lock();
-    if let Some(state) = saved.take_if(|state| &state.previous == previous) {
-        // The snapshot includes the original modes and adapter/target identities.
-        // Restore them atomically rather than resizing an intermediate topology.
-        // It is taken either way: a snapshot that no longer applies (an
-        // adapter went away mid-stream) left behind would refuse every
-        // later session with "display topology already prepared".
-        match apply_topology(&state.paths, &state.modes) {
+    if let Some(state) = saved.as_ref().filter(|state| &state.previous == previous) {
+        // Keep adapter/target identities while Windows denies access. Once it
+        // accepts the topology or rejects it for another reason (e.g. an
+        // adapter went away), the snapshot has served its purpose.
+        let result = apply_topology(&state.paths, &state.modes);
+        if result
+            .as_ref()
+            .is_err_and(crate::video::DesktopUnavailable::is)
+        {
+            return result;
+        }
+        *saved = None;
+        match result {
             Ok(()) => return Ok(()),
             Err(e) => tracing::warn!(
                 "restore the saved display topology: {e:#}; setting the size back instead"
@@ -570,6 +585,20 @@ pub(super) fn restore(previous: &Previous) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::selection_rank;
+
+    #[test]
+    fn access_denied_defers_topology_restore() {
+        use super::*;
+        use windows::Win32::Foundation::ERROR_INVALID_PARAMETER;
+
+        assert!(topology_result(0).is_ok());
+        assert!(crate::video::DesktopUnavailable::is(
+            &topology_result(ERROR_ACCESS_DENIED.0 as i32).unwrap_err()
+        ));
+        assert!(!crate::video::DesktopUnavailable::is(
+            &topology_result(ERROR_INVALID_PARAMETER.0 as i32).unwrap_err()
+        ));
+    }
     #[test]
     #[ignore]
     fn hardware_display_modes() -> anyhow::Result<()> {
