@@ -511,9 +511,12 @@ impl Target {
 /// How long a stream waits for its own desktop to come back after Windows
 /// took it, with no helper to show the secure desktop meanwhile.
 const OWN_LIMIT: Duration = Duration::from_secs(5);
-/// The same while the SYSTEM helper starts: the task, its agent in this
-/// session and its first frame.
+/// The same while the SYSTEM helper starts: the task and its agent in this
+/// session, until it grants a mapping.
 const HELPER_LIMIT: Duration = Duration::from_secs(15);
+/// How long a mapping the helper granted may go without its first frame.
+/// Counted from the grant: starting the helper may take longer than this.
+const FIRST_FRAME: Duration = Duration::from_secs(5);
 /// A loss that is not an access denial (a mode change, a driver reset)
 /// usually ends by itself; the helper is asked only once it lasts this long.
 const HELPER_AFTER: Duration = Duration::from_secs(1);
@@ -539,10 +542,11 @@ enum Phase {
     Idle,
     /// Asked; no mapping yet.
     Connecting,
-    /// A mapping, but no frame in it yet. Until one comes, the loss still
-    /// ends the stream at the limit: a helper that connects and then sends
-    /// nothing must not freeze the last picture forever.
-    Awaiting,
+    /// A mapping, granted then, but no frame in it yet. Until one comes,
+    /// the stream ends [`FIRST_FRAME`] after the grant: a helper that
+    /// connects and then sends nothing must not freeze the last picture
+    /// forever.
+    Awaiting(Instant),
     /// Frames came: the stream lasts as long as the secure desktop does,
     /// even while it is still and nothing new arrives.
     Serving,
@@ -580,9 +584,9 @@ impl Fallback {
     fn connecting(&mut self) {
         self.phase = Phase::Connecting;
     }
-    /// The helper sent a mapping; its first frame is still to come.
-    fn connected(&mut self) {
-        self.phase = Phase::Awaiting;
+    /// The helper sent a mapping at `now`; its first frame is still to come.
+    fn connected(&mut self, now: Instant) {
+        self.phase = Phase::Awaiting(now);
     }
     /// A frame from the helper arrived.
     fn served(&mut self) {
@@ -604,15 +608,18 @@ impl Fallback {
     /// The stream should end: neither its own desktop nor the helper's
     /// frames came back in time.
     fn expired(&self, now: Instant) -> bool {
-        let limit = if self.unavailable() {
-            OWN_LIMIT
-        } else {
-            HELPER_LIMIT
+        let Some(lost) = self.lost else {
+            return false;
         };
-        !self.serving()
-            && self
-                .lost
-                .is_some_and(|t| now.saturating_duration_since(t) >= limit)
+        let since = |t: Instant| now.saturating_duration_since(t);
+        if self.unavailable() {
+            return since(lost) >= OWN_LIMIT;
+        }
+        match self.phase {
+            Phase::Serving => false,
+            Phase::Awaiting(granted) => since(granted) >= FIRST_FRAME,
+            Phase::Idle | Phase::Connecting => since(lost) >= HELPER_LIMIT,
+        }
     }
     /// Whether the last picture may be repeated meanwhile: only while the
     /// helper can still take over, so a stream without one never shows a
@@ -870,7 +877,7 @@ impl Capture {
             anyhow::Error::msg("duplicate desktop output: the secure desktop is up")
                 .context(crate::video::DesktopUnavailable)
         };
-        let deadline = Instant::now() + OWN_LIMIT;
+        let asked = Instant::now();
         loop {
             let frames = match elevated::connect_frames(self.want()) {
                 Ok(frames) => frames,
@@ -882,9 +889,11 @@ impl Capture {
                 }
             };
             self.helper = Helper::Serving(frames);
-            self.fallback.connected();
+            // The first frame's time starts at the grant: starting a cold
+            // helper may itself take longer than that.
+            self.fallback.connected(Instant::now());
             let mut resized = false;
-            while Instant::now() < deadline {
+            while !self.fallback.expired(Instant::now()) {
                 match self.helper_frame(Duration::from_millis(100)) {
                     Ok(true) => return Ok(()),
                     Ok(false) => {}
@@ -899,10 +908,10 @@ impl Capture {
                 }
             }
             self.helper = Helper::Off;
-            if !resized || Instant::now() >= deadline {
+            if !resized || asked.elapsed() >= HELPER_LIMIT {
                 return Err(unavailable());
             }
-            self.fallback.connecting();
+            self.fallback.renegotiate(Instant::now());
         }
     }
     fn want(&self) -> super::frames::Want {
@@ -1204,7 +1213,12 @@ impl Capture {
             // Wake for the next own retry even when the helper sends nothing.
             let wait = timeout.min(self.retry.at.saturating_duration_since(Instant::now()));
             match self.helper_frame(wait) {
-                Ok(changed) => return Ok(Some(changed)),
+                Ok(changed) => {
+                    // A helper that granted a mapping but sends no picture
+                    // still ends the stream at its limit.
+                    self.ensure_not_expired()?;
+                    return Ok(Some(changed));
+                }
                 Err(e) if e.is::<Resized>() => {
                     // Keep the last picture while the helper maps the new size.
                     tracing::info!(
@@ -1221,15 +1235,19 @@ impl Capture {
                 }
             }
         }
-        anyhow::ensure!(
-            !self.fallback.expired(Instant::now()),
-            "desktop duplication unavailable after access loss"
-        );
+        self.ensure_not_expired()?;
         let now = Instant::now();
         // Nothing to wait on: sleep out the caller's wait (or the backoff)
         // instead of having it poll in a loop.
         thread::sleep(timeout.min(self.retry.at.saturating_duration_since(now)));
         Ok(Some(false))
+    }
+    fn ensure_not_expired(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.fallback.expired(Instant::now()),
+            "desktop duplication unavailable after access loss"
+        );
+        Ok(())
     }
     fn poll_helper(&mut self) {
         let Helper::Connecting(started) = &self.helper else {
@@ -1239,7 +1257,7 @@ impl Capture {
             Ok(Ok(frames)) => {
                 tracing::info!("the screen helper answered: waiting for its first frame");
                 self.helper = Helper::Serving(frames);
-                self.fallback.connected();
+                self.fallback.connected(Instant::now());
             }
             Ok(Err(e)) => {
                 tracing::warn!("the screen helper is unavailable, so the lock screen and administrator prompts cannot be shown: {e:#}");
@@ -1904,12 +1922,13 @@ mod tests {
         // Starting the helper gets longer than a plain loss, not forever.
         assert!(!f.expired(t + OWN_LIMIT));
         assert!(f.expired(t + HELPER_LIMIT));
-        f.connected();
-        assert!(!f.wants_helper(t + Duration::from_secs(2), true));
-        // Connected but no frame yet: still the helper's limit, so a helper
+        let granted = t + Duration::from_secs(2);
+        f.connected(granted);
+        assert!(!f.wants_helper(granted, true));
+        // Connected but no frame yet: the first frame's limit, so a helper
         // that never sends one cannot freeze the old picture.
-        assert!(!f.expired(t + OWN_LIMIT));
-        assert!(f.expired(t + HELPER_LIMIT));
+        assert!(!f.expired(granted + FIRST_FRAME - Duration::from_millis(1)));
+        assert!(f.expired(granted + FIRST_FRAME));
         f.served();
         // Serving frames, the stream lasts as long as the secure desktop.
         assert!(!f.expired(t + Duration::from_secs(3600)));
@@ -1945,7 +1964,7 @@ mod tests {
         let mut f = Fallback::new(true);
         f.lose(t);
         f.connecting();
-        f.connected();
+        f.connected(t);
         f.served();
         assert!(!f.expired(t + Duration::from_secs(30)));
         f.failed();
@@ -1958,7 +1977,7 @@ mod tests {
         let mut f = Fallback::new(true);
         f.lose(t);
         f.connecting();
-        f.connected();
+        f.connected(t);
         f.served();
         // Long into the secure desktop, its size changes: the helper ends
         // that mapping, and is asked for one of the new size.
@@ -1967,13 +1986,56 @@ mod tests {
         assert!(!f.unavailable() && f.keeps_picture(), "not a failure");
         assert!(!f.wants_helper(resized, true), "already asked again");
         assert!(!f.expired(resized + OWN_LIMIT));
+        assert!(f.expired(resized + HELPER_LIMIT), "connecting is bounded");
         // The new mapping gets the same time to show its first frame...
-        f.connected();
-        assert!(!f.expired(resized + HELPER_LIMIT - Duration::from_millis(1)));
-        assert!(f.expired(resized + HELPER_LIMIT));
+        let granted = resized + Duration::from_secs(3);
+        f.connected(granted);
+        assert!(!f.expired(granted + FIRST_FRAME - Duration::from_millis(1)));
+        assert!(f.expired(granted + FIRST_FRAME));
         // ...and once it does, serves on.
         f.served();
         assert!(!f.expired(resized + Duration::from_secs(3600)));
+    }
+    #[test]
+    fn a_granted_mapping_that_sends_nothing_ends_the_stream() {
+        use super::*;
+        let t = Instant::now();
+        let mut f = Fallback::new(true);
+        f.lose(t);
+        f.connecting();
+        let granted = t + Duration::from_secs(1);
+        f.connected(granted);
+        // Well before the helper's start limit: the first frame's limit
+        // counts from the grant, and nothing later lifts it but a frame.
+        assert!(!f.expired(granted + FIRST_FRAME - Duration::from_millis(1)));
+        assert!(f.expired(granted + FIRST_FRAME));
+        assert!(f.expired(t + HELPER_LIMIT));
+        assert!(f.expired(t + Duration::from_secs(3600)), "never freezes");
+        assert!(!f.wants_helper(t + Duration::from_secs(3600), true));
+    }
+    #[test]
+    fn a_slow_cold_start_still_gets_its_first_frame_time() {
+        use super::*;
+        // Opening on the secure desktop: the task, the agent and the grant
+        // took longer than a frame's limit, and the grant still counts.
+        let t = Instant::now();
+        let mut f = Fallback::new(true);
+        f.lose(t);
+        let granted = t + Duration::from_secs(9);
+        f.connected(granted);
+        assert!(!f.expired(granted));
+        assert!(!f.expired(granted + FIRST_FRAME - Duration::from_millis(1)));
+        assert!(f.expired(granted + FIRST_FRAME));
+        // So does a grant late in an active stream's start limit.
+        let mut f = Fallback::new(true);
+        f.lose(t);
+        f.connecting();
+        let granted = t + HELPER_LIMIT - Duration::from_millis(100);
+        f.connected(granted);
+        assert!(!f.expired(t + HELPER_LIMIT));
+        assert!(f.expired(granted + FIRST_FRAME));
+        f.served();
+        assert!(!f.expired(granted + FIRST_FRAME));
     }
     /// Needs the helper set up (a build with LATCH_HELPER_TEST_DIR, its
     /// folder and task): pretends Windows took the desktop, takes the
