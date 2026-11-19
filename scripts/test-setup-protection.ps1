@@ -2,7 +2,9 @@
 # log symlinks before any elevated file write. No real install is touched.
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\setup-protection.ps1"
-$root = Join-Path ([IO.Path]::GetPathRoot($env:RUNNER_TEMP)) ('LatchProtectionTest-' + [guid]::NewGuid().ToString('N'))
+# On the system drive, as %ProgramFiles% is: setup checks every folder up
+# from the volume root, and a CI runner's work drive lets users write there.
+$root = Join-Path ([IO.Path]::GetPathRoot([Environment]::SystemDirectory)) ('LatchProtectionTest-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
 try {
     $acl = New-Object Security.AccessControl.DirectorySecurity
