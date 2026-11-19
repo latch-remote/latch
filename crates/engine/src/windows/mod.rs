@@ -482,7 +482,7 @@ impl Pipeline {
             Self::Failed(_) => bail!("Windows video pipeline failed to reopen"),
             Self::Mf(p) => {
                 let result = p.next(keyframe, idle).or_else(|error| {
-                    if !matches!(p.encoder, VideoEncoder::Amf(_)) {
+                    if !matches!(p.encoder, VideoEncoder::Amf(_)) || p.capture.desktop_lost() {
                         return Err(error);
                     }
                     tracing::warn!("AMF pipeline failed; reopening Media Foundation: {error:#}");
@@ -494,6 +494,15 @@ impl Pipeline {
                 });
                 match result {
                     Ok(frame) => return Ok(frame),
+                    Err(e) if p.capture.desktop_lost() => {
+                        // Windows took the desktop away (the lock screen or an
+                        // administrator prompt), so no frame reached the
+                        // encoder. Keep its codec, and start over once the
+                        // desktop can be duplicated again.
+                        let info = self.info();
+                        *self = Self::Failed(info);
+                        return Err(e.context("the desktop is unavailable"));
+                    }
                     Err(e) if matches!(p.config.codec, Codec::Hevc | Codec::Av1) => {
                         // Neither Microsoft's encoder nor Latch's software one
                         // makes HEVC, and the viewer decodes nothing else on

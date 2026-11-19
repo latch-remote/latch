@@ -739,6 +739,7 @@ impl ClientApp {
                                 if self.view.interrupted.is_none() {
                                     self.view.handle_interruption();
                                 }
+                                self.view.set_reconnect_reason(&message);
                             } else {
                                 self.view.interrupted = Some(crate::stream::Interruption::Failed);
                             }
@@ -764,8 +765,11 @@ impl ClientApp {
                             // An explicit end or host-side Stop must never be
                             // answered by automatic takeover.
                             self.view.interrupted = Some(crate::stream::Interruption::Failed);
-                        } else if error && self.view.interrupted.is_none() {
-                            self.view.handle_interruption();
+                        } else if error {
+                            if self.view.interrupted.is_none() {
+                                self.view.handle_interruption();
+                            }
+                            self.view.set_reconnect_reason(&message);
                         }
                         if code != 0 {
                             tracing::warn!(
@@ -1623,7 +1627,7 @@ impl ClientApp {
                 ui.push_id(&pc.node_id, |ui| {
                     ui::list_row(ui, Some(tone), &pc.name, &detail, |ui| {
                         if pc.can_stream() && !pc.remembered {
-                            let label = if pc.online {
+                            let label = if pc.online || pc.tailscale_online {
                                 "Connect"
                             } else {
                                 "Wake and connect"
@@ -2500,7 +2504,7 @@ fn describe(pc: &Pc) -> (Tone, String) {
             },
         );
     }
-    if !pc.online {
+    if !pc.online && !pc.tailscale_online {
         return if pc.can_wake() {
             (
                 Tone::Neutral,
@@ -2528,7 +2532,10 @@ fn describe(pc: &Pc) -> (Tone, String) {
             Tone::Warning,
             format!("{os}{at} · Update Latch there to connect"),
         ),
-        None => (Tone::Neutral, format!("{os}{at} · Latch isn't answering")),
+        None => (
+            Tone::Warning,
+            format!("{os}{at} · On, but Latch isn't running there"),
+        ),
     }
 }
 
@@ -2664,10 +2671,14 @@ mod tests {
         });
         assert!(line(&pc).contains("Asleep"));
         assert!(line(&pc).contains("can wake it"));
-        pc.online = true;
-        assert!(line(&pc).contains("Latch isn't answering"));
-        assert_eq!(describe(&pc).0, Tone::Neutral);
+        // Awake on Tailscale with nothing answering: not asleep, so no
+        // wake offer, even though Latch knows how to wake it.
+        pc.tailscale_online = true;
+        assert!(line(&pc).contains("Latch isn't running there"));
+        assert!(!line(&pc).contains("Asleep"));
+        assert_eq!(describe(&pc).0, Tone::Warning);
         assert!(line(&pc).len() < 80, "{}", line(&pc));
+        pc.online = true;
         pc.host = Some(latch_core::api::Status {
             streamer: latch_core::api::Streamer {
                 protocol: 1,
@@ -4390,6 +4401,7 @@ pub(crate) mod snapshots {
                     os: n.os.clone(),
                     ip: n.ipv4(),
                     online: n.online,
+                    tailscale_online: n.online,
                     host: n.online.then(|| a_status(&n.host_name, &n.os)),
                     ..Default::default()
                 })
@@ -4796,6 +4808,7 @@ mod live_snapshot {
                     attempt,
                     deadline: Instant::now(),
                     in_flight: true,
+                    reason: None,
                 },
             ));
             // The action is queued, but the next worker hasn't started yet.
@@ -5092,6 +5105,7 @@ mod live_snapshot {
                         attempt: previous_attempt,
                         deadline: Instant::now(),
                         in_flight: true,
+                        reason: None,
                     },
                 ));
             }

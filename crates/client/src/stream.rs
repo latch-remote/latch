@@ -121,6 +121,8 @@ pub struct ReconnectState {
     pub attempt: u32,
     pub deadline: Instant,
     pub in_flight: bool,
+    /// Why the host can't stream right now, when it said so.
+    pub reason: Option<String>,
 }
 
 pub fn delay_for_attempt(attempt: u32) -> Duration {
@@ -143,6 +145,7 @@ impl ReconnectState {
             attempt,
             deadline: now + delay_for_attempt(attempt),
             in_flight: false,
+            reason: None,
         }
     }
 
@@ -166,6 +169,7 @@ impl ReconnectState {
     pub fn next_attempt(&self, now: Instant) -> Option<Self> {
         let mut next = Self::with_attempt(self.attempt.saturating_add(1), now);
         next.started = self.started;
+        next.reason = self.reason.clone();
         if next.attempt > 3 {
             // Spread retrying viewers over 20–30 seconds throughout an outage.
             next.deadline = now + Duration::from_millis(rand::random::<u64>() % 10_001 + 20_000);
@@ -550,6 +554,16 @@ impl View {
         }
     }
 
+    /// Say why reconnecting is waiting, when the host told us; a host that
+    /// said nothing clears an earlier reason.
+    pub fn set_reconnect_reason(&mut self, message: &str) {
+        if let Some(Interruption::Reconnecting(state)) = &mut self.interrupted {
+            state.reason = message
+                .contains(latch_proto::control::end::DESKTOP_UNAVAILABLE)
+                .then(|| latch_proto::control::end::DESKTOP_UNAVAILABLE.to_string());
+        }
+    }
+
     pub fn cancel_reconnect(&mut self) {
         self.interrupted = None;
     }
@@ -759,11 +773,19 @@ impl View {
                             Interruption::Reconnecting(state) => {
                                 let now = Instant::now();
                                 let remaining_secs = state.remaining_secs(now);
+                                let title = if state.reason.is_some() {
+                                    format!("Waiting for {}", live.pc)
+                                } else {
+                                    "Connection lost".to_string()
+                                };
                                 ui.label(
-                                    RichText::new("Connection lost")
+                                    RichText::new(title)
                                         .font(theme::semibold(theme::text::TITLE))
                                         .color(P.text),
                                 );
+                                if let Some(reason) = &state.reason {
+                                    ui::muted(ui, reason);
+                                }
                                 if remaining_secs > 0 && !state.in_flight {
                                     ui::muted(
                                         ui,
@@ -831,6 +853,7 @@ impl View {
                                                 attempt: 1,
                                                 deadline: Instant::now(),
                                                 in_flight: true,
+                                                reason: None,
                                             }));
                                         actions.push(Action::Reconnect);
                                     }
@@ -6309,6 +6332,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_locked_windows_pc_is_explained_while_reconnecting() {
+        use latch_proto::control::end::DESKTOP_UNAVAILABLE;
+        let mut view = view_with_bar();
+        let live = dummy_live(&egui::Context::default());
+        live.frames.publish(latch_stream::video::Frame::default());
+        view.interrupted = Some(Interruption::reconnecting(Instant::now()));
+        // Only the host's lock-screen sentence is shown; anything else is not.
+        view.set_reconnect_reason("the host closed the connection");
+        assert!(
+            matches!(&view.interrupted, Some(Interruption::Reconnecting(s)) if s.reason.is_none())
+        );
+        view.set_reconnect_reason(&format!("the host refused: {DESKTOP_UNAVAILABLE}"));
+        // The reason survives the next attempt.
+        view.handle_interruption();
+        assert!(
+            matches!(&view.interrupted, Some(Interruption::Reconnecting(s)) if s.attempt == 2 && s.reason.as_deref() == Some(DESKTOP_UNAVAILABLE))
+        );
+
+        let mut h = harness_with(
+            Vec2::new(1400.0, 860.0),
+            1.0,
+            false,
+            fixture(view, Extra::default()),
+        );
+        let pc = live.pc.clone();
+        h.state_mut().live = Some(live);
+        h.run_steps(2);
+        assert!(h.query_by_label(&format!("Waiting for {pc}")).is_some());
+        assert!(h.query_by_label(DESKTOP_UNAVAILABLE).is_some());
+        assert!(h.query_by_label("Connection lost").is_none());
+        assert!(h.query_by_label("Reconnect now").is_some());
+    }
+
+    #[test]
     fn review_countdown_dispatches_once_and_back_cancels_in_flight() {
         let (mut h, _) = recording(View::default(), false);
         h.state_mut().view.interrupted = Some(Interruption::Reconnecting(ReconnectState {
@@ -6316,6 +6373,7 @@ pub(crate) mod tests {
             attempt: 1,
             deadline: Instant::now() - Duration::from_secs(1),
             in_flight: false,
+            reason: None,
         }));
         h.run_steps(1);
         assert_eq!(

@@ -548,7 +548,17 @@ fn duplicate(output: &display::Output, gpu: &Gpu) -> Result<IDXGIOutputDuplicati
                 .DuplicateOutput(&gpu.device),
         }
     }
-    .context("duplicate desktop output")
+    .map_err(|e| {
+        // The lock screen, sign-in screen and administrator prompts are on
+        // the secure desktop, which only SYSTEM may duplicate.
+        let access_denied = e.code() == E_ACCESSDENIED;
+        let e = anyhow::Error::new(e).context("duplicate desktop output");
+        if access_denied {
+            e.context(crate::video::DesktopUnavailable)
+        } else {
+            e
+        }
+    })
 }
 // SAFETY: D3D11/DXGI interfaces are free threaded and the immediate context has
 // multithread protection. Capture is used exclusively by its video worker; no
@@ -884,6 +894,12 @@ impl Capture {
         self.duplication = Some(duplication);
         self.retry = ReopenBackoff::new();
         Ok(())
+    }
+    /// Windows took the desktop away (access loss) and it has not been
+    /// duplicated again since: a lock screen, an administrator prompt, or
+    /// a mode change. Whatever fails meanwhile is not the encoder's fault.
+    pub fn desktop_lost(&self) -> bool {
+        self.duplication.is_none()
     }
     pub fn grab(&mut self, timeout: Duration) -> Result<bool> {
         let drawn = self

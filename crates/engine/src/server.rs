@@ -477,6 +477,10 @@ impl Server {
             } else {
                 500
             };
+            if video::DesktopUnavailable::is(&e) {
+                // Retryable: the viewer keeps trying until the PC is unlocked.
+                return Refusal::new(503, video::DesktopUnavailable.to_string());
+            }
             Refusal::new(status, format!("could not capture the screen: {e:#}"))
         })?;
         config.color = pipeline.info().color;
@@ -2198,10 +2202,12 @@ fn encode_video(
                     let now = Instant::now();
                     recoveries.retain(|t| now - *t < VIDEO_RECOVERY_WINDOW);
                     if recoveries.len() >= VIDEO_RECOVERIES {
-                        session.end(
-                            end::CAPTURE_FAILED,
-                            &format!("The host could not capture its screen: {failure:#}"),
-                        );
+                        let message = if video::DesktopUnavailable::is(&failure) {
+                            video::DesktopUnavailable.to_string()
+                        } else {
+                            format!("The host could not capture its screen: {failure:#}")
+                        };
+                        session.end(end::CAPTURE_FAILED, &message);
                         return;
                     }
                     recoveries.push_back(now);

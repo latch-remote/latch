@@ -277,6 +277,11 @@ pub mod end {
     pub const VIEWER_SILENT: u32 = 4;
     pub const HOST_STOPPING: u32 = 5;
     pub const TRANSPORT_FAILED: u32 = 6;
+    /// The message a Windows host ends or refuses a stream with while its
+    /// desktop is the lock screen or an administrator prompt, which no
+    /// signed-in process can capture. The viewer keeps retrying and says
+    /// why.
+    pub const DESKTOP_UNAVAILABLE: &str = "Windows is locked or showing an administrator prompt, which Latch can't show. Unlock it or answer the prompt at the PC, and the stream comes back.";
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
