@@ -25,7 +25,8 @@
 //!   each it starts the agent, its own executable and nothing else, with a
 //!   copy of its SYSTEM token moved to that session, on `winsta0\default`.
 //!   It looks again every few seconds, and when a host rings its wake
-//!   event, while any agent runs; then it exits.
+//!   event, while any agent runs; then it exits. The wake only hurries it:
+//!   when the event's name is taken, it runs without one.
 //! - The **agent**: SYSTEM in the user's session. It serves the named pipe
 //!   `LatchInput-{session}`, whose security admits only SYSTEM and the
 //!   recorded user, and accepts a connection only from that user's host
@@ -65,8 +66,8 @@ use windows::{
     core::{s, HSTRING, PCWSTR, PWSTR},
     Win32::{
         Foundation::{
-            CloseHandle, LocalFree, BOOL, FILETIME, HANDLE, HLOCAL, HWND, WAIT_OBJECT_0,
-            WAIT_TIMEOUT,
+            CloseHandle, GetLastError, LocalFree, BOOL, ERROR_ALREADY_EXISTS, FILETIME, HANDLE,
+            HLOCAL, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Security::{
             Authorization::{
@@ -239,8 +240,8 @@ fn pipe_name(session: u32) -> String {
     format!(r"\\.\pipe\{base}-{session}")
 }
 
-/// The broker's wake event, in the global namespace, which only services
-/// and administrators may create names in.
+/// The broker's wake event, in the global namespace. Any local process may
+/// create an event there, so the broker uses only one it created itself.
 fn wake_name() -> String {
     let base = if TEST_DIR.is_some() {
         TEST_NAME
@@ -615,6 +616,9 @@ struct Roster {
     /// until a host rings the wake event, so an agent that went idle is
     /// not started again and again while another session streams.
     quiet: BTreeSet<u32>,
+    /// No wake event: a host could not ask again, so an ended agent is
+    /// started again on the next pass instead of being left quiet.
+    unwakeable: bool,
 }
 impl Roster {
     /// The approved sessions to start an agent in now: each at most once.
@@ -630,7 +634,9 @@ impl Roster {
     }
     fn ended(&mut self, session: u32) {
         self.running.remove(&session);
-        self.quiet.insert(session);
+        if !self.unwakeable {
+            self.quiet.insert(session);
+        }
     }
     /// A host asked for its agent.
     fn woken(&mut self) {
@@ -682,6 +688,25 @@ impl Drop for Descriptor {
     }
 }
 
+/// The wake event, created by this broker with [`wake_sddl`]. `None` when
+/// the name is taken: another process's event, whose security is its own,
+/// is never waited on.
+fn wake_event(approved: &str) -> Option<Handle> {
+    let created = (|| {
+        let (attributes, _descriptor) = security(&wake_sddl(approved))?;
+        let name = HSTRING::from(wake_name());
+        // SAFETY: The attributes outlive the call; the event is owned.
+        let event = Handle(unsafe { CreateEventW(Some(&attributes), false, false, &name)? });
+        // SAFETY: Reads this thread's last error, which CreateEventW set.
+        let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        ensure!(!existed, "another process holds {}", wake_name());
+        anyhow::Ok(event)
+    })();
+    created
+        .map_err(|e| trace(|| format!("no wake event, looking every few seconds: {e:#}")))
+        .ok()
+}
+
 /// The task's process: starts an agent in each session where the approved
 /// user runs the recorded host, and keeps doing so while any agent runs.
 /// The task ignores a start while the broker runs, so a host whose agent
@@ -690,12 +715,12 @@ fn broker() -> Result<()> {
     let expected = recorded_host()?;
     let approved = recorded_user()?;
     let exe = std::env::current_exe()?;
-    let (attributes, _descriptor) = security(&wake_sddl(&approved))?;
-    let name = HSTRING::from(wake_name());
-    // SAFETY: The attributes outlive the call; the event is owned.
-    let wake = Handle(unsafe { CreateEventW(Some(&attributes), false, false, &name)? });
+    let wake = wake_event(&approved);
     let mut agents: BTreeMap<u32, Handle> = BTreeMap::new();
-    let mut roster = Roster::default();
+    let mut roster = Roster {
+        unwakeable: wake.is_none(),
+        ..Default::default()
+    };
     loop {
         agents.retain(|&session, agent| {
             // SAFETY: The process handle is owned.
@@ -721,6 +746,10 @@ fn broker() -> Result<()> {
         if roster.done() {
             return Ok(());
         }
+        let Some(wake) = &wake else {
+            thread::sleep(RECONCILE);
+            continue;
+        };
         // SAFETY: The event is owned.
         if unsafe { WaitForSingleObject(wake.0, RECONCILE.as_millis() as u32) } == WAIT_OBJECT_0 {
             trace(|| "woken by a host".into());
@@ -1795,6 +1824,24 @@ mod tests {
         roster.ended(1);
         roster.ended(5);
         assert!(roster.done(), "no agent left: the broker exits");
+    }
+
+    #[test]
+    fn without_a_wake_event_an_ended_agent_starts_again_on_the_next_pass() {
+        // Another process holds the wake event's name: no host can ring it,
+        // so the broker keeps every approved session served by itself.
+        let mut roster = Roster {
+            unwakeable: true,
+            ..Default::default()
+        };
+        assert_eq!(roster.to_start(&[1, 2]), vec![1, 2]);
+        roster.started(1);
+        roster.started(2);
+        roster.ended(2);
+        assert!(!roster.done());
+        assert_eq!(roster.to_start(&[1, 2]), vec![2]);
+        roster.ended(1);
+        assert!(roster.done(), "it still exits once no agent runs");
     }
 
     #[test]
