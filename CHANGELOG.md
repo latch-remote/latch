@@ -6,6 +6,16 @@ GitHub release notes, so each version gets a heading of the form
 
 ## Unreleased
 
+- Keep a Windows stream going through administrator prompts and the lock
+  screen. Admin setup installs a small SYSTEM helper that shows the secure
+  desktop, takes clicks and typing there, and sends Ctrl+Alt+Delete from
+  the toolbar. Without the helper, a locked PC is explained ("Windows
+  is locked or showing an administrator prompt") instead of dropping the
+  stream, and its video encoder is no longer turned off afterwards.
+- Say **On, but Latch isn't running there** for a PC Tailscale sees online
+  that doesn't answer, instead of trying to wake it.
+- Restore the Windows display size after an administrator prompt or lock,
+  and don't leave it at 800×600 when Windows refuses the change.
 - Keep Windows mouse and keyboard input responsive when a foreground game
   denies cursor confinement, including through the elevated input helper.
 - Fix stretched letter spacing in wrapped menu help text.
