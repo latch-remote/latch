@@ -259,6 +259,9 @@ public static class LatchInstallStop {
         Start-Process -FilePath $DestExe -WorkingDirectory $DestDir
     }
 } finally {
+    # The installer's own quit marked this sign-in as stopped; a failed
+    # install must not keep the logon task from bringing the host back.
+    Remove-Item -LiteralPath (Join-Path $DestDir 'stopped-logon') -Force -ErrorAction SilentlyContinue
     if ($RestoreLogonTask) {
         Enable-ScheduledTask -TaskName $LogonTaskName -TaskPath '\' | Out-Null
     }

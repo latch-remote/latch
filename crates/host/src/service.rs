@@ -305,6 +305,9 @@ impl Service {
                     }
                     return Ok(());
                 }
+                // A scheduled check finds the port taken by a copy that is
+                // starting or busy: that copy serves, so this one leaves quietly.
+                Err(_) if scheduled => return Ok(()),
                 Err(e) => return Err(e).context(format!("bind TCP {port}")),
             }
         };
@@ -402,6 +405,17 @@ impl Service {
     /// restart, so the logon entry is kept unless the owner turned it off.
     fn ensure_autostart(&self, exe: std::path::PathBuf) {
         if !self.cfg.lock().start_with_windows {
+            // Turned off while removing the logon task failed: try again, so
+            // it doesn't keep starting a host the owner turned off.
+            #[cfg(windows)]
+            {
+                let log = self.log.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = crate::setup::remove_logon_task() {
+                        push_log(&log, format!("could not remove the logon task: {e:#}"));
+                    }
+                });
+            }
             return;
         }
         // Rewrite even when a Run value already exists: install-host.ps1
@@ -965,10 +979,12 @@ impl Service {
                 if !self.stop_stream() {
                     return Response::json(409, &Ack::err("stream cleanup is still running"));
                 }
+                // The stream has ended already: quit even if the marker can't
+                // be written. The logon task then brings the host back within
+                // five minutes instead of it staying up after a Stop.
                 #[cfg(windows)]
                 if let Err(e) = crate::windows_startup::record_stop() {
-                    self.power_pending.store(false, Ordering::Release);
-                    return Response::json(500, &Ack::err(format!("{e:#}")));
+                    self.log(format!("could not record the stop for this sign-in: {e:#}"));
                 }
                 self.log("control panel asked the service to stop");
                 std::thread::spawn(|| {

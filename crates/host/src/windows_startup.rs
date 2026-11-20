@@ -18,7 +18,15 @@ use windows::Win32::System::Threading::{
 };
 
 const HANDOVER: &str = r"Local\LatchHostHandover";
+/// A permanent contract between this version and every later one: an
+/// updated exe is started with this variable naming an event, and must
+/// open the update guard and set that event before its parent lets go.
+/// A later version that drops it can't be installed by this one's update
+/// (the update fails and rolls back; the host stays reachable).
 const HANDOVER_READY: &str = "LATCH_HANDOVER_READY";
+/// How long a new exe has to acknowledge, long enough for antivirus to scan
+/// an executable it has never seen.
+const HANDOVER_ACK_MS: u32 = 30_000;
 
 fn own(handle: HANDLE) -> OwnedHandle {
     // SAFETY: the Win32 call returned a newly owned, valid handle.
@@ -150,6 +158,7 @@ pub(crate) fn hold_child_handover() -> Result<OwnedHandle> {
     if let Some(name) = std::env::var_os(HANDOVER_READY) {
         // SAFETY: the name lives through the call and the event handle is owned.
         let event = own(unsafe { OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(name)) }?);
+        // SAFETY: the event handle is owned and open.
         unsafe { SetEvent(HANDLE(event.as_raw_handle())) }?;
     }
     Ok(guard)
@@ -164,7 +173,9 @@ pub(crate) fn spawn_handover(command: &mut Command) -> Result<std::process::Chil
     let event = own(unsafe { CreateEventW(None, true, false, &HSTRING::from(&name)) }?);
     let mut child = command.env(HANDOVER_READY, name).spawn()?;
     // SAFETY: the process owns the event for the entire wait.
-    if unsafe { WaitForSingleObject(HANDLE(event.as_raw_handle()), 5_000) } == WAIT_OBJECT_0 {
+    if unsafe { WaitForSingleObject(HANDLE(event.as_raw_handle()), HANDOVER_ACK_MS) }
+        == WAIT_OBJECT_0
+    {
         return Ok(child);
     }
     let _ = child.kill();

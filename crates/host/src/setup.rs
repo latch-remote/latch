@@ -1093,6 +1093,7 @@ try {{
     Write-Output "Could not remove Latch's login entries: $_"
     exit 1
 }}
+$ErrorActionPreference = 'Continue'
 Write-Output "Latch no longer starts when you sign in."
 try {{ Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:{port}/v1/quit' -ContentType 'application/json' -Body '{{}}' -TimeoutSec 2 | Out-Null; Start-Sleep -Milliseconds 800 }} catch {{}}
 $session = (Get-Process -Id $PID).SessionId
@@ -1270,7 +1271,7 @@ fn create_logon_task(exe: &Path, sid: &str, name: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn remove_logon_task() -> Result<()> {
+pub(crate) fn remove_logon_task() -> Result<()> {
     let name = logon_task_name(&latch_engine::windows::current_user_sid()?);
     let _ = run_schtasks(schtasks_command().args(["/Delete", "/TN", &name, "/F"]));
     anyhow::ensure!(
