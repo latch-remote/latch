@@ -1002,8 +1002,10 @@ Get-Process latch-host, brolink-host -ErrorAction SilentlyContinue | Where-Objec
 Write-Output "Stopped Latch."
 $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 foreach ($name in '{run}', '{legacy_run}') {{ Remove-ItemProperty -LiteralPath $run -Name $name -ErrorAction SilentlyContinue }}
-if (Get-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue) {{
-    Unregister-ScheduledTask -TaskName '{task}' -Confirm:$false -ErrorAction SilentlyContinue
+foreach ($task in '{task}', '{logon_task}') {{
+    if (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue) {{
+        Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+    }}
 }}
 Write-Output "Latch no longer starts when you sign in."
 foreach ($folder in @([Environment]::GetFolderPath('Desktop'), (Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs'))) {{
@@ -1016,6 +1018,7 @@ Write-Output "Removed the shortcuts and the entry in Settings > Apps."
         run = "LatchHost",
         legacy_run = crate::legacy::WINDOWS_RUN_VALUE,
         task = START_TASK,
+        logon_task = LOGON_TASK,
         apps = APPS_KEY,
     )
 }
@@ -1023,6 +1026,86 @@ Write-Output "Removed the shortcuts and the entry in Settings > Apps."
 /// The task `install-host.ps1` starts the service with over SSH.
 #[cfg(any(windows, test))]
 const START_TASK: &str = "LatchHostStart";
+/// The task that starts the service at logon next to the Run value, and
+/// again every five minutes while the user is signed in: Windows sometimes
+/// skips Run values at a logon, and a host that stopped has to come back
+/// by itself on a PC nobody can reach in person. A copy started while
+/// another serves exits at once (see `Service::run_at`).
+#[cfg(any(windows, test))]
+const LOGON_TASK: &str = "LatchHostLogon";
+
+/// [`LOGON_TASK`] for `exe`, as Task Scheduler XML. It runs as `user_sid`
+/// only while they are signed in, unelevated, like the Run value: no other
+/// rights than the Run value's. One copy at a time, no time limit, on
+/// battery too, at normal priority (Task Scheduler's default runs below it).
+#[cfg(any(windows, test))]
+fn logon_task_xml(exe: &Path, user_sid: &str) -> String {
+    let xml = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    };
+    let exe = exe.display().to_string();
+    // By text, so the tests on other systems split a Windows path too.
+    let dir = xml(exe.rsplit_once(['\\', '/']).map_or("", |(dir, _)| dir));
+    let command = xml(&exe);
+    let sid = xml(user_sid);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Starts Latch when you sign in, and again if it stops.</Description></RegistrationInfo>
+  <Triggers>
+    <LogonTrigger><Enabled>true</Enabled><UserId>{sid}</UserId></LogonTrigger>
+    <TimeTrigger><Repetition><Interval>PT5M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><StartBoundary>2000-01-01T00:00:00</StartBoundary><Enabled>true</Enabled></TimeTrigger>
+  </Triggers>
+  <Principals><Principal id="Author"><UserId>{sid}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>5</Priority>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{command}</Command><Arguments>--background</Arguments><WorkingDirectory>{dir}</WorkingDirectory></Exec></Actions>
+</Task>
+"#
+    )
+}
+
+/// Register [`LOGON_TASK`] for `exe`, replacing an older registration. A
+/// copy the task already runs keeps running (Task Scheduler leaves running
+/// instances alone when a task is registered again).
+#[cfg(windows)]
+fn register_logon_task(exe: &Path) -> Result<()> {
+    let sid = latch_engine::windows::current_user_sid()?;
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in logon_task_xml(exe, &sid).encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    let file = std::env::temp_dir().join(format!("latch-logon-task-{}.xml", std::process::id()));
+    std::fs::write(&file, bytes).context("write the logon task")?;
+    let status = schtasks_command()
+        .args(["/Create", "/TN", LOGON_TASK, "/F", "/XML"])
+        .arg(&file)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = std::fs::remove_file(&file);
+    anyhow::ensure!(
+        status.context("run schtasks")?.success(),
+        "could not register the logon task"
+    );
+    Ok(())
+}
+
 /// The Settings > Apps entry `install-host.ps1` writes for this user.
 #[cfg(any(windows, test))]
 const APPS_KEY: &str = r"HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Latch";
@@ -1122,7 +1205,7 @@ exit 0
 }
 
 /// Register or remove `latch-host.exe --background` under the current
-/// user's Run key.
+/// user's Run key, and [`LOGON_TASK`] next to it.
 pub fn set_start_with_windows(enable: bool, exe: &Path) -> Result<()> {
     #[cfg(windows)]
     {
@@ -1158,6 +1241,20 @@ pub fn set_start_with_windows(enable: bool, exe: &Path) -> Result<()> {
             status.success() || (!enable && !starts_with_windows()),
             "could not update the Run key"
         );
+        if enable {
+            register_logon_task(exe)?;
+        } else if task_registered(LOGON_TASK) {
+            let _ = schtasks_command()
+                .args(["/Delete", "/TN", LOGON_TASK, "/F"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            anyhow::ensure!(
+                !task_registered(LOGON_TASK),
+                "could not remove the logon task"
+            );
+        }
         Ok(())
     }
     #[cfg(not(windows))]
@@ -1387,7 +1484,35 @@ mod tests {
         assert!(u.contains(r"HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"));
         assert!(u.contains("'Latch Host.lnk'"));
         assert!(u.contains(r"'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Latch'"));
-        assert!(u.contains("Unregister-ScheduledTask -TaskName 'LatchHostStart'"));
+        assert!(u.contains("foreach ($task in 'LatchHostStart', 'LatchHostLogon')"));
+        assert!(u.contains("Unregister-ScheduledTask -TaskName $task"));
+    }
+
+    /// The logon task starts the service as the signed-in user, unelevated,
+    /// at logon and every five minutes, one copy at a time and with no time
+    /// limit; the path is escaped for XML.
+    #[test]
+    fn the_logon_task_restarts_the_service_as_the_user() {
+        let x = logon_task_xml(
+            Path::new(r"C:\Users\A&B <x>\Latch\latch-host.exe"),
+            TEST_SID,
+        );
+        assert!(x.contains(r"<Command>C:\Users\A&amp;B &lt;x&gt;\Latch\latch-host.exe</Command>"));
+        assert!(
+            x.contains(r"<WorkingDirectory>C:\Users\A&amp;B &lt;x&gt;\Latch</WorkingDirectory>")
+        );
+        assert!(x.contains("<Arguments>--background</Arguments>"));
+        assert!(x.contains(&format!(
+            "<LogonTrigger><Enabled>true</Enabled><UserId>{TEST_SID}</UserId>"
+        )));
+        assert!(x.contains(&format!("<UserId>{TEST_SID}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel>")));
+        assert!(x.contains("<Interval>PT5M</Interval>"));
+        assert!(x.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
+        assert!(x.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(x.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
+        assert!(!x.contains("HighestAvailable"));
+        let special = logon_task_xml(Path::new(SPECIAL_PATH), TEST_SID);
+        assert!(special.contains("&apos; $ `") && !special.contains("' $ `"));
     }
 
     /// Setup puts the input helper in a folder only administrators can
