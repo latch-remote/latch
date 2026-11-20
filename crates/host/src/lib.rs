@@ -20,6 +20,8 @@ pub mod virtual_display;
 pub mod wake;
 
 mod local_control;
+#[cfg(windows)]
+mod windows_startup;
 
 #[cfg(test)]
 #[path = "../../../tests/pairs/format.rs"]

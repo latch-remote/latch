@@ -26,7 +26,6 @@ use latch_core::update;
 use semver::Version;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::process::Child;
 use std::time::{Duration, Instant};
 
 /// Anything smaller is not the host.
@@ -188,7 +187,7 @@ pub fn apply(exe: &Path) -> Result<Handover> {
 /// already exited after `grace` (a crash, a missing library). Returns its
 /// process id.
 pub fn hand_over(exe: &Path, grace: Duration) -> Result<u32> {
-    let mut child = start_service(exe, &["--replaces", &std::process::id().to_string()])
+    let mut child = start_guarded_service(exe, &["--replaces", &std::process::id().to_string()])
         .context("start the new service")?;
     std::thread::sleep(grace);
     if let Ok(Some(status)) = child.try_wait() {
@@ -197,10 +196,12 @@ pub fn hand_over(exe: &Path, grace: Duration) -> Result<u32> {
     Ok(child.id())
 }
 
-/// `exe --background <args>`, detached from this process.
-fn start_service(exe: &Path, args: &[&str]) -> std::io::Result<Child> {
-    let mut c = std::process::Command::new(exe);
-    c.arg("--background")
+/// `exe --background <args>`, detached from this process. On Windows it
+/// must acquire the guard before the parent can release its own handle.
+fn start_guarded_service(exe: &Path, args: &[&str]) -> Result<std::process::Child> {
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("--background")
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -208,9 +209,11 @@ fn start_service(exe: &Path, args: &[&str]) -> std::io::Result<Child> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        c.creation_flags(0x0000_0008 | 0x0800_0000); // DETACHED_PROCESS | CREATE_NO_WINDOW
+        command.creation_flags(0x0000_0008 | 0x0800_0000); // DETACHED_PROCESS | CREATE_NO_WINDOW
+        crate::windows_startup::spawn_handover(&mut command)
     }
-    c.spawn()
+    #[cfg(not(windows))]
+    Ok(command.spawn()?)
 }
 
 fn apply_within(exe: &Path, grace: Duration) -> Result<Handover> {
@@ -251,7 +254,7 @@ fn apply_within(exe: &Path, grace: Duration) -> Result<Handover> {
 /// which is what it puts back if it has to. Call before exiting.
 pub fn start_probation(exe: &Path, h: &Handover, version: &str) -> Result<()> {
     let exe = exe.display().to_string();
-    start_service(
+    start_guarded_service(
         &h.retired,
         &[
             "--probation",
@@ -272,6 +275,8 @@ pub fn start_probation(exe: &Path, h: &Handover, version: &str) -> Result<()> {
 /// `exe` and start it again. A PC nobody can reach in person must not be
 /// left with a service that started and then died.
 pub fn probation(exe: &Path, new_pid: u32, version: &str) -> Result<()> {
+    #[cfg(windows)]
+    let _guard = crate::windows_startup::hold_child_handover()?;
     let retired = std::env::current_exe().context("own path")?;
     let verdict = watch(
         answering_version,
@@ -291,7 +296,8 @@ pub fn probation(exe: &Path, new_pid: u32, version: &str) -> Result<()> {
         kill(new_pid);
     }
     restore_previous(exe, &retired)?;
-    start_service(exe, &["--replaces", &new_pid.to_string()])
+    start_guarded_service(exe, &["--replaces", &new_pid.to_string()])
+        .map(drop)
         .context("start the previous version again")?;
     tracing::info!("the previous version is back in place and starting");
     Ok(())

@@ -285,7 +285,10 @@ pub fn reconcile() -> Result<Option<linux::UpdateState>> {
         } else if restart_needed {
             let this = std::fs::metadata("/proc/self/exe")?;
             if Some((this.dev(), this.ino())) == state.replacement {
-                super::start_service(&state.exe, &["--replaces", &std::process::id().to_string()])?;
+                super::start_guarded_service(
+                    &state.exe,
+                    &["--replaces", &std::process::id().to_string()],
+                )?;
                 std::process::exit(0);
             }
         }
@@ -379,7 +382,7 @@ fn supervise_with(
                         child.wait()?;
                     }
                     process.terminate()?;
-                    child = Some(super::start_service(
+                    child = Some(super::start_guarded_service(
                         exe,
                         &["--replaces", &old_pid.to_string()],
                     )?);

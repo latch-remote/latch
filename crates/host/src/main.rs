@@ -24,6 +24,9 @@ struct Args {
     /// Run the control service with no window.
     #[arg(long)]
     background: bool,
+    /// Start from the Windows logon watchdog.
+    #[arg(long, requires = "background", conflicts_with_all = ["replaces", "probation"])]
+    scheduled: bool,
     /// Started by an update: wait for this process to give up the port.
     #[arg(long, requires = "background")]
     replaces: Option<u32>,
@@ -124,9 +127,12 @@ fn main() -> Result<()> {
     if latch_client::refresh::run_helper() {
         return Ok(());
     }
+    let args = Args::parse();
+    if args.scheduled && service::scheduled_should_exit()? {
+        return Ok(());
+    }
     // Before anything can replace it: which file this process is.
     let _ = service::started_from();
-    let args = Args::parse();
     let log = log_file(&args);
     init_logging(log);
     install_panic_hook(log.and_then(|log| data_dir().ok().map(|d| d.join(log))));
@@ -164,7 +170,7 @@ fn main() -> Result<()> {
     if args.background {
         // Started by a window or a supervisor, nobody sees stderr: the
         // reason it could not start belongs in its log.
-        let run = move || Service::new().run_arc(args.replaces.is_some());
+        let run = move || Service::run_background(args.replaces.is_some(), args.scheduled);
         #[cfg(target_os = "macos")]
         let result = latch_engine::mac::with_main_queue(run);
         #[cfg(not(target_os = "macos"))]
@@ -291,6 +297,24 @@ mod tests {
     use super::{log_file, panic_line, Args, DEFAULT_LOG};
     use clap::Parser;
     use tracing_subscriber::EnvFilter;
+
+    #[test]
+    fn scheduled_is_only_a_background_start() {
+        assert!(Args::try_parse_from(["latch-host", "--scheduled"]).is_err());
+        assert!(
+            Args::try_parse_from(["latch-host", "--background", "--scheduled"])
+                .unwrap()
+                .scheduled
+        );
+        assert!(Args::try_parse_from([
+            "latch-host",
+            "--background",
+            "--scheduled",
+            "--replaces",
+            "1",
+        ])
+        .is_err());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

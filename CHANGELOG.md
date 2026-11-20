@@ -6,6 +6,10 @@ GitHub release notes, so each version gets a heading of the form
 
 ## Unreleased
 
+- Start the Windows host from a sign-in task as well as the Run key, and
+  check every five minutes that it's still running. Windows sometimes skips
+  Run keys at sign-in, which left a remote PC unreachable after a restart,
+  and a host that stopped stayed stopped until the next sign-in.
 - Keep a Windows stream going through administrator prompts and the lock
   screen. Admin setup installs a small SYSTEM helper that shows the secure
   desktop, takes clicks and typing there, and sends Ctrl+Alt+Delete from

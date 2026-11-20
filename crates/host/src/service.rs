@@ -229,19 +229,29 @@ impl Service {
         }
     }
 
-    pub fn run_arc(self, replacing: bool) -> Result<()> {
-        Arc::new(self).run(replacing)
+    /// An update replacement holds the handover guard while waiting for
+    /// the service it replaces to give up the port.
+    pub fn run_background(replacing: bool, scheduled: bool) -> Result<()> {
+        #[cfg(windows)]
+        let handover = replacing
+            .then(crate::windows_startup::hold_child_handover)
+            .transpose()?;
+        Arc::new(Self::new()).run_at(
+            replacing,
+            scheduled,
+            CONTROL_PORT,
+            #[cfg(windows)]
+            handover,
+        )
     }
 
-    /// Bind, then serve forever. Fails only when the port is taken, which
-    /// means another copy is already running. `replacing` is the service an
-    /// update just started: the old one is still answering its last request,
-    /// so wait for the port rather than give up.
-    pub fn run(self: Arc<Self>, replacing: bool) -> Result<()> {
-        self.run_at(replacing, CONTROL_PORT)
-    }
-
-    fn run_at(self: Arc<Self>, replacing: bool, port: u16) -> Result<()> {
+    fn run_at(
+        self: Arc<Self>,
+        replacing: bool,
+        scheduled: bool,
+        port: u16,
+        #[cfg(windows)] handover: Option<std::os::windows::io::OwnedHandle>,
+    ) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
             self.record_linux_update_issue(update::linux::reconcile().map(|_| ()));
@@ -288,14 +298,33 @@ impl Service {
                     // another already serves. Exit 0: a supervisor that
                     // restarts on failure then leaves the running one alone
                     // instead of respawning this one every few seconds.
-                    self.log(format!(
-                        "another Latch service already answers on TCP {port}; this copy exits ({e})"
-                    ));
+                    if !scheduled {
+                        self.log(format!(
+                            "another Latch service already answers on TCP {port}; this copy exits ({e})"
+                        ));
+                    }
                     return Ok(());
                 }
+                // A scheduled check finds the port taken by a copy that is
+                // starting or busy: that copy serves, so this one leaves quietly.
+                Err(_) if scheduled => return Ok(()),
                 Err(e) => return Err(e).context(format!("bind TCP {port}")),
             }
         };
+        #[cfg(windows)]
+        {
+            drop(handover);
+            if scheduled {
+                // A quit or handover may have started after the preflight.
+                if crate::windows_startup::handover_active()?
+                    || crate::windows_startup::stopped_this_logon()?
+                {
+                    return Ok(());
+                }
+            } else if let Err(e) = crate::windows_startup::clear_stop() {
+                tracing::warn!("{e:#}");
+            }
+        }
         if let Err(e) = crate::prep::migrate() {
             self.log(format!("migrating legacy configuration: {e:#}"));
         }
@@ -326,7 +355,11 @@ impl Service {
             if replacing {
                 self.log("updated: the previous version has been replaced");
             }
-            self.ensure_autostart(&exe);
+            // A watchdog invocation already has its task. Only ordinary
+            // starts should write login entries, with their own exe path.
+            if !scheduled {
+                self.ensure_autostart(exe);
+            }
         }
         // Before the first request: under userspace Tailscale every tailnet
         // peer arrives from loopback, so that has to be known first.
@@ -370,17 +403,35 @@ impl Service {
 
     /// A PC nobody can reach in person has to come back by itself after a
     /// restart, so the logon entry is kept unless the owner turned it off.
-    fn ensure_autostart(&self, exe: &std::path::Path) {
+    fn ensure_autostart(&self, exe: std::path::PathBuf) {
         if !self.cfg.lock().start_with_windows {
+            // Turned off while removing the logon task failed: try again, so
+            // it doesn't keep starting a host the owner turned off.
+            #[cfg(windows)]
+            {
+                let log = self.log.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = crate::setup::remove_logon_task() {
+                        push_log(&log, format!("could not remove the logon task: {e:#}"));
+                    }
+                });
+            }
             return;
         }
         // Rewrite even when a Run value already exists: install-host.ps1
         // may have moved the exe after the first setup, and the old path
         // would start nothing at logon. Written only: this is the service,
         // so it must not stop itself or start a second copy.
-        if let Err(e) = crate::setup::register_autostart(exe) {
-            self.log(format!("could not register start at logon: {e:#}"));
-        }
+        let log = self.log.clone();
+        let register = move || {
+            if let Err(e) = crate::setup::register_autostart(&exe) {
+                push_log(&log, format!("could not register start at logon: {e:#}"));
+            }
+        };
+        #[cfg(windows)]
+        std::thread::spawn(register);
+        #[cfg(not(windows))]
+        register();
     }
 
     fn refresh_loop(self: Arc<Self>) {
@@ -928,6 +979,13 @@ impl Service {
                 if !self.stop_stream() {
                     return Response::json(409, &Ack::err("stream cleanup is still running"));
                 }
+                // The stream has ended already: quit even if the marker can't
+                // be written. The logon task then brings the host back within
+                // five minutes instead of it staying up after a Stop.
+                #[cfg(windows)]
+                if let Err(e) = crate::windows_startup::record_stop() {
+                    self.log(format!("could not record the stop for this sign-in: {e:#}"));
+                }
                 self.log("control panel asked the service to stop");
                 std::thread::spawn(|| {
                     std::thread::sleep(Duration::from_millis(300));
@@ -1008,22 +1066,22 @@ impl Service {
                 let log = self.log.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(500));
-                    match update::apply(&exe) {
-                        Ok(h) => {
-                            if let Err(e) = update::start_probation(&exe, &h, &version.to_string())
-                            {
-                                tracing::warn!("{e:#}");
-                            }
-                            if let Some(server) = server {
-                                server.stop(end::HOST_STOPPING, "This host is updating.");
-                            }
-                            tracing::info!("handing over to {version}");
-                            std::process::exit(0);
+                    let hand_over = || -> Result<()> {
+                        #[cfg(windows)]
+                        let _guard = crate::windows_startup::hold_handover()?;
+                        let h = update::apply(&exe)?;
+                        if let Err(e) = update::start_probation(&exe, &h, &version.to_string()) {
+                            tracing::warn!("{e:#}");
                         }
-                        Err(e) => {
-                            push_log(&log, format!("update to {version} failed: {e:#}"));
-                            running.store(false, Ordering::Release);
+                        if let Some(server) = server {
+                            server.stop(end::HOST_STOPPING, "This host is updating.");
                         }
+                        tracing::info!("handing over to {version}");
+                        std::process::exit(0);
+                    };
+                    if let Err(e) = hand_over() {
+                        push_log(&log, format!("update to {version} failed: {e:#}"));
+                        running.store(false, Ordering::Release);
                     }
                 });
                 Response::json(200, &Ack::ok())
@@ -1466,6 +1524,18 @@ pub fn service_alive() -> bool {
     )
     .map(|r| r.status == 200)
     .unwrap_or(false)
+}
+
+/// Run before initializing logs or constructing a service.
+pub fn scheduled_should_exit() -> Result<bool> {
+    #[cfg(windows)]
+    return crate::windows_startup::scheduled_should_exit(
+        crate::windows_startup::handover_active,
+        service_alive,
+        crate::windows_startup::stopped_this_logon,
+    );
+    #[cfg(not(windows))]
+    Ok(service_alive())
 }
 
 /// Whether opening the window starts the background service. A PC must
@@ -2429,7 +2499,7 @@ mod tests {
             return;
         };
         Arc::new(Service::new())
-            .run_at(false, port.parse().unwrap())
+            .run_at(false, false, port.parse().unwrap())
             .unwrap();
     }
 

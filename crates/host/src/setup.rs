@@ -99,17 +99,86 @@ fn schtasks_command() -> std::process::Command {
     trusted_command(&system_dir().join("schtasks.exe"))
 }
 
-/// Whether the task `name` is registered and this user may see it, as
-/// `schtasks.exe` says (no PowerShell module is loaded to ask).
 #[cfg(windows)]
 pub(crate) fn task_registered(name: &str) -> bool {
-    schtasks_command()
-        .args(["/Query", "/TN", name])
+    query_task(name).unwrap_or(false)
+}
+
+/// Query the task directly so a missing task has a distinct, locale-neutral
+/// result. schtasks /Query uses the same exit code for absence and errors.
+#[cfg(windows)]
+fn query_task(name: &str) -> Result<bool> {
+    use windows::core::{BSTR, VARIANT};
+    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::System::TaskScheduler::{ITaskService, TaskScheduler};
+
+    // SAFETY: balance successful COM initialization on this thread, after
+    // dropping its COM interfaces. A preexisting apartment also works.
+    unsafe {
+        let apartment = CoInitializeEx(None, COINIT_MULTITHREADED);
+        if apartment != RPC_E_CHANGED_MODE {
+            apartment.ok()?;
+        }
+        let result = (|| {
+            let scheduler: ITaskService =
+                CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER)?;
+            let empty = VARIANT::default();
+            scheduler.Connect(&empty, &empty, &empty, &empty)?;
+            let root = scheduler.GetFolder(&BSTR::from(r"\"))?;
+            task_query_result(root.GetTask(&BSTR::from(name)))
+        })();
+        if apartment.is_ok() {
+            CoUninitialize();
+        }
+        result
+    }
+}
+
+#[cfg(windows)]
+fn task_query_result<T>(result: windows::core::Result<T>) -> Result<bool> {
+    match result {
+        Ok(_) => Ok(true),
+        Err(e) if e.code() == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND.to_hresult() => {
+            Ok(false)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(windows)]
+fn run_schtasks(command: &mut std::process::Command) -> Result<std::process::ExitStatus> {
+    let mut child = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .spawn()
+        .context("start schtasks")?;
+    wait_for_child(&mut child, std::time::Duration::from_secs(30)).context("run schtasks")
+}
+
+#[cfg(windows)]
+fn wait_for_child(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+) -> Result<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + limit;
+    let error = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) => break anyhow::anyhow!("timed out after {} s", limit.as_secs()),
+            Err(e) => break e.into(),
+        }
+    };
+    let _ = child.kill();
+    child.wait().context("reap the child after stopping it")?;
+    Err(error)
 }
 
 /// What the administrator step exits with when it never ran setup.
@@ -913,6 +982,13 @@ pub fn uninstall() -> Result<Vec<String>> {
             .filter(|l| !l.is_empty())
             .map(String::from)
             .collect();
+        if !user.status.success() {
+            done.push(String::from_utf8_lossy(&user.stderr).trim().to_owned());
+            anyhow::bail!(
+                "The user uninstall step did not finish.\n{}",
+                done.join("\n")
+            );
+        }
         let status = powershell_command()
             .args(["-Command", &launch_script(&uninstall_machine_ps())])
             .status()
@@ -988,24 +1064,41 @@ pub fn tell(title: &str, text: &str, failed: bool) {
     }
 }
 
-/// The signed-in user's part of `--uninstall`: stop Latch (but not this
-/// process, `own_pid`), remove its Run values, the task an install over SSH
-/// starts it with, the shortcuts and the Apps entry `install-host.ps1`
-/// writes.
+/// The signed-in user's part of `--uninstall`: remove and verify the
+/// login entries before stopping Latch, then remove its shortcuts and
+/// Apps entry. The uninstall process itself is excluded by `own_pid`.
 #[cfg(any(windows, test))]
 fn uninstall_user_ps(own_pid: u32) -> String {
     format!(
-        r#"$ErrorActionPreference = 'Continue'
+        r#"$ErrorActionPreference = 'Stop'
+$run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$names = '{task}', "{logon_task}-$sid"
+function Get-LatchTasks {{
+    Get-ScheduledTask -ErrorAction Stop | Where-Object {{ $_.TaskPath -eq '\' -and $_.TaskName -in $names }}
+}}
+try {{
+    if (Test-Path -LiteralPath $run) {{
+        foreach ($name in '{run}', '{legacy_run}') {{
+            if ($name -in (Get-Item -LiteralPath $run).Property) {{
+                Remove-ItemProperty -LiteralPath $run -Name $name
+            }}
+        }}
+    }}
+    foreach ($task in Get-LatchTasks) {{
+        Unregister-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Confirm:$false
+    }}
+    if (Get-LatchTasks) {{ throw 'A Latch startup task is still registered.' }}
+}} catch {{
+    Write-Output "Could not remove Latch's login entries: $_"
+    exit 1
+}}
+$ErrorActionPreference = 'Continue'
+Write-Output "Latch no longer starts when you sign in."
 try {{ Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:{port}/v1/quit' -ContentType 'application/json' -Body '{{}}' -TimeoutSec 2 | Out-Null; Start-Sleep -Milliseconds 800 }} catch {{}}
 $session = (Get-Process -Id $PID).SessionId
 Get-Process latch-host, brolink-host -ErrorAction SilentlyContinue | Where-Object {{ $_.Id -ne {own_pid} -and $_.SessionId -eq $session }} | Stop-Process -Force -ErrorAction SilentlyContinue
 Write-Output "Stopped Latch."
-$run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-foreach ($name in '{run}', '{legacy_run}') {{ Remove-ItemProperty -LiteralPath $run -Name $name -ErrorAction SilentlyContinue }}
-if (Get-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue) {{
-    Unregister-ScheduledTask -TaskName '{task}' -Confirm:$false -ErrorAction SilentlyContinue
-}}
-Write-Output "Latch no longer starts when you sign in."
 foreach ($folder in @([Environment]::GetFolderPath('Desktop'), (Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs'))) {{
     foreach ($name in 'Latch Host.lnk', 'BroLink Host.lnk') {{ Remove-Item -LiteralPath (Join-Path $folder $name) -Force -ErrorAction SilentlyContinue }}
 }}
@@ -1016,6 +1109,7 @@ Write-Output "Removed the shortcuts and the entry in Settings > Apps."
         run = "LatchHost",
         legacy_run = crate::legacy::WINDOWS_RUN_VALUE,
         task = START_TASK,
+        logon_task = LOGON_TASK,
         apps = APPS_KEY,
     )
 }
@@ -1023,6 +1117,170 @@ Write-Output "Removed the shortcuts and the entry in Settings > Apps."
 /// The task `install-host.ps1` starts the service with over SSH.
 #[cfg(any(windows, test))]
 const START_TASK: &str = "LatchHostStart";
+/// The task that starts the service at logon next to the Run value, and
+/// again every five minutes while the user is signed in: Windows sometimes
+/// skips Run values at a logon, and a host that stopped has to come back
+/// by itself on a PC nobody can reach in person. A copy started while
+/// another serves exits at once (see `Service::run_at`).
+#[cfg(any(windows, test))]
+const LOGON_TASK: &str = "LatchHostLogon";
+
+#[cfg(any(windows, test))]
+fn logon_task_name(sid: &str) -> String {
+    format!("{LOGON_TASK}-{sid}")
+}
+
+/// [`LOGON_TASK`] for `exe`, as Task Scheduler XML. It runs as `user_sid`
+/// only while they are signed in, unelevated, like the Run value: no other
+/// rights than the Run value's. One copy at a time, no time limit, on
+/// battery too, at normal priority (Task Scheduler's default runs below it).
+#[cfg(any(windows, test))]
+fn logon_task_xml(exe: &Path, user_sid: &str) -> String {
+    let xml = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    };
+    let dir = xml(&logon_working_directory(exe));
+    let command = xml(&exe.to_string_lossy());
+    let sid = xml(user_sid);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Starts Latch when you sign in, and again if it stops.</Description></RegistrationInfo>
+  <Triggers>
+    <LogonTrigger><Enabled>true</Enabled><UserId>{sid}</UserId></LogonTrigger>
+    <TimeTrigger><Repetition><Interval>PT5M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><StartBoundary>2000-01-01T00:00:00</StartBoundary><Enabled>true</Enabled></TimeTrigger>
+  </Triggers>
+  <Principals><Principal id="Author"><UserId>{sid}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>5</Priority>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{command}</Command><Arguments>--background --scheduled</Arguments><WorkingDirectory>{dir}</WorkingDirectory></Exec></Actions>
+</Task>
+"#
+    )
+}
+
+#[cfg(any(windows, test))]
+fn logon_working_directory(exe: &Path) -> String {
+    #[cfg(windows)]
+    return exe
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .display()
+        .to_string();
+    #[cfg(not(windows))]
+    {
+        // Linux tests feed Windows paths to the XML generator.
+        let path = exe.to_string_lossy();
+        let Some(end) = path.rfind(['\\', '/']) else {
+            return String::new();
+        };
+        let end = if end == 2 && path.as_bytes()[1] == b':' {
+            end + 1
+        } else {
+            end
+        };
+        path[..end].to_owned()
+    }
+}
+
+/// Register [`LOGON_TASK`] for `exe`, replacing an older registration. A
+/// copy the task already runs keeps running (Task Scheduler leaves running
+/// instances alone when a task is registered again).
+#[cfg(windows)]
+fn register_logon_task(exe: &Path) -> Result<()> {
+    register_unelevated(crate::windows_startup::elevated()?, || {
+        let sid = latch_engine::windows::current_user_sid()?;
+        create_logon_task(exe, &sid, &logon_task_name(&sid))
+    })
+}
+
+#[cfg(any(windows, test))]
+fn register_unelevated(elevated: bool, register: impl FnOnce() -> Result<()>) -> Result<()> {
+    if elevated {
+        tracing::warn!("skipping logon task registration from an elevated process");
+        return Ok(());
+    }
+    register()
+}
+
+#[cfg(windows)]
+fn create_logon_task(exe: &Path, sid: &str, name: &str) -> Result<()> {
+    use std::io::{Read, Write};
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in logon_task_xml(exe, sid).encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    let path = std::env::temp_dir().join(format!(
+        "latch-logon-task-{:032x}.xml",
+        rand::random::<u128>()
+    ));
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ.0)
+        .open(&path)
+        .context("create the logon task XML")?;
+    let result = (|| {
+        writer
+            .write_all(&bytes)
+            .context("write the logon task XML")?;
+        // schtasks opens the XML without write sharing. Reopen read-only
+        // and verify the bytes under that lock before handing it the path.
+        drop(writer);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0)
+            .open(&path)
+            .context("lock the logon task XML")?;
+        let mut actual = Vec::new();
+        (&file)
+            .take(bytes.len() as u64 + 1)
+            .read_to_end(&mut actual)?;
+        anyhow::ensure!(actual == bytes, "the logon task XML changed");
+        let status = run_schtasks(
+            schtasks_command()
+                .args(["/Create", "/TN", name, "/F", "/XML"])
+                .arg(&path),
+        )?;
+        anyhow::ensure!(
+            status.success(),
+            "could not register the logon task ({status})"
+        );
+        drop(file);
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+#[cfg(windows)]
+pub(crate) fn remove_logon_task() -> Result<()> {
+    let name = logon_task_name(&latch_engine::windows::current_user_sid()?);
+    let _ = run_schtasks(schtasks_command().args(["/Delete", "/TN", &name, "/F"]));
+    anyhow::ensure!(
+        !query_task(&name).context("could not verify removal of the logon task")?,
+        "could not remove the logon task"
+    );
+    Ok(())
+}
+
 /// The Settings > Apps entry `install-host.ps1` writes for this user.
 #[cfg(any(windows, test))]
 const APPS_KEY: &str = r"HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Latch";
@@ -1122,16 +1380,14 @@ exit 0
 }
 
 /// Register or remove `latch-host.exe --background` under the current
-/// user's Run key.
+/// user's Run key, and [`LOGON_TASK`] next to it.
 pub fn set_start_with_windows(enable: bool, exe: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
         let reg = |args: &[&str]| {
-            std::process::Command::new("reg")
+            trusted_command(&system_dir().join("reg.exe"))
                 .args(args)
-                .creation_flags(0x0800_0000)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
@@ -1139,8 +1395,8 @@ pub fn set_start_with_windows(enable: bool, exe: &Path) -> Result<()> {
         // An earlier version's value goes either way: on, it is replaced;
         // off, it would still start the host.
         let _ = reg(&["delete", KEY, "/v", crate::legacy::WINDOWS_RUN_VALUE, "/f"]);
-        let status = if enable {
-            reg(&[
+        if enable {
+            let status = reg(&[
                 "add",
                 KEY,
                 "/v",
@@ -1150,18 +1406,28 @@ pub fn set_start_with_windows(enable: bool, exe: &Path) -> Result<()> {
                 "/d",
                 &run_value(exe),
                 "/f",
-            ])?
-        } else {
-            reg(&["delete", KEY, "/v", "LatchHost", "/f"])?
-        };
+            ])?;
+            return finish_autostart_enable(status.success(), || register_logon_task(exe));
+        }
+        let run = reg(&["delete", KEY, "/v", "LatchHost", "/f"]);
+        let task = remove_logon_task();
         anyhow::ensure!(
-            status.success() || (!enable && !starts_with_windows()),
+            run.is_ok_and(|status| status.success() || !starts_with_windows()),
             "could not update the Run key"
         );
-        Ok(())
+        task
     }
     #[cfg(not(windows))]
     crate::unix_setup::set_autostart(enable, exe)
+}
+
+#[cfg(any(windows, test))]
+fn finish_autostart_enable(run_written: bool, register: impl FnOnce() -> Result<()>) -> Result<()> {
+    anyhow::ensure!(run_written, "could not update the Run key");
+    if let Err(e) = register() {
+        tracing::warn!("could not register the logon task: {e:#}");
+    }
+    Ok(())
 }
 
 /// Keep the login registration current from the background service: the
@@ -1179,18 +1445,16 @@ pub fn register_autostart(exe: &Path) -> Result<()> {
 pub fn starts_with_windows() -> bool {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         ["LatchHost", crate::legacy::WINDOWS_RUN_VALUE]
             .iter()
             .any(|value| {
-                std::process::Command::new("reg")
+                trusted_command(&system_dir().join("reg.exe"))
                     .args([
                         "query",
                         r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
                         "/v",
                         value,
                     ])
-                    .creation_flags(0x0800_0000)
                     .output()
                     .map(|o| o.status.success())
                     .unwrap_or(false)
@@ -1387,7 +1651,106 @@ mod tests {
         assert!(u.contains(r"HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"));
         assert!(u.contains("'Latch Host.lnk'"));
         assert!(u.contains(r"'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Latch'"));
-        assert!(u.contains("Unregister-ScheduledTask -TaskName 'LatchHostStart'"));
+        assert!(u.contains("$names = 'LatchHostStart', \"LatchHostLogon-$sid\""));
+        assert!(u.contains("[Security.Principal.WindowsIdentity]::GetCurrent().User.Value"));
+        let stop = u.find("/v1/quit").unwrap();
+        assert!(u.find("Remove-ItemProperty -LiteralPath $run").unwrap() < stop);
+        let delete = u.find("Unregister-ScheduledTask").unwrap();
+        let verify = u.find("if (Get-LatchTasks)").unwrap();
+        assert!(delete < verify && verify < stop);
+        assert!(u.find("exit 1").unwrap() < stop);
+    }
+
+    /// The logon task starts the service as the signed-in user, unelevated,
+    /// at logon and every five minutes, one copy at a time and with no time
+    /// limit; the path is escaped for XML.
+    #[test]
+    fn the_logon_task_restarts_the_service_as_the_user() {
+        let x = logon_task_xml(
+            Path::new(r"C:\Users\A&B <x>\Latch\latch-host.exe"),
+            TEST_SID,
+        );
+        assert!(x.contains(r"<Command>C:\Users\A&amp;B &lt;x&gt;\Latch\latch-host.exe</Command>"));
+        assert!(
+            x.contains(r"<WorkingDirectory>C:\Users\A&amp;B &lt;x&gt;\Latch</WorkingDirectory>")
+        );
+        assert!(x.contains("<Arguments>--background --scheduled</Arguments>"));
+        assert!(x.contains(&format!(
+            "<LogonTrigger><Enabled>true</Enabled><UserId>{TEST_SID}</UserId>"
+        )));
+        assert!(x.contains(&format!("<UserId>{TEST_SID}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel>")));
+        assert!(x.contains("<Interval>PT5M</Interval>"));
+        assert!(x.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
+        assert!(x.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(x.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
+        assert!(!x.contains("HighestAvailable"));
+        let special = logon_task_xml(Path::new(SPECIAL_PATH), TEST_SID);
+        assert!(special.contains("&apos; $ `") && !special.contains("' $ `"));
+    }
+
+    #[test]
+    fn watchdog_task_names_are_per_user_and_drive_root_is_preserved() {
+        assert_eq!(
+            logon_task_name(TEST_SID),
+            format!("LatchHostLogon-{TEST_SID}")
+        );
+        assert_ne!(
+            logon_task_name(TEST_SID),
+            logon_task_name("S-1-5-21-1-2-3-1002")
+        );
+        let root = logon_task_xml(Path::new(r"C:\latch-host.exe"), TEST_SID);
+        assert!(root.contains(r"<WorkingDirectory>C:\</WorkingDirectory>"));
+    }
+
+    #[test]
+    fn a_watchdog_failure_keeps_the_successful_run_setting() {
+        assert!(finish_autostart_enable(true, || anyhow::bail!("scheduler unavailable")).is_ok());
+        assert!(finish_autostart_enable(false, || panic!("Run write failed")).is_err());
+    }
+
+    #[test]
+    fn an_elevated_host_never_creates_the_logon_task_xml() {
+        assert!(register_unelevated(true, || panic!("elevated registration")).is_ok());
+        assert!(register_unelevated(false, || anyhow::bail!("attempted register")).is_err());
+    }
+
+    #[test]
+    fn installer_pauses_the_watchdog_and_checks_the_listener_path() {
+        let script = include_str!("../../../scripts/install-host.ps1");
+        assert!(script.contains(r#"$LogonTaskName = "LatchHostLogon-$Me""#));
+        let disable = script.find("Disable-ScheduledTask").unwrap();
+        let quit = script.find("/v1/quit").unwrap();
+        let copy = script.find("Copy-Item $Exe $DestExe").unwrap();
+        assert!(disable < quit && quit < copy);
+        let ready = script.find("if (Test-InstalledHostListening)").unwrap();
+        assert!(ready < script.find("Latch Host is running").unwrap());
+        assert!(script.contains("Get-NetTCPConnection -LocalPort 47850 -State Listen"));
+        assert!(script.contains("Get-Process -Id $listener.OwningProcess"));
+        assert!(script.contains("$owner.Path -eq $DestExe"));
+        let restore = script.rsplit_once("} finally {").unwrap().1;
+        assert!(restore.contains("Enable-ScheduledTask -TaskName $LogonTaskName"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_a_missing_task_counts_as_removed() {
+        use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND};
+        assert!(task_query_result(Ok(())).unwrap());
+        assert!(!task_query_result::<()>(Err(ERROR_FILE_NOT_FOUND.to_hresult().into())).unwrap());
+        assert!(task_query_result::<()>(Err(ERROR_ACCESS_DENIED.to_hresult().into())).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_timed_out_child_is_killed_and_reaped() {
+        let mut child = trusted_command(&system_dir().join("ping.exe"))
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let result = wait_for_child(&mut child, std::time::Duration::from_millis(40));
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     /// Setup puts the input helper in a folder only administrators can
@@ -1663,7 +2026,7 @@ mod tests {
         );
         assert!(lines[1].eq_ignore_ascii_case(&system), "{out}");
         assert!(lines[2].eq_ignore_ascii_case(&system), "{out}");
-        assert!(!task_registered("LatchNoSuchTask-7f3a"));
+        assert!(!query_task("LatchThrowaway-NoSuchTask-c8116e7d").unwrap());
     }
 
     #[test]
