@@ -302,6 +302,27 @@ impl Unencodable {
     }
 }
 
+/// Windows moved to a desktop no signed-in process may capture or send
+/// input to: the lock screen, the sign-in screen, or an administrator
+/// prompt. Nothing about the encoder is wrong, and the picture comes back
+/// once someone at the PC unlocks it or answers the prompt.
+#[derive(Debug)]
+pub struct DesktopUnavailable;
+
+impl std::fmt::Display for DesktopUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(latch_proto::control::end::DESKTOP_UNAVAILABLE)
+    }
+}
+
+impl std::error::Error for DesktopUnavailable {}
+
+impl DesktopUnavailable {
+    pub fn is(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<DesktopUnavailable>().is_some()
+    }
+}
+
 /// What this machine can encode, best first.
 pub fn encodable() -> Vec<Codec> {
     encodable_for_display(None)

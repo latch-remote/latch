@@ -1555,15 +1555,39 @@ fn idle_probes_share_sender_accounting_and_stop_under_pressure() {
 }
 
 #[test]
+fn preparation_refusal_preserves_the_retryable_desktop_message() {
+    let error = anyhow::anyhow!("a display write was denied").context(video::DesktopUnavailable);
+    let refusal = Refusal::preparation(error.context("preparing the display"));
+    assert_eq!(refusal.status, 503);
+    assert_eq!(refusal.message, end::DESKTOP_UNAVAILABLE);
+    let ended = refusal.into_end();
+    assert_eq!(ended.code, end::TRANSPORT_FAILED);
+    assert_eq!(ended.message, end::DESKTOP_UNAVAILABLE);
+
+    let refusal = Refusal::preparation(anyhow::anyhow!("invalid mode"));
+    assert_eq!(refusal.status, 500);
+    assert_eq!(
+        refusal.message,
+        "could not prepare the desktop: invalid mode"
+    );
+}
+
+#[test]
 fn fallback_refits_geometry_and_prepares_the_final_mode() {
     let prepared_sizes = Arc::new(Mutex::new(Vec::new()));
     let seen = prepared_sizes.clone();
+    let desktop_prepared = Arc::new(AtomicBool::new(false));
+    let active = desktop_prepared.clone();
     let server = Server::bind(
         0,
         Options {
             prepare: Some(Box::new(move |r| {
+                assert!(!active.swap(true, Ordering::AcqRel), "undo must run first");
                 seen.lock().push((r.width, r.height, r.fps));
-                Ok(None)
+                let active = active.clone();
+                Ok(Some(Box::new(move || {
+                    active.store(false, Ordering::Release)
+                })))
             })),
             ..test_options::options()
         },
@@ -1595,11 +1619,13 @@ fn fallback_refits_geometry_and_prepares_the_final_mode() {
         || vec![Codec::H264High, Codec::H264Baseline],
         limits_for,
         |cfg| {
+            assert!(desktop_prepared.load(Ordering::Acquire));
             calls.push(cfg.clone());
             Err(video::Unencodable("injected open failure".into()).into())
         },
     );
     assert!(result.is_err());
+    assert!(!desktop_prepared.load(Ordering::Acquire));
     assert_eq!(calls.len(), 2);
     let last = calls.last().unwrap();
     assert_eq!((last.width, last.height, last.fps), expected);
@@ -1806,8 +1832,21 @@ fn synthetic_dxgi_session_delivers_cursor_while_video_waits() {
 
 #[test]
 fn compatible_display_offer_probes_before_takeover_and_opens_after_cleanup() {
-    let server = Server::bind(0, test_options::options()).unwrap();
     let old = session("127.0.0.1:9".parse().unwrap());
+    let server = Server::bind(
+        0,
+        Options {
+            prepare: Some(Box::new({
+                let old = old.clone();
+                move |_| {
+                    assert!(*old.finished.lock(), "prepare must wait for the old undo");
+                    Ok(None)
+                }
+            })),
+            ..test_options::options()
+        },
+    )
+    .unwrap();
     *server.current.lock() = Some(old.clone());
     let cleanup = {
         let old = old.clone();
@@ -1969,4 +2008,37 @@ fn stop_waits_for_a_preparation_that_is_being_dropped() {
     drop(reservation);
     assert!(result.recv_timeout(Duration::from_secs(1)).unwrap());
     stopping.join().unwrap();
+}
+
+#[test]
+fn dropping_an_unused_preparation_keeps_its_reservation_through_undo() {
+    let opening = Arc::new(Opening::default());
+    let guard = opening.lock(Duration::ZERO).unwrap();
+    let prepared = Prepared {
+        desktop: Some(Box::new({
+            let opening = opening.clone();
+            move || assert!(opening.lock(Duration::ZERO).is_none())
+        })),
+        pipeline: None,
+        audio: None,
+        audio_problem: String::new(),
+        mic: None,
+        mic_problem: String::new(),
+        input: None,
+        input_problem: None,
+        pads: None,
+        pads_problem: String::new(),
+        feedback: Arc::new(FeedbackHub::default()),
+        info: None,
+        codec: Codec::H264Baseline,
+        req: serde_json::from_value(serde_json::json!({
+            "protocol": latch_proto::PROTOCOL, "width": 64, "height": 64, "fps": 30,
+            "bitrate_kbps": 1000, "codecs": ["h264-baseline"], "udp_port": 9, "audio": false
+        }))
+        .unwrap(),
+        peer: "127.0.0.1:9".parse().unwrap(),
+        opening: Some(guard),
+    };
+    drop(prepared);
+    assert!(opening.lock(Duration::ZERO).is_some());
 }

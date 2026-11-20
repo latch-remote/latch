@@ -28,11 +28,10 @@ pub fn log_path() -> Option<PathBuf> {
 /// Under `%ProgramFiles%`, which only administrators can change.
 const SETUP_DIR: &str = r"Latch\Setup";
 
-/// Windows' own PowerShell, by full path. A bare `powershell` is looked
-/// for in the running executable's folder first, which for Latch is one
-/// the user can write to.
+/// Windows' system folder (`System32`), from Windows itself rather than
+/// an environment variable the caller chose.
 #[cfg(any(windows, test))]
-fn powershell_exe() -> PathBuf {
+fn system_dir() -> PathBuf {
     #[cfg(windows)]
     {
         #[link(name = "kernel32")]
@@ -47,10 +46,70 @@ fn powershell_exe() -> PathBuf {
             "Windows system directory unavailable"
         );
         PathBuf::from(String::from_utf16_lossy(&buffer[..n]))
-            .join(r"WindowsPowerShell\v1.0\powershell.exe")
     }
     #[cfg(not(windows))]
-    PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+    PathBuf::from(r"C:\Windows\System32")
+}
+
+/// Windows' own PowerShell, by full path. A bare `powershell` is looked
+/// for in the running executable's folder first, which for Latch is one
+/// the user can write to.
+#[cfg(any(windows, test))]
+fn powershell_exe() -> PathBuf {
+    system_dir().join(r"WindowsPowerShell\v1.0\powershell.exe")
+}
+
+/// `program` (a file in [`system_dir`]) in an environment the caller
+/// cannot steer, as setup needs it whenever it may run elevated: `PATH` is
+/// only the system folder, PowerShell loads modules only from Windows' own
+/// folder (Windows PowerShell 5.1 otherwise looks in the user's Documents
+/// first, which their unelevated processes can write to), and the working
+/// directory is the system folder. No window.
+#[cfg(any(windows, test))]
+fn trusted_command(program: &Path) -> std::process::Command {
+    let system = system_dir();
+    let mut command = std::process::Command::new(program);
+    command
+        .env("PATH", &system)
+        .env(
+            "PSModulePath",
+            system.join(r"WindowsPowerShell\v1.0\Modules"),
+        )
+        .current_dir(&system);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command
+}
+
+/// Windows' PowerShell as [`trusted_command`] starts it, without the
+/// user's profile scripts and without prompts.
+#[cfg(any(windows, test))]
+fn powershell_command() -> std::process::Command {
+    let mut command = trusted_command(&powershell_exe());
+    command.args(["-NoProfile", "-NonInteractive"]);
+    command
+}
+
+/// Windows' `schtasks.exe`, as [`trusted_command`] starts it.
+#[cfg(any(windows, test))]
+fn schtasks_command() -> std::process::Command {
+    trusted_command(&system_dir().join("schtasks.exe"))
+}
+
+/// Whether the task `name` is registered and this user may see it, as
+/// `schtasks.exe` says (no PowerShell module is loaded to ask).
+#[cfg(windows)]
+pub(crate) fn task_registered(name: &str) -> bool {
+    schtasks_command()
+        .args(["/Query", "/TN", name])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// What the administrator step exits with when it never ran setup.
@@ -88,47 +147,83 @@ fn elevation_error(code: Option<i32>) -> String {
 /// nothing in a folder a user can change: the install folder under
 /// `%LOCALAPPDATA%` is the user's, and an unzipped copy may sit in one
 /// every user can write to. `program` is only named in the firewall rules.
+///
+/// `user_sid` is the user who asked for setup, unelevated: whoever
+/// approves the prompt may be another administrator, and it is the asking
+/// user whose Latch the input helper is for. `elevated_input` is that
+/// user's setting, which the elevated step cannot read from another
+/// account's profile.
 #[cfg(any(windows, test))]
-fn stage_script(program: &str, sha256: &str) -> String {
+fn stage_script(program: &str, sha256: &str, user_sid: &str, elevated_input: bool) -> String {
     format!(
         r#"$ErrorActionPreference = 'Stop'
-$program = '{program}'
+$program = {program}
+$sha256 = {sha256}
+$userSid = {user_sid}
+$elevatedInput = {elevated_input}
 {protection}
+$pins = @{{}}
 try {{
-    $root = [Environment]::GetFolderPath('ProgramFiles')
-    Assert-Protected $root
-    $parent = Join-Path $root 'Latch'
-    if (-not (Test-Path -LiteralPath $parent)) {{ New-Item -ItemType Directory -Path $parent | Out-Null }}
-    Assert-Protected $parent
+  try {{
+    # Everything the elevated copy may load sits in this folder. One that
+    # anyone else could change is made again, empty and protected.
     $dir = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) '{dir}'
-    if (-not (Test-Path -LiteralPath $dir)) {{ New-Item -ItemType Directory -Path $dir | Out-Null }}
-    Assert-Protected $dir
+    Reset-ProtectedFolder $dir ([Environment]::GetFolderPath('ProgramFiles')) $pins
     $copy = Join-Path $dir 'latch-host.exe'
-    if (Test-Path -LiteralPath $copy) {{ Assert-Protected $copy }}
-    Copy-Item -LiteralPath $program -Destination $copy -Force
-}} catch {{ exit {copy_failed} }}
-if ((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne '{sha256}') {{
+    if (Test-Path -LiteralPath $copy) {{ Remove-Item -LiteralPath $copy -Force }}
+    [IO.File]::Copy($program, $copy)
+    if (Test-Protected $copy) {{ Repair-Protected $copy }}
+  }} catch {{ exit {copy_failed} }}
+if ((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne $sha256) {{
     Remove-Item -LiteralPath $copy -Force -ErrorAction SilentlyContinue
     exit {changed}
 }}
 # Started directly rather than through the shell, which would ask again
 # about a downloaded file this window already runs.
 $start = New-Object System.Diagnostics.ProcessStartInfo $copy
-$start.Arguments = '--setup-elevated --program "' + $program + '"'
+$start.Arguments = '--setup-elevated --program "' + $program + '" --for-user ' + $userSid + ' --elevated-input ' + $elevatedInput
 $start.UseShellExecute = $false
 $start.WorkingDirectory = $dir
 $p = [System.Diagnostics.Process]::Start($start)
 $p.WaitForExit()
 Remove-Item -LiteralPath $copy -Force -ErrorAction SilentlyContinue
 exit $p.ExitCode
+}} finally {{
+    foreach ($handle in $pins.Values) {{ $handle.Dispose() }}
+}}
 "#,
-        program = q(program),
-        protection = include_str!("../../../scripts/setup-protection.ps1"),
+        program = ps_data(program),
+        protection = protection_ps(),
         dir = SETUP_DIR,
-        sha256 = sha256,
+        sha256 = ps_data(sha256),
+        user_sid = ps_data(user_sid),
+        elevated_input = ps_data(&elevated_input.to_string()),
         copy_failed = exit::COPY_FAILED,
         changed = exit::CHANGED,
     )
+}
+
+/// `scripts/setup-protection.ps1` as setup embeds it: without its comment
+/// lines, which would only lengthen the elevated command line (Windows
+/// caps it at 32767 characters, and the script travels base64-encoded).
+fn protection_ps() -> String {
+    include_str!("../../../scripts/setup-protection.ps1")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Only the checks (`Test-Protected`, `Assert-Protected`,
+/// `Assert-ProtectedTree`), for a script that repairs nothing and must fit
+/// the command line with room to spare, such as uninstall's.
+#[cfg(any(windows, test))]
+fn protection_checks_ps() -> String {
+    let full = protection_ps();
+    let end = full
+        .find("function Repair-Protected")
+        .expect("the repair functions follow the checks");
+    full[..end].to_owned()
 }
 
 /// The unelevated launcher: Windows' PowerShell, elevated through UAC, runs
@@ -136,17 +231,13 @@ exit $p.ExitCode
 /// fixes when it is approved, rather than in a file the user could edit.
 #[cfg(any(windows, test))]
 fn launch_script(stage: &str) -> String {
-    // Elevated scripts must not resolve tools from a caller's PATH or cwd.
-    let stage = format!(
-        "$env:PATH = [Environment]::SystemDirectory; Set-Location -LiteralPath ([Environment]::SystemDirectory);\n{stage}"
-    );
     // Already elevated (an administrator's SSH session, a window started as
     // administrator): no prompt to show, and none could be shown in
     // session 0.
     format!(
-        "$encoded = '{encoded}'; if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{ & '{ps}' -NoProfile -NonInteractive -EncodedCommand $encoded; exit $LASTEXITCODE }}; try {{ $p = Start-Process -FilePath '{ps}' -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList ('-NoProfile -NonInteractive -EncodedCommand ' + $encoded) -ErrorAction Stop }} catch {{ exit {declined} }}; if ($null -eq $p) {{ exit {declined} }}; exit $p.ExitCode",
-        ps = q(&powershell_exe().display().to_string()),
-        encoded = encoded_command(&stage),
+        "$encoded = '{encoded}'; $ps = {ps}; if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{ & $ps -NoProfile -NonInteractive -EncodedCommand $encoded; exit $LASTEXITCODE }}; try {{ $p = Start-Process -FilePath $ps -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList ('-NoProfile -NonInteractive -EncodedCommand ' + $encoded) -ErrorAction Stop }} catch {{ exit {declined} }}; if ($null -eq $p) {{ exit {declined} }}; exit $p.ExitCode",
+        ps = ps_data(&powershell_exe().display().to_string()),
+        encoded = encoded_command(stage),
         declined = exit::DECLINED,
     )
 }
@@ -160,7 +251,6 @@ fn encoded_command(script: &str) -> String {
 }
 
 /// Standard base64 with padding, for `-EncodedCommand`.
-#[cfg(any(windows, test))]
 fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -180,16 +270,15 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-pub fn script(p: &Plan<'_>) -> String {
-    let q = |s: &str| s.replace('\'', "''");
+/// The setup script. `user_sid`: the user setup is for (see
+/// [`stage_script`]), already checked.
+pub fn script(p: &Plan<'_>, user_sid: &str) -> String {
     let adapter = if p.adapter.is_empty() {
         "Step \"Wake-on-LAN: adapter unknown, skipped\"\n".to_string()
     } else {
         format!(
-            r#"# The names are single-quoted literals held in variables. Spliced into
-# a double-quoted string, a '$' in a name would expand and a '"' end it.
-$wakeAdapter = '{adapter}'
-$wakeDevice = '{desc}'
+            r#"$wakeAdapter = {adapter}
+$wakeDevice = {desc}
 Step "Enabling Wake-on-LAN on '$wakeAdapter'"
 try {{
     Set-NetAdapterPowerManagement -Name $wakeAdapter -WakeOnMagicPacket Enabled -ErrorAction Stop
@@ -212,8 +301,8 @@ if ($k) {{
 }} else {{ Write-Output "  no class key for the adapter; keywords unchanged" }}
 try {{ powercfg /deviceenablewake $wakeDevice | Out-Null }} catch {{ Write-Output "  powercfg: $_" }}
 "#,
-            adapter = q(p.adapter),
-            desc = q(p.adapter_description)
+            adapter = ps_data(p.adapter),
+            desc = ps_data(p.adapter_description)
         )
     };
     format!(
@@ -229,17 +318,17 @@ Step "Opening TCP and UDP {port} to the tailnet for Latch"
 # it; unanswered (nobody at the PC, an install over SSH) that becomes a pair
 # of inbound Block rules for the program, and a Block rule wins over every
 # Allow below. Only rules for this very executable are removed.
-$latchExe = '{exe}'
+$latchExe = {exe}
 Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue | Where-Object {{ $_.Program -ieq $latchExe }} | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {{ $_.Action -eq 'Block' -and $_.Direction -eq 'Inbound' }} | Remove-NetFirewallRule -ErrorAction SilentlyContinue
 foreach ($rule in 'Latch Host', 'Latch Media') {{ netsh advfirewall firewall delete rule name="$rule" | Out-Null }}
 # Tailscale's addresses only: its IPv4 range and its IPv6 one.
-netsh advfirewall firewall add rule name="Latch Host" dir=in action=allow protocol=TCP localport={port} remoteip={tailnet} program='{exe}' | Out-Null
+netsh advfirewall firewall add rule name="Latch Host" dir=in action=allow protocol=TCP localport={port} remoteip={tailnet} "program=$latchExe" | Out-Null
 if ($LASTEXITCODE -ne 0) {{ $setupFailed = $true }}
-netsh advfirewall firewall add rule name="Latch Media" dir=in action=allow protocol=UDP localport={port} remoteip={tailnet} program='{exe}' | Out-Null
+netsh advfirewall firewall add rule name="Latch Media" dir=in action=allow protocol=UDP localport={port} remoteip={tailnet} "program=$latchExe" | Out-Null
 if ($LASTEXITCODE -ne 0) {{ $setupFailed = $true }}
 Step "Opening UDP 9 to check the wake path while this PC is awake"
 netsh advfirewall firewall delete rule name="Latch wake" | Out-Null
-netsh advfirewall firewall add rule name="Latch wake" dir=in action=allow protocol=UDP localport=9 program='{exe}' | Out-Null
+netsh advfirewall firewall add rule name="Latch wake" dir=in action=allow protocol=UDP localport=9 "program=$latchExe" | Out-Null
 if ($LASTEXITCODE -ne 0) {{ $setupFailed = $true }}
 {input_helper}
 {virtual_display}
@@ -259,13 +348,13 @@ if ($vddModesUnchanged) {{ Step "Latch setup finished (virtual display modes unc
 else {{ Step "Latch setup finished" }}
 exit 0
 "#,
-        protection = include_str!("../../../scripts/setup-protection.ps1"),
+        protection = protection_ps(),
         retire = crate::legacy::retire_windows_ps(),
         port = CONTROL_PORT,
         tailnet = "100.64.0.0/10,fd7a:115c:a1e0::/48",
-        exe = q(&p.exe.display().to_string()),
+        exe = ps_data(&p.exe.display().to_string()),
         virtual_display = crate::virtual_display::setup_ps(),
-        input_helper = input_helper_ps(p.elevated_input, p.exe),
+        input_helper = input_helper_ps(p.elevated_input, user_sid),
         record = record_power_ps(),
         gamepad_driver = gamepad_driver_ps(),
     )
@@ -325,51 +414,159 @@ try {{
     )
 }
 
-/// The task that runs the input helper, elevated, for windows that run as
-/// administrator (see `latch_engine::windows`'s `elevated` module).
+/// The task that runs the input helper as SYSTEM, for windows that run as
+/// administrator and the secure desktop (see `latch_engine::windows`'s
+/// `elevated` module).
 const INPUT_TASK: &str = "LatchInput";
+/// Windows' policy that lets services send Ctrl+Alt+Delete (SendSAS).
+const SAS_POLICY_KEY: &str = r"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
+/// Setup turned that policy on (it was unset), so it turns it off again.
+const SAS_MARK_KEY: &str = r"HKLM:\SOFTWARE\Latch\Input";
+
+/// Takes back the SendSAS policy when setup set it, and then only if it
+/// still holds exactly what setup wrote (the DWORD 1): an administrator
+/// who changed it since keeps their value.
+fn sas_policy_removal_ps() -> String {
+    format!(
+        r#"if ((Get-ItemProperty -LiteralPath '{mark}' -Name SasPolicyAdded -ErrorAction SilentlyContinue).SasPolicyAdded -eq '1') {{
+    $sasKey = Get-Item -LiteralPath '{policy}' -ErrorAction SilentlyContinue
+    if ($sasKey -and ($sasKey.GetValueNames() -contains 'SoftwareSASGeneration') -and $sasKey.GetValueKind('SoftwareSASGeneration') -eq [Microsoft.Win32.RegistryValueKind]::DWord -and $sasKey.GetValue('SoftwareSASGeneration') -eq 1) {{
+        Remove-ItemProperty -LiteralPath '{policy}' -Name SoftwareSASGeneration -ErrorAction SilentlyContinue
+    }}
+    Remove-Item -LiteralPath '{mark}' -Recurse -Force -ErrorAction SilentlyContinue
+}}"#,
+        mark = SAS_MARK_KEY,
+        policy = SAS_POLICY_KEY,
+    )
+}
 
 /// Setup's step for the input helper. Windows ignores input an unelevated
-/// Latch sends while an elevated window is in front, so a stream starts
-/// this task, which runs a copy of this checked file elevated as the user
-/// who ran setup. The copy sits in `%ProgramFiles%\Latch\Input`, which
-/// only administrators can change, and is replaced on every setup.
-fn input_helper_ps(enabled: bool, installed: &Path) -> String {
+/// Latch sends while an elevated window is in front, and only SYSTEM can
+/// show or control the lock screen, the sign-in screen and administrator
+/// prompts. So a stream starts this task, which runs a copy of this checked
+/// file as LocalSystem; that copy starts its agent in the sessions where
+/// the approved user runs the host recorded in `host-path.txt`, and serves
+/// only that user's host. Turning this on therefore lets that user's Latch
+/// (and whatever can run as that user and control it) answer administrator
+/// prompts on this PC.
+///
+/// `user_sid` is the approved user, recorded in `user-sid.txt`: the one
+/// who asked for setup, not the administrator who approved the prompt.
+/// The copy sits in `%ProgramFiles%\Latch\Input`, which only
+/// administrators can change and which is made again when anything in it
+/// is not theirs, and is replaced on every setup. The task's security lets
+/// the approved user start it, and only administrators change it.
+fn input_helper_ps(enabled: bool, user_sid: &str) -> String {
     if !enabled {
         return format!(
             r#"Step "Removing administrator input helper"
-Stop-ScheduledTask -TaskName '{INPUT_TASK}' -ErrorAction SilentlyContinue
-if (Get-ScheduledTask -TaskName '{INPUT_TASK}' -ErrorAction SilentlyContinue) {{
-    Unregister-ScheduledTask -TaskName '{INPUT_TASK}' -Confirm:$false -ErrorAction Stop
-}}"#
+try {{
+    Stop-ScheduledTask -TaskName '{INPUT_TASK}' -ErrorAction SilentlyContinue
+    if (Get-ScheduledTask -TaskName '{INPUT_TASK}' -ErrorAction SilentlyContinue) {{
+        Unregister-ScheduledTask -TaskName '{INPUT_TASK}' -Confirm:$false -ErrorAction Stop
+    }}
+    # The agents run apart from the task: stop them too, and remove the
+    # copy, so no host keeps asking for a helper that is off.
+    $inputDir = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Latch\Input'
+    $inputExe = Join-Path $inputDir 'latch-host.exe'
+    Get-Process -Name 'latch-host' -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -ieq $inputExe }} | Stop-Process -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $inputDir) {{
+        Start-Sleep -Milliseconds 500
+        Assert-ProtectedTree (Split-Path -Parent $inputDir)
+        Remove-Tree $inputDir
+    }}
+}} catch {{ Write-Output "  input helper: $_"; $setupFailed = $true }}
+{sas}"#,
+            sas = sas_policy_removal_ps(),
         );
     }
     format!(
-        r#"Step "Letting a viewer control windows that run as administrator"
+        r#"Step "Letting a viewer control windows that run as administrator, the lock screen and administrator prompts"
+$inputOldEnabled = $false
+$inputReplaced = $false
+$inputReady = $false
 try {{
+    # The user who asked for setup; whoever approved the prompt may be
+    # another administrator. Only this user's Latch may use the helper.
+    $approvedSid = {user_sid}
+    $approvedName = ([Security.Principal.SecurityIdentifier]$approvedSid).Translate([Security.Principal.NTAccount]).Value
+    Write-Output "  for $approvedName, whose Latch can then answer administrator prompts"
     $inputSource = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Latch\Setup\latch-host.exe'
     Assert-ProtectedTree $inputSource
     $inputDir = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Latch\Input'
-    if (-not (Test-Path -LiteralPath $inputDir)) {{ New-Item -ItemType Directory -Path $inputDir | Out-Null }}
-    Assert-ProtectedTree $inputDir
     $inputExe = Join-Path $inputDir 'latch-host.exe'
-    # A running helper holds the file it runs from.
-    Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue
-    Get-Process -Name 'latch-host' -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -ieq $inputExe }} | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Milliseconds 500
-    if (Test-Path -LiteralPath $inputExe) {{ Assert-Protected $inputExe }}
+    # A running helper holds the file it runs from, and a stream would
+    # start an enabled task again: disable it first, then stop it and
+    # wait until no helper runs.
+    $inputOld = Get-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue
+    if ($inputOld) {{
+        $inputOldEnabled = $inputOld.State -ne 'Disabled'
+        Disable-ScheduledTask -TaskName '{task}' -ErrorAction Stop | Out-Null
+        Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue
+    }}
+    $inputStopBy = (Get-Date).AddSeconds(10)
+    while ($running = @(Get-Process -Name 'latch-host' -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -ieq $inputExe }})) {{
+        if ((Get-Date) -gt $inputStopBy) {{ throw "the running input helper did not stop" }}
+        $running | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 200
+    }}
+    # SYSTEM runs what is in this folder. A tree with unsafe contents
+    # is moved aside and replaced with a protected one.
+    $inputReplaced = $true
+    Reset-ProtectedFolder $inputDir
     Copy-Item -LiteralPath $inputSource -Destination $inputExe -Force -ErrorAction Stop
     $hostRecord = Join-Path $inputDir 'host-path.txt'
-    if (Test-Path -LiteralPath $hostRecord) {{ Assert-Protected $hostRecord }}
-    Set-Content -LiteralPath $hostRecord -Value '{installed}' -Encoding UTF8 -ErrorAction Stop
+    Set-Content -LiteralPath $hostRecord -Value $latchExe -Encoding UTF8 -ErrorAction Stop
+    $userRecord = Join-Path $inputDir 'user-sid.txt'
+    Set-Content -LiteralPath $userRecord -Value $approvedSid -Encoding ASCII -ErrorAction Stop
+    foreach ($written in $inputExe, $hostRecord, $userRecord) {{ if (Test-Protected $written) {{ Repair-Protected $written }} }}
+    if (-not (Test-ProtectedContents $inputDir)) {{ throw "$inputDir is not protected" }}
     $action = New-ScheduledTaskAction -Execute $inputExe -Argument '{arg}' -WorkingDirectory $inputDir
-    $principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -Priority 4
+    # LocalSystem, the only account that can reach the secure desktop.
+    $principal = New-ScheduledTaskPrincipal -UserId '{system}' -LogonType ServiceAccount -RunLevel Highest
+    # Registered disabled, and enabled once only the approved user may start it.
+    $settings = New-ScheduledTaskSettingsSet -Disable -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -Priority 4
     Register-ScheduledTask -TaskName '{task}' -Action $action -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
-}} catch {{ Write-Output "  input helper: $_"; $setupFailed = $true }}"#,
-        installed = installed.display().to_string().replace('\'', "''"),
+    # SYSTEM and administrators may change the task; the approved user may
+    # only read and start it. Nobody else may even start it.
+    $scheduler = New-Object -ComObject Schedule.Service
+    $scheduler.Connect()
+    $scheduler.GetFolder('\').GetTask('{task}').SetSecurityDescriptor("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;$approvedSid)", 0)
+    Enable-ScheduledTask -TaskName '{task}' -ErrorAction Stop | Out-Null
+    $inputReady = $true
+    # Ctrl+Alt+Delete from a viewer: Windows lets a service (the helper runs
+    # as SYSTEM) send it only under this policy. Setup sets it when unset.
+    # It marks that first, so a setup that stops part way still takes it
+    # back, and takes the mark back if the write fails; turning this off or
+    # uninstalling removes the value only while it is still setup's.
+    if ($null -eq (Get-ItemProperty -LiteralPath '{policy}' -Name SoftwareSASGeneration -ErrorAction SilentlyContinue)) {{
+        if (-not (Test-Path -LiteralPath '{mark}')) {{ New-Item -Path '{mark}' -Force -ErrorAction Stop | Out-Null }}
+        New-ItemProperty -LiteralPath '{mark}' -Name SasPolicyAdded -Value '1' -PropertyType String -Force -ErrorAction Stop | Out-Null
+        try {{
+            New-ItemProperty -LiteralPath '{policy}' -Name SoftwareSASGeneration -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+        }} catch {{
+            Remove-ItemProperty -LiteralPath '{mark}' -Name SasPolicyAdded -ErrorAction SilentlyContinue
+            throw
+        }}
+    }} elseif ((Get-ItemProperty -LiteralPath '{policy}').SoftwareSASGeneration -notin 1, 3) {{
+        Write-Output "  Ctrl+Alt+Delete from a viewer stays off: the SoftwareSASGeneration policy is set to something else"
+    }}
+}} catch {{
+    Write-Output "  input helper: $_"
+    $setupFailed = $true
+    if (-not $inputReplaced) {{
+        # Its files are untouched: the helper this PC had keeps working.
+        if ($inputOldEnabled) {{ Enable-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue | Out-Null }}
+    }} elseif (-not $inputReady) {{
+        Write-Output "  the input helper stays off until setup runs again"
+    }}
+}}"#,
+        user_sid = ps_data(user_sid),
         task = INPUT_TASK,
         arg = "--input-helper",
+        system = "S-1-5-18",
+        policy = SAS_POLICY_KEY,
+        mark = SAS_MARK_KEY,
     )
 }
 
@@ -418,7 +615,6 @@ pub fn run(p: &Plan<'_>) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         static WARNED: parking_lot::Mutex<Option<std::time::Instant>> =
             parking_lot::Mutex::new(None);
         let viewer = latch_core::http::get_json::<latch_core::api::Status>(
@@ -440,10 +636,18 @@ pub fn run(p: &Plan<'_>) -> Result<()> {
         let sha256 = latch_core::update::sha256_hex(
             &std::fs::read(p.exe).with_context(|| format!("read {}", p.exe.display()))?,
         );
-        let launch = launch_script(&stage_script(&p.exe.display().to_string(), &sha256));
-        let status = std::process::Command::new(powershell_exe())
-            .args(["-NoProfile", "-NonInteractive", "-Command", &launch])
-            .creation_flags(0x0800_0000)
+        // The user the input helper is for: this one, unelevated. The
+        // prompt may be approved with another administrator's account.
+        let user_sid = latch_engine::windows::current_user_sid()
+            .context("read which user is setting up Latch")?;
+        let launch = launch_script(&stage_script(
+            &p.exe.display().to_string(),
+            &sha256,
+            &user_sid,
+            p.elevated_input,
+        ));
+        let status = powershell_command()
+            .args(["-Command", &launch])
             .status()
             .context("launch elevated Latch Host")?;
         anyhow::ensure!(status.success(), elevation_error(status.code()));
@@ -470,10 +674,9 @@ fn refuse_during_stream(
 /// Run a read-only PowerShell probe and return what it printed.
 #[cfg(windows)]
 pub(crate) fn powershell(script: &str) -> Result<String> {
-    use std::os::windows::process::CommandExt;
-    let out = std::process::Command::new(powershell_exe())
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .creation_flags(0x0800_0000)
+    let out = powershell_command()
+        .args(["-Command", script])
+        .stdin(std::process::Stdio::null())
         .output()
         .context("run powershell")?;
     anyhow::ensure!(
@@ -485,30 +688,75 @@ pub(crate) fn powershell(script: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-// Only the Windows setup path is compiled in a release build; tests use it everywhere.
-#[cfg_attr(not(windows), allow(dead_code))]
-/// A PowerShell single-quoted literal: only `'` needs escaping, nothing is
-/// expanded.
-fn q(s: &str) -> String {
-    s.replace('\'', "''")
+/// A PowerShell expression that decodes data without parsing it as source.
+fn ps_data(s: &str) -> String {
+    format!(
+        "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}'))",
+        base64(s.as_bytes())
+    )
+}
+
+/// Hold each directory from the local volume root before opening its
+/// children. The caller also checks the owners and ACLs before writing.
+#[cfg(windows)]
+fn pin_setup_path(path: &Path) -> Result<Vec<std::fs::File>> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::{Component, Prefix};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    anyhow::ensure!(
+        matches!(path.components().next(), Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))),
+        "setup requires a local path"
+    );
+    let mut pins = Vec::new();
+    let ancestors = path.ancestors().collect::<Vec<_>>();
+    for dir in ancestors.into_iter().rev() {
+        let pin = std::fs::OpenOptions::new()
+            .access_mode((FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES).0)
+            .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(dir)
+            .with_context(|| format!("pin setup directory {}", dir.display()))?;
+        let info = pin.metadata()?;
+        anyhow::ensure!(
+            info.is_dir() && info.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0,
+            "unsafe setup directory {}",
+            dir.display()
+        );
+        pins.push(pin);
+    }
+    Ok(pins)
 }
 
 /// Generate and run the setup script. Called from `--setup-elevated`,
 /// already elevated: with `program`, by the copy [`stage_script`] made in
-/// `%ProgramFiles%\Latch\Setup`; without, by an administrator's own
-/// session (SSH), which stages this file the same way first.
-pub fn run_as_admin(program: Option<&Path>) -> Result<()> {
+/// `%ProgramFiles%\Latch\Setup`, which also passes the user who asked
+/// (`for_user`) and their `elevated_input` setting; without, by an
+/// administrator's own session (SSH), which stages this file the same way
+/// first, for that administrator.
+pub fn run_as_admin(
+    program: Option<&Path>,
+    for_user: Option<&str>,
+    elevated_input: Option<bool>,
+) -> Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         let exe = std::env::current_exe().context("own path")?;
         let Some(program) = program else {
             let sha256 = latch_core::update::sha256_hex(&std::fs::read(&exe)?);
-            let stage = stage_script(&exe.display().to_string(), &sha256);
-            let status = std::process::Command::new(powershell_exe())
-                .args(["-NoProfile", "-NonInteractive", "-EncodedCommand"])
+            let user_sid = latch_engine::windows::current_user_sid()?;
+            let stage = stage_script(
+                &exe.display().to_string(),
+                &sha256,
+                &user_sid,
+                crate::config::HostConfig::load_read_only().elevated_input,
+            );
+            let status = powershell_command()
+                .arg("-EncodedCommand")
                 .arg(encoded_command(&stage))
-                .creation_flags(0x0800_0000)
                 .status()
                 .context("run the setup copy")?;
             anyhow::ensure!(status.success(), elevation_error(status.code()));
@@ -517,9 +765,10 @@ pub fn run_as_admin(program: Option<&Path>) -> Result<()> {
         // Everything below is written beside this copy, so it has to be
         // the one in Program Files and not a file a user put anywhere.
         let dir = exe.parent().context("own folder")?.to_path_buf();
+        let _pins = pin_setup_path(&dir)?;
         let checked = powershell(&format!(
-            "{}\n$root = [Environment]::GetFolderPath('ProgramFiles'); Assert-Protected $root; $parent = Join-Path $root 'Latch'; Assert-Protected $parent; $dir = Join-Path $parent 'Setup'; Assert-Protected $dir; $log = Join-Path $dir 'setup.log'; if (Test-Path -LiteralPath $log) {{ Assert-Protected $log }}; Write-Output $dir",
-            include_str!("../../../scripts/setup-protection.ps1")
+            "{}\n$dir = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Latch\\Setup'; Assert-ProtectedTree $dir; $log = Join-Path $dir 'setup.log'; if ((Test-Path -LiteralPath $log) -and (Test-Protected $log)) {{ Remove-Item -LiteralPath $log -Force }}; Write-Output $dir",
+            protection_ps()
         ))?;
         let protected = PathBuf::from(checked.trim()).canonicalize()?;
         anyhow::ensure!(
@@ -531,9 +780,18 @@ pub fn run_as_admin(program: Option<&Path>) -> Result<()> {
             "{} is not an installed latch-host.exe",
             program.display()
         );
+        let user_sid = for_user.context(
+            "setup was not told which user it is for; start it again from Latch's window",
+        )?;
+        approvable(
+            user_sid,
+            program,
+            &latch_engine::windows::users_running(program),
+        )?;
         let wake = crate::wake::probe();
         let plan = Plan {
-            elevated_input: crate::config::HostConfig::load().elevated_input,
+            elevated_input: elevated_input
+                .unwrap_or_else(|| crate::config::HostConfig::load_read_only().elevated_input),
             exe: program,
             adapter: &wake.adapter,
             adapter_description: &wake.description,
@@ -547,7 +805,7 @@ pub fn run_as_admin(program: Option<&Path>) -> Result<()> {
         // still never opens a file that is already there.
         use std::io::Write;
         let mut bytes = b"\xEF\xBB\xBF".to_vec();
-        bytes.extend(script(&plan).as_bytes());
+        bytes.extend(script(&plan, user_sid).as_bytes());
         let mut tmp = None;
         for _ in 0..5 {
             let candidate = dir.join(format!(
@@ -573,10 +831,8 @@ pub fn run_as_admin(program: Option<&Path>) -> Result<()> {
         let log = dir.join("setup.log");
         let out = std::fs::File::create(&log)?;
         let err = out.try_clone()?;
-        let status = std::process::Command::new(powershell_exe())
+        let status = powershell_command()
             .args([
-                "-NoProfile",
-                "-NonInteractive",
                 "-ExecutionPolicy",
                 "Bypass",
                 "-File",
@@ -584,7 +840,6 @@ pub fn run_as_admin(program: Option<&Path>) -> Result<()> {
             ])
             .stdout(out)
             .stderr(err)
-            .creation_flags(0x0800_0000)
             .status();
         let _ = std::fs::remove_file(&tmp);
         let status = status.context("run setup script")?;
@@ -593,9 +848,27 @@ pub fn run_as_admin(program: Option<&Path>) -> Result<()> {
     }
     #[cfg(not(windows))]
     {
-        let _ = program;
+        let _ = (program, for_user, elevated_input);
         anyhow::bail!("setup runs on Windows only")
     }
+}
+
+/// Whether the elevated step may approve `sid`, as the unelevated window
+/// passed it across the prompt: a person's account (never SYSTEM, a
+/// service or a group) that runs `program`, the Latch that asked, right
+/// now (`running`: the users running it).
+#[cfg(windows)]
+fn approvable(sid: &str, program: &Path, running: &[String]) -> Result<()> {
+    anyhow::ensure!(
+        latch_engine::windows::is_user_sid(sid),
+        "setup was asked for {sid:?}, which is not a user's account"
+    );
+    anyhow::ensure!(
+        running.iter().any(|u| u == sid),
+        "setup was asked for {sid}, who is not running {}",
+        program.display()
+    );
+    Ok(())
 }
 
 /// Whether two canonical paths name the same folder: Windows compares
@@ -629,11 +902,9 @@ fn plausible_program(path: &str) -> bool {
 pub fn uninstall() -> Result<Vec<String>> {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        let user = std::process::Command::new(powershell_exe())
-            .args(["-NoProfile", "-NonInteractive", "-EncodedCommand"])
+        let user = powershell_command()
+            .arg("-EncodedCommand")
             .arg(encoded_command(&uninstall_user_ps(std::process::id())))
-            .creation_flags(0x0800_0000)
             .output()
             .context("run the uninstall script")?;
         let mut done: Vec<String> = String::from_utf8_lossy(&user.stdout)
@@ -642,14 +913,8 @@ pub fn uninstall() -> Result<Vec<String>> {
             .filter(|l| !l.is_empty())
             .map(String::from)
             .collect();
-        let status = std::process::Command::new(powershell_exe())
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &launch_script(&uninstall_machine_ps()),
-            ])
-            .creation_flags(0x0800_0000)
+        let status = powershell_command()
+            .args(["-Command", &launch_script(&uninstall_machine_ps())])
             .status()
             .context("launch the administrator step")?;
         match status.code() {
@@ -787,6 +1052,7 @@ Stop-ScheduledTask -TaskName '{input_task}' -ErrorAction SilentlyContinue
 if (Get-ScheduledTask -TaskName '{input_task}' -ErrorAction SilentlyContinue) {{
     Unregister-ScheduledTask -TaskName '{input_task}' -Confirm:$false -ErrorAction SilentlyContinue
 }}
+{sas}
 $latchSaved = '{key}'
 Step "Removing the ViGEmBus gamepad driver if Latch's setup installed it"
 if ((Get-ItemProperty -LiteralPath $latchSaved -Name '{mark}' -ErrorAction SilentlyContinue).'{mark}' -eq '1') {{
@@ -843,11 +1109,12 @@ if ($setupFailed) {{ Step "Some steps failed. See the lines above."; exit 1 }}
 Step "Latch uninstall finished"
 exit 0
 "#,
-        protection = include_str!("../../../scripts/setup-protection.ps1"),
+        protection = protection_checks_ps(),
         retire = crate::legacy::retire_windows_ps(),
         vdd = crate::virtual_display::uninstall_ps(),
         task = START_TASK,
         input_task = INPUT_TASK,
+        sas = sas_policy_removal_ps(),
         key = SAVED_KEY,
         mark = VIGEM_MARK,
         entry = VIGEM_ENTRY,
@@ -939,17 +1206,26 @@ pub fn run_value(exe: &Path) -> String {
 }
 
 #[cfg(test)]
+const SPECIAL_PATH: &str = r"C:\Users\’ ‘ ‚ ‛ ' $ ` lab\Latch\latch-host.exe";
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The user who asked for setup, unelevated.
+    const TEST_SID: &str = "S-1-5-21-1-2-3-1001";
+
     #[test]
     fn setup_opens_both_control_transports_and_keeps_wake_and_display_steps() {
-        let s = script(&Plan {
-            elevated_input: true,
-            exe: Path::new("C:\\Users\\O'Brien\\Latch\\latch-host.exe"),
-            adapter: "Ethernet",
-            adapter_description: "Realtek",
-        });
+        let s = script(
+            &Plan {
+                elevated_input: true,
+                exe: Path::new("C:\\Users\\O'Brien\\Latch\\latch-host.exe"),
+                adapter: "Ethernet",
+                adapter_description: "Realtek",
+            },
+            TEST_SID,
+        );
         // Tailscale's IPv4 range and its IPv6 one (IN-10).
         assert!(
             s.contains("protocol=TCP localport=47850 remoteip=100.64.0.0/10,fd7a:115c:a1e0::/48")
@@ -957,7 +1233,7 @@ mod tests {
         assert!(
             s.contains("protocol=UDP localport=47850 remoteip=100.64.0.0/10,fd7a:115c:a1e0::/48")
         );
-        assert!(s.contains("O''Brien"));
+        assert!(s.contains(&ps_data(r"C:\Users\O'Brien\Latch\latch-host.exe")));
         assert!(s.contains("HiberbootEnabled"));
         assert!(s.contains("*WakeOnMagicPacket"));
         assert!(s.contains("vdd_settings.xml"));
@@ -972,12 +1248,15 @@ mod tests {
     /// installed; uninstall removes only that.
     #[test]
     fn setup_installs_the_pinned_gamepad_driver_and_uninstall_only_removes_its_own() {
-        let s = script(&Plan {
-            elevated_input: true,
-            exe: Path::new(r"C:\Latch\latch-host.exe"),
-            adapter: "",
-            adapter_description: "",
-        });
+        let s = script(
+            &Plan {
+                elevated_input: true,
+                exe: Path::new(r"C:\Latch\latch-host.exe"),
+                adapter: "",
+                adapter_description: "",
+            },
+            TEST_SID,
+        );
         let step = s
             .split("Step \"Installing the ViGEmBus gamepad driver")
             .nth(1)
@@ -1017,12 +1296,15 @@ mod tests {
     /// `--uninstall` can put them back (IN-11).
     #[test]
     fn setup_records_the_power_settings_before_changing_them() {
-        let s = script(&Plan {
-            elevated_input: true,
-            exe: Path::new("C:\\Latch\\latch-host.exe"),
-            adapter: "",
-            adapter_description: "",
-        });
+        let s = script(
+            &Plan {
+                elevated_input: true,
+                exe: Path::new("C:\\Latch\\latch-host.exe"),
+                adapter: "",
+                adapter_description: "",
+            },
+            TEST_SID,
+        );
         let record = s
             .find(r"$latchSaved = 'HKLM:\SOFTWARE\Latch\Setup'")
             .unwrap();
@@ -1069,12 +1351,15 @@ mod tests {
             assert!(at < m.find("Remove-Item -LiteralPath $latchSaved").unwrap());
         }
         // Setup records the very names uninstall reads back.
-        let setup = script(&Plan {
-            elevated_input: true,
-            exe: Path::new("C:\\Latch\\latch-host.exe"),
-            adapter: "",
-            adapter_description: "",
-        });
+        let setup = script(
+            &Plan {
+                elevated_input: true,
+                exe: Path::new("C:\\Latch\\latch-host.exe"),
+                adapter: "",
+                adapter_description: "",
+            },
+            TEST_SID,
+        );
         for (name, setting) in [
             ("StandbyTimeoutAC", "STANDBYIDLE"),
             ("HibernateTimeoutAC", "HIBERNATEIDLE"),
@@ -1110,42 +1395,135 @@ mod tests {
     /// that runs it elevated; uninstall takes both away again.
     #[test]
     fn setup_installs_the_elevated_input_helper_and_uninstall_removes_it() {
-        let setup = script(&Plan {
-            elevated_input: true,
-            exe: Path::new(r"C:\Latch\latch-host.exe"),
-            adapter: "",
-            adapter_description: "",
-        });
-        let step = input_helper_ps(true, Path::new(r"C:\Latch\latch-host.exe"));
+        let setup = script(
+            &Plan {
+                elevated_input: true,
+                exe: Path::new(r"C:\Latch\latch-host.exe"),
+                adapter: "",
+                adapter_description: "",
+            },
+            TEST_SID,
+        );
+        let step = input_helper_ps(true, TEST_SID);
         assert!(setup.contains(&step));
         assert!(step.contains(r"'Latch\Setup\latch-host.exe'"));
         assert!(step.contains(r"'Latch\Input'"));
         let copy = step.find("Copy-Item -LiteralPath $inputSource").unwrap();
-        for check in [
+        let at = |needle: &str| step.find(needle).unwrap_or_else(|| panic!("no {needle}"));
+        // The old task is disabled before it is stopped, so a reconnect
+        // cannot start the old helper again while its file is replaced, and
+        // the files are replaced only once no helper runs (bounded).
+        let in_order = [
             "Assert-ProtectedTree $inputSource",
-            "Assert-ProtectedTree $inputDir",
-            "Assert-Protected $inputExe",
+            "Disable-ScheduledTask -TaskName 'LatchInput' -ErrorAction Stop",
             "Stop-ScheduledTask -TaskName 'LatchInput'",
-        ] {
-            assert!(step.find(check).unwrap() < copy, "{check} before the copy");
+            "$inputStopBy = (Get-Date).AddSeconds(10)",
+            "throw \"the running input helper did not stop\"",
+            "$running | Stop-Process -Force",
+            "$inputReplaced = $true",
+            // Made again when anything in it is not administrators'.
+            "Reset-ProtectedFolder $inputDir",
+            "Copy-Item -LiteralPath $inputSource",
+        ];
+        for pair in in_order.windows(2) {
+            assert!(at(pair[0]) < at(pair[1]), "{} before {}", pair[0], pair[1]);
         }
+        assert!(!step.contains("Start-Sleep -Milliseconds 500"));
+        // The new task is registered disabled and enabled only once its
+        // file, records and permissions are in place.
+        assert!(step.contains("New-ScheduledTaskSettingsSet -Disable "));
+        let enable = at("Enable-ScheduledTask -TaskName 'LatchInput' -ErrorAction Stop");
+        assert!(at(".SetSecurityDescriptor(") < enable);
+        assert!(enable < at("$inputReady = $true"));
+        // A failure before the files were touched re-enables the old task
+        // if it was enabled; after, the helper stays off and says so.
+        let failed = step.split("} catch {").last().unwrap();
+        let restore = failed
+            .find("if ($inputOldEnabled) { Enable-ScheduledTask -TaskName 'LatchInput'")
+            .expect("re-enables the untouched old task");
+        assert!(failed.find("if (-not $inputReplaced)").unwrap() < restore);
+        assert!(failed.contains("elseif (-not $inputReady)"));
+        assert!(failed.contains("stays off until setup runs again"));
+        // What setup wrote is checked, repaired if the owner is not trusted,
+        // and the whole folder checked again before the task is registered.
+        let register = step.find("Register-ScheduledTask").unwrap();
+        let repair = step
+            .find("foreach ($written in $inputExe, $hostRecord, $userRecord) { if (Test-Protected $written) { Repair-Protected $written } }")
+            .expect("repairs what it wrote");
+        let verify = step
+            .find("if (-not (Test-ProtectedContents $inputDir)) { throw")
+            .expect("checks the folder again");
+        assert!(copy < repair && repair < verify && verify < register);
         assert!(step.contains("-Argument '--input-helper'"));
-        assert!(step.contains("-RunLevel Highest"));
-        assert!(step.contains("-LogonType Interactive"));
+        // LocalSystem, by SID so no translated account name can miss.
+        assert!(step.contains(
+            "New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest"
+        ));
+        assert!(!step.contains("-LogonType Interactive"));
         assert!(step.contains("-MultipleInstances IgnoreNew"));
         assert!(step.contains("Register-ScheduledTask -TaskName 'LatchInput'"));
+        // The approved user is the one who asked for setup, recorded beside
+        // the helper, and checked to be a real account before anything.
+        assert!(step.contains(&format!("$approvedSid = {}", ps_data(TEST_SID))));
+        let translate = step
+            .find("([Security.Principal.SecurityIdentifier]$approvedSid).Translate([Security.Principal.NTAccount])")
+            .expect("the SID names an account");
+        assert!(translate < copy);
+        assert!(step.contains("Set-Content -LiteralPath $userRecord -Value $approvedSid"));
+        assert!(step.contains("'user-sid.txt'"));
+        assert!(
+            !step.contains("$identity"),
+            "never the elevated administrator"
+        );
+        // Only that user may start the SYSTEM task, besides SYSTEM and
+        // administrators; nobody else may change it.
+        let secure = step
+            .find(".GetTask('LatchInput').SetSecurityDescriptor(\"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;$approvedSid)\", 0)")
+            .expect("task security");
+        assert!(register < secure);
+        for broad in [";AU)", ";WD)", ";IU)", ";BU)"] {
+            assert!(!step.contains(broad), "{broad}");
+        }
         assert!(step.contains("$setupFailed = $true"));
         assert!(
             !step.contains("LOCALAPPDATA"),
             "nothing elevated from the user's folder"
         );
+        // Ctrl+Alt+Delete: the policy is set only when unset, the mark is
+        // written first, and taken back when the write fails.
+        let unset = step
+            .find("if ($null -eq (Get-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System' -Name SoftwareSASGeneration")
+            .expect("checks the policy first");
+        let mark = step
+            .find(
+                r"New-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Latch\Input' -Name SasPolicyAdded",
+            )
+            .unwrap();
+        let write = step
+            .find("-Name SoftwareSASGeneration -Value 1 -PropertyType DWord")
+            .unwrap();
+        assert!(unset < mark && mark < write, "intent first");
+        let rollback = step
+            .find(r"Remove-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Latch\Input' -Name SasPolicyAdded")
+            .expect("rolls the mark back");
+        assert!(write < rollback);
 
-        let disabled = input_helper_ps(false, Path::new(r"C:\Latch\latch-host.exe"));
+        let disabled = input_helper_ps(false, TEST_SID);
         assert!(disabled.contains("Stop-ScheduledTask"));
         assert!(disabled.contains("Unregister-ScheduledTask"));
         assert!(!disabled.contains("-RunLevel Highest"));
+        // Turning it off stops the agents, which run apart from the task,
+        // and removes the copy.
+        let stop = disabled
+            .find("Where-Object { $_.Path -ieq $inputExe } | Stop-Process -Force")
+            .expect("stops the agents");
+        assert!(stop < disabled.find("Remove-Tree $inputDir").unwrap());
+        // Takes the policy back only when setup set it.
+        let mark = disabled.find("SasPolicyAdded -eq '1'").unwrap();
+        assert!(mark < disabled.find("Remove-ItemProperty").unwrap());
         assert!(step.contains("host-path.txt"));
         let m = uninstall_machine_ps();
+        assert!(m.contains(&sas_policy_removal_ps()));
         assert!(m.contains("Unregister-ScheduledTask -TaskName 'LatchInput'"));
         assert!(m.contains("$inputDir = Join-Path $latchDir 'Input'"));
         assert!(
@@ -1154,12 +1532,138 @@ mod tests {
         );
     }
 
+    /// Cleanup removes SoftwareSASGeneration only while it is exactly the
+    /// DWORD 1 setup wrote; an administrator's later value stays.
+    #[test]
+    fn sas_cleanup_removes_only_the_value_setup_wrote() {
+        let removal = sas_policy_removal_ps();
+        let marked = removal.find("SasPolicyAdded -eq '1'").unwrap();
+        let exact = removal
+            .find("GetValueKind('SoftwareSASGeneration') -eq [Microsoft.Win32.RegistryValueKind]::DWord -and $sasKey.GetValue('SoftwareSASGeneration') -eq 1")
+            .expect("checks the value is still setup's");
+        let remove = removal
+            .find("Remove-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System' -Name SoftwareSASGeneration")
+            .unwrap();
+        assert!(marked < exact && exact < remove);
+        // The mark goes either way, so a later setup starts afresh.
+        let unmark = removal
+            .find(r"Remove-Item -LiteralPath 'HKLM:\SOFTWARE\Latch\Input'")
+            .unwrap();
+        assert!(remove < unmark);
+        assert_eq!(
+            removal[..unmark].matches("Remove-ItemProperty").count(),
+            1,
+            "{removal}"
+        );
+    }
+
+    /// The SID crosses the prompt on a command line: the elevated step
+    /// takes only a person's account that runs the Latch that asked.
+    #[cfg(windows)]
+    #[test]
+    fn the_elevated_step_approves_only_the_user_running_the_asking_latch() {
+        let program = Path::new(r"C:\Users\Ada\AppData\Local\Latch\latch-host.exe");
+        let running = vec![TEST_SID.to_string()];
+        assert!(approvable(TEST_SID, program, &running).is_ok());
+        // Another account, even a real one, that does not run it.
+        assert!(approvable("S-1-5-21-1-2-3-1002", program, &running).is_err());
+        // Not an account at all, even when "running".
+        for sid in [
+            "S-1-5-18",
+            "S-1-5-32-544",
+            "S-1-5-21-1-2-3-1001)(A;;GA;;;WD",
+        ] {
+            assert!(
+                approvable(sid, program, &[sid.to_string()]).is_err(),
+                "{sid}"
+            );
+        }
+        // This test process: its own user runs it.
+        let me = latch_engine::windows::current_user_sid().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        assert!(latch_engine::windows::users_running(&exe).contains(&me));
+    }
+
     #[cfg(windows)]
     #[test]
     fn the_engine_starts_the_task_setup_registers() {
         assert_eq!(INPUT_TASK, latch_engine::windows::INPUT_TASK);
         let exe = latch_engine::windows::input_helper_exe().unwrap();
         assert!(exe.ends_with(r"Latch\Input\latch-host.exe"));
+    }
+
+    /// Every PowerShell and schtasks setup starts is Windows' own, by full
+    /// path, without profiles, finding modules and programs only in the
+    /// system folder and starting there: nothing the user can write is
+    /// loaded into a process that may be elevated.
+    #[test]
+    fn setup_starts_windows_tools_in_a_trusted_environment() {
+        let system = system_dir();
+        for (command, program) in [
+            (powershell_command(), powershell_exe()),
+            (schtasks_command(), system.join("schtasks.exe")),
+        ] {
+            assert_eq!(Path::new(command.get_program()), program);
+            assert!(program.starts_with(&system));
+            assert_eq!(command.get_current_dir(), Some(system.as_path()));
+            let envs: std::collections::HashMap<_, _> = command
+                .get_envs()
+                .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(PathBuf::from)))
+                .collect();
+            assert_eq!(envs.get("PATH"), Some(&Some(system.clone())));
+            assert_eq!(
+                envs.get("PSModulePath"),
+                Some(&Some(system.join(r"WindowsPowerShell\v1.0\Modules")))
+            );
+        }
+        let args: Vec<_> = powershell_command()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["-NoProfile", "-NonInteractive"]);
+        // No other way to start them is left in setup.
+        let source = include_str!("setup.rs");
+        let spawn = ["std::process::Command::new(", "powershell_exe())"].concat();
+        assert!(!source.contains(&spawn));
+        assert_eq!(
+            source
+                .matches(&["Command::new(", "program)"].concat())
+                .count(),
+            1
+        );
+    }
+
+    /// What PowerShell itself reports in that environment: no user module
+    /// folder, and the system folder as its location.
+    #[cfg(windows)]
+    #[test]
+    fn trusted_powershell_sees_only_system_modules() {
+        let out = powershell(
+            "Write-Output $env:PSModulePath; Write-Output $env:PATH; Write-Output (Get-Location).Path",
+        )
+        .unwrap();
+        let lines: Vec<_> = out.lines().map(str::trim).collect();
+        let system = system_dir().display().to_string();
+        let modules = system_dir()
+            .join(r"WindowsPowerShell\v1.0\Modules")
+            .display()
+            .to_string();
+        let documents = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users".into());
+        assert!(
+            lines[0].split(';').all(|dir| !dir
+                .to_ascii_lowercase()
+                .starts_with(&documents.to_ascii_lowercase())),
+            "{out}"
+        );
+        assert!(
+            lines[0]
+                .split(';')
+                .any(|dir| dir.eq_ignore_ascii_case(&modules)),
+            "{out}"
+        );
+        assert!(lines[1].eq_ignore_ascii_case(&system), "{out}");
+        assert!(lines[2].eq_ignore_ascii_case(&system), "{out}");
+        assert!(!task_registered("LatchNoSuchTask-7f3a"));
     }
 
     #[test]
@@ -1185,7 +1689,7 @@ mod tests {
     #[test]
     fn elevated_commands_fit_the_windows_command_line() {
         for script in [
-            stage_script(r"C:\Latch\latch-host.exe", &"ab".repeat(32)),
+            stage_script(r"C:\Latch\latch-host.exe", &"ab".repeat(32), TEST_SID, true),
             uninstall_machine_ps(),
         ] {
             assert!(launch_script(&script).encode_utf16().count() < 32000);
@@ -1216,16 +1720,12 @@ mod tests {
     /// the caller names is written to (IN-01, IN-02).
     #[test]
     fn the_elevated_step_runs_a_checked_copy_from_program_files() {
-        let program = r"C:\Users\O'Brien $x\AppData\Local\Latch\latch-host.exe";
-        let stage = stage_script(program, &"ab".repeat(32));
-        assert!(
-            stage.contains(r"$program = 'C:\Users\O''Brien $x\AppData\Local\Latch\latch-host.exe'"),
-            "{stage}"
-        );
+        let program = SPECIAL_PATH;
+        let stage = stage_script(program, &"ab".repeat(32), TEST_SID, true);
+        assert!(stage.contains(&format!("$program = {}", ps_data(program))));
+        assert!(!stage.contains(program));
         assert!(stage.contains(r"[Environment]::GetFolderPath('ProgramFiles')) 'Latch\Setup'"));
-        let copy = stage
-            .find("Copy-Item -LiteralPath $program -Destination $copy")
-            .unwrap();
+        let copy = stage.find("[IO.File]::Copy($program, $copy)").unwrap();
         let check = stage
             .find("Get-FileHash -LiteralPath $copy -Algorithm SHA256")
             .unwrap();
@@ -1234,18 +1734,18 @@ mod tests {
             copy < check && check < run,
             "copy, then check, then run the copy"
         );
-        assert!(stage.contains(&format!("-ne '{}'", "ab".repeat(32))));
-        assert!(stage.contains("'--setup-elevated --program \"' + $program + '\"'"));
+        assert!(stage.contains(&format!("$sha256 = {}", ps_data(&"ab".repeat(32)))));
+        assert!(stage.contains(".Hash -ne $sha256"));
+        assert!(stage.contains("'--setup-elevated --program \"' + $program + '\" --for-user "));
         assert!(!stage.contains("--local-app-data"));
         assert!(!stage.contains("ProcessStartInfo $program"));
 
         let launch = launch_script(&stage);
-        assert!(
-            launch.contains(
-                r"-FilePath 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -Verb RunAs"
-            ) || std::env::var_os("SystemRoot").is_some(),
-            "{launch}"
-        );
+        assert!(launch.contains(&format!(
+            "$ps = {}",
+            ps_data(&powershell_exe().display().to_string())
+        )));
+        assert!(launch.contains("-FilePath $ps -Verb RunAs"));
         assert!(
             !launch.contains("latch-host.exe"),
             "the user's file is never elevated: {launch}"
@@ -1260,25 +1760,93 @@ mod tests {
             2,
             "elevated or prompted, the same script"
         );
-        let secured = format!("$env:PATH = [Environment]::SystemDirectory; Set-Location -LiteralPath ([Environment]::SystemDirectory);\n{stage}");
-        let utf16 = secured
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>();
-        assert_eq!(encoded, base64(&utf16));
-        assert_eq!(encoded, encoded_command(&secured));
+        assert_eq!(encoded, encoded_command(&stage));
+        assert!(stage.contains("$env:PATH = [Environment]::SystemDirectory"));
+        assert!(stage.contains("Set-Location -LiteralPath ([Environment]::SystemDirectory)"));
         assert!(launch.contains("catch { exit 1223 }"));
     }
 
     #[test]
     fn setup_checks_permissions_and_links_before_writing() {
-        let s = stage_script(r"C:\Latch\latch-host.exe", &"ab".repeat(32));
-        assert!(s.contains("Assert-Protected $dir"));
-        assert!(s.contains("Assert-Protected $copy"));
+        let s = stage_script(r"C:\Latch\latch-host.exe", &"ab".repeat(32), TEST_SID, true);
+        assert!(s.contains(
+            "Reset-ProtectedFolder $dir ([Environment]::GetFolderPath('ProgramFiles')) $pins"
+        ));
+        assert!(s.contains("if (Test-Protected $copy) { Repair-Protected $copy }"));
         assert!(s.contains("ReparsePoint"));
         assert!(s.contains("GetOwner([Security.Principal.SecurityIdentifier])"));
-        assert!(s.find("Assert-Protected $copy").unwrap() < s.find("Copy-Item").unwrap());
+        assert!(s.find("Reset-ProtectedFolder $dir").unwrap() < s.find("[IO.File]::Copy").unwrap());
         assert!(s.contains("$start.WorkingDirectory = $dir"));
+        assert!(s.find("$p.WaitForExit()").unwrap() < s.rfind("$handle.Dispose()").unwrap());
+        // The asking user and their setting go to the elevated step.
+        assert!(s.contains(&format!("$userSid = {}", ps_data(TEST_SID))));
+        assert!(s.contains(&format!("$elevatedInput = {}", ps_data("true"))));
+        assert!(s.contains(" + $userSid + ' --elevated-input ' + $elevatedInput"));
+    }
+
+    #[test]
+    fn embedded_protection_keeps_every_function_and_drops_comments() {
+        let embedded = protection_ps();
+        for function in [
+            "function Test-Protected",
+            "function Assert-Protected",
+            "function Assert-ProtectedTree",
+            "function Repair-Protected",
+            "function Move-UntrustedTree",
+            "function Use-ProtectedFolder",
+            "function Test-ProtectedContents",
+            "function Remove-Tree",
+            "function Reset-ProtectedFolder",
+        ] {
+            assert!(embedded.contains(function), "{function}");
+        }
+        assert!(embedded.lines().all(|l| !l.trim_start().starts_with('#')));
+        assert!(embedded.contains("throw 'Setup requires an administrator'"));
+        // Uninstall only checks, and needs no more.
+        let checks = protection_checks_ps();
+        assert!(checks.contains("function Assert-ProtectedTree"));
+        assert!(!checks.contains("function Repair-Protected"));
+        assert!(!checks.contains("Reset-ProtectedFolder"));
+        assert!(uninstall_machine_ps().contains(&checks));
+        for function in ["Repair-Protected", "Reset-ProtectedFolder", "Remove-Tree"] {
+            assert!(!uninstall_machine_ps().contains(function), "{function}");
+        }
+    }
+
+    /// Only SYSTEM, Administrators and TrustedInstaller may own or change
+    /// what setup runs: never the account running setup, whose SID is
+    /// also that of its unelevated processes.
+    #[test]
+    fn only_system_administrators_and_trustedinstaller_are_trusted() {
+        let protection = include_str!("../../../scripts/setup-protection.ps1");
+        let trusted = protection
+            .split("$trusted = @(")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .unwrap();
+        assert_eq!(trusted.matches("'S-1-").count(), 3, "{trusted}");
+        for sid in [
+            "'S-1-5-18'",
+            "'S-1-5-32-544'",
+            "'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'",
+        ] {
+            assert!(trusted.contains(sid), "{sid}");
+        }
+        assert!(!trusted.contains("$identity"));
+        // Generic all and generic write count as write access.
+        assert!(protection.contains("0x10000000 -bor 0x40000000"));
+        // Repair makes Administrators the owner and resets to what the
+        // checked parent passes on, then checks again; never a link.
+        let repair = protection
+            .split("function Repair-Protected")
+            .nth(1)
+            .unwrap();
+        let repair = repair.split("\nfunction ").next().unwrap();
+        let link = repair.find("ReparsePoint").unwrap();
+        let own = repair.find("takeown.exe') /A /F $path").unwrap();
+        let reset = repair.find("icacls.exe') $path /reset").unwrap();
+        let check = repair.find("Assert-Protected $path").unwrap();
+        assert!(link < own && own < reset && reset < check);
     }
 
     #[test]
@@ -1286,6 +1854,32 @@ mod tests {
         let installer = include_str!("../../../scripts/install-host.ps1");
         assert!(installer.contains("} finally {"));
         assert!(installer.contains("Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false"));
+    }
+
+    /// The SYSTEM helper's broker and agents are also latch-host.exe; the
+    /// unelevated installer stops only this user's copy at its own path.
+    #[test]
+    fn the_installer_stops_only_its_own_host() {
+        let installer = include_str!("../../../scripts/install-host.ps1");
+        assert!(!installer.contains("Get-Process latch-host"));
+        assert!(!installer.contains("Stop-Process -InputObject"));
+        // Checked and ended through one handle, from either PowerShell.
+        let stop = installer.split("public static bool Stop(").nth(1).unwrap();
+        let at = |needle: &str| stop.find(needle).unwrap_or_else(|| panic!("no {needle}"));
+        let open = at("OpenProcess(Terminate | QueryLimited | Synchronize, false, pid)");
+        for check in [
+            "QueryFullProcessImageNameW(process,",
+            "GetProcessTimes(process,",
+            "Owner(process) != sid",
+        ] {
+            assert!(
+                open < at(check) && at(check) < at("TerminateProcess(process, 1)"),
+                "{check}"
+            );
+        }
+        assert!(installer.contains(
+            "[LatchInstallStop]::Stop([uint32]$candidate.ProcessId, $DestExe, $Me, $candidate.CreationDate.ToFileTimeUtc())"
+        ));
     }
 
     #[test]
@@ -1336,16 +1930,21 @@ mod tests {
 
     #[test]
     fn setup_lifts_windows_block_rules_for_this_executable_only() {
-        let s = script(&Plan {
-            elevated_input: true,
-            exe: Path::new("C:\\Users\\O'Brien\\latch-host.exe"),
-            adapter: "",
-            adapter_description: "",
-        });
-        assert!(
-            s.contains("$latchExe = 'C:\\Users\\O''Brien\\latch-host.exe'"),
-            "{s}"
+        let s = script(
+            &Plan {
+                elevated_input: true,
+                exe: Path::new(SPECIAL_PATH),
+                adapter: SPECIAL_PATH,
+                adapter_description: SPECIAL_PATH,
+            },
+            TEST_SID,
         );
+        for variable in ["$latchExe", "$wakeAdapter", "$wakeDevice"] {
+            assert!(s.contains(&format!("{variable} = {}", ps_data(SPECIAL_PATH))));
+        }
+        assert!(!s.contains(SPECIAL_PATH));
+        assert!(s.contains(r#""program=$latchExe""#));
+        assert!(s.contains("-LiteralPath $hostRecord -Value $latchExe"));
         assert!(s.contains("$_.Program -ieq $latchExe"));
         assert!(s.contains("$_.Action -eq 'Block' -and $_.Direction -eq 'Inbound'"));
         let lift = s.find("Remove-NetFirewallRule").unwrap();
@@ -1367,12 +1966,15 @@ mod tests {
         let description = std::env::var("LATCH_DUMP_ADAPTER_DESC").unwrap_or_default();
         std::fs::write(
             out,
-            script(&Plan {
-                elevated_input: true,
-                exe: Path::new(&exe),
-                adapter: &adapter,
-                adapter_description: &description,
-            }),
+            script(
+                &Plan {
+                    elevated_input: true,
+                    exe: Path::new(&exe),
+                    adapter: &adapter,
+                    adapter_description: &description,
+                },
+                TEST_SID,
+            ),
         )
         .unwrap();
         // Both parts of --uninstall, which CI also runs.
@@ -1382,7 +1984,7 @@ mod tests {
         }
         // The elevated staging step and the one-line launcher around it.
         if let Ok(out) = std::env::var("LATCH_DUMP_STAGE_SCRIPT") {
-            let stage = stage_script(&exe, &"0".repeat(64));
+            let stage = stage_script(&exe, &"0".repeat(64), TEST_SID, true);
             std::fs::write(format!("{out}.launch.ps1"), launch_script(&stage)).unwrap();
             std::fs::write(out, stage).unwrap();
         }

@@ -4,7 +4,7 @@
 # `latch` and `latch-bin` on the AUR are an unrelated program.
 
 pkgname=latch-remote-bin
-pkgver=6.1.0
+pkgver=6.1.1
 pkgrel=1
 pkgdesc='Low-latency desktop and game streaming between your own computers over Tailscale (release binary)'
 arch=('x86_64' 'aarch64')
@@ -41,8 +41,8 @@ source_x86_64=("latch-host-linux-x64-${pkgver}.tar.gz::${_releases}/latch-host-l
 source_aarch64=("latch-host-linux-arm64-${pkgver}.tar.gz::${_releases}/latch-host-linux-arm64.tar.gz")
 sha256sums=('559cc1eb2f06a108172398e1fbf47b076c2226ff7950157e0fe739d114a98c4f'
             '67aaa4ce442653e4b39eac30974a894ea561854f9b665d1aedb12218d12a2aa0')
-sha256sums_x86_64=('de81e369480811f940a632278807ee134fea35942b2b9bfb66d66243c95bec84')
-sha256sums_aarch64=('d0555465150258adc1688acf3a78e59cde772f2f211d5660031c2ee2bcac0dbc')
+sha256sums_x86_64=('0c76e7d353a06de750f5f41207b4b9a09e17212b6520adfb224bcd5f42816f37')
+sha256sums_aarch64=('6288a5df216df1ae8755db4df6a85962b856ef8e76721576982c609bbeb2daad')
 
 package() {
   local dir

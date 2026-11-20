@@ -4,12 +4,15 @@ mod amf;
 mod audio;
 mod capture;
 mod cursor;
+mod desktop;
 mod display;
 mod elevated;
 mod encode;
+mod frames;
 mod input;
 mod mf;
 mod mf_ltr;
+mod pipe;
 mod runtime;
 mod vigem;
 
@@ -370,21 +373,23 @@ impl MfPipeline {
             {
                 let device = self.capture.gpu.device.as_raw();
                 let size = (self.capture.display.width, self.capture.display.height);
-                // Only a new picture goes ahead; repeats wait their turn.
-                if self.capture.grab(Duration::ZERO)? {
-                    if device != self.capture.gpu.device.as_raw()
-                        || size != (self.capture.display.width, self.capture.display.height)
-                    {
-                        self.moved = true;
-                    } else {
-                        self.pacer.taken(Instant::now());
-                        self.last_capture = self.capture.captured;
-                        let picture = self.converter.convert(&self.capture.frame)?;
-                        let (number, recovery) = encoder.submit(&picture.texture, false)?;
-                        self.last_picture = self.last_picture.max(self.picture_base + number);
-                        self.ahead
-                            .push_back((self.last_capture, false, number, recovery));
-                    }
+                let grabbed = self.capture.grab(Duration::ZERO)?;
+                // A reopen (after unlock, or a deferred resize) can change the
+                // size or device without delivering a picture yet: notice it
+                // either way, or the stream keeps the old size.
+                if device != self.capture.gpu.device.as_raw()
+                    || size != (self.capture.display.width, self.capture.display.height)
+                {
+                    self.moved = true;
+                } else if grabbed {
+                    // Only a new picture goes ahead; repeats wait their turn.
+                    self.pacer.taken(Instant::now());
+                    self.last_capture = self.capture.captured;
+                    let picture = self.converter.convert(&self.capture.frame)?;
+                    let (number, recovery) = encoder.submit(&picture.texture, false)?;
+                    self.last_picture = self.last_picture.max(self.picture_base + number);
+                    self.ahead
+                        .push_back((self.last_capture, false, number, recovery));
                 }
             }
             if Instant::now() >= deadline {
@@ -482,7 +487,7 @@ impl Pipeline {
             Self::Failed(_) => bail!("Windows video pipeline failed to reopen"),
             Self::Mf(p) => {
                 let result = p.next(keyframe, idle).or_else(|error| {
-                    if !matches!(p.encoder, VideoEncoder::Amf(_)) {
+                    if !matches!(p.encoder, VideoEncoder::Amf(_)) || p.capture.desktop_lost() {
                         return Err(error);
                     }
                     tracing::warn!("AMF pipeline failed; reopening Media Foundation: {error:#}");
@@ -494,6 +499,15 @@ impl Pipeline {
                 });
                 match result {
                     Ok(frame) => return Ok(frame),
+                    Err(e) if p.capture.desktop_lost() => {
+                        // Windows took the desktop away (the lock screen or an
+                        // administrator prompt), so no frame reached the
+                        // encoder. Keep its codec, and start over once the
+                        // desktop can be duplicated again.
+                        let info = self.info();
+                        *self = Self::Failed(info);
+                        return Err(e.context("the desktop is unavailable"));
+                    }
                     Err(e) if matches!(p.config.codec, Codec::Hevc | Codec::Av1) => {
                         // Neither Microsoft's encoder nor Latch's software one
                         // makes HEVC, and the viewer decodes nothing else on
@@ -757,7 +771,8 @@ pub fn open_pads(feedback: crate::gamepad::FeedbackFn) -> Result<crate::gamepad:
     Ok(crate::gamepad::Pads::opened(vigem::open()?, feedback))
 }
 pub use elevated::{
-    helper_exe as input_helper_exe, run_helper as run_input_helper, TASK as INPUT_TASK,
+    current_user_sid, helper_exe as input_helper_exe, is_user_sid, run_helper as run_input_helper,
+    users_running, TASK as INPUT_TASK,
 };
 pub fn encodable(display: Option<&str>) -> Vec<Codec> {
     let display = display.map(str::to_owned);

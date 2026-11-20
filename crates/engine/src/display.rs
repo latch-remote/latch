@@ -11,6 +11,8 @@ pub struct Previous {
     pub width: u32,
     pub height: u32,
     pub refresh_hz: u32,
+    #[cfg(windows)]
+    pub(crate) generation: u64,
 }
 
 /// The displays this host can share, each with the id a stream request
@@ -30,7 +32,10 @@ pub fn list() -> anyhow::Result<Vec<HostDisplay>> {
 /// nearest rate it offers. `display` is the one the viewer chose, as
 /// [`list`] names it. `Ok(None)` when this host does not resize (a Mac, a
 /// PC with a real monitor, a chosen display that is not the one it would
-/// resize) or already has that size.
+/// resize) or already has that size. On Windows, a display change denied
+/// by the secure desktop can be deferred. Use the returned `Previous` as a
+/// [`DesktopPreparation`](crate::server::DesktopPreparation) so the stream
+/// starts the retry after capture opens and cancels it at cleanup.
 pub fn prepare(
     width: u32,
     height: u32,
@@ -48,6 +53,9 @@ pub fn prepare(
     }
 }
 
+/// Restore the previous mode and cancel a deferred preparation. Windows
+/// defers the restore if the secure desktop is active and ignores it after
+/// another preparation starts.
 pub fn restore(previous: &Previous) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     return crate::linux::restore_display(previous);
@@ -58,6 +66,12 @@ pub fn restore(previous: &Previous) -> anyhow::Result<()> {
         let _ = previous;
         Ok(())
     }
+}
+
+/// Supersede any Windows restore before running a custom desktop prep command.
+#[cfg(windows)]
+pub fn begin_custom_prepare() {
+    Previous::begin_custom_prepare();
 }
 
 #[cfg(test)]

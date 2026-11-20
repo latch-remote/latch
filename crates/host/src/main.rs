@@ -81,6 +81,15 @@ struct Args {
     /// staging step to the copy it runs from Program Files.
     #[arg(long, value_name = "EXE", requires = "setup_elevated", hide = true)]
     program: Option<std::path::PathBuf>,
+    /// The user who asked for setup, unelevated (their SID), passed by the
+    /// staging step: the administrator who approved the prompt may be
+    /// someone else. Checked before setup uses it.
+    #[arg(long, value_name = "SID", requires = "program", hide = true)]
+    for_user: Option<String>,
+    /// That user's "Control windows that run as administrator" setting,
+    /// which the elevated step cannot read from another account.
+    #[arg(long, value_name = "BOOL", requires = "program", hide = true)]
+    elevated_input: Option<bool>,
 }
 
 /// The log file under the data directory, if this run keeps one. The
@@ -166,7 +175,11 @@ fn main() -> Result<()> {
         return run_setup();
     }
     if args.setup_elevated {
-        return latch_host::setup::run_as_admin(args.program.as_deref());
+        return latch_host::setup::run_as_admin(
+            args.program.as_deref(),
+            args.for_user.as_deref(),
+            args.elevated_input,
+        );
     }
     if args.uninstall {
         let result = latch_host::setup::uninstall();
@@ -190,8 +203,11 @@ fn main() -> Result<()> {
 
 fn run_setup() -> Result<()> {
     let exe = std::env::current_exe()?;
+    // Read only: an administrator may run --setup, and the elevated
+    // process must neither write to the user's folder nor start PowerShell
+    // to migrate it.
     latch_host::setup::run(&latch_host::setup::Plan {
-        elevated_input: latch_host::config::HostConfig::load().elevated_input,
+        elevated_input: latch_host::config::HostConfig::load_read_only().elevated_input,
         exe: &exe,
         adapter: "",
         adapter_description: "",
@@ -323,6 +339,27 @@ mod tests {
         .unwrap();
         assert_eq!(log_file(&staged), None);
         assert!(staged.program.is_some());
+        // The staging step names the user setup is for, and their setting.
+        let staged = Args::try_parse_from([
+            "latch-host",
+            "--setup-elevated",
+            "--program",
+            r"C:\Users\Ada\AppData\Local\Latch\latch-host.exe",
+            "--for-user",
+            "S-1-5-21-1-2-3-1001",
+            "--elevated-input",
+            "true",
+        ])
+        .unwrap();
+        assert_eq!(staged.for_user.as_deref(), Some("S-1-5-21-1-2-3-1001"));
+        assert_eq!(staged.elevated_input, Some(true));
+        assert!(Args::try_parse_from([
+            "latch-host",
+            "--setup-elevated",
+            "--for-user",
+            "S-1-5-21-1-2-3-1001"
+        ])
+        .is_err());
         assert!(Args::try_parse_from(["latch-host", "--program", "x.exe"]).is_err());
         assert!(Args::try_parse_from(["latch-host", "--uninstall", "--background"]).is_err());
         let uninstall = Args::try_parse_from(["latch-host", "--uninstall"]).unwrap();

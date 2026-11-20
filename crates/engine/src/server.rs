@@ -78,10 +78,35 @@ fn audio_packet_samples_with_limit(channels: usize, datagram_size: usize) -> usi
     audio::FRAME / audio::FRAME.div_ceil(fits.max(1))
 }
 
-/// Readies the desktop for a session (for example, sizes it to the
-/// viewer); returns what undoes that when the session ends.
-pub type Prepare =
-    Box<dyn Fn(&StreamRequest) -> anyhow::Result<Option<Box<dyn FnOnce() + Send>>> + Send + Sync>;
+/// Readies the desktop for a session and returns its cleanup handle.
+pub type Prepare = Box<
+    dyn Fn(&StreamRequest) -> anyhow::Result<Option<Box<dyn DesktopPreparation>>> + Send + Sync,
+>;
+
+pub trait DesktopPreparation: Send {
+    /// Runs after capture opens and the stream is accepted.
+    fn start(&mut self, _stopping: Arc<AtomicBool>) {}
+    fn undo(self: Box<Self>);
+}
+
+impl<F: FnOnce() + Send> DesktopPreparation for F {
+    fn undo(self: Box<Self>) {
+        self();
+    }
+}
+
+impl DesktopPreparation for crate::display::Previous {
+    fn start(&mut self, _stopping: Arc<AtomicBool>) {
+        #[cfg(windows)]
+        self.start_deferred(_stopping);
+    }
+
+    fn undo(self: Box<Self>) {
+        if let Err(error) = crate::display::restore(&self) {
+            tracing::warn!("could not restore the desktop: {error:#}");
+        }
+    }
+}
 
 pub struct Options {
     pub relay: Option<latch_relay::ClientConfig>,
@@ -155,6 +180,18 @@ impl Refusal {
         Self {
             status,
             message: message.into(),
+        }
+    }
+
+    fn desktop_unavailable() -> Self {
+        Self::new(503, end::DESKTOP_UNAVAILABLE)
+    }
+
+    fn preparation(error: anyhow::Error) -> Self {
+        if video::DesktopUnavailable::is(&error) {
+            Self::desktop_unavailable()
+        } else {
+            Self::new(500, format!("could not prepare the desktop: {error:#}"))
         }
     }
 
@@ -390,13 +427,12 @@ impl Server {
         req.height = height;
         req.fps = fps;
         req.bitrate_kbps = req.bitrate_kbps.clamp(500, limits.max_kbps);
-        let undo = match &self.options.prepare {
-            Some(prepare) => prepare(&req)
-                .map_err(|e| Refusal::new(500, format!("could not prepare the desktop: {e:#}")))?,
+        let desktop = match &self.options.prepare {
+            Some(prepare) => prepare(&req).map_err(Refusal::preparation)?,
             None => None,
         };
         let mut prepared = Prepared {
-            undo,
+            desktop,
             pipeline: None,
             audio: None,
             audio_problem: String::new(),
@@ -456,13 +492,11 @@ impl Server {
                     prepared.req.height = config.height;
                     prepared.req.fps = config.fps;
                     prepared.req.bitrate_kbps = config.bitrate_kbps;
-                    if let Some(undo) = prepared.undo.take() {
-                        undo();
+                    if let Some(desktop) = prepared.desktop.take() {
+                        desktop.undo();
                     }
-                    prepared.undo = match &self.options.prepare {
-                        Some(prepare) => prepare(&prepared.req).map_err(|e| {
-                            Refusal::new(500, format!("could not prepare the desktop: {e:#}"))
-                        })?,
+                    prepared.desktop = match &self.options.prepare {
+                        Some(prepare) => prepare(&prepared.req).map_err(Refusal::preparation)?,
                         None => None,
                     };
                     prepared.codec = next;
@@ -477,6 +511,10 @@ impl Server {
             } else {
                 500
             };
+            if video::DesktopUnavailable::is(&e) {
+                // Retryable: the viewer keeps trying until the PC is unlocked.
+                return Refusal::desktop_unavailable();
+            }
             Refusal::new(status, format!("could not capture the screen: {e:#}"))
         })?;
         config.color = pipeline.info().color;
@@ -719,6 +757,7 @@ impl Server {
                 })
         });
         let started = Instant::now();
+        let desktop = &mut prepared.desktop;
         let reason = self.control(&session, tcp, accept, prepared.input_problem.take(), {
             let server = self.clone();
             let session = session.clone();
@@ -730,6 +769,11 @@ impl Server {
                         .name("stream-video".into())
                         .spawn(move || send_video(&server, &session, pipeline, config, video::open))
                 };
+                if video.is_ok() {
+                    if let Some(desktop) = desktop.as_mut() {
+                        desktop.start(session.stop.clone());
+                    }
+                }
                 let audio = audio.map(|capture| {
                     let server = server.clone();
                     let session = session.clone();
@@ -754,8 +798,8 @@ impl Server {
         if let Some(Ok(thread)) = pad_feedback {
             let _ = thread.join();
         }
-        if let Some(undo) = prepared.undo.take() {
-            undo();
+        if let Some(desktop) = prepared.desktop.take() {
+            desktop.undo();
         }
         {
             let mut current = self.current.lock();
@@ -1392,7 +1436,7 @@ impl Drop for OpeningGuard {
 /// What [`Server::prepare`] opened, for [`Server::run`]. Dropped unused, it
 /// undoes the desktop preparation.
 pub struct Prepared {
-    undo: Option<Box<dyn FnOnce() + Send>>,
+    desktop: Option<Box<dyn DesktopPreparation>>,
     pipeline: Option<(Box<dyn VideoPipeline>, VideoConfig)>,
     audio: Option<Box<dyn AudioCapture>>,
     audio_problem: String,
@@ -1424,8 +1468,8 @@ impl Drop for Prepared {
         self.audio.take();
         self.input.take();
         self.pads.take();
-        if let Some(undo) = self.undo.take() {
-            undo();
+        if let Some(desktop) = self.desktop.take() {
+            desktop.undo();
         }
         self.opening.take();
     }
@@ -2198,10 +2242,12 @@ fn encode_video(
                     let now = Instant::now();
                     recoveries.retain(|t| now - *t < VIDEO_RECOVERY_WINDOW);
                     if recoveries.len() >= VIDEO_RECOVERIES {
-                        session.end(
-                            end::CAPTURE_FAILED,
-                            &format!("The host could not capture its screen: {failure:#}"),
-                        );
+                        let message = if video::DesktopUnavailable::is(&failure) {
+                            video::DesktopUnavailable.to_string()
+                        } else {
+                            format!("The host could not capture its screen: {failure:#}")
+                        };
+                        session.end(end::CAPTURE_FAILED, &message);
                         return;
                     }
                     recoveries.push_back(now);

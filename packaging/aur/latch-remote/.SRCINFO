@@ -1,6 +1,6 @@
 pkgbase = latch-remote
 	pkgdesc = Low-latency desktop and game streaming between your own computers over Tailscale
-	pkgver = 6.1.0
+	pkgver = 6.1.1
 	pkgrel = 1
 	url = https://github.com/latch-remote/latch
 	arch = x86_64
@@ -24,9 +24,9 @@ pkgbase = latch-remote
 	optdepends = nvidia-utils: NVENC video encoding
 	optdepends = pipewire: Wayland screen sharing
 	optdepends = xdg-desktop-portal: Wayland screen sharing and input
-	source = https://github.com/latch-remote/latch-releases/releases/download/v6.1.0/latch-6.1.0-source.tar.gz
+	source = https://github.com/latch-remote/latch-releases/releases/download/v6.1.1/latch-6.1.1-source.tar.gz
 	source = latch-host.desktop
-	sha256sums = 58ed99388cce6e5c34fe1f08a853255c1b7e76a491f010ce2f4ee86d2c6944a1
+	sha256sums = 388389481f1df9d0a8ac156043a33c6779dc5201dfebe6bce03558cf894f028a
 	sha256sums = 67aaa4ce442653e4b39eac30974a894ea561854f9b665d1aedb12218d12a2aa0
 
 pkgname = latch-remote

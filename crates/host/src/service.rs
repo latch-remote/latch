@@ -628,7 +628,7 @@ impl Service {
             && !latch_engine::windows::input_helper_exe().is_some_and(|exe| exe.is_file())
         {
             setup.push(
-                "Windows that run as administrator ignore a viewer's mouse and keyboard.".into(),
+                "Windows that run as administrator ignore a viewer's mouse and keyboard, and the lock screen and administrator prompts end a stream.".into(),
             );
         }
         Status {

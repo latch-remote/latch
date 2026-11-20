@@ -40,6 +40,9 @@ pub struct Pc {
     pub ip: Option<Ipv4Addr>,
     /// The Latch control service answered during discovery.
     pub online: bool,
+    /// Tailscale lists the machine online: it is awake, whether or not
+    /// Latch answers there.
+    pub tailscale_online: bool,
     /// The Latch control service answered.
     pub host: Option<Status>,
     pub known: Option<KnownPc>,
@@ -515,6 +518,7 @@ fn probe_peer(cfg: &ClientConfig, n: &tailscale::Node) -> Pc {
         os: n.os.clone(),
         ip,
         online: host.is_some(),
+        tailscale_online: n.online,
         host,
         known,
         remembered: false,
@@ -710,6 +714,8 @@ pub struct Target {
     pub name: String,
     pub ip: Ipv4Addr,
     pub online: bool,
+    /// Tailscale lists it online, so it is not asleep.
+    pub tailscale_online: bool,
     pub mac: Option<wake::MacAddr>,
     pub lan_ip: Option<Ipv4Addr>,
     pub public_ip: Option<Ipv4Addr>,
@@ -731,6 +737,7 @@ impl Target {
             name: pc.name.clone(),
             ip: pc.ip?,
             online: pc.host.is_some(),
+            tailscale_online: pc.tailscale_online,
             mac: k
                 .and_then(|k| k.mac.as_deref())
                 .and_then(wake::MacAddr::parse),
@@ -1052,8 +1059,20 @@ fn run(c: &Connect, generation: u64) -> Result<()> {
         c.ctx.request_repaint();
     };
 
-    // 1. Wake it if nothing answers.
-    if !t.online && !port_open(t.ip, CONTROL_PORT, Duration::from_millis(1200)) {
+    // 1. Wake it if nothing answers. A machine Tailscale lists online is
+    // awake: Latch isn't running there, and wake packets won't start it.
+    // One round still goes out in case it fell asleep since Tailscale
+    // last heard from it; then the wait below says what is wrong.
+    let answering = t.online || port_open(t.ip, CONTROL_PORT, Duration::from_millis(1200));
+    if !answering && t.tailscale_online {
+        if let Some(mac) = t.mac {
+            let n = wake::send(mac, t.lan_ip, t.public_ip);
+            tracing::info!(
+                "{} is on Tailscale; sent {n} wake packets for {mac} anyway",
+                t.name
+            );
+        }
+    } else if !answering {
         let mac = t.mac.ok_or_else(|| {
             anyhow!("{} isn't answering, and Latch doesn't know how to wake it yet. Turn it on once while Latch runs there, so this machine can learn how.", t.name)
         })?;

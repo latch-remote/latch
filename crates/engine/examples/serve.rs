@@ -16,7 +16,7 @@
 mod measurement_relay;
 
 use latch_core::http::{self, Response};
-use latch_engine::server::{Options, Server};
+use latch_engine::server::{DesktopPreparation, Options, Server};
 use latch_proto::control::{self, StreamRequest};
 use std::net::TcpListener;
 
@@ -53,13 +53,7 @@ fn main() -> anyhow::Result<()> {
                         req.fps,
                         req.display.as_deref(),
                     )?;
-                    Ok(previous.map(|previous| {
-                        Box::new(move || {
-                            if let Err(e) = latch_engine::display::restore(&previous) {
-                                eprintln!("restore display: {e:#}");
-                            }
-                        }) as Box<dyn FnOnce() + Send>
-                    }))
+                    Ok(previous.map(|previous| Box::new(previous) as Box<dyn DesktopPreparation>))
                 }) as latch_engine::server::Prepare
             }),
             log: Box::new(|line| eprintln!("{line}")),

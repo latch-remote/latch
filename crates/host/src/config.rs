@@ -60,14 +60,38 @@ impl HostConfig {
         }
     }
 
-    fn load_path(path: &std::path::Path) -> Self {
-        match std::fs::read_to_string(path) {
+    /// The settings in a file as read: defaults when there is none, and
+    /// `None` for one that is empty, unreadable or does not parse.
+    fn parse_file(read: std::io::Result<String>) -> Option<Self> {
+        match read {
             Ok(text) if !text.trim().is_empty() => match latch_core::config::parse_lenient(&text) {
-                Ok((config, dropped)) if dropped.is_empty() => config,
-                _ => Self::safest(),
+                Ok((config, dropped)) if dropped.is_empty() => Some(config),
+                _ => None,
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            _ => Self::safest(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Self::default()),
+            _ => None,
+        }
+    }
+
+    fn load_path(path: &std::path::Path) -> Self {
+        Self::parse_file(std::fs::read_to_string(path)).unwrap_or_else(Self::safest)
+    }
+
+    /// As [`Self::load_path`] after the input migration, without running
+    /// it: an `elevated_input` the file does not record yet is what the
+    /// migration would write, `input_task()`. Nothing is written.
+    #[cfg(any(windows, test))]
+    fn load_path_read_only(path: &std::path::Path, input_task: impl FnOnce() -> bool) -> Self {
+        let read = std::fs::read_to_string(path);
+        let unrecorded = !matches!(&read, Ok(text) if !input_migration_needed(text));
+        match Self::parse_file(read) {
+            Some(mut config) => {
+                if unrecorded {
+                    config.elevated_input = input_task();
+                }
+                config
+            }
+            None => Self::safest(),
         }
     }
 
@@ -83,6 +107,20 @@ impl HostConfig {
         }
     }
 
+    /// The settings as [`Self::load`] gives them, for a process that may
+    /// be elevated (setup): it writes nothing to the user's folder and
+    /// starts no PowerShell, whose modules an elevated process must not
+    /// look for where the user can write.
+    pub fn load_read_only() -> Self {
+        match latch_core::config::data_dir() {
+            #[cfg(windows)]
+            Ok(dir) => Self::load_path_read_only(&dir.join(FILE), input_task_registered),
+            #[cfg(not(windows))]
+            Ok(dir) => Self::load_path(&dir.join(FILE)),
+            Err(_) => Self::safest(),
+        }
+    }
+
     #[cfg(windows)]
     fn migrate_input(path: &std::path::Path) {
         // Presence of the field is the one-time migration marker, including false.
@@ -90,9 +128,7 @@ impl HostConfig {
         if !input_migration_needed(&text) {
             return;
         }
-        let enabled = crate::setup::powershell(
-            "if (Get-ScheduledTask -TaskName 'LatchInput' -ErrorAction SilentlyContinue) { 'present' }"
-        ).is_ok_and(|s| s.trim() == "present");
+        let enabled = input_task_registered();
         // A malformed existing file must not be replaced with permissive defaults.
         let _ = latch_core::config::update(FILE, |c: &mut Self| c.elevated_input = enabled);
     }
@@ -122,6 +158,12 @@ impl HostConfig {
     }
 }
 
+/// Whether an earlier setup registered the input helper's task.
+#[cfg(windows)]
+fn input_task_registered() -> bool {
+    crate::setup::task_registered(latch_engine::windows::INPUT_TASK)
+}
+
 #[cfg(any(windows, test))]
 fn input_migration_needed(text: &str) -> bool {
     !text
@@ -148,6 +190,45 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// The elevated setup step reads the setting as the migration would
+    /// leave it, writing nothing and asking about the task only when the
+    /// file does not record the setting yet.
+    #[test]
+    fn read_only_load_resolves_the_input_setting_without_writing() {
+        let dir = std::env::temp_dir().join(format!("latch-config-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE);
+        let asked = std::cell::Cell::new(0);
+        let task = |present| {
+            let asked = &asked;
+            move || {
+                asked.set(asked.get() + 1);
+                present
+            }
+        };
+        // No file: the defaults, with the task deciding.
+        assert!(HostConfig::load_path_read_only(&path, task(true)).elevated_input);
+        assert!(!path.exists(), "nothing written");
+        for (text, present, expected, asks) in [
+            ("power_allowed = false\n", true, true, true),
+            ("power_allowed = false\n", false, false, true),
+            ("elevated_input = false\n", true, false, false),
+            ("elevated_input = true\n", false, true, false),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            asked.set(0);
+            let cfg = HostConfig::load_path_read_only(&path, task(present));
+            assert_eq!(cfg.elevated_input, expected, "{text}");
+            assert_eq!(asked.get() == 1, asks, "{text}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+        // A damaged file stays the safest settings, input off.
+        std::fs::write(&path, "power_allowed = false\n[").unwrap();
+        let cfg = HostConfig::load_path_read_only(&path, task(true));
+        assert_eq!(cfg, HostConfig::safest());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
