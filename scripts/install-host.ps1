@@ -39,26 +39,48 @@ $DestDir = Join-Path $env:LOCALAPPDATA "Latch"
 # goes once this one is in place.
 $OldDir = Join-Path $env:LOCALAPPDATA "BroLink"
 $DestExe = Join-Path $DestDir "latch-host.exe"
+$Me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$LogonTaskName = "LatchHostLogon-$Me"
+$LogonTask = Get-ScheduledTask -ErrorAction Stop |
+    Where-Object { $_.TaskPath -eq '\' -and $_.TaskName -eq $LogonTaskName }
+$RestoreLogonTask = $LogonTask -and $LogonTask.State -ne 'Disabled'
 
-# A running service or panel holds the old exe open; stop them first.
-try {
-    $ControlHeaders = @{}
-    $ControlToken = Join-Path $DestDir 'local-control-token'
-    if (Test-Path -LiteralPath $ControlToken) {
-        $ControlHeaders['x-latch-local-control'] = (Get-Content -LiteralPath $ControlToken -Raw).Trim()
+function Test-InstalledHostListening {
+    foreach ($listener in Get-NetTCPConnection -LocalPort 47850 -State Listen -ErrorAction SilentlyContinue) {
+        if ($listener.LocalAddress -notin '0.0.0.0', '127.0.0.1') { continue }
+        $owner = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
+        if ($owner.Path -eq $DestExe) { return $true }
     }
-    Invoke-RestMethod -Headers $ControlHeaders -Method Post -Uri "http://127.0.0.1:47850/v1/quit" -ContentType 'application/json' -Body '{}' -TimeoutSec 2 | Out-Null
-    Start-Sleep -Milliseconds 800
-} catch {}
-# Only this user's host at the path being replaced: the secure-desktop
-# helper also runs as latch-host.exe, as SYSTEM from Program Files, and
-# stopping it unelevated fails with access denied. Each candidate is opened
-# once, and its path, user and start time are checked through that very
-# handle before it is ended through it: a process id reused since the list
-# was taken is never stopped, and the path is read the same way from 32-bit
-# PowerShell as from 64-bit (where Get-Process gives none for a 64-bit
-# process).
-Add-Type -TypeDefinition @'
+    return $false
+}
+
+try {
+    if ($RestoreLogonTask) {
+        Disable-ScheduledTask -TaskName $LogonTaskName -TaskPath '\' | Out-Null
+    }
+
+    # A running service or panel holds the old exe open; stop them first.
+    try {
+        $ControlHeaders = @{}
+        $ControlToken = Join-Path $DestDir 'local-control-token'
+        if (Test-Path -LiteralPath $ControlToken) {
+            $ControlHeaders['x-latch-local-control'] = (Get-Content -LiteralPath $ControlToken -Raw).Trim()
+        }
+        Invoke-RestMethod -Headers $ControlHeaders -Method Post -Uri "http://127.0.0.1:47850/v1/quit" -ContentType 'application/json' -Body '{}' -TimeoutSec 2 | Out-Null
+        Start-Sleep -Milliseconds 800
+    } catch {}
+    if ($LogonTask) {
+        Stop-ScheduledTask -TaskName $LogonTaskName -TaskPath '\'
+    }
+    # Only this user's host at the path being replaced: the secure-desktop
+    # helper also runs as latch-host.exe, as SYSTEM from Program Files, and
+    # stopping it unelevated fails with access denied. Each candidate is opened
+    # once, and its path, user and start time are checked through that very
+    # handle before it is ended through it: a process id reused since the list
+    # was taken is never stopped, and the path is read the same way from 32-bit
+    # PowerShell as from 64-bit (where Get-Process gives none for a 64-bit
+    # process).
+    Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
@@ -129,109 +151,115 @@ public static class LatchInstallStop {
     }
 }
 '@
-$Me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-foreach ($candidate in Get-CimInstance Win32_Process -Filter "Name = 'latch-host.exe'") {
-    if (!$candidate.CreationDate) { continue }
-    [void][LatchInstallStop]::Stop([uint32]$candidate.ProcessId, $DestExe, $Me, $candidate.CreationDate.ToFileTimeUtc())
-}
-Get-Process brolink-host -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Milliseconds 300
-if ((Test-Path $OldDir) -and -not (Test-Path (Join-Path $DestDir "host.toml"))) {
+    foreach ($candidate in Get-CimInstance Win32_Process -Filter "Name = 'latch-host.exe'") {
+        if (!$candidate.CreationDate) { continue }
+        [void][LatchInstallStop]::Stop([uint32]$candidate.ProcessId, $DestExe, $Me, $candidate.CreationDate.ToFileTimeUtc())
+    }
+    Get-Process brolink-host -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep -Milliseconds 300
+    if ((Test-Path $OldDir) -and -not (Test-Path (Join-Path $DestDir "host.toml"))) {
+        New-Item -ItemType Directory -Force -Path $DestDir | Out-Null
+        Get-ChildItem -LiteralPath $OldDir -Force | Where-Object { $_.Name -notmatch '\.(exe|zip)(\.old|\.new)?$' -and $_.Name -ne 'engine' } |
+            ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $DestDir -Recurse -Force }
+        Write-Host "Settings carried over from the previous install."
+    }
     New-Item -ItemType Directory -Force -Path $DestDir | Out-Null
-    Get-ChildItem -LiteralPath $OldDir -Force | Where-Object { $_.Name -notmatch '\.(exe|zip)(\.old|\.new)?$' -and $_.Name -ne 'engine' } |
-        ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $DestDir -Recurse -Force }
-    Write-Host "Settings carried over from the previous install."
-}
-New-Item -ItemType Directory -Force -Path $DestDir | Out-Null
-Copy-Item $Exe $DestExe -Force
-Write-Host "Installed: $DestExe"
-# Latch 4 kept its engine's archive (about 25 MB) and the scripts that
-# started the engine in this folder. Latch 5 has no separate engine; the
-# engine itself was in Program Files, which setup's retire step removes.
-foreach ($old in 'Sunshine-Windows-AMD64-lite.zip', 'take-over-engine.ps1', 'take-over-engine.vbs', 'take-over-engine.cmd') {
-    Remove-Item -LiteralPath (Join-Path $DestDir $old) -Force -ErrorAction SilentlyContinue
-}
-$Wsh = New-Object -ComObject WScript.Shell
-$Desktop = [Environment]::GetFolderPath("Desktop")
-$StartMenu = Join-Path ([Environment]::GetFolderPath("StartMenu")) "Programs"
-New-Item -ItemType Directory -Force -Path $StartMenu | Out-Null
-foreach ($folder in @($Desktop, $StartMenu)) {
-    Remove-Item -LiteralPath (Join-Path $folder "BroLink Host.lnk") -Force -ErrorAction SilentlyContinue
-    $Lnk = $Wsh.CreateShortcut((Join-Path $folder "Latch Host.lnk"))
-    $Lnk.TargetPath = $DestExe
-    $Lnk.WorkingDirectory = $DestDir
-    $Lnk.Description = "Your PC, from your Mac"
-    $Lnk.Save()
-}
+    Copy-Item $Exe $DestExe -Force
+    Write-Host "Installed: $DestExe"
+    # Latch 4 kept its engine's archive (about 25 MB) and the scripts that
+    # started the engine in this folder. Latch 5 has no separate engine; the
+    # engine itself was in Program Files, which setup's retire step removes.
+    foreach ($old in 'Sunshine-Windows-AMD64-lite.zip', 'take-over-engine.ps1', 'take-over-engine.vbs', 'take-over-engine.cmd') {
+        Remove-Item -LiteralPath (Join-Path $DestDir $old) -Force -ErrorAction SilentlyContinue
+    }
+    $Wsh = New-Object -ComObject WScript.Shell
+    $Desktop = [Environment]::GetFolderPath("Desktop")
+    $StartMenu = Join-Path ([Environment]::GetFolderPath("StartMenu")) "Programs"
+    New-Item -ItemType Directory -Force -Path $StartMenu | Out-Null
+    foreach ($folder in @($Desktop, $StartMenu)) {
+        Remove-Item -LiteralPath (Join-Path $folder "BroLink Host.lnk") -Force -ErrorAction SilentlyContinue
+        $Lnk = $Wsh.CreateShortcut((Join-Path $folder "Latch Host.lnk"))
+        $Lnk.TargetPath = $DestExe
+        $Lnk.WorkingDirectory = $DestDir
+        $Lnk.Description = "Your PC, from your Mac"
+        $Lnk.Save()
+    }
 
-# The background service at logon; the app offers the same toggle.
-$Run = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-# A profile that never had a login item has no Run key.
-if (-not (Test-Path $Run)) { New-Item -Path $Run | Out-Null }
-Remove-ItemProperty -Path $Run -Name "BroLinkHost" -ErrorAction SilentlyContinue
-New-ItemProperty -Path $Run -Name "LatchHost" -Value "`"$DestExe`" --background" -PropertyType String -Force | Out-Null
+    # The background service at logon; the app offers the same toggle.
+    $Run = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+    # A profile that never had a login item has no Run key.
+    if (-not (Test-Path $Run)) { New-Item -Path $Run | Out-Null }
+    Remove-ItemProperty -Path $Run -Name "BroLinkHost" -ErrorAction SilentlyContinue
+    New-ItemProperty -Path $Run -Name "LatchHost" -Value "`"$DestExe`" --background" -PropertyType String -Force | Out-Null
 
-# Settings > Apps lists it, and its Uninstall runs latch-host --uninstall.
-$Apps = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Latch"
-New-Item -Path $Apps -Force | Out-Null
-$Version = (Get-Item -LiteralPath $DestExe).VersionInfo.ProductVersion
-foreach ($v in @(
-        @('DisplayName', 'Latch'),
-        @('DisplayIcon', $DestExe),
-        @('DisplayVersion', "$Version"),
-        @('InstallLocation', $DestDir),
-        @('UninstallString', "`"$DestExe`" --uninstall")
-    )) {
-    New-ItemProperty -Path $Apps -Name $v[0] -Value $v[1] -PropertyType String -Force | Out-Null
-}
-foreach ($flag in 'NoModify', 'NoRepair') {
-    New-ItemProperty -Path $Apps -Name $flag -Value 1 -PropertyType DWord -Force | Out-Null
-}
+    # Settings > Apps lists it, and its Uninstall runs latch-host --uninstall.
+    $Apps = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Latch"
+    New-Item -Path $Apps -Force | Out-Null
+    $Version = (Get-Item -LiteralPath $DestExe).VersionInfo.ProductVersion
+    foreach ($v in @(
+            @('DisplayName', 'Latch'),
+            @('DisplayIcon', $DestExe),
+            @('DisplayVersion', "$Version"),
+            @('InstallLocation', $DestDir),
+            @('UninstallString', "`"$DestExe`" --uninstall")
+        )) {
+        New-ItemProperty -Path $Apps -Name $v[0] -Value $v[1] -PropertyType String -Force | Out-Null
+    }
+    foreach ($flag in 'NoModify', 'NoRepair') {
+        New-ItemProperty -Path $Apps -Name $flag -Value 1 -PropertyType DWord -Force | Out-Null
+    }
 
-if (Test-Path $OldDir) {
-    Remove-Item -LiteralPath $OldDir -Recurse -Force -ErrorAction SilentlyContinue
-    if (Test-Path $OldDir) { Write-Host "Could not remove the previous install folder completely; it is safe to delete." }
-}
+    if (Test-Path $OldDir) {
+        Remove-Item -LiteralPath $OldDir -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path $OldDir) { Write-Host "Could not remove the previous install folder completely; it is safe to delete." }
+    }
 
-Write-Host "Shortcut: Desktop\Latch Host.lnk"
-Write-Host "Open Latch and click 'Set up as administrator' on the Sharing tab once."
-Write-Host "If you already ran setup from the unzipped copy, run it once more from this install so the firewall allows $DestExe."
-if ((Get-Process -Id $PID).SessionId -eq 0) {
-    # The task runs as this user, unelevated like the Run key, in the session
-    # they are signed in to. Task Scheduler's defaults would stop the host
-    # after 72 hours, or on battery, and run it at below-normal priority.
-    $TaskName = "LatchHostStart"
-    $up = $false
-    try {
-        $action = New-ScheduledTaskAction -Execute $DestExe -Argument "--background" -WorkingDirectory $DestDir
-        # USERDOMAIN is not set in an SSH session; the token's own name is.
-        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-        $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
-        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Priority 5
-        Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-        Start-ScheduledTask -TaskName $TaskName
-        foreach ($i in 1..20) {
-            Start-Sleep -Milliseconds 750
-            try {
-                Invoke-RestMethod -Uri "http://127.0.0.1:47850/v1/status" -UseBasicParsing -TimeoutSec 2 | Out-Null
-                $up = $true
-                break
-            } catch {}
+    Write-Host "Shortcut: Desktop\Latch Host.lnk"
+    Write-Host "Open Latch and click 'Set up as administrator' on the Sharing tab once."
+    Write-Host "If you already ran setup from the unzipped copy, run it once more from this install so the firewall allows $DestExe."
+    if ((Get-Process -Id $PID).SessionId -eq 0) {
+        # The task runs as this user, unelevated like the Run key, in the session
+        # they are signed in to. Task Scheduler's defaults would stop the host
+        # after 72 hours, or on battery, and run it at below-normal priority.
+        $TaskName = "LatchHostStart"
+        $up = $false
+        try {
+            $action = New-ScheduledTaskAction -Execute $DestExe -Argument "--background" -WorkingDirectory $DestDir
+            # USERDOMAIN is not set in an SSH session; the token's own name is.
+            $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
+            $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Priority 5
+            Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+            Start-ScheduledTask -TaskName $TaskName
+            foreach ($i in 1..20) {
+                Start-Sleep -Milliseconds 750
+                try {
+                    Invoke-RestMethod -Uri "http://127.0.0.1:47850/v1/status" -UseBasicParsing -TimeoutSec 2 | Out-Null
+                    if (Test-InstalledHostListening) {
+                        $up = $true
+                        break
+                    }
+                } catch {}
+            }
+        } catch {
+            Write-Host "Could not start Latch Host in the signed-in session: $_"
+        } finally {
+            # Deleting a task does not terminate its running instances. Remove
+            # the temporary registration even when startup failed or timed out.
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
         }
-    } catch {
-        Write-Host "Could not start Latch Host in the signed-in session: $_"
-    } finally {
-        # Deleting a task does not terminate its running instances. Remove
-        # the temporary registration even when startup failed or timed out.
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    }
-    if ($up) {
-        Write-Host "Latch Host is running in the signed-in user's session."
+        if ($up) {
+            Write-Host "Latch Host is running in the signed-in user's session."
+        } else {
+            Write-Host "Could not verify that $DestExe is serving TCP 47850 in the signed-in session. Latch Host is set to start at sign-in."
+        }
+    } elseif ($NoStart) {
+        Start-Process -FilePath $DestExe -ArgumentList "--background" -WorkingDirectory $DestDir
     } else {
-        Write-Host "Nobody is signed in to this PC's desktop: Latch Host starts at the next sign-in."
+        Start-Process -FilePath $DestExe -WorkingDirectory $DestDir
     }
-} elseif ($NoStart) {
-    Start-Process -FilePath $DestExe -ArgumentList "--background" -WorkingDirectory $DestDir
-} else {
-    Start-Process -FilePath $DestExe -WorkingDirectory $DestDir
+} finally {
+    if ($RestoreLogonTask) {
+        Enable-ScheduledTask -TaskName $LogonTaskName -TaskPath '\' | Out-Null
+    }
 }
