@@ -137,7 +137,7 @@ Latch 4.x and 5.x look for updates in this repository, which also carries
 each release's macOS and Windows archives while it is public. Use
 **Check now** to update; a 5.x Windows host accepts the update a new Mac
 pushes. Update before this repository becomes private: after that those
-versions no longer find new releases. If **Check now** cannot find 6.1.0,
+versions no longer find new releases. If **Check now** cannot find 6.1.1,
 install once from the public release page on each machine. On Windows,
 unzip the release and run its `install-host.ps1`. On macOS, replace the
 app as above. On Linux, replace the binary and restart the service using
