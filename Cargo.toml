@@ -39,7 +39,7 @@ toml = "0.8"
 parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-rand = "0.8"
+rand = "0.10"
 directories = "5"
 clap = { version = "4", features = ["derive"] }
 eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts", "accesskit", "x11", "wayland"] }
