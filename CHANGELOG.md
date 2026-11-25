@@ -9,6 +9,12 @@ GitHub release notes, so each version gets a heading of the form
 - Keep Windows mouse and keyboard input responsive when a foreground game
   denies cursor confinement, including through the elevated input helper.
 - Fix stretched letter spacing in wrapped menu help text.
+- Say **Latch isn't answering** instead of **Offline · Turn it on to connect**
+  for a machine Tailscale lists as online when no Latch host responds, and skip
+  relay warnings and stream recovery for it.
+- Escape `%%s` in `deploy/native/latch-display.service` so systemd does not
+  expand `%s` to the user's shell when writing the X authority cookie on fresh
+  headless Linux installs.
 - Say **Your relay dropped** instead of **Relayed via Tokyo** when
   Tailscale leaves a working peer relay for its DERP relay after packets go
   missing, and blame the packet loss instead of the router in Connection

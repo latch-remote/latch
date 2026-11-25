@@ -2771,6 +2771,14 @@ mod tests {
         gaming_pc.online = false;
         gaming_pc.path.direct = Some(false);
         let disc = Discovery {
+            pcs: vec![gaming_pc.clone()],
+            ..Default::default()
+        };
+        assert!(path_warnings(&disc, None).is_empty());
+        // Nothing is said about a machine that is up on Tailscale without Latch.
+        gaming_pc.online = true;
+        gaming_pc.host = None;
+        let disc = Discovery {
             pcs: vec![gaming_pc],
             ..Default::default()
         };
