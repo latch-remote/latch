@@ -674,7 +674,7 @@ impl ClientApp {
                 .lock()
                 .pcs
                 .iter()
-                .any(|pc| pc.node_id == live.node_id && pc.online);
+                .any(|pc| pc.node_id == live.node_id && pc.host.is_some());
             self.view
                 .observe_recovery(online, std::time::SystemTime::now(), Instant::now());
             let mut prog = self.progress.lock();
@@ -2550,7 +2550,13 @@ fn host_audio_problem(discovery: &Mutex<Discovery>, node_id: &str) -> Option<Str
 /// update that is behind `release`.
 fn path_warnings(disc: &Discovery, release: Option<&latch_core::update::Release>) -> Vec<String> {
     let mut out = Vec::new();
-    for pc in disc.pcs.iter().filter(|p| !p.remembered && p.online) {
+    // Only machines Latch answers on: a relayed path to one that runs no
+    // Latch host is nothing to act on.
+    for pc in disc
+        .pcs
+        .iter()
+        .filter(|p| !p.remembered && p.online && p.host.is_some())
+    {
         let nat = pc.host.as_ref().and_then(|h| h.nat.as_ref());
         if let Some(t) = path::explain(&pc.name, &pc.path, nat, disc.self_nat.as_ref()) {
             out.push(t);
@@ -2764,6 +2770,14 @@ mod tests {
         // Nothing is said about a PC that is off.
         gaming_pc.online = false;
         gaming_pc.path.direct = Some(false);
+        let disc = Discovery {
+            pcs: vec![gaming_pc.clone()],
+            ..Default::default()
+        };
+        assert!(path_warnings(&disc, None).is_empty());
+        // Nothing is said about a machine that is up on Tailscale without Latch.
+        gaming_pc.online = true;
+        gaming_pc.host = None;
         let disc = Discovery {
             pcs: vec![gaming_pc],
             ..Default::default()
