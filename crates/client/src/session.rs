@@ -38,7 +38,8 @@ pub struct Pc {
     /// Tailscale OS string ("windows", "macOS", "linux").
     pub os: String,
     pub ip: Option<Ipv4Addr>,
-    /// The Latch control service answered during discovery.
+    /// Tailscale lists the machine as online; whether Latch answered there
+    /// is [`Pc::host`].
     pub online: bool,
     /// The Latch control service answered.
     pub host: Option<Status>,
@@ -514,7 +515,9 @@ fn probe_peer(cfg: &ClientConfig, n: &tailscale::Node) -> Pc {
         name: n.name().to_string(),
         os: n.os.clone(),
         ip,
-        online: host.is_some(),
+        // Tailscale's word, not Latch's: a machine that is up but runs no
+        // Latch host is "not answering", never "offline".
+        online: n.online,
         host,
         known,
         remembered: false,
@@ -1986,6 +1989,26 @@ mod tests {
             );
         }
         assert!(d.error.is_some() || !d.login.is_empty());
+    }
+
+    #[test]
+    fn a_machine_tailscale_lists_as_up_is_online_even_without_latch() {
+        // No IPv4, so nothing is probed and no Latch host answers.
+        let n = tailscale::Node {
+            id: "nVPS".into(),
+            host_name: "t3code-gcp".into(),
+            os: "linux".into(),
+            online: true,
+            ..Default::default()
+        };
+        let pc = probe_peer(&ClientConfig::default(), &n);
+        assert!(pc.online, "Tailscale says it is up");
+        assert!(pc.host.is_none());
+        let off = probe_peer(
+            &ClientConfig::default(),
+            &tailscale::Node { online: false, ..n },
+        );
+        assert!(!off.online);
     }
 
     #[test]
